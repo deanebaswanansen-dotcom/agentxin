@@ -21,7 +21,6 @@ import { ReaderWorkspace } from './components/ReaderWorkspace.js';
 import { ProjectTree } from './components/ProjectTree.js';
 import { SettingsPanel } from './components/SettingsPanel.js';
 import { ErrorProvider, useErrorReporter } from './components/ErrorToast.js';
-import { AuthGate } from './components/AuthGate.js';
 import { Icon } from './components/Icon.js';
 import { useDialogFocusTrap } from './components/useDialogFocusTrap.js';
 import {
@@ -59,11 +58,7 @@ function BrandLogo(): JSX.Element {
   );
 }
 
-interface WorkbenchProps {
-  onLogout?: () => void;
-}
-
-function Workbench({ onLogout }: WorkbenchProps): JSX.Element {
+function Workbench(): JSX.Element {
   const { reportError } = useErrorReporter();
   useDialogFocusTrap();
 
@@ -263,6 +258,13 @@ function Workbench({ onLogout }: WorkbenchProps): JSX.Element {
     setAppMode('reader');
   }, []);
 
+  const handleLogout = useCallback(() => {
+    apiClient.modelConfig.clear();
+    setShowSettings(false);
+    setDrawer('none');
+    reportError('已登出，本次 API Key 已清除。');
+  }, [reportError]);
+
   // ESC 关闭当前浮层或回到 Agent 模式
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
@@ -374,16 +376,14 @@ function Workbench({ onLogout }: WorkbenchProps): JSX.Element {
             >
               <Icon name="settings" /> 设置
             </button>
-            {onLogout ? (
-              <button
-                type="button"
-                className="nwa-button nwa-button--ghost nwa-button--sm"
-                onClick={onLogout}
-                title="退出登录"
-              >
-                退出
-              </button>
-            ) : null}
+            <button
+              type="button"
+              className="nwa-button nwa-button--ghost nwa-button--sm"
+              onClick={handleLogout}
+              title="清除本次 API Key"
+            >
+              登出
+            </button>
           </div>
         </header>
       ) : null}
@@ -650,11 +650,7 @@ function Workbench({ onLogout }: WorkbenchProps): JSX.Element {
 export function App(): JSX.Element {
   return (
     <ErrorProvider>
-      <AuthGate>
-        {(session, onLogout) => (
-          <Workbench onLogout={session.authRequired ? onLogout : undefined} />
-        )}
-      </AuthGate>
+      <Workbench />
     </ErrorProvider>
   );
 }

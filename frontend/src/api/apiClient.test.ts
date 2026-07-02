@@ -7,7 +7,7 @@ import {
   parseSseEvents,
   type SseEvent,
 } from './apiClient.js';
-import type { ApiError, WritingRequestBody } from '../types/index.js';
+import type { ApiError, ModelConfig, WritingRequestBody } from '../types/index.js';
 
 // ---------------------------------------------------------------------------
 // fetch mocking helpers
@@ -56,6 +56,7 @@ function installFetch(impl: (url: string, init?: RequestInit) => Response | Prom
 }
 
 afterEach(() => {
+  client().modelConfig.clear();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -67,6 +68,46 @@ const client = () => createApiClient('/api');
 // ---------------------------------------------------------------------------
 
 describe('apiClient request building', () => {
+  it('keeps model config in page memory, sends it as a request header, and clears it', async () => {
+    const api = client();
+    const config: ModelConfig = {
+      baseUrl: 'https://api.example.com',
+      apiKey: 'sk-secret-key',
+      modelName: 'novel-model',
+      temperature: 0.75,
+      topP: 0.85,
+    };
+
+    await expect(api.modelConfig.get()).resolves.toEqual({
+      baseUrl: '',
+      modelName: '',
+      apiKeyMasked: '',
+      temperature: 1,
+      topP: 1,
+    });
+    await expect(api.modelConfig.save(config)).resolves.toEqual({
+      baseUrl: 'https://api.example.com',
+      modelName: 'novel-model',
+      apiKeyMasked: '****-key',
+      temperature: 0.75,
+      topP: 0.85,
+    });
+
+    const mock = installFetch(() => jsonResponse([]));
+    await api.projects.list();
+    const headers = mock.mock.calls[0][1]?.headers as Record<string, string>;
+    expect(JSON.parse(decodeURIComponent(headers['X-Agentxin-Model-Config']))).toEqual(config);
+
+    api.modelConfig.clear();
+    await expect(api.modelConfig.get()).resolves.toEqual({
+      baseUrl: '',
+      modelName: '',
+      apiKeyMasked: '',
+      temperature: 1,
+      topP: 1,
+    });
+  });
+
   it('issues a POST with JSON body for project creation and parses the result', async () => {
     const mock = installFetch(() => jsonResponse({ id: 'p1' }, { status: 201 }));
     const result = await client().projects.create('我的小说');

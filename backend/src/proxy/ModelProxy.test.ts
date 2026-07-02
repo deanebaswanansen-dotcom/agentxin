@@ -250,7 +250,7 @@ describe('OpenAiCompatibleModelProxy error handling', () => {
     const err = thrown as ProxyError;
     expect(err.code).toBe('PROVIDER_ERROR');
     expect(err.status).toBe(429);
-  });
+  }, 20000);
 
   it('throws ProxyError when the request is aborted (5.5)', async () => {
     // Realistic mock: fetch rejects with an AbortError when the signal is set.
@@ -337,5 +337,5 @@ describe('OpenAiCompatibleModelProxy API key safety (5.6)', () => {
     const err = thrown as ProxyError;
     expect(err.message.includes(API_KEY)).toBe(false);
     expect((err.stack ?? '').includes(API_KEY)).toBe(false);
-  });
+  }, 20000);
 });

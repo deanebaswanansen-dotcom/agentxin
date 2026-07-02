@@ -14,10 +14,11 @@
  *   and `modelName` in the clear, plus a MASKED API key. The raw key is NEVER
  *   included (Requirements 4.2, 5.6 / Property 15). When no config has been
  *   saved yet, an empty view is returned so the frontend can render its form.
- * - getInternalConfig: return the FULL {@link ModelConfig} (including the raw
- *   `apiKey`) for server-side use by the writing flow / ModelProxy
- *   (Requirement 4.5). Returns `undefined` when unset. This MUST NOT be exposed
- *   over any frontend-facing transport.
+ * - getInternalConfig: return the FULL request-scoped {@link ModelConfig}
+ *   (including the raw `apiKey`) for server-side use by the writing flow /
+ *   ModelProxy. Returns `undefined` when the current request did not include
+ *   the volatile browser-held config. This MUST NOT be exposed over any
+ *   frontend-facing transport.
  *
  * Validation failures raise a {@link ServiceError} so the transport layer can
  * map them to the unified API error response.
@@ -25,6 +26,7 @@
 import type { DataStore } from '../../store/DataStore.js';
 import type { ModelConfig, ModelConfigView } from '../../types/index.js';
 import { ServiceError } from '../ServiceError.js';
+import { getRequestModelConfig, hasRequestModelConfigScope } from './requestModelConfig.js';
 
 /** Fixed run of mask characters used to obscure the API key. */
 const MASK = '****';
@@ -89,14 +91,17 @@ export class ModelConfigService {
   }
 
   /**
-   * Return the FULL model configuration (including the raw API key) for
-   * internal server-side use by the writing flow / ModelProxy (Requirement
-   * 4.5). Returns `undefined` when no configuration has been saved.
+   * Return the FULL model configuration (including the raw API key) for the
+   * current request. The production writing path intentionally does not fall
+   * back to persisted server config, so a refresh/close/logout loses the key.
    *
    * SECURITY: the result contains the plaintext API key and MUST NOT be
    * serialized to any frontend-facing response. Use {@link getView} for that.
    */
   async getInternalConfig(): Promise<ModelConfig | undefined> {
+    if (hasRequestModelConfigScope()) {
+      return getRequestModelConfig();
+    }
     return this.store.getModelConfig();
   }
 }

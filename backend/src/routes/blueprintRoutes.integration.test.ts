@@ -121,6 +121,10 @@ const MODEL_CONFIG: ModelConfig = {
   modelName: 'gpt-test',
 };
 
+function modelConfigHeaders(config: ModelConfig = MODEL_CONFIG): Record<string, string> {
+  return { 'X-Agentxin-Model-Config': encodeURIComponent(JSON.stringify(config)) };
+}
+
 /** 从累计的 SSE 文本中解析所有 `delta` 事件并 JSON 解码其 data。 */
 function parseDeltaEvents(body: string): string[] {
   return [...body.matchAll(/event: delta\ndata: (.*)\n\n/g)].map(
@@ -184,6 +188,7 @@ describe('blueprintRoutes 集成（buildServer + app.inject）', () => {
     const res = await app.inject({
       method: 'POST',
       url: `/api/projects/_/chapters/${chapterId}/blueprint`,
+      headers: modelConfigHeaders(),
       payload: { targetWords: 300, requirement: '主角在雨夜揭开真相。' },
     });
 
@@ -242,6 +247,7 @@ describe('blueprintRoutes 集成（buildServer + app.inject）', () => {
     const res = await app.inject({
       method: 'POST',
       url: '/api/projects/_/chapters/does-not-exist/blueprint',
+      headers: modelConfigHeaders(),
       payload: { targetWords: 300, requirement: '任意需求。' },
     });
 
@@ -269,6 +275,7 @@ describe('blueprintRoutes 集成（buildServer + app.inject）', () => {
     const res = await app.inject({
       method: 'POST',
       url: `/api/projects/_/chapters/${chapterId}/blueprint`,
+      headers: modelConfigHeaders(),
       payload: { targetWords: 50, requirement: '任意需求。' },
     });
 
@@ -382,6 +389,7 @@ describe('blueprintRoutes 集成（buildServer + app.inject）', () => {
     const res = await app.inject({
       method: 'POST',
       url: `/api/chapters/${chapterId}/scenes/scene-1/write`,
+      headers: modelConfigHeaders(),
       payload: {},
     });
 
@@ -409,6 +417,7 @@ describe('blueprintRoutes 集成（buildServer + app.inject）', () => {
     const res = await app.inject({
       method: 'POST',
       url: `/api/chapters/${chapterId}/scenes/scene-404/write`,
+      headers: modelConfigHeaders(),
       payload: {},
     });
 
@@ -435,6 +444,7 @@ describe('blueprintRoutes 集成（buildServer + app.inject）', () => {
     const res = await app.inject({
       method: 'POST',
       url: `/api/chapters/${chapterId}/scenes/scene-404/expand`,
+      headers: modelConfigHeaders(),
       payload: { addWords: 100 },
     });
 
@@ -452,6 +462,7 @@ describe('blueprintRoutes 集成（buildServer + app.inject）', () => {
     const res = await app.inject({
       method: 'POST',
       url: `/api/chapters/${chapterId}/scenes/scene-404/rewrite`,
+      headers: modelConfigHeaders(),
       payload: { instruction: '让节奏更紧凑' },
     });
 

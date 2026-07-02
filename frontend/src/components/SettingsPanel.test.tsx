@@ -28,6 +28,7 @@ function makeClient(overrides: Partial<SettingsClient['modelConfig']> = {}): Set
     modelConfig: {
       get: vi.fn().mockResolvedValue(view),
       save: vi.fn().mockResolvedValue(view),
+      clear: vi.fn(),
       ...overrides,
     },
     cacheStats: {
@@ -116,7 +117,7 @@ describe('SettingsPanel', () => {
     render(<SettingsPanel client={client} />);
 
     expect(await screen.findByText('（演示模式，无需真实密钥）')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: '保存配置' }));
+    fireEvent.click(screen.getByRole('button', { name: '启用本次 API' }));
 
     await waitFor(() =>
       expect(save).toHaveBeenCalledWith({
@@ -164,7 +165,7 @@ describe('SettingsPanel', () => {
     fireEvent.change(screen.getByLabelText('温度'), { target: { value: '1.25' } });
     fireEvent.change(screen.getByLabelText('Top-P'), { target: { value: '0.85' } });
     fireEvent.change(screen.getByLabelText('API Key'), { target: { value: 'sk-secret-key' } });
-    fireEvent.click(screen.getByRole('button', { name: '保存配置' }));
+    fireEvent.click(screen.getByRole('button', { name: '启用本次 API' }));
 
     await waitFor(() =>
       expect(save).toHaveBeenCalledWith({
@@ -198,7 +199,7 @@ describe('SettingsPanel', () => {
       target: { value: 'custom-novel-model' },
     });
     fireEvent.change(screen.getByLabelText('API Key'), { target: { value: 'sk-secret-key' } });
-    fireEvent.click(screen.getByRole('button', { name: '保存配置' }));
+    fireEvent.click(screen.getByRole('button', { name: '启用本次 API' }));
 
     await waitFor(() =>
       expect(save).toHaveBeenCalledWith({

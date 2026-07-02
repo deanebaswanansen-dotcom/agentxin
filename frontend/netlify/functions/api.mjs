@@ -17,11 +17,6 @@ function readEnv(name, fallback) {
 
 function hydrateBackendEnv() {
   for (const name of [
-    'APP_AUTH_DISABLED',
-    'APP_AUTH_USERNAME',
-    'APP_AUTH_PASSWORD',
-    'APP_AUTH_PASSWORD_SHA256',
-    'APP_SESSION_SECRET',
     'NETLIFY',
     'NODE_ENV',
   ]) {

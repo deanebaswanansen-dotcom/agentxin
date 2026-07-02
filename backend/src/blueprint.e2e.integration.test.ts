@@ -68,6 +68,10 @@ const MODEL_CONFIG: ModelConfig = {
   modelName: 'gpt-test',
 };
 
+function modelConfigHeaders(config: ModelConfig = MODEL_CONFIG): Record<string, string> {
+  return { 'X-Agentxin-Model-Config': encodeURIComponent(JSON.stringify(config)) };
+}
+
 /**
  * 从写作调用的对话消息中识别目标场景标识符。
  *
@@ -223,6 +227,7 @@ describe('端到端集成：项目→章节→蓝图（mock 提供商）→分�
     const bpRes = await app.inject({
       method: 'POST',
       url: `/api/projects/_/chapters/${chapterId}/blueprint`,
+      headers: modelConfigHeaders(),
       payload: { targetWords: 300, requirement: '主角在雨夜揭开真相。' },
     });
     expect(bpRes.statusCode).toBe(200);
@@ -246,6 +251,7 @@ describe('端到端集成：项目→章节→蓝图（mock 提供商）→分�
       const writeRes = await app.inject({
         method: 'POST',
         url: `/api/chapters/${chapterId}/scenes/${sceneId}/write`,
+        headers: modelConfigHeaders(),
         payload: {},
       });
       expect(writeRes.statusCode).toBe(200);

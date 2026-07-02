@@ -25,6 +25,12 @@ interface SseEvent {
   data: string;
 }
 
+const MODEL_CONFIG = { baseUrl: 'mock', apiKey: 'mock-key', modelName: 'mock-model' };
+
+function modelConfigHeaders(): Record<string, string> {
+  return { 'X-Agentxin-Model-Config': encodeURIComponent(JSON.stringify(MODEL_CONFIG)) };
+}
+
 /** 极简 SSE 帧解析（逐块累积，按空行切分）。 */
 function parseFrames(buffer: string): { events: SseEvent[]; rest: string } {
   const events: SseEvent[] = [];
@@ -58,8 +64,6 @@ describe('E2E: full_novel streaming over real HTTP', () => {
     const memFile = join(dir, 'agent-memory.json');
 
     const store = await FileDataStore.create(storeFile);
-    // 配置 Mock 提供商：无需任何 API Key，即可走真实 proxy 链的 mock 分支。
-    await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock-key', modelName: 'mock-model' });
 
     const memory = new MemoryService(await MemoryStore.create(memFile));
     const app = buildServer(store, undefined, memory);
@@ -68,7 +72,7 @@ describe('E2E: full_novel streaming over real HTTP', () => {
     try {
       const res = await fetch(`${address}/api/agent/run-stream`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+        headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream', ...modelConfigHeaders() },
         body: JSON.stringify({
           task: 'full_novel',
           mode: 'draft',

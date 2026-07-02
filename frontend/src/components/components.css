@@ -781,65 +781,6 @@
 }
 
 /* ==========================================================================
-   登录页
-   ========================================================================== */
-
-.nwa-auth-screen {
-  min-height: 100vh;
-  display: grid;
-  place-items: center;
-  padding: 1.5rem;
-  background:
-    radial-gradient(circle at 20% 18%, rgba(132, 84, 228, 0.14), transparent 28%),
-    linear-gradient(135deg, #17131d 0%, #242018 48%, #f7f1e4 49%, #f7f1e4 100%);
-}
-
-.nwa-auth-card {
-  width: min(420px, 100%);
-  display: grid;
-  gap: 1rem;
-  padding: 1.5rem;
-  border: 1px solid rgba(97, 74, 48, 0.22);
-  border-radius: 8px;
-  background: rgba(255, 251, 243, 0.96);
-  box-shadow: 0 18px 40px rgba(33, 25, 18, 0.18);
-}
-
-.nwa-auth-card__brand {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-}
-
-.nwa-auth-card__brand svg,
-.nwa-auth-card > svg {
-  width: 2rem;
-  height: 2rem;
-  color: var(--accent-primary);
-}
-
-.nwa-auth-card__brand h1 {
-  margin: 0;
-  font-family: var(--font-display);
-  font-size: 1.35rem;
-}
-
-.nwa-auth-card__brand p,
-.nwa-auth-card > p {
-  margin: 0;
-  color: var(--text-muted);
-}
-
-.nwa-auth-card__warning {
-  padding: 0.75rem;
-  border: 1px solid rgba(179, 77, 48, 0.24);
-  border-radius: 6px;
-  background: rgba(255, 241, 230, 0.9);
-  color: #8b351d;
-  font-size: 0.9rem;
-}
-
-/* ==========================================================================
    设置面板
    ========================================================================== */
 

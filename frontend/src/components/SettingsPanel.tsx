@@ -1,18 +1,9 @@
 /**
  * Settings panel for the model configuration (task 12.7, Requirement 8.5).
  *
- * Lets the user view and update the model configuration (`baseUrl`, `apiKey`,
- * `modelName`):
- *  - On mount it loads the persisted config via `apiClient.modelConfig.get`,
- *    which returns a SAFE view: `baseUrl`, `modelName` and a MASKED API key
- *    (`apiKeyMasked`, e.g. "sk-****abcd"). The raw key is never sent to the
- *    frontend, so the masked value is displayed read-only as a reference and
- *    the editable API-key field starts empty.
- *  - Saving submits the full {@link ModelConfig} via `apiClient.modelConfig.save`
- *    (`PUT /api/model-config`). Because the original key cannot be retrieved,
- *    the user must (re)enter the API key to save. The backend validates that
- *    none of the three fields are empty (Requirement 4.4); we mirror that
- *    client-side to give immediate feedback and disable the save button.
+ * Lets the user enable an in-memory model configuration (`baseUrl`, `apiKey`,
+ * `modelName`) for the current page session only. The raw API key is kept in
+ * browser memory and is lost on refresh, close, or explicit logout.
  *
  * Backend errors are surfaced through the injected `onError` callback (wire it
  * to the global error reporter from `ErrorProvider`, Requirement 8.6). The
@@ -86,8 +77,7 @@ function isAbort(error: unknown): boolean {
 }
 
 /**
- * View and update the model configuration. Displays the masked API key from
- * the GET endpoint and submits updates via the save endpoint.
+ * View and update the current page-session model configuration.
  */
 export function SettingsPanel({
   onError,
@@ -295,7 +285,7 @@ export function SettingsPanel({
             })();
           }}
         >
-          🚀 一键启用 Mock (本地演示) —— 无需任何 Key，立即体验
+          🚀 一键启用 Mock (本地演示) -- 无需任何 Key，立即体验
         </button>
         <span className="nwa-muted" style={{ fontSize: '0.75rem' }}>适合新手快速试用全部 Agent 任务与蓝图分场景流程</span>
       </div>
@@ -415,7 +405,7 @@ export function SettingsPanel({
                 className="nwa-input"
                 type="password"
                 autoComplete="off"
-                placeholder={hasSavedKey ? '已保存（重新输入以更新）' : '输入 API Key'}
+                placeholder={hasSavedKey ? '本次已启用（重新输入以更新）' : '输入 API Key'}
                 aria-label="API Key"
                 value={apiKey}
                 disabled={busy}
@@ -426,7 +416,7 @@ export function SettingsPanel({
               />
               {hasSavedKey ? (
                 <span className="nwa-field__hint nwa-muted">
-                  当前已保存：<code>{apiKeyMasked}</code>
+                  本次已启用：<code>{apiKeyMasked}</code>
                 </span>
               ) : (
                 <span className="nwa-field__hint nwa-muted">尚未配置 API Key。</span>
@@ -479,9 +469,9 @@ export function SettingsPanel({
               className="nwa-button"
               disabled={busy || !canSave}
             >
-              {busy ? '保存中…' : '保存配置'}
+              {busy ? '启用中…' : '启用本次 API'}
             </button>
-            {saved ? <span className="nwa-muted" role="status">已保存</span> : null}
+            {saved ? <span className="nwa-muted" role="status">本次已启用</span> : null}
           </div>
 
           <section className="nwa-cache-panel" aria-label="缓存率">

@@ -63,6 +63,41 @@ import { ReasoningArtifactFilter } from '../lib/reasoningSanitizer.js';
 const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
 const DEFAULT_BASE_URL = (env?.VITE_API_BASE_URL ?? '/api').replace(/\/$/, '');
 
+let volatileModelConfig: ModelConfig | null = null;
+
+function toModelConfigView(config: ModelConfig | null): ModelConfigView {
+  if (config === null) {
+    return {
+      baseUrl: '',
+      modelName: '',
+      apiKeyMasked: '',
+      temperature: 1,
+      topP: 1,
+    };
+  }
+  return {
+    baseUrl: config.baseUrl,
+    modelName: config.modelName,
+    apiKeyMasked: maskApiKey(config.apiKey),
+    temperature: config.temperature ?? 1,
+    topP: config.topP ?? 1,
+  };
+}
+
+function maskApiKey(apiKey: string): string {
+  const chars = Array.from(apiKey);
+  if (chars.length === 0) return '';
+  const reveal = chars.slice(Math.max(1, chars.length - 4)).join('');
+  return `****${reveal}`;
+}
+
+function modelConfigHeader(): Record<string, string> {
+  if (volatileModelConfig === null) return {};
+  return {
+    'X-Agentxin-Model-Config': encodeURIComponent(JSON.stringify(volatileModelConfig)),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -172,8 +207,10 @@ async function request<T>(
 ): Promise<T> {
   const init: RequestInit = { method, signal: options?.signal };
   if (body !== undefined) {
-    init.headers = { 'Content-Type': 'application/json' };
+    init.headers = { 'Content-Type': 'application/json', ...modelConfigHeader() };
     init.body = JSON.stringify(body);
+  } else {
+    init.headers = modelConfigHeader();
   }
 
   const res = await fetch(`${baseUrl}${path}`, init);
@@ -332,11 +369,11 @@ async function streamSse(
 ): Promise<string> {
   const init: RequestInit = {
     method: 'POST',
-    headers: { Accept: 'text/event-stream' },
+    headers: { Accept: 'text/event-stream', ...modelConfigHeader() },
     signal: options?.signal,
   };
   if (body !== undefined) {
-    init.headers = { 'Content-Type': 'application/json', Accept: 'text/event-stream' };
+    init.headers = { 'Content-Type': 'application/json', Accept: 'text/event-stream', ...modelConfigHeader() };
     init.body = JSON.stringify(body);
   }
 
@@ -436,13 +473,6 @@ async function streamWrite(
 export interface AgentRunStreamOptions {
   signal?: AbortSignal;
   onProgress?: (event: AgentProgressEvent) => void;
-}
-
-export interface AuthSessionView {
-  authRequired: boolean;
-  configured: boolean;
-  authenticated: boolean;
-  username?: string;
 }
 
 /**
@@ -549,11 +579,6 @@ function decodeSceneId(data: string): string | undefined {
 // ---------------------------------------------------------------------------
 
 export interface ApiClient {
-  auth: {
-    session(signal?: AbortSignal): Promise<AuthSessionView>;
-    login(username: string, password: string, signal?: AbortSignal): Promise<AuthSessionView>;
-    logout(signal?: AbortSignal): Promise<{ ok: true }>;
-  };
   agent: {
     run(body: AgentRunRequest, signal?: AbortSignal): Promise<AgentRunResult>;
     runStream(body: AgentRunRequest, options?: AgentRunStreamOptions): Promise<AgentRunResult>;
@@ -619,6 +644,7 @@ export interface ApiClient {
   modelConfig: {
     get(signal?: AbortSignal): Promise<ModelConfigView>;
     save(config: ModelConfig, signal?: AbortSignal): Promise<ModelConfigView>;
+    clear(): void;
   };
   cacheStats: {
     get(signal?: AbortSignal): Promise<CacheStatsSummary>;
@@ -696,12 +722,6 @@ export interface ApiClient {
 export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
   const b = baseUrl.replace(/\/$/, '');
   return {
-    auth: {
-      session: (signal) => request(b, 'GET', '/auth/session', undefined, { signal }),
-      login: (username, password, signal) =>
-        request(b, 'POST', '/auth/login', { username, password }, { signal }),
-      logout: (signal) => request(b, 'POST', '/auth/logout', undefined, { signal }),
-    },
     agent: {
       run: (body, signal) => request(b, 'POST', '/agent/run', body, { signal }),
       runStream: (body, options) => streamAgentRun(b, body, options),
@@ -759,8 +779,14 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
       },
     },
     modelConfig: {
-      get: (signal) => request(b, 'GET', '/model-config', undefined, { signal }),
-      save: (config, signal) => request(b, 'PUT', '/model-config', config, { signal }),
+      get: async (_signal) => toModelConfigView(volatileModelConfig),
+      save: async (config, _signal) => {
+        volatileModelConfig = { ...config };
+        return toModelConfigView(volatileModelConfig);
+      },
+      clear: () => {
+        volatileModelConfig = null;
+      },
     },
     cacheStats: {
       get: (signal) => request(b, 'GET', '/cache-stats', undefined, { signal }),

@@ -143,9 +143,6 @@ export interface WritingContextInput {
 // ---------------------------------------------------------------------------
 
 export type ErrorCode =
-  | 'AUTH_REQUIRED'
-  | 'AUTH_INVALID'
-  | 'AUTH_NOT_CONFIGURED'
   | 'VALIDATION_ERROR'
   | 'NOT_FOUND'
   | 'MODEL_NOT_CONFIGURED'
@@ -157,9 +154,6 @@ export type ErrorCode =
  * 便于在服务端/客户端代码中以值的形式引用错误码而无需散落字符串字面量。
  */
 export const ERROR_CODES = {
-  AUTH_REQUIRED: 'AUTH_REQUIRED',
-  AUTH_INVALID: 'AUTH_INVALID',
-  AUTH_NOT_CONFIGURED: 'AUTH_NOT_CONFIGURED',
   VALIDATION_ERROR: 'VALIDATION_ERROR',
   NOT_FOUND: 'NOT_FOUND',
   MODEL_NOT_CONFIGURED: 'MODEL_NOT_CONFIGURED',

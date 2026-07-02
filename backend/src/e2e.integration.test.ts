@@ -85,6 +85,16 @@ function parseDeltaEvents(body: string): string[] {
   );
 }
 
+const MODEL_CONFIG: ModelConfig = {
+  baseUrl: 'https://provider.example.com/v1',
+  apiKey: 'sk-secret-key-1234',
+  modelName: 'gpt-test',
+};
+
+function modelConfigHeaders(config: ModelConfig = MODEL_CONFIG): Record<string, string> {
+  return { 'X-Agentxin-Model-Config': encodeURIComponent(JSON.stringify(config)) };
+}
+
 describe('端到端集成：创建项目→章节→写作（mock 提供商）→采用文本', () => {
   let dir: string;
   let app: FastifyInstance;
@@ -111,11 +121,7 @@ describe('端到端集成：创建项目→章节→写作（mock 提供商）�
     const cfgRes = await app.inject({
       method: 'PUT',
       url: '/api/model-config',
-      payload: {
-        baseUrl: 'https://provider.example.com/v1',
-        apiKey: 'sk-secret-key-1234',
-        modelName: 'gpt-test',
-      },
+      payload: MODEL_CONFIG,
     });
     expect(cfgRes.statusCode).toBe(200);
     // 安全：响应只返回掩码视图，绝不含原始 API Key（Req 4.2/5.6）。
@@ -168,6 +174,7 @@ describe('端到端集成：创建项目→章节→写作（mock 提供商）�
     const writeRes = await app.inject({
       method: 'POST',
       url: `/api/projects/${projectId}/chapters/${chapterId}/write`,
+      headers: modelConfigHeaders(),
       payload: { operation: 'continue', instruction: '继续写' },
     });
     expect(writeRes.statusCode).toBe(200);

@@ -57,7 +57,7 @@ import { PacingChecker } from './services/blueprint/PacingChecker.js';
 import { SceneExpander } from './services/blueprint/SceneExpander.js';
 import { SceneRewriter } from './services/blueprint/SceneRewriter.js';
 import { NovelImportService } from './services/import/NovelImportService.js';
-import { registerSessionAuth } from './services/auth/sessionAuth.js';
+import { registerRequestModelConfig } from './services/modelConfig/requestModelConfig.js';
 import { registerProjectRoutes } from './routes/projectRoutes.js';
 import { registerChapterRoutes } from './routes/chapterRoutes.js';
 import { registerSettingRoutes } from './routes/settingRoutes.js';
@@ -139,7 +139,7 @@ export function buildServer(
     return { status: 'ok' };
   });
 
-  registerSessionAuth(app);
+  registerRequestModelConfig(app);
 
   app.get('/api/cache-stats', async () => getCacheStatsSummary());
   app.post('/api/cache-stats/reset', async () => {
