@@ -21,6 +21,7 @@ import { ReaderWorkspace } from './components/ReaderWorkspace.js';
 import { ProjectTree } from './components/ProjectTree.js';
 import { SettingsPanel } from './components/SettingsPanel.js';
 import { ErrorProvider, useErrorReporter } from './components/ErrorToast.js';
+import { AuthGate } from './components/AuthGate.js';
 import { Icon } from './components/Icon.js';
 import { useDialogFocusTrap } from './components/useDialogFocusTrap.js';
 import {
@@ -58,7 +59,11 @@ function BrandLogo(): JSX.Element {
   );
 }
 
-function Workbench(): JSX.Element {
+interface WorkbenchProps {
+  onLogout?: () => void;
+}
+
+function Workbench({ onLogout }: WorkbenchProps): JSX.Element {
   const { reportError } = useErrorReporter();
   useDialogFocusTrap();
 
@@ -369,6 +374,16 @@ function Workbench(): JSX.Element {
             >
               <Icon name="settings" /> 设置
             </button>
+            {onLogout ? (
+              <button
+                type="button"
+                className="nwa-button nwa-button--ghost nwa-button--sm"
+                onClick={onLogout}
+                title="退出登录"
+              >
+                退出
+              </button>
+            ) : null}
           </div>
         </header>
       ) : null}
@@ -635,7 +650,11 @@ function Workbench(): JSX.Element {
 export function App(): JSX.Element {
   return (
     <ErrorProvider>
-      <Workbench />
+      <AuthGate>
+        {(session, onLogout) => (
+          <Workbench onLogout={session.authRequired ? onLogout : undefined} />
+        )}
+      </AuthGate>
     </ErrorProvider>
   );
 }

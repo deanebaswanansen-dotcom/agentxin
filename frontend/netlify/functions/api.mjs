@@ -15,8 +15,26 @@ function readEnv(name, fallback) {
   return netlifyValue ?? process.env[name] ?? fallback;
 }
 
+function hydrateBackendEnv() {
+  for (const name of [
+    'APP_AUTH_DISABLED',
+    'APP_AUTH_USERNAME',
+    'APP_AUTH_PASSWORD',
+    'APP_AUTH_PASSWORD_SHA256',
+    'APP_SESSION_SECRET',
+    'NETLIFY',
+    'NODE_ENV',
+  ]) {
+    const value = globalThis.Netlify?.env?.get?.(name);
+    if (value !== undefined) process.env[name] = value;
+  }
+  process.env.NETLIFY ??= 'true';
+  process.env.NODE_ENV ??= 'production';
+}
+
 async function getApp() {
   appPromise ??= (async () => {
+    hydrateBackendEnv();
     const dataFile = readEnv('DATA_FILE', join(tmpdir(), 'agentxin-store.json'));
     const memoryFile = readEnv('AGENT_MEMORY_FILE', join(tmpdir(), 'agentxin-memory.json'));
     const store = await FileDataStore.create(dataFile);

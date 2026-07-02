@@ -8,12 +8,16 @@ describe('App shell', () => {
   beforeEach(() => {
     vi.stubGlobal(
       'fetch',
-      vi.fn(async () =>
-        new Response(JSON.stringify([]), {
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        const body = url.includes('/auth/session')
+          ? { authRequired: false, configured: false, authenticated: true }
+          : [];
+        return new Response(JSON.stringify(body), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
-        }),
-      ),
+        });
+      }),
     );
   });
 
@@ -27,6 +31,26 @@ describe('App shell', () => {
     expect(
       await screen.findByRole('heading', { name: /小说\s*Agent/ }),
     ).toBeInTheDocument();
+  });
+
+  it('shows the login form when auth is required', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({ authRequired: true, configured: true, authenticated: false }),
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          },
+        ),
+      ),
+    );
+
+    render(<App />);
+
+    expect(await screen.findByRole('main', { name: '登录' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '登录' })).toBeDisabled();
   });
 
   it('renders the project tree and centered chat workspace immediately', async () => {

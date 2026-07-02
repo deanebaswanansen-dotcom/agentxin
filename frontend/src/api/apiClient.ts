@@ -438,6 +438,13 @@ export interface AgentRunStreamOptions {
   onProgress?: (event: AgentProgressEvent) => void;
 }
 
+export interface AuthSessionView {
+  authRequired: boolean;
+  configured: boolean;
+  authenticated: boolean;
+  username?: string;
+}
+
 /**
  * Consume the agent SSE stream (`POST /api/agent/run-stream`). Forwards each
  * `event: progress` frame to `onProgress`, captures the final `event: result`
@@ -542,6 +549,11 @@ function decodeSceneId(data: string): string | undefined {
 // ---------------------------------------------------------------------------
 
 export interface ApiClient {
+  auth: {
+    session(signal?: AbortSignal): Promise<AuthSessionView>;
+    login(username: string, password: string, signal?: AbortSignal): Promise<AuthSessionView>;
+    logout(signal?: AbortSignal): Promise<{ ok: true }>;
+  };
   agent: {
     run(body: AgentRunRequest, signal?: AbortSignal): Promise<AgentRunResult>;
     runStream(body: AgentRunRequest, options?: AgentRunStreamOptions): Promise<AgentRunResult>;
@@ -684,6 +696,12 @@ export interface ApiClient {
 export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
   const b = baseUrl.replace(/\/$/, '');
   return {
+    auth: {
+      session: (signal) => request(b, 'GET', '/auth/session', undefined, { signal }),
+      login: (username, password, signal) =>
+        request(b, 'POST', '/auth/login', { username, password }, { signal }),
+      logout: (signal) => request(b, 'POST', '/auth/logout', undefined, { signal }),
+    },
     agent: {
       run: (body, signal) => request(b, 'POST', '/agent/run', body, { signal }),
       runStream: (body, options) => streamAgentRun(b, body, options),
