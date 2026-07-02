@@ -51,8 +51,8 @@ export interface PythonBridgeResult {
   result?: unknown;
 }
 
-const __dirname = fileURLToPath(new URL('.', import.meta.url));
-const ROOT = resolve(__dirname, '../../..'); // backend -> project root
+const moduleDir = fileURLToPath(new URL('.', import.meta.url));
+const ROOT = resolve(moduleDir, '../../..'); // backend -> project root
 
 function toRelative(p: string): string {
   try {
