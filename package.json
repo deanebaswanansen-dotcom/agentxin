@@ -1,0 +1,17 @@
+{
+  "name": "agentxin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "backend",
+    "frontend"
+  ],
+  "scripts": {
+    "build": "npm run build -w backend && npm run build -w frontend",
+    "typecheck": "npm run typecheck -w backend && npm run typecheck -w frontend"
+  },
+  "engines": {
+    "node": "22.x"
+  }
+}
