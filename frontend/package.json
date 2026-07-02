@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@hello-pangea/dnd": "^18.0.1",
+    "fastify": "^4.28.1",
     "jszip": "^3.10.1",
     "lottie-web": "^5.13.0",
     "react": "18.3.1",
