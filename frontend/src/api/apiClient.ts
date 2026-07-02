@@ -181,7 +181,19 @@ async function request<T>(
     const errBody = await readBody(res);
     throw toApiClientError(errBody, res.status, res.statusText);
   }
-  return (await readBody(res)) as T;
+  const parsedBody = await readBody(res);
+  if (typeof parsedBody === 'string') {
+    throw new ApiClientError(
+      {
+        error: {
+          code: 'STORE_ERROR',
+          message: '接口返回了非 JSON 响应，可能是后端 API 未部署或路径被静态站回退。',
+        },
+      },
+      res.status,
+    );
+  }
+  return parsedBody as T;
 }
 
 /** Encode a path segment (typically an id) for safe URL interpolation. */

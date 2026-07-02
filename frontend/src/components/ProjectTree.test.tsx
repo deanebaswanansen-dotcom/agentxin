@@ -72,4 +72,22 @@ describe('ProjectTree', () => {
     expect(screen.queryByText('旧项目')).not.toBeInTheDocument();
     expect(client.projects.list).toHaveBeenCalledTimes(1);
   });
+
+  it('surfaces a malformed project list without crashing the tree', async () => {
+    const client = makeClient();
+    vi.mocked(client.projects.list).mockResolvedValue('<!doctype html>' as unknown as []);
+    const onError = vi.fn();
+
+    render(
+      <ProjectTree
+        onSelectProject={vi.fn()}
+        onSelectChapter={vi.fn()}
+        onError={onError}
+        client={client}
+      />,
+    );
+
+    await waitFor(() => expect(onError).toHaveBeenCalled());
+    expect(screen.getByText('还没有项目，输入名称创建第一个吧。')).toBeInTheDocument();
+  });
 });

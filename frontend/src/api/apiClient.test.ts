@@ -25,6 +25,13 @@ function jsonResponse(body: unknown, init?: { status?: number; statusText?: stri
   });
 }
 
+function htmlResponse(body = '<!doctype html><html></html>'): Response {
+  return new Response(body, {
+    status: 200,
+    headers: { 'Content-Type': 'text/html' },
+  });
+}
+
 /** Build a Response whose body is a ReadableStream emitting the given chunks. */
 function sseResponse(chunks: string[], init?: { status?: number }): Response {
   const encoder = new TextEncoder();
@@ -84,6 +91,15 @@ describe('apiClient request building', () => {
     ];
     installFetch(() => jsonResponse(chapters));
     await expect(client().chapters.list('p1')).resolves.toEqual(chapters);
+  });
+
+  it('rejects HTML fallback responses from static hosting', async () => {
+    installFetch(() => htmlResponse());
+    const err: ApiClientError = await client().projects.list().catch((e) => e);
+
+    expect(err).toBeInstanceOf(ApiClientError);
+    expect(err.code).toBe('STORE_ERROR');
+    expect(err.message).toContain('非 JSON 响应');
   });
 });
 

@@ -67,6 +67,9 @@ export function ProjectListView({
       setLoading(true);
       try {
         const list = await client.projects.list(signal);
+        if (!Array.isArray(list)) {
+          throw new Error('项目列表接口返回格式错误：期望数组。');
+        }
         setProjects(list);
       } catch (error) {
         handleError(error);
