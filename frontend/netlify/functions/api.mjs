@@ -1,10 +1,10 @@
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { buildServer } from '../../backend/dist/index.js';
-import { MemoryService } from '../../backend/dist/services/memory/MemoryService.js';
-import { MemoryStore } from '../../backend/dist/services/memory/MemoryStore.js';
-import { FileDataStore } from '../../backend/dist/store/FileDataStore.js';
+import { buildServer } from '../../../backend/dist/index.js';
+import { MemoryService } from '../../../backend/dist/services/memory/MemoryService.js';
+import { MemoryStore } from '../../../backend/dist/services/memory/MemoryStore.js';
+import { FileDataStore } from '../../../backend/dist/store/FileDataStore.js';
 
 let appPromise;
 

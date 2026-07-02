@@ -1,6 +1,7 @@
 [build]
-  command = "npm run build"
-  publish = "frontend/dist"
+  base = "frontend"
+  command = "npm --prefix ../backend install && npm --prefix ../backend run build && npm run build"
+  publish = "dist"
 
 [functions]
   directory = "netlify/functions"
