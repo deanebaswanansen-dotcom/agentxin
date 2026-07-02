@@ -1,0 +1,69 @@
+/* ==========================================================================
+   Novel Agent theme: fantasy writing desk.
+   ========================================================================== */
+
+:root {
+  --bg-base: #15131a;
+  --bg-glass: rgba(255, 247, 232, 0.84);
+  --bg-glass-hover: rgba(255, 239, 210, 0.9);
+  --bg-surface: rgba(255, 250, 240, 0.94);
+  --bg-surface-hover: rgba(255, 238, 205, 0.82);
+
+  --border-subtle: rgba(98, 72, 47, 0.2);
+  --border-glass: rgba(255, 255, 255, 0.28);
+  --border-glow: rgba(20, 184, 166, 0.42);
+
+  --text-primary: #231914;
+  --text-secondary: #594132;
+  --text-muted: #77685d;
+
+  --accent-primary: #8b3f1d;
+  --accent-secondary: #0f766e;
+  --accent-tertiary: #7c3aed;
+  --accent-soft: rgba(15, 118, 110, 0.12);
+  --accent-warm-soft: rgba(251, 146, 60, 0.18);
+  --danger: #b42318;
+  --danger-soft: #fee4e2;
+  --warning: #b54708;
+  --warning-soft: #fff1c2;
+  --success: #047857;
+  --success-soft: #d1fae5;
+  --accent-gradient: linear-gradient(90deg, #8b3f1d, #0f766e 52%, #7c3aed);
+
+  --shadow-sm: 0 8px 24px rgba(39, 23, 12, 0.12);
+  --shadow-glass: 0 18px 50px rgba(10, 7, 5, 0.24);
+  --shadow-glow: 0 0 0 1px rgba(255, 255, 255, 0.22), 0 14px 42px rgba(15, 118, 110, 0.18);
+  --glass-blur: blur(18px) saturate(1.25);
+
+  --transition-fast: 0.15s ease;
+  --transition-smooth: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+
+  --z-workspace: 1;
+  --z-header: 10;
+  --z-popover: 30;
+  --z-mobile-sidebar: 80;
+  --z-mobile-chat: 85;
+  --z-drawer: 100;
+  --z-toast: 900;
+  --z-modal: 1000;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', '微软雅黑', Roboto, Helvetica, Arial,
+    sans-serif;
+  --font-display: 'Georgia', 'Times New Roman', 'Songti SC', 'SimSun', serif;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  overflow: auto;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}

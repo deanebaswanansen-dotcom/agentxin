@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000">
+  <defs>
+    <linearGradient id="wall" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f5efe2"/>
+      <stop offset="0.5" stop-color="#e8decf"/>
+      <stop offset="1" stop-color="#d4e3dd"/>
+    </linearGradient>
+    <linearGradient id="desk" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#b9835d"/>
+      <stop offset="1" stop-color="#6f4a34"/>
+    </linearGradient>
+    <radialGradient id="sun" cx="0.5" cy="0.5" r="0.7">
+      <stop offset="0" stop-color="#fff2c7" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#fff2c7" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1600" height="1000" fill="url(#wall)"/>
+  <circle cx="1230" cy="185" r="240" fill="url(#sun)"/>
+  <path d="M0 730h1600v270H0z" fill="#d9cabb"/>
+  <path d="M0 746c220-22 405-12 572 28 226 54 492 54 1028-28v254H0z" fill="#c8b6a4" opacity="0.54"/>
+  <rect x="176" y="170" width="350" height="500" rx="10" fill="#efe6d8" stroke="#bfae9c" stroke-width="8"/>
+  <path d="M236 230h230M236 302h230M236 374h230M236 446h230M236 518h230M236 590h230" stroke="#bfae9c" stroke-width="8" stroke-linecap="round"/>
+  <g>
+    <rect x="248" y="250" width="34" height="52" fill="#0f766e"/>
+    <rect x="292" y="242" width="34" height="60" fill="#8b3f1d"/>
+    <rect x="336" y="260" width="34" height="42" fill="#475569"/>
+    <rect x="250" y="398" width="38" height="48" fill="#7c3aed"/>
+    <rect x="302" y="388" width="38" height="58" fill="#0f766e"/>
+    <rect x="355" y="405" width="62" height="41" fill="#b45309"/>
+    <rect x="248" y="540" width="56" height="50" fill="#334155"/>
+    <rect x="318" y="528" width="42" height="62" fill="#8b3f1d"/>
+    <rect x="374" y="552" width="72" height="38" fill="#0f766e"/>
+  </g>
+  <rect x="1022" y="150" width="315" height="400" rx="12" fill="#f8faf8" stroke="#bfae9c" stroke-width="8"/>
+  <path d="M1178 150v400M1022 348h315" stroke="#bfae9c" stroke-width="7"/>
+  <path d="M1054 214c84-22 157-26 250-4M1055 412c82-14 163-15 250 2" stroke="#d7e5e0" stroke-width="12" stroke-linecap="round"/>
+  <rect x="338" y="720" width="910" height="92" rx="16" fill="url(#desk)"/>
+  <path d="M392 812v130M1168 812v130" stroke="#5a3b2b" stroke-width="48" stroke-linecap="round"/>
+  <path d="M606 688h360l58 32H548z" fill="#fefbf4" stroke="#ad9b8a" stroke-width="5"/>
+  <path d="M625 687c73 24 144 24 213 0M834 687c48 24 94 25 138 0" fill="none" stroke="#c9b9a8" stroke-width="5"/>
+  <rect x="700" y="552" width="230" height="138" rx="8" fill="#1f2937"/>
+  <rect x="718" y="570" width="194" height="100" rx="4" fill="#e9f5f0"/>
+  <path d="M744 600h132M744 630h96" stroke="#0f766e" stroke-width="10" stroke-linecap="round"/>
+  <path d="M1000 660c30-46 76-44 107 0 24 34 20 82-17 112-33 26-82 20-108-13-22-28-16-70 18-99z" fill="#eef7f2" stroke="#a3b8ad" stroke-width="6"/>
+  <path d="M1051 626v-74" stroke="#6f4a34" stroke-width="10" stroke-linecap="round"/>
+  <path d="M1014 560c46-40 91-40 135 0" stroke="#0f766e" stroke-width="12" stroke-linecap="round"/>
+</svg>

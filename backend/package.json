@@ -1,0 +1,28 @@
+{
+  "name": "novel-writing-agent-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Backend (Fastify + TypeScript) for the Novel Writing Agent",
+  "type": "module",
+  "scripts": {
+    "cli": "tsx src/cli/main.ts",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "acceptance:long-novel": "tsx scripts/run-long-novel-acceptance.ts",
+    "acceptance:continuity": "tsx scripts/run-continuity-acceptance.ts",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "fastify": "4.28.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.2",
+    "fast-check": "3.23.1",
+    "tsx": "4.19.2",
+    "typescript": "5.6.3",
+    "vitest": "2.1.8"
+  }
+}

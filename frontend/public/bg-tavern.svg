@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#12101a"/>
+      <stop offset="0.45" stop-color="#2f2330"/>
+      <stop offset="1" stop-color="#5b2d1b"/>
+    </linearGradient>
+    <radialGradient id="lamp" cx="0.5" cy="0.5" r="0.55">
+      <stop offset="0" stop-color="#ffe9a6" stop-opacity="0.95"/>
+      <stop offset="0.42" stop-color="#d27b2a" stop-opacity="0.5"/>
+      <stop offset="1" stop-color="#d27b2a" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="wood" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5c3421"/>
+      <stop offset="1" stop-color="#241612"/>
+    </linearGradient>
+  </defs>
+  <rect width="1600" height="1000" fill="url(#sky)"/>
+  <path d="M0 760h1600v240H0z" fill="#231612"/>
+  <path d="M0 782c235-40 447-41 655-2 247 46 487 41 945-23v243H0z" fill="#2c1b14" opacity="0.85"/>
+  <path d="M95 730h145V410h-75l-70 75zM1230 730h185V360h-86l-99 103z" fill="#271a19" opacity="0.92"/>
+  <path d="M360 735h500V388c-112-62-244-70-355-3-82 50-130 132-145 225z" fill="#34201b" opacity="0.92"/>
+  <path d="M410 734h390V445c-95-50-196-51-283-3-72 40-108 111-107 205z" fill="#201411"/>
+  <path d="M922 733h210V505h-210z" fill="#2d1a15"/>
+  <path d="M960 548h134v185H960z" fill="#17121a"/>
+  <path d="M1019 548v185M960 642h134" stroke="#8b5433" stroke-width="6" opacity="0.9"/>
+  <path d="M168 493h120M157 548h155M147 603h170M136 658h190" stroke="#8a5434" stroke-width="12" stroke-linecap="round"/>
+  <circle cx="212" cy="520" r="18" fill="#8bf6ff" opacity="0.8"/>
+  <circle cx="253" cy="575" r="20" fill="#b483ff" opacity="0.78"/>
+  <circle cx="194" cy="632" r="23" fill="#ffe28d" opacity="0.84"/>
+  <ellipse cx="540" cy="828" rx="280" ry="38" fill="#130c0a" opacity="0.45"/>
+  <path d="M220 780h540v82H220z" fill="url(#wood)"/>
+  <path d="M220 780h540" stroke="#9a5d36" stroke-width="8"/>
+  <path d="M285 862v88M695 862v88" stroke="#1a0f0b" stroke-width="34" stroke-linecap="round"/>
+  <path d="M1080 782h255v74h-255z" fill="url(#wood)"/>
+  <path d="M1124 856v82M1292 856v82" stroke="#1a0f0b" stroke-width="28" stroke-linecap="round"/>
+  <circle cx="498" cy="164" r="138" fill="url(#lamp)"/>
+  <circle cx="1148" cy="194" r="120" fill="url(#lamp)"/>
+  <circle cx="330" cy="314" r="86" fill="url(#lamp)"/>
+  <circle cx="1375" cy="410" r="92" fill="url(#lamp)"/>
+  <path d="M498 74v98m-35 0h70l-15 82h-40zM1148 92v82m-31 0h62l-14 72h-34zM330 252v64m-24 0h48l-11 55h-26zM1375 342v70m-26 0h52l-11 60h-30z" stroke="#ffd98b" stroke-width="8" stroke-linecap="round" stroke-linejoin="round" fill="#8b3f1d"/>
+  <path d="M0 164c270-70 472-82 690-36 245 52 501 35 910-84" fill="none" stroke="#0d0b11" stroke-width="46" opacity="0.7"/>
+  <path d="M0 184c270-70 472-82 690-36 245 52 501 35 910-84" fill="none" stroke="#6d4329" stroke-width="8" opacity="0.65"/>
+  <g opacity="0.7">
+    <circle cx="132" cy="248" r="2.5" fill="#ffe9a6"/>
+    <circle cx="612" cy="262" r="3" fill="#ffe9a6"/>
+    <circle cx="884" cy="158" r="2" fill="#ffe9a6"/>
+    <circle cx="1265" cy="286" r="2.5" fill="#ffe9a6"/>
+    <circle cx="1452" cy="180" r="2" fill="#ffe9a6"/>
+  </g>
+</svg>

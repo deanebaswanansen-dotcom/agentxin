@@ -1,0 +1,7 @@
+{
+  "projectsDirEnv": "NOVEL_PROJECTS_DIR",
+  "defaultProvider": "mock",
+  "defaultTemperature": 0.8,
+  "defaultMaxTokens": 4096,
+  "defaultTimeoutMs": 120000
+}

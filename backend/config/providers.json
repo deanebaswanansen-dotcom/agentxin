@@ -1,0 +1,17 @@
+{
+  "mock": {
+    "type": "mock"
+  },
+  "deepseek": {
+    "type": "openai-compatible",
+    "baseUrlEnv": "LLM_BASE_URL",
+    "apiKeyEnv": "LLM_API_KEY",
+    "modelEnv": "LLM_MODEL"
+  },
+  "openai": {
+    "type": "openai-compatible",
+    "baseUrlEnv": "OPENAI_BASE_URL",
+    "apiKeyEnv": "OPENAI_API_KEY",
+    "modelEnv": "OPENAI_MODEL"
+  }
+}
