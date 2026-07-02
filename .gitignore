@@ -3,6 +3,8 @@ dist/
 data/
 backend/data/
 .agentxin/
+.netlify/
+frontend/.netlify/
 logs/
 cache/
 .env

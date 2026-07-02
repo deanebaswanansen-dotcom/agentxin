@@ -8,6 +8,8 @@ import { FileDataStore } from '../../../backend/dist/store/FileDataStore.js';
 
 let appPromise;
 
+// Keep this function inside the frontend base directory so Netlify deploys it
+// with the same site that serves the Vite SPA.
 function readEnv(name, fallback) {
   const netlifyValue = globalThis.Netlify?.env?.get?.(name);
   return netlifyValue ?? process.env[name] ?? fallback;
