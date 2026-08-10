@@ -29,6 +29,14 @@ export interface StreamCompletionOptions {
 const DEFAULT_TEMPERATURE = 1;
 const DEFAULT_TOP_P = 1;
 
+// Reasoning models (DeepSeek V4 family, Kimi, etc.) default to "thinking mode"
+// ON: the hidden `reasoning_content` and the visible `content` SHARE one output
+// budget (`max_tokens`). A low budget lets the thinking chain consume it all,
+// yielding `finish_reason: "length"` with an EMPTY `content` (a saved chapter
+// that reads as "not written"). Provider docs recommend >= 16k `max_tokens`
+// for thinking models to leave room for the final answer.
+const DEFAULT_MAX_TOKENS = 16384;
+
 export interface ModelProxy {
   streamCompletion(
     config: ModelConfig,
@@ -127,7 +135,7 @@ export class OpenAiCompatibleModelProxy implements ModelProxy {
       model: config.modelName,
       messages,
       stream: true,
-      max_tokens: 8192,
+      max_tokens: DEFAULT_MAX_TOKENS,
       temperature: config.temperature ?? DEFAULT_TEMPERATURE,
       top_p: config.topP ?? DEFAULT_TOP_P,
     };
