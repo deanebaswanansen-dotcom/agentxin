@@ -57,7 +57,8 @@ npm test
 > 不推荐把后端塞进 Netlify Function —— 它有 ~60s 执行上限，长文/整章生成会超时（HTTP 502）。
 
 1. **部署后端**（选一个免费常驻平台，如 Render / Railway）
-   - 直接连接本仓库，仓库根 `Procfile` 已配置启动命令 `cd backend && node dist/index.js`。
+   - **Render 最快**：仓库根有 [`render.yaml`](render.yaml) 蓝本，Render 面板 「New + → Blueprint」连接本仓库即可自动生成配置。
+   - 或直接连接本仓库，仓库根 `Procfile` 已配置启动命令 `cd backend && node dist/index.js`。
    - 构建命令：`npm --prefix backend install && npm --prefix backend run build`
    - 环境变量：
      | 变量 | 说明 |
@@ -73,6 +74,10 @@ npm test
    - Netlify 构建环境变量里加：`VITE_API_BASE_URL=https://<后端域名>/api`，然后重新部署前端。
    - 本地 `npm run dev` 不设此变量，仍走 Vite 代理到 `127.0.0.1:3000`，互不影响。
 3. 打开前端站点，设置页填 API Key 即可使用。生成过程无超时限制。
+
+> 排查：若报「Agent 流未返回最终结果」，说明前端仍在走 Netlify Function（60s 上限）。
+> 打开浏览器 DevTools → Network，看 `run-stream` 请求地址——若含 `/.netlify/functions/api`，
+> 就是还没指向常驻后端，请补步骤 2 的 `VITE_API_BASE_URL` 并重新部署前端。
 
 ## 模型
 

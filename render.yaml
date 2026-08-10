@@ -1,0 +1,23 @@
+# Render Blueprint — one-click backend deployment.
+#
+# How to use:
+#   1. Push this repo to GitHub.
+#   2. In Render dashboard: "New +" -> "Blueprint", connect this repo.
+#   3. Render reads render.yaml and provisions the web service automatically.
+#   4. (Optional) set CORS_ORIGIN to your Netlify site URL when prompted, or
+#      leave it blank (backend then allows all origins).
+#   5. Note: the free tier filesystem is ephemeral — project data resets on
+#      redeploy/restart. Mount a persistent disk for real data (paid plan) and
+#      point DATA_FILE / AGENT_MEMORY_FILE / REFERENCE_FILE /
+#      LONG_NOVEL_CONFIG_FILE at it.
+services:
+  - type: web
+    name: agentxin-backend
+    runtime: node
+    plan: free
+    buildCommand: npm --prefix backend install && npm --prefix backend run build
+    startCommand: node backend/dist/index.js
+    healthCheckPath: /health
+    envVars:
+      - key: CORS_ORIGIN
+        sync: false
