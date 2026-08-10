@@ -101,6 +101,27 @@ export function buildServer(
 ): FastifyInstance {
   const app = Fastify({ logger: false });
 
+  // CORS for cross-origin deployments (persistent backend host). The frontend is
+  // a static SPA (e.g. on Netlify) that sends the per-session model config via
+  // the `x-agentxin-model-config` request header, so preflight must allow it.
+  // Local dev is same-origin (Vite proxy), so these headers are harmless there.
+  // Restrict with `CORS_ORIGIN` env var (e.g. https://your-site.netlify.app);
+  // defaults to `*` for a personal tool.
+  const corsAllowOrigin = process.env.CORS_ORIGIN?.trim() || '*';
+  app.addHook('onRequest', async (request, reply) => {
+    reply.header('Access-Control-Allow-Origin', corsAllowOrigin);
+    reply.header('Access-Control-Allow-Headers', 'Content-Type, Accept, x-agentxin-model-config');
+    reply.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+    if (request.headers.origin && corsAllowOrigin !== '*') {
+      reply.header('Vary', 'Origin');
+    }
+    if (request.method === 'OPTIONS') {
+      // Short-circuit the CORS preflight.
+      reply.code(204).send();
+      return reply;
+    }
+  });
+
   // Domain services — all built from the single shared store (Req 7.1, 7.2).
   // Shared model proxy: default to the real OpenAI-compatible proxy wrapped in a
   // local disk response cache (improves cache rate / cost). When a proxy is
