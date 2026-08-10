@@ -42,7 +42,7 @@ describe('requestModelConfig', () => {
     await app.close();
   });
 
-  it('prevents HTTP requests without a volatile header from falling back to stored config', async () => {
+  it('falls back to stored config when the volatile header is absent', async () => {
     const stored: ModelConfig = {
       baseUrl: 'https://stored.example.com',
       apiKey: 'sk-stored',
@@ -61,9 +61,11 @@ describe('requestModelConfig', () => {
     registerRequestModelConfig(app);
     app.get('/internal', async () => ({ config: (await service.getInternalConfig()) ?? null }));
 
+    // No browser header → use server-persisted key (refresh-friendly).
     const withoutHeader = await app.inject({ method: 'GET', url: '/internal' });
-    expect(withoutHeader.json()).toEqual({ config: null });
+    expect(withoutHeader.json()).toEqual({ config: stored });
 
+    // Header still wins when present.
     const volatile = {
       baseUrl: 'https://volatile.example.com',
       apiKey: 'sk-volatile',

@@ -18,8 +18,11 @@ import type {
   AgentTask,
   Chapter,
   Id,
+  LongNovelAutomationLevel,
+  NovelPlanSummary,
 } from '../../types/index.js';
 import { AGENT_TASKS, TASK_PLANS } from './agentTasks.js';
+import { buildAgentRunOptions } from './buildAgentRunOptions.js';
 import { type ChatMessage } from './types.js';
 import { makeId } from './types-shared.js';
 
@@ -29,6 +32,8 @@ export interface UseAgentEngineOptions {
   onError?: (error: unknown) => void;
   /** 任务完成回调（供 App 刷新列表/加载章节到抽屉）。 */
   onCompleted?: (result: AgentRunResult) => void;
+  /** 流式进度（供中央预览面板实时显示当前在干什么）。 */
+  onStreamingChange?: (state: { streaming: boolean; content: string; thinking: string }) => void;
   /** 注入对话流的消息操作（来自 useChatEngine）。 */
   appendMessage: (message: ChatMessage) => void;
   updateMessage: (id: string, updater: (prev: ChatMessage) => ChatMessage) => void;
@@ -49,6 +54,19 @@ export interface AgentRunParams {
   chapters?: number;
   /** 整本生成的每章字数（仅 full_novel）。 */
   targetWords?: number;
+  /**
+   * StoryForge 风格计划采纳：把分章大纲 / 创作规则交给 full_novel，
+   * 写正文前写入项目资料并注入章节锚点。
+   */
+  planSummary?: NovelPlanSummary;
+  /** long_novel：自动化等级。 */
+  automationLevel?: LongNovelAutomationLevel;
+  /** long_novel：全书目标字数。 */
+  totalWords?: number;
+}
+
+function isRunnableAgentTask(task: string): task is AgentTask {
+  return task !== 'plan' && task !== 'reference' && AGENT_TASKS.some((t) => t.key === task);
 }
 
 function isAbort(error: unknown): boolean {
@@ -59,8 +77,16 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
   run: (params: AgentRunParams) => Promise<void>;
   stop: () => void;
 } {
-  const { projectId, chapterId, onError, onCompleted, appendMessage, updateMessage, removeMessage } =
-    options;
+  const {
+    projectId,
+    chapterId,
+    onError,
+    onCompleted,
+    onStreamingChange,
+    appendMessage,
+    updateMessage,
+    removeMessage,
+  } = options;
 
   const [running, setRunning] = useState(false);
   const [runningTask, setRunningTask] = useState<AgentTask | null>(null);
@@ -80,6 +106,10 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
     async (params: AgentRunParams) => {
       const { task, prompt } = params;
       if (running) return;
+      if (!isRunnableAgentTask(task)) {
+        onError?.(new Error('计划模式请使用对话区的选项提交，不要直接当 Agent 任务执行。'));
+        return;
+      }
       // auto_next/workspace_review/chapter_diagnosis 允许空 prompt
       if (
         task !== 'auto_next' &&
@@ -119,6 +149,12 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
 
       const controller = new AbortController();
       abortRef.current = controller;
+      const progressLines: string[] = [`启动任务：${taskTitle}`];
+      onStreamingChange?.({
+        streaming: true,
+        content: progressLines.join('\n'),
+        thinking: `任务：${taskTitle}\n模式：${effectiveMode === 'draft' ? '直接成文' : '只要方案'}`,
+      });
 
       try {
         const body = {
@@ -127,16 +163,14 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
           prompt: prompt.trim(),
           projectId: projectId ?? undefined,
           chapterId: chapterId ?? undefined,
-          options:
-            task === 'auto_next'
-              ? { targetWords: params.targetWords ?? 2000 }
-              : task === 'full_novel'
-                ? {
-                    chapters: params.chapters ?? 3,
-                    targetWords: params.targetWords ?? 1500,
-                    totalChapters: params.chapters ?? 3,
-                  }
-                : undefined,
+          options: buildAgentRunOptions({
+            task,
+            chapters: params.chapters,
+            targetWords: params.targetWords,
+            totalWords: params.totalWords,
+            automationLevel: params.automationLevel,
+            planSummary: params.planSummary,
+          }),
         } as const;
 
         let chapterPreview: Pick<Chapter, 'id' | 'title' | 'content'> | null = null;
@@ -150,9 +184,29 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
                     if (prev.kind !== 'agent-progress') return prev;
                     return { ...prev, events: [...prev.events, event] };
                   });
+                  const prefix =
+                    event.current !== undefined && event.total !== undefined
+                      ? `[${event.current}/${event.total}] `
+                      : '';
+                  progressLines.push(`${prefix}${event.message}`);
+                  // Keep the live pane focused on the latest stretch of work.
+                  const tail = progressLines.slice(-40).join('\n');
+                  onStreamingChange?.({
+                    streaming: true,
+                    content: tail,
+                    thinking: `任务：${taskTitle}\n模式：${effectiveMode === 'draft' ? '直接成文' : '只要方案'}\n阶段：${event.phase}`,
+                  });
                 },
               })
             : await apiClient.agent.run(body, controller.signal);
+
+        // 结果一到就立刻关掉中央「生成中」遮罩——后续拉预览/切换项目不应再挡住编辑器。
+        progressLines.push('任务完成，正在整理结果…');
+        onStreamingChange?.({
+          streaming: false,
+          content: '',
+          thinking: '',
+        });
 
         // 若生成了章节，拉取预览
         if (next.chapterId !== undefined) {
@@ -188,6 +242,12 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
         onCompleted?.(next);
       } catch (error) {
         if (isAbort(error)) {
+          progressLines.push('任务已停止。');
+          onStreamingChange?.({
+            streaming: true,
+            content: progressLines.slice(-40).join('\n'),
+            thinking: `任务：${taskTitle}`,
+          });
           updateMessage(progressMsgId, (prev) => {
             if (prev.kind !== 'agent-progress') return prev;
             return {
@@ -223,6 +283,7 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
         setRunning(false);
         setRunningTask(null);
         abortRef.current = null;
+        onStreamingChange?.({ streaming: false, content: '', thinking: '' });
       }
     },
     [
@@ -234,6 +295,7 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
       removeMessage,
       onCompleted,
       onError,
+      onStreamingChange,
     ],
   );
 

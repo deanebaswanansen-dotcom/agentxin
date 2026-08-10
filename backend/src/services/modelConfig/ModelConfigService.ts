@@ -92,15 +92,19 @@ export class ModelConfigService {
 
   /**
    * Return the FULL model configuration (including the raw API key) for the
-   * current request. The production writing path intentionally does not fall
-   * back to persisted server config, so a refresh/close/logout loses the key.
+   * current request. Prefers the request-scoped browser header; if the client
+   * did not send a key this turn, fall back to the server-persisted config so
+   * a page refresh does not force re-entry when the key was saved earlier.
    *
    * SECURITY: the result contains the plaintext API key and MUST NOT be
    * serialized to any frontend-facing response. Use {@link getView} for that.
    */
   async getInternalConfig(): Promise<ModelConfig | undefined> {
     if (hasRequestModelConfigScope()) {
-      return getRequestModelConfig();
+      const fromRequest = getRequestModelConfig();
+      if (fromRequest !== undefined) {
+        return fromRequest;
+      }
     }
     return this.store.getModelConfig();
   }

@@ -1,13 +1,40 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import apiClient from '../api/apiClient.js';
 import agentThinkingAnimation from '../assets/lottie/agent-thinking.json';
 import taskCompleteAnimation from '../assets/lottie/task-complete.json';
-import type { AgentProgressEvent, AgentRunMode, AgentRunResult, AgentTask, Chapter, Id } from '../types/index.js';
+import type {
+  AgentProgressEvent,
+  AgentRunMode,
+  AgentRunResult,
+  AgentTask,
+  Chapter,
+  Id,
+  NovelPlanAnswer,
+  NovelPlanHistoryTurn,
+  NovelPlanQuestion,
+  NovelPlanSummary,
+  NovelPlanTargetTask,
+  NovelPlanTurnResponse,
+} from '../types/index.js';
+import { buildAgentRunOptions } from './chat/buildAgentRunOptions.js';
 import { Icon, type IconName } from './Icon.js';
 import { LottieMotion } from './LottieMotion.js';
 import './components.css';
 
 export type AgentClient = Pick<typeof apiClient, 'agent'> & Partial<Pick<typeof apiClient, 'chapters'>>;
+
+const PLAN_ELIGIBLE_TASKS = new Set<AgentTask>(['novel', 'full_novel', 'long_novel', 'outline', 'title']);
+
+function isPlanTargetTask(task: AgentTask): task is NovelPlanTargetTask {
+  return PLAN_ELIGIBLE_TASKS.has(task);
+}
+
+type PlanPhase = 'idle' | 'asking' | 'ready';
+
+interface LocalPlanAnswer {
+  selectedOptionIds: string[];
+  customText: string;
+}
 
 export interface AgentCommandCenterProps {
   selectedProjectId?: Id | null;
@@ -51,6 +78,16 @@ const TASKS: Array<{
     lockedMode: true,
     placeholder: '例：废土机械师重建文明，节奏明快、多反转...',
     button: '生成整本',
+  },
+  {
+    key: 'long_novel',
+    icon: 'brain',
+    title: '长篇小说模式',
+    desc: '多子代理：规划→世界→人物→大纲→章节循环 + Gate 审校/记忆/伏笔（SPEC）。',
+    mode: 'draft',
+    lockedMode: true,
+    placeholder: '例：20 万字赛博修仙，连载节奏，主角靠代码御剑…',
+    button: '启动长篇',
   },
   {
     key: 'auto_next',
@@ -153,10 +190,17 @@ const TASKS: Array<{
 ];
 
 const TASK_PLANS: Record<AgentTask, string[]> = {
-  novel: ['创建或复用项目', '世界观子 Agent', '人物子 Agent', '大纲子 Agent', '正文子 Agent 写首章'],
-  full_novel: ['建项目 + 设定包', '写入初始故事记忆', '逐章生成（回灌记忆）', '每章反思自我进化', '累积连贯整本草稿'],
-  title: ['按标题建项', '扩展题材与卖点', '分步写入设定', '生成开篇正文'],
-  outline: ['创建或复用项目', '世界观 / 人物 / 大纲分步生成', '保存到项目资料'],
+  novel: ['计划模式追问（可选）', '创建或复用项目', '世界观子 Agent', '人物子 Agent', '大纲子 Agent', '正文子 Agent 写首章'],
+  full_novel: ['计划模式追问（可选）', '建项目 + 设定包', '写入初始故事记忆', '逐章生成（回灌记忆）', '每章反思自我进化', '累积连贯整本草稿'],
+  long_novel: [
+    '主 Agent 读取自动化等级',
+    'PlanningDirector / 世界 / 人物 / 大纲',
+    'ChapterAgent 章节循环',
+    'Continuity + Memory Gate',
+    '硬冲突暂停 / 检查点',
+  ],
+  title: ['计划模式追问（可选）', '按标题建项', '扩展题材与卖点', '分步写入设定', '生成开篇正文'],
+  outline: ['计划模式追问（可选）', '创建或复用项目', '世界观 / 人物 / 大纲分步生成', '保存到项目资料'],
   polish: ['解析润写需求', '载入章节（如有）', '润写子 Agent 输出', '保存建议或写回章节'],
   diagnostic: ['汇总章节与设定', '诊断子 Agent 分析', '保存诊断报告'],
   material_research: ['生成公开检索关键词', '检索 Wikisource / HN / RSS', '清洗资料片段', '提炼套路与原创建议', '保存 Markdown 报告'],
@@ -224,9 +268,26 @@ export function AgentCommandCenter({
   const [liveProgress, setLiveProgress] = useState<AgentProgressEvent[]>([]);
   const abortRef = useRef<AbortController | null>(null);
 
+  // 计划模式（开局头脑风暴追问）
+  const [planMode, setPlanMode] = useState(true);
+  const [planPhase, setPlanPhase] = useState<PlanPhase>('idle');
+  const [planBusy, setPlanBusy] = useState(false);
+  const [planMessage, setPlanMessage] = useState('');
+  const [planQuestions, setPlanQuestions] = useState<NovelPlanQuestion[]>([]);
+  const [planRound, setPlanRound] = useState(0);
+  const [planBrief, setPlanBrief] = useState('');
+  const [planSummary, setPlanSummary] = useState<NovelPlanSummary | null>(null);
+  const [planHistory, setPlanHistory] = useState<NovelPlanHistoryTurn[]>([]);
+  const [planAnswers, setPlanAnswers] = useState<Record<string, LocalPlanAnswer>>({});
+  /** 头脑风暴开始时锁定的灵感种子（避免 ready 后 brief 覆盖输入框导致 seed 丢失）。 */
+  const [planSeed, setPlanSeed] = useState('');
+  const planAbortRef = useRef<AbortController | null>(null);
+
   const activeTask = TASKS.find((item) => item.key === task) ?? TASKS[0];
   const planSteps = TASK_PLANS[task];
   const modeLocked = activeTask.lockedMode === true;
+  const planEligible = isPlanTargetTask(task);
+  const planActive = planEligible && planMode;
 
   useEffect(() => {
     if (!running) {
@@ -244,15 +305,59 @@ export function AgentCommandCenter({
   useEffect(() => {
     return () => {
       abortRef.current?.abort();
+      planAbortRef.current?.abort();
     };
+  }, []);
+
+  const resetPlanSession = useCallback(() => {
+    planAbortRef.current?.abort();
+    planAbortRef.current = null;
+    setPlanBusy(false);
+    setPlanPhase('idle');
+    setPlanMessage('');
+    setPlanQuestions([]);
+    setPlanRound(0);
+    setPlanBrief('');
+    setPlanSummary(null);
+    setPlanHistory([]);
+    setPlanAnswers({});
+    setPlanSeed('');
+  }, []);
+
+  const applyPlanResponse = useCallback((response: NovelPlanTurnResponse, historyAfter: NovelPlanHistoryTurn[]) => {
+    setPlanHistory(historyAfter);
+    setPlanRound(response.round);
+    setPlanMessage(response.message);
+    if (response.status === 'ready') {
+      setPlanPhase('ready');
+      setPlanQuestions([]);
+      setPlanAnswers({});
+      setPlanBrief(response.brief ?? '');
+      setPlanSummary(response.planSummary ?? null);
+      if (response.brief?.trim()) {
+        setPrompt(response.brief.trim());
+      }
+    } else {
+      setPlanPhase('asking');
+      setPlanBrief('');
+      setPlanSummary(null);
+      const qs = response.questions ?? [];
+      setPlanQuestions(qs);
+      const initial: Record<string, LocalPlanAnswer> = {};
+      for (const q of qs) {
+        initial[q.id] = { selectedOptionIds: [], customText: '' };
+      }
+      setPlanAnswers(initial);
+    }
   }, []);
 
   const stop = useCallback(() => {
     abortRef.current?.abort();
+    planAbortRef.current?.abort();
   }, []);
 
-  const run = useCallback(async () => {
-    const text = prompt.trim();
+  const runWithPrompt = useCallback(async (textOverride?: string) => {
+    const text = (textOverride ?? prompt).trim();
     if (task !== 'auto_next' && task !== 'workspace_review' && task !== 'chapter_diagnosis' && text.length === 0) return;
     if (running) return;
     setRunning(true);
@@ -274,12 +379,16 @@ export function AgentCommandCenter({
         prompt: text,
         projectId: selectedProjectId ?? undefined,
         chapterId: selectedChapterId ?? undefined,
-        options:
-          task === 'auto_next'
-            ? { targetWords: 2000 }
-            : task === 'full_novel'
-            ? { chapters: fullNovelChapters, targetWords: fullNovelWords, totalChapters: fullNovelChapters }
-            : undefined,
+        options: buildAgentRunOptions({
+          task,
+          chapters: planSummary?.chapterCount ?? fullNovelChapters,
+          targetWords: planSummary?.wordsPerChapter ?? fullNovelWords,
+          totalChapters: planSummary?.chapterCount ?? fullNovelChapters,
+          totalWords: planSummary?.totalWords ?? fullNovelChapters * fullNovelWords,
+          automationLevel: 'semi_auto',
+          planSummary: planSummary ?? undefined,
+          autoNextTargetWords: 2000,
+        }),
       } as const;
 
       // 所有任务统一走 SSE 流式接口，实时显示进度到中央面板。
@@ -334,6 +443,7 @@ export function AgentCommandCenter({
     onError,
     onStreamingChange,
     planSteps.length,
+    planSummary,
     prompt,
     running,
     selectedChapterId,
@@ -341,19 +451,164 @@ export function AgentCommandCenter({
     task,
   ]);
 
+  const run = useCallback(async () => {
+    await runWithPrompt();
+  }, [runWithPrompt]);
+
+  const buildStructuredAnswers = useCallback((): NovelPlanAnswer[] => {
+    return planQuestions.map((q) => {
+      const local = planAnswers[q.id] ?? { selectedOptionIds: [], customText: '' };
+      return {
+        questionId: q.id,
+        selectedOptionIds: local.selectedOptionIds,
+        customText: local.customText.trim() || undefined,
+      };
+    });
+  }, [planAnswers, planQuestions]);
+
+  const formatAnswersForHistory = useCallback((answers: NovelPlanAnswer[], questions: NovelPlanQuestion[]): string => {
+    return answers
+      .map((a) => {
+        const q = questions.find((item) => item.id === a.questionId);
+        const labels = a.selectedOptionIds
+          .map((id) => q?.options.find((o) => o.id === id)?.label ?? id)
+          .join('、');
+        const custom = a.customText?.trim();
+        const parts = [labels || null, custom ? `补充：${custom}` : null].filter(Boolean);
+        return `${q?.question ?? a.questionId} → ${parts.join('；') || '（跳过）'}`;
+      })
+      .join('\n');
+  }, []);
+
+  const callPlanTurn = useCallback(async (params: {
+    seedPrompt: string;
+    history: NovelPlanHistoryTurn[];
+    answers?: NovelPlanAnswer[];
+    forceReady?: boolean;
+  }) => {
+    if (!isPlanTargetTask(task)) return;
+    if (client.agent.planTurn === undefined) {
+      onError?.(new Error('当前客户端未接入计划模式接口（agent.planTurn）。'));
+      return;
+    }
+    setPlanBusy(true);
+    const controller = new AbortController();
+    planAbortRef.current = controller;
+    try {
+      const response = await client.agent.planTurn(
+        {
+          seedPrompt: params.seedPrompt,
+          targetTask: task,
+          history: params.history,
+          answers: params.answers,
+          forceReady: params.forceReady,
+        },
+        controller.signal,
+      );
+      const historyAfter = [...params.history];
+      if (params.answers && params.answers.length > 0) {
+        historyAfter.push({
+          role: 'user',
+          content: formatAnswersForHistory(params.answers, planQuestions),
+        });
+      } else if (params.history.length === 0) {
+        historyAfter.push({ role: 'user', content: `灵感：${params.seedPrompt}` });
+      }
+      historyAfter.push({ role: 'assistant', content: response.message });
+      applyPlanResponse(response, historyAfter);
+    } catch (error) {
+      if (!isAbort(error)) {
+        onError?.(error);
+      }
+    } finally {
+      setPlanBusy(false);
+      planAbortRef.current = null;
+    }
+  }, [applyPlanResponse, client.agent, formatAnswersForHistory, onError, planQuestions, task]);
+
+  const startBrainstorm = useCallback(async () => {
+    const seed = prompt.trim();
+    if (!seed || planBusy || running) return;
+    setResult(null);
+    setPlanHistory([]);
+    setPlanSeed(seed);
+    setPlanPhase('idle');
+    await callPlanTurn({ seedPrompt: seed, history: [] });
+  }, [callPlanTurn, planBusy, prompt, running]);
+
+  const submitPlanAnswers = useCallback(async (forceReady = false) => {
+    const seed = planSeed.trim() || prompt.trim();
+    if (!seed || planBusy || running) return;
+    const answers = buildStructuredAnswers();
+    const hasAny =
+      forceReady ||
+      answers.some((a) => a.selectedOptionIds.length > 0 || (a.customText?.trim().length ?? 0) > 0);
+    if (!hasAny) return;
+    await callPlanTurn({
+      seedPrompt: seed,
+      history: planHistory,
+      answers,
+      forceReady,
+    });
+  }, [buildStructuredAnswers, callPlanTurn, planBusy, planHistory, planSeed, prompt, running]);
+
+  const generateFromBrief = useCallback(async () => {
+    const brief = planBrief.trim() || prompt.trim();
+    if (!brief) return;
+    setPrompt(brief);
+    await runWithPrompt(brief);
+  }, [planBrief, prompt, runWithPrompt]);
+
+  const toggleOption = useCallback((question: NovelPlanQuestion, optionId: string) => {
+    setPlanAnswers((prev) => {
+      const current = prev[question.id] ?? { selectedOptionIds: [], customText: '' };
+      const selected = new Set(current.selectedOptionIds);
+      if (question.multiSelect) {
+        if (selected.has(optionId)) selected.delete(optionId);
+        else selected.add(optionId);
+      } else {
+        selected.clear();
+        selected.add(optionId);
+      }
+      return {
+        ...prev,
+        [question.id]: { ...current, selectedOptionIds: Array.from(selected) },
+      };
+    });
+  }, []);
+
+  const setCustomAnswer = useCallback((questionId: string, customText: string) => {
+    setPlanAnswers((prev) => {
+      const current = prev[questionId] ?? { selectedOptionIds: [], customText: '' };
+      return { ...prev, [questionId]: { ...current, customText } };
+    });
+  }, []);
+
   const needsProject =
     task === 'auto_next' || task === 'diagnostic' || task === 'chapter_diagnosis' || task === 'workspace_review';
   const canRun =
     !running &&
+    !planBusy &&
     (task === 'auto_next' || task === 'workspace_review' || task === 'chapter_diagnosis' || prompt.trim().length > 0) &&
     (!needsProject || Boolean(selectedProjectId)) &&
     (task !== 'chapter_diagnosis' || Boolean(selectedChapterId));
+
+  const canSubmitPlan = useMemo(() => {
+    if (planBusy || running || planPhase !== 'asking') return false;
+    return planQuestions.some((q) => {
+      const a = planAnswers[q.id];
+      return Boolean(a && (a.selectedOptionIds.length > 0 || a.customText.trim().length > 0));
+    });
+  }, [planAnswers, planBusy, planPhase, planQuestions, running]);
 
   const selectTask = useCallback((next: (typeof TASKS)[number]) => {
     setTask(next.key);
     setMode(next.mode);
     setResult(null);
-  }, []);
+    // 开局类任务默认打开计划模式；其它任务关掉。
+    setPlanMode(PLAN_ELIGIBLE_TASKS.has(next.key));
+    resetPlanSession();
+  }, [resetPlanSession]);
 
   // One-click switch to Mock demo preset (NEW-01: lower barrier for first-time users without keys)
   const handleEnableMock = useCallback(async () => {
@@ -461,23 +716,60 @@ export function AgentCommandCenter({
           )}
         </div>
 
+        {planEligible ? (
+          <div className="nwa-agent__plan-toggle" aria-label="计划模式开关">
+            <label className="nwa-agent__plan-switch">
+              <input
+                type="checkbox"
+                checked={planMode}
+                disabled={running || planBusy}
+                onChange={(event) => {
+                  const on = event.target.checked;
+                  setPlanMode(on);
+                  if (!on) resetPlanSession();
+                }}
+              />
+              <span>
+                <strong>计划模式</strong>
+                <small>开局像头脑风暴一样追问你，对齐赛道 / 爽点 / 禁忌后再生成</small>
+              </span>
+            </label>
+            {planPhase !== 'idle' ? (
+              <button
+                type="button"
+                className="nwa-button nwa-button--ghost"
+                disabled={running || planBusy}
+                onClick={resetPlanSession}
+              >
+                重置对话
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+
         <textarea
           className="nwa-agent__input"
           aria-label="一句话写作需求"
           rows={5}
-          placeholder={activeTask.placeholder}
+          placeholder={
+            planActive
+              ? '先丢一个灵感种子，例如：赛博修仙学院，主角靠写代码御剑…（计划模式会追着问）'
+              : activeTask.placeholder
+          }
           value={prompt}
-          disabled={running}
+          disabled={running || planBusy || (planActive && planPhase === 'asking')}
           onChange={(event) => setPrompt(event.target.value)}
           onKeyDown={(event) => {
             if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
               event.preventDefault();
-              void run();
+              if (planActive && planPhase === 'idle') void startBrainstorm();
+              else if (planActive && planPhase === 'ready') void generateFromBrief();
+              else if (!planActive) void run();
             }
           }}
         />
 
-        {task === 'full_novel' ? (
+        {task === 'full_novel' || task === 'long_novel' ? (
           <div className="nwa-agent__params" aria-label="整本生成参数">
             <label className="nwa-agent__param">
               <span>章节数</span>
@@ -486,7 +778,7 @@ export function AgentCommandCenter({
                 min={1}
                 max={500}
                 value={fullNovelChapters}
-                disabled={running}
+                disabled={running || planBusy}
                 onChange={(event) => {
                   const n = Number(event.target.value);
                   setFullNovelChapters(Number.isFinite(n) ? Math.min(500, Math.max(1, Math.round(n))) : 3);
@@ -501,7 +793,7 @@ export function AgentCommandCenter({
                 max={8000}
                 step={100}
                 value={fullNovelWords}
-                disabled={running}
+                disabled={running || planBusy}
                 onChange={(event) => {
                   const n = Number(event.target.value);
                   setFullNovelWords(Number.isFinite(n) ? Math.min(8000, Math.max(300, Math.round(n))) : 1500);
@@ -511,6 +803,146 @@ export function AgentCommandCenter({
             <span className="nwa-muted nwa-agent__param-hint">
               共约 {(fullNovelChapters * fullNovelWords).toLocaleString()} 字（章节越多耗时越长）
             </span>
+          </div>
+        ) : null}
+
+        {planActive && (planPhase !== 'idle' || planBusy) ? (
+          <div className="nwa-plan" aria-label="计划模式头脑风暴" aria-live="polite">
+            <div className="nwa-plan__head">
+              <strong>
+                <Icon name="brain" /> 开局头脑风暴
+                {planRound > 0 ? ` · 第 ${planRound} 轮` : ''}
+              </strong>
+              <span>{planBusy ? '责编思考中…' : planPhase === 'ready' ? '方案已收束' : '请选择或补充'}</span>
+            </div>
+
+            {planMessage ? <p className="nwa-plan__message">{planMessage}</p> : null}
+
+            {planBusy && planPhase === 'idle' ? (
+              <div className="nwa-plan__loading">
+                <LottieMotion
+                  animationData={agentThinkingAnimation}
+                  label="计划模式思考"
+                  fallbackIcon="brain"
+                  className="nwa-lottie--agent"
+                />
+                <span>正在根据你的灵感准备第一轮问题…</span>
+              </div>
+            ) : null}
+
+            {planPhase === 'asking' && planQuestions.length > 0 ? (
+              <div className="nwa-plan__questions">
+                {planQuestions.map((question) => {
+                  const answer = planAnswers[question.id] ?? { selectedOptionIds: [], customText: '' };
+                  return (
+                    <fieldset key={question.id} className="nwa-plan__question">
+                      <legend>
+                        {question.question}
+                        {question.multiSelect ? <em>可多选</em> : null}
+                      </legend>
+                      <div className="nwa-plan__options" role="group" aria-label={question.question}>
+                        {question.options.map((option) => {
+                          const selected = answer.selectedOptionIds.includes(option.id);
+                          return (
+                            <button
+                              key={option.id}
+                              type="button"
+                              className={`nwa-plan__option${selected ? ' nwa-plan__option--selected' : ''}`}
+                              disabled={planBusy || running}
+                              aria-pressed={selected}
+                              onClick={() => toggleOption(question, option.id)}
+                            >
+                              <strong>{option.label}</strong>
+                              {option.description ? <small>{option.description}</small> : null}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <label className="nwa-plan__custom">
+                        <span>其他 / 补充</span>
+                        <input
+                          type="text"
+                          value={answer.customText}
+                          disabled={planBusy || running}
+                          placeholder="不选上面的也可以，直接写你的答案"
+                          onChange={(event) => setCustomAnswer(question.id, event.target.value)}
+                        />
+                      </label>
+                    </fieldset>
+                  );
+                })}
+              </div>
+            ) : null}
+
+            {planPhase === 'ready' ? (
+              <div className="nwa-plan__ready">
+                {planSummary ? (
+                  <dl className="nwa-plan__summary">
+                    {planSummary.title ? <><dt>书名向</dt><dd>{planSummary.title}</dd></> : null}
+                    {planSummary.genre ? <><dt>赛道</dt><dd>{planSummary.genre}</dd></> : null}
+                    {planSummary.protagonist ? <><dt>主角</dt><dd>{planSummary.protagonist}</dd></> : null}
+                    {planSummary.hook ? <><dt>钩子</dt><dd>{planSummary.hook}</dd></> : null}
+                    {planSummary.tone ? <><dt>基调</dt><dd>{planSummary.tone}</dd></> : null}
+                    {planSummary.constraints && planSummary.constraints.length > 0 ? (
+                      <>
+                        <dt>禁忌</dt>
+                        <dd>{planSummary.constraints.join('；')}</dd>
+                      </>
+                    ) : null}
+                  </dl>
+                ) : null}
+                {planBrief ? (
+                  <pre className="nwa-plan__brief" aria-label="生成用 brief">{planBrief}</pre>
+                ) : null}
+              </div>
+            ) : null}
+
+            <div className="nwa-plan__actions">
+              {planPhase === 'asking' ? (
+                <>
+                  <button
+                    type="button"
+                    className="nwa-button"
+                    disabled={!canSubmitPlan}
+                    onClick={() => void submitPlanAnswers(false)}
+                  >
+                    {planBusy ? '提交中…' : '提交回答，继续追问'}
+                  </button>
+                  <button
+                    type="button"
+                    className="nwa-button nwa-button--ghost"
+                    disabled={planBusy || running}
+                    onClick={() => void submitPlanAnswers(true)}
+                  >
+                    够了，直接出方案
+                  </button>
+                </>
+              ) : null}
+              {planPhase === 'ready' ? (
+                <>
+                  <button
+                    type="button"
+                    className="nwa-button"
+                    disabled={!canRun || !planBrief.trim()}
+                    onClick={() => void generateFromBrief()}
+                  >
+                    用方案{activeTask.button.replace(/^开始/, '') || '生成'}
+                  </button>
+                  <button
+                    type="button"
+                    className="nwa-button nwa-button--ghost"
+                    disabled={planBusy || running}
+                    onClick={() => {
+                      setPlanPhase('idle');
+                      setPlanQuestions([]);
+                      setPlanMessage('想再挖深一点？改灵感后重新头脑风暴，或直接生成。');
+                    }}
+                  >
+                    返回修改
+                  </button>
+                </>
+              ) : null}
+            </div>
           </div>
         ) : null}
 
@@ -528,17 +960,45 @@ export function AgentCommandCenter({
 
         <div className="nwa-agent__actions">
           <span className="nwa-agent__hint">
-            {needsProject
-              ? selectedProjectId
-                ? '将写入当前项目。'
-                : '需要先选项目。'
-              : selectedProjectId
-                ? '将写入当前项目。'
-                : '未选项目时会自动新建。'}
+            {planActive
+              ? planPhase === 'ready'
+                ? 'brief 已写入输入框，可微调后再生成。'
+                : planPhase === 'asking'
+                  ? '答完一轮会继续追问；也可以随时收束出方案。'
+                  : '开启计划模式后，先头脑风暴对齐，再一键生成。'
+              : needsProject
+                ? selectedProjectId
+                  ? '将写入当前项目。'
+                  : '需要先选项目。'
+                : selectedProjectId
+                  ? '将写入当前项目。'
+                  : '未选项目时会自动新建。'}
           </span>
-          {running ? (
+          {running || planBusy ? (
             <button type="button" className="nwa-button nwa-button--danger" onClick={stop}>
               停止
+            </button>
+          ) : planActive && planPhase === 'idle' ? (
+            <div className="nwa-agent__action-group">
+              <button type="button" className="nwa-button" disabled={!canRun} onClick={() => void startBrainstorm()}>
+                开始头脑风暴
+              </button>
+              <button
+                type="button"
+                className="nwa-button nwa-button--ghost"
+                disabled={!canRun}
+                onClick={() => void run()}
+              >
+                跳过，{activeTask.button}
+              </button>
+            </div>
+          ) : planActive && planPhase === 'ready' ? (
+            <button type="button" className="nwa-button" disabled={!canRun} onClick={() => void generateFromBrief()}>
+              {activeTask.button}
+            </button>
+          ) : planActive && planPhase === 'asking' ? (
+            <button type="button" className="nwa-button" disabled={!canSubmitPlan} onClick={() => void submitPlanAnswers(false)}>
+              提交回答
             </button>
           ) : (
             <button type="button" className="nwa-button" disabled={!canRun} onClick={() => void run()}>

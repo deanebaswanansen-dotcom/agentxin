@@ -57,6 +57,11 @@ function installFetch(impl: (url: string, init?: RequestInit) => Response | Prom
 
 afterEach(() => {
   client().modelConfig.clear();
+  try {
+    window.localStorage.removeItem('nwa.modelConfig.v1');
+  } catch {
+    // ignore
+  }
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -68,7 +73,7 @@ const client = () => createApiClient('/api');
 // ---------------------------------------------------------------------------
 
 describe('apiClient request building', () => {
-  it('keeps model config in page memory, sends it as a request header, and clears it', async () => {
+  it('persists model config to localStorage, sends it as a request header, and clears it', async () => {
     const api = client();
     const config: ModelConfig = {
       baseUrl: 'https://api.example.com',
@@ -85,6 +90,19 @@ describe('apiClient request building', () => {
       temperature: 1,
       topP: 1,
     });
+    // save also mirrors to backend via PUT (best-effort)
+    const mock = installFetch((url) => {
+      if (String(url).includes('/model-config')) {
+        return jsonResponse({
+          baseUrl: config.baseUrl,
+          modelName: config.modelName,
+          apiKeyMasked: '****-key',
+          temperature: 0.75,
+          topP: 0.85,
+        });
+      }
+      return jsonResponse([]);
+    });
     await expect(api.modelConfig.save(config)).resolves.toEqual({
       baseUrl: 'https://api.example.com',
       modelName: 'novel-model',
@@ -92,11 +110,22 @@ describe('apiClient request building', () => {
       temperature: 0.75,
       topP: 0.85,
     });
+    expect(window.localStorage.getItem('nwa.modelConfig.v1')).toContain('sk-secret-key');
 
-    const mock = installFetch(() => jsonResponse([]));
     await api.projects.list();
-    const headers = mock.mock.calls[0][1]?.headers as Record<string, string>;
+    const listCall = mock.mock.calls.find((call) => String(call[0]).includes('/projects'));
+    const headers = listCall?.[1]?.headers as Record<string, string>;
     expect(JSON.parse(decodeURIComponent(headers['X-Agentxin-Model-Config']))).toEqual(config);
+
+    // New client instance still hydrates from localStorage
+    const api2 = createApiClient('/api');
+    await expect(api2.modelConfig.get()).resolves.toEqual({
+      baseUrl: 'https://api.example.com',
+      modelName: 'novel-model',
+      apiKeyMasked: '****-key',
+      temperature: 0.75,
+      topP: 0.85,
+    });
 
     api.modelConfig.clear();
     await expect(api.modelConfig.get()).resolves.toEqual({
@@ -106,6 +135,7 @@ describe('apiClient request building', () => {
       temperature: 1,
       topP: 1,
     });
+    expect(window.localStorage.getItem('nwa.modelConfig.v1')).toBeNull();
   });
 
   it('issues a POST with JSON body for project creation and parses the result', async () => {

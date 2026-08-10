@@ -57,6 +57,9 @@ import { PacingChecker } from './services/blueprint/PacingChecker.js';
 import { SceneExpander } from './services/blueprint/SceneExpander.js';
 import { SceneRewriter } from './services/blueprint/SceneRewriter.js';
 import { NovelImportService } from './services/import/NovelImportService.js';
+import { ReferenceStore } from './services/reference/ReferenceStore.js';
+import { ReferenceAnalysisService } from './services/reference/ReferenceAnalysisService.js';
+import { LongNovelConfigStore } from './services/agent/longNovel/LongNovelConfigStore.js';
 import { registerRequestModelConfig } from './services/modelConfig/requestModelConfig.js';
 import { registerProjectRoutes } from './routes/projectRoutes.js';
 import { registerChapterRoutes } from './routes/chapterRoutes.js';
@@ -65,9 +68,12 @@ import { registerModelConfigRoutes } from './routes/modelConfigRoutes.js';
 import { registerWritingRoutes } from './routes/writingRoutes.js';
 import { registerBlueprintRoutes } from './routes/blueprintRoutes.js';
 import { registerAgentRoutes } from './routes/agentRoutes.js';
+import { registerPlanRoutes } from './routes/planRoutes.js';
 import { registerFreeChatRoutes } from './routes/freeChatRoutes.js';
 import { registerImportRoutes } from './routes/importRoutes.js';
+import { registerReferenceRoutes } from './routes/referenceRoutes.js';
 import { FreeChatService } from './services/freeChat/FreeChatService.js';
+import { NovelPlanService } from './services/agent/NovelPlanService.js';
 import { getCacheStatsSummary, resetCacheStats } from './proxy/cacheStats.js';
 
 /**
@@ -90,6 +96,8 @@ export function buildServer(
   store: DataStore,
   modelProxy?: ModelProxy,
   memoryService?: MemoryService,
+  referenceStore?: ReferenceStore,
+  longNovelConfigStore?: LongNovelConfigStore,
 ): FastifyInstance {
   const app = Fastify({ logger: false });
 
@@ -102,12 +110,21 @@ export function buildServer(
   // loaded service is injected. Production start() injects a persistent one;
   // tests get isolated in-memory state with no repo file pollution.
   const memory = memoryService ?? new MemoryService(MemoryStore.ephemeral());
+  const refs = referenceStore ?? ReferenceStore.ephemeral();
+  const longNovelConfigs = longNovelConfigStore ?? LongNovelConfigStore.ephemeral();
   const projectService = new ProjectService(store);
   const chapterService = new ChapterService(store);
   const settingService = new SettingService(store);
   const modelConfigService = new ModelConfigService(store);
   const writingService = new WritingService(store, modelConfigService, proxy);
   const freeChatService = new FreeChatService(store, modelConfigService, proxy);
+  const referenceService = new ReferenceAnalysisService(
+    refs,
+    store,
+    modelConfigService,
+    proxy,
+    memory,
+  );
 
   // Blueprint domain services — chapter blueprint generation, per-scene writing,
   // merging, checks, expansion and rewriting (task 13.1; Req 15.1, 15.2).
@@ -127,7 +144,10 @@ export function buildServer(
     blueprintService,
     chapterWriter,
     memory,
+    referenceService,
+    longNovelConfigs,
   );
+  const novelPlanService = new NovelPlanService(modelConfigService, proxy);
   const wordCountChecker = new WordCountChecker(store);
   const pacingChecker = new PacingChecker(store, modelConfigService, proxy);
   const sceneExpander = new SceneExpander(store, modelConfigService, proxy);
@@ -154,8 +174,10 @@ export function buildServer(
   registerModelConfigRoutes(app, modelConfigService);
   registerWritingRoutes(app, writingService);
   registerAgentRoutes(app, agentService);
+  registerPlanRoutes(app, novelPlanService);
   registerFreeChatRoutes(app, freeChatService);
   registerImportRoutes(app, importService);
+  registerReferenceRoutes(app, referenceService);
   registerBlueprintRoutes(app, {
     blueprintService,
     sceneWriter,
@@ -188,7 +210,13 @@ export async function start(): Promise<FastifyInstance> {
   // Load persisted Agent long-term memory so reflections/summaries survive restarts.
   const memoryStore = await MemoryStore.create(process.env.AGENT_MEMORY_FILE ?? undefined);
   const memory = new MemoryService(memoryStore);
-  const app = buildServer(store, undefined, memory);
+  const referenceStore = await ReferenceStore.create(
+    process.env.REFERENCE_FILE ?? undefined,
+  );
+  const longNovelConfigStore = await LongNovelConfigStore.create(
+    process.env.LONG_NOVEL_CONFIG_FILE ?? undefined,
+  );
+  const app = buildServer(store, undefined, memory, referenceStore, longNovelConfigStore);
 
   const port = Number(process.env.PORT ?? 3000);
   const address = await app.listen({ port, host: '0.0.0.0' });

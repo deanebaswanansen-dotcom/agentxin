@@ -105,10 +105,11 @@ export function useWorkspaceSelection({
       setSelectedProjectId(result.projectId);
       selectProjectNameFromServer(result.projectId);
       if (result.chapterId !== undefined) {
-        resetChapter();
+        // 直接打开刚生成的章节，避免只清空编辑器、用户以为还在「生成中」。
+        void loadChapter(result.projectId, result.chapterId);
       }
     },
-    [bumpProjectList, resetChapter, selectProjectNameFromServer],
+    [bumpProjectList, loadChapter, selectProjectNameFromServer],
   );
 
   const handleSaved = useCallback((chapterId: Id, content: string) => {

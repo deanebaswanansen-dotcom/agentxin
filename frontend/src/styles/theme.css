@@ -3,23 +3,29 @@
    ========================================================================== */
 
 :root {
+  /* 面板用更高不透明度，避免背景图透出导致字色「融进」画面 */
   --bg-base: #15131a;
-  --bg-glass: rgba(255, 247, 232, 0.84);
-  --bg-glass-hover: rgba(255, 239, 210, 0.9);
-  --bg-surface: rgba(255, 250, 240, 0.94);
-  --bg-surface-hover: rgba(255, 238, 205, 0.82);
+  --bg-glass: rgba(255, 250, 240, 0.94);
+  --bg-glass-hover: rgba(255, 244, 226, 0.97);
+  --bg-surface: #fffcf6;
+  --bg-surface-hover: #f4ebe0;
+  --bg-panel-solid: #fffcf6;
+  --bg-editor: #fffdf9;
 
-  --border-subtle: rgba(98, 72, 47, 0.2);
-  --border-glass: rgba(255, 255, 255, 0.28);
+  --border-subtle: rgba(98, 72, 47, 0.22);
+  --border-glass: rgba(255, 255, 255, 0.4);
   --border-glow: rgba(20, 184, 166, 0.42);
 
-  --text-primary: #231914;
-  --text-secondary: #594132;
-  --text-muted: #77685d;
+  /* 对比度：主文 ≈ 深棕 on 乳白，辅文不低于 WCAG AA 近似 */
+  --text-primary: #1c1410;
+  --text-secondary: #4a372c;
+  --text-muted: #5c4a3d;
+  --text-on-dark: #fff8ee;
+  --text-on-dark-muted: rgba(255, 248, 238, 0.82);
 
   --accent-primary: #8b3f1d;
   --accent-secondary: #0f766e;
-  --accent-tertiary: #7c3aed;
+  --accent-tertiary: #6d28d9;
   --accent-soft: rgba(15, 118, 110, 0.12);
   --accent-warm-soft: rgba(251, 146, 60, 0.18);
   --danger: #b42318;
@@ -51,6 +57,17 @@
     'Hiragino Sans GB', 'Microsoft YaHei', '微软雅黑', Roboto, Helvetica, Arial,
     sans-serif;
   --font-display: 'Georgia', 'Times New Roman', 'Songti SC', 'SimSun', serif;
+
+  /* 流体字号：窗口拉伸时保持可读，窄栏不小于阈值 */
+  --fs-xs: clamp(0.75rem, 0.7rem + 0.2vw, 0.8125rem);
+  --fs-sm: clamp(0.8125rem, 0.76rem + 0.25vw, 0.9rem);
+  --fs-base: clamp(0.9rem, 0.84rem + 0.28vw, 1rem);
+  --fs-md: clamp(0.95rem, 0.88rem + 0.32vw, 1.0625rem);
+  --fs-lg: clamp(1.05rem, 0.95rem + 0.45vw, 1.25rem);
+  --fs-xl: clamp(1.2rem, 1.05rem + 0.55vw, 1.45rem);
+  --lh-tight: 1.35;
+  --lh-body: 1.65;
+  --lh-prose: 1.85;
 }
 
 html,
@@ -59,11 +76,24 @@ body {
   padding: 0;
 }
 
+html {
+  font-size: 100%;
+  text-size-adjust: 100%;
+  -webkit-text-size-adjust: 100%;
+}
+
 body {
   background: var(--bg-base);
   color: var(--text-primary);
   font-family: var(--font-sans);
+  font-size: var(--fs-base);
+  line-height: var(--lh-body);
   overflow: auto;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+/* 全局可读性：避免极小字 + 过淡辅色 */
+.nwa-muted {
+  color: var(--text-muted);
 }

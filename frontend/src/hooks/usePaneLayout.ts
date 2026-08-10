@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState, type PointerEvent as ReactPointerEvent } from 'react';
 
 const PANE_STORAGE_KEY = 'nwa:pane-widths.v1';
-const MIN_LEFT_WIDTH = 200;
+/** 侧栏过窄时中文标签易截断；对话栏过窄时字号/选项会挤在一起 */
+const MIN_LEFT_WIDTH = 220;
 const MAX_LEFT_WIDTH = 420;
-const MIN_RIGHT_WIDTH = 320;
-const MAX_RIGHT_WIDTH = 640;
+const MIN_RIGHT_WIDTH = 360;
+const MAX_RIGHT_WIDTH = 720;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));

@@ -37,9 +37,15 @@ export function SlashMenu({
 }: SlashMenuProps): JSX.Element | null {
   // query 形如 "/新书" 或 "/新"；提取过滤词
   const filterText = query.startsWith('/') ? query.slice(1).trim().toLowerCase() : '';
+  const mockMatches =
+    filterText.length === 0 ||
+    'mock'.includes(filterText) ||
+    '演示模式'.includes(filterText);
 
   const filteredTasks = useMemo(() => {
     if (filterText.length === 0) return AGENT_TASKS;
+    const exact = AGENT_TASKS.find((task) => task.slash.toLowerCase() === filterText);
+    if (exact) return [exact];
     return AGENT_TASKS.filter(
       (t) =>
         t.title.toLowerCase().includes(filterText) ||
@@ -53,7 +59,7 @@ export function SlashMenu({
     | { type: 'mock' }
     | { type: 'task'; def: AgentTaskDef; disabled: boolean };
   const items: MenuItem[] = useMemo(() => {
-    const result: MenuItem[] = [{ type: 'mock' }];
+    const result: MenuItem[] = mockMatches ? [{ type: 'mock' }] : [];
     for (const def of filteredTasks) {
       const disabled =
         (def.needsProject === true && !hasProject) ||
@@ -61,7 +67,7 @@ export function SlashMenu({
       result.push({ type: 'task', def, disabled });
     }
     return result;
-  }, [filteredTasks, hasProject, hasChapter]);
+  }, [filteredTasks, hasProject, hasChapter, mockMatches]);
 
   const [activeIndex, setActiveIndex] = useState(0);
 

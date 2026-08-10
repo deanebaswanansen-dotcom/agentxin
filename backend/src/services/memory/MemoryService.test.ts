@@ -6,6 +6,11 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { MemoryStore } from './MemoryStore.js';
 import { MemoryService, scaledMemoryOptions } from './MemoryService.js';
 
+/** Distinct strings that stay well below fact/foreshadow Jaccard merge threshold. */
+function uniqueText(prefix: string, i: number): string {
+  return `${prefix}:${i}:${String.fromCharCode(0x4e00 + i * 37)}${String.fromCharCode(0x9000 - i * 41)}:k${(i * 104729) % 999983}`;
+}
+
 describe('MemoryService', () => {
   let dir: string;
 
@@ -145,5 +150,195 @@ describe('MemoryService', () => {
     const added = await svc.recordFacts('p1', [{ kind: 'plot', text: '反派是黑龙会会长赵武' }]);
     expect(added).toBe(1);
     expect(svc.get('p1').facts).toHaveLength(2);
+  });
+
+  it('plants foreshadows, echoes/resolves them, and injects open ledger into context', async () => {
+    const { svc } = await service();
+    const added = await svc.plantForeshadows('p1', [
+      {
+        title: '热数据坟场',
+        detail: '学院封锁了一片热数据坟场',
+        urgency: 'high',
+        suggestPayoffBy: '中后期',
+        plantedChapterTitle: '第1章',
+      },
+      {
+        title: '导师的芯片',
+        detail: '导师袖口闪过非法芯片',
+        urgency: 'medium',
+        plantedChapterTitle: '第1章',
+      },
+    ]);
+    expect(added).toBe(2);
+    expect(svc.listOpenForeshadows('p1')).toHaveLength(2);
+
+    // 近重复埋设应合并
+    const again = await svc.plantForeshadows('p1', [
+      { title: '热数据坟场', detail: '学院封锁了一片热数据坟场。', urgency: 'high' },
+    ]);
+    expect(again).toBe(0);
+    expect(svc.listOpenForeshadows('p1')).toHaveLength(2);
+
+    const echoed = await svc.touchForeshadows('p1', [
+      { match: '热数据坟场', status: 'echoed', chapterTitle: '第2章', note: '主角再次梦到坟场坐标' },
+    ]);
+    expect(echoed).toBe(1);
+    expect(svc.listOpenForeshadows('p1').find((f) => f.title.includes('热数据'))?.status).toBe(
+      'echoed',
+    );
+
+    const resolved = await svc.touchForeshadows('p1', [
+      { match: '导师的芯片', status: 'resolved', chapterTitle: '第3章', note: '芯片是监工信标' },
+    ]);
+    expect(resolved).toBe(1);
+    expect(svc.listOpenForeshadows('p1')).toHaveLength(1);
+
+    const ctxEarly = svc.buildContext('p1', { progressRatio: 0.2 });
+    expect(ctxEarly).toContain('伏笔台账');
+    expect(ctxEarly).toContain('热数据坟场');
+    expect(ctxEarly).not.toContain('临近收束');
+
+    const ctxLate = svc.buildContext('p1', { progressRatio: 0.9 });
+    expect(ctxLate).toContain('临近收束');
+    expect(ctxLate).toContain('至少推进或回收');
+
+    const ledger = svc.formatForeshadowLedger('p1');
+    expect(ledger).toContain('未回收');
+    expect(ledger).toContain('已回收');
+    expect(ledger).toContain('导师的芯片');
+  });
+
+  it('loads legacy memory without foreshadows field as empty array', async () => {
+    const file = join(dir, 'legacy.json');
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(
+      file,
+      JSON.stringify({
+        version: 1,
+        projects: {
+          p1: {
+            summaries: [],
+            facts: [],
+            learnings: [],
+            workflow: [],
+            updatedAt: new Date().toISOString(),
+          },
+        },
+      }),
+      'utf8',
+    );
+    const svc = new MemoryService(await MemoryStore.create(file));
+    expect(svc.get('p1').foreshadows).toEqual([]);
+    expect(svc.listOpenForeshadows('p1')).toEqual([]);
+  });
+
+  it('serializes concurrent mutators so unique facts / summaries / foreshadows are not lost', async () => {
+    const { svc } = await service();
+    const N = 40;
+    const expectedFacts = Array.from({ length: N }, (_, i) => uniqueText('fact', i));
+    const expectedForeshadowTitles = Array.from({ length: N }, (_, i) => uniqueText('fs-title', i));
+
+    const factOps = Array.from({ length: N }, (_, i) =>
+      svc.recordFacts('p1', [{ kind: 'plot', text: expectedFacts[i]! }]),
+    );
+    const summaryOps = Array.from({ length: N }, (_, i) =>
+      svc.appendChapterSummary('p1', {
+        chapterId: `c-${i}`,
+        title: `第${i}章`,
+        summary: uniqueText('summary', i),
+      }),
+    );
+    const foreshadowOps = Array.from({ length: N }, (_, i) =>
+      svc.plantForeshadows('p1', [
+        {
+          title: expectedForeshadowTitles[i]!,
+          detail: uniqueText('fs-detail', i),
+          urgency: 'medium',
+        },
+      ]),
+    );
+
+    const [factAdds, , foreshadowAdds] = await Promise.all([
+      Promise.all(factOps),
+      Promise.all(summaryOps),
+      Promise.all(foreshadowOps),
+    ]);
+
+    expect(factAdds.reduce((a, b) => a + b, 0)).toBe(N);
+    expect(foreshadowAdds.reduce((a, b) => a + b, 0)).toBe(N);
+
+    const mem = svc.get('p1');
+    expect(mem.facts).toHaveLength(N);
+    expect(mem.summaries).toHaveLength(N);
+    expect(mem.foreshadows).toHaveLength(N);
+
+    const factTexts = new Set(mem.facts.map((f) => f.text));
+    for (const text of expectedFacts) {
+      expect(factTexts.has(text)).toBe(true);
+    }
+    const chapterIds = new Set(mem.summaries.map((s) => s.chapterId));
+    for (let i = 0; i < N; i += 1) {
+      expect(chapterIds.has(`c-${i}`)).toBe(true);
+    }
+    const foreshadowTitles = new Set(mem.foreshadows.map((f) => f.title));
+    for (const title of expectedForeshadowTitles) {
+      expect(foreshadowTitles.has(title)).toBe(true);
+    }
+  });
+
+  it('keeps concurrent writes to two projectIds isolated and complete', async () => {
+    const { svc } = await service();
+    const N = 25;
+    const factsA = Array.from({ length: N }, (_, i) => uniqueText('projA', i));
+    const factsB = Array.from({ length: N }, (_, i) => uniqueText('projB', i));
+
+    await Promise.all([
+      ...Array.from({ length: N }, (_, i) =>
+        svc.recordFacts('proj-a', [{ kind: 'character', text: factsA[i]! }]),
+      ),
+      ...Array.from({ length: N }, (_, i) =>
+        svc.recordFacts('proj-b', [{ kind: 'world', text: factsB[i]! }]),
+      ),
+      ...Array.from({ length: N }, (_, i) =>
+        svc.appendChapterSummary('proj-a', {
+          chapterId: `a-${i}`,
+          title: `A${i}`,
+          summary: uniqueText('sumA', i),
+        }),
+      ),
+      ...Array.from({ length: N }, (_, i) =>
+        svc.appendChapterSummary('proj-b', {
+          chapterId: `b-${i}`,
+          title: `B${i}`,
+          summary: uniqueText('sumB', i),
+        }),
+      ),
+    ]);
+
+    const a = svc.get('proj-a');
+    const b = svc.get('proj-b');
+    expect(a.facts).toHaveLength(N);
+    expect(b.facts).toHaveLength(N);
+    expect(a.summaries).toHaveLength(N);
+    expect(b.summaries).toHaveLength(N);
+    expect(new Set(a.facts.map((f) => f.text))).toEqual(new Set(factsA));
+    expect(new Set(b.facts.map((f) => f.text))).toEqual(new Set(factsB));
+  });
+
+  it('MemoryStore.update applies mutator atomically under the write queue', async () => {
+    const { store } = await service();
+    await Promise.all(
+      Array.from({ length: 30 }, (_, i) =>
+        store.update('p1', (memory) => {
+          memory.workflow.push({
+            id: `w-${i}`,
+            task: 't',
+            summary: `s-${i}`,
+            at: new Date().toISOString(),
+          });
+        }),
+      ),
+    );
+    expect(store.read('p1').workflow).toHaveLength(30);
   });
 });

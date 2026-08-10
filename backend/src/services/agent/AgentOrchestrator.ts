@@ -10,7 +10,11 @@ import type {
   AgentTask,
   ChatMessage,
   Id,
+  LongNovelAutomationLevel,
+  LongNovelModeConfig,
   ModelConfig,
+  NovelPlanChapterOutline,
+  NovelPlanSummary,
 } from '../../types/index.js';
 import { getCacheStatsSummary, type CacheStatsSummary } from '../../proxy/cacheStats.js';
 import { pythonBridge, type PythonBridgeResult } from '../../proxy/PythonBridge.js';
@@ -20,11 +24,13 @@ import { ServiceError } from '../ServiceError.js';
 import type { ModelConfigService } from '../modelConfig/ModelConfigService.js';
 import type { MemoryService } from '../memory/MemoryService.js';
 import { scaledMemoryOptions } from '../memory/MemoryService.js';
+import type { ReferenceAnalysisService } from '../reference/ReferenceAnalysisService.js';
 import { MaterialResearchService } from '../research/MaterialResearchService.js';
 import { stripReasoningArtifacts } from '../text/reasoningSanitizer.js';
+import type { LongNovelConfigStore } from './longNovel/LongNovelConfigStore.js';
+import { defaultLongNovelConfig, runChapterQualityGates, type GateResult } from './longNovel/qualityGates.js';
 import {
   ContinuityInspectorSubAgent,
-  runReflectionAndInspectionParallel,
   type InspectorReport,
 } from './subagents/index.js';
 
@@ -41,6 +47,7 @@ const TASK_MODES: Record<AgentTask, AgentRunMode | 'either'> = {
   workspace_review: 'reference',
   auto_next: 'draft',
   full_novel: 'draft',
+  long_novel: 'draft',
   plan_blueprint: 'draft',
   write_scene: 'draft',
   write_chapter_from_blueprint: 'draft',
@@ -113,6 +120,8 @@ export class AgentOrchestrator {
     private readonly blueprintService: BlueprintService,
     private readonly chapterWriter: ChapterWriter,
     private readonly memory: MemoryService,
+    private readonly referenceService?: ReferenceAnalysisService,
+    private readonly longNovelConfigStore?: LongNovelConfigStore,
   ) {
     this.inspector = new ContinuityInspectorSubAgent(modelProxy);
   }
@@ -145,19 +154,19 @@ export class AgentOrchestrator {
     let result: AgentRunResult;
     switch (task) {
       case 'novel':
-        result = await this.runOnboard(config, prompt, mode, request.projectId, signal, 'novel');
+        result = await this.runOnboard(config, prompt, mode, request.projectId, signal, 'novel', onProgress);
         break;
       case 'title':
-        result = await this.runOnboard(config, prompt, mode, request.projectId, signal, 'title');
+        result = await this.runOnboard(config, prompt, mode, request.projectId, signal, 'title', onProgress);
         break;
       case 'outline':
-        result = await this.runOutlineOnly(config, prompt, request.projectId, signal);
+        result = await this.runOutlineOnly(config, prompt, request.projectId, signal, onProgress);
         break;
       case 'polish':
-        result = await this.runPolish(config, prompt, mode, request.projectId, request.chapterId, signal);
+        result = await this.runPolish(config, prompt, mode, request.projectId, request.chapterId, signal, onProgress);
         break;
       case 'diagnostic':
-        result = await this.runDiagnostic(config, prompt, request.projectId, signal);
+        result = await this.runDiagnostic(config, prompt, request.projectId, signal, onProgress);
         break;
       case 'material_research':
         result = await this.runMaterialResearch(config, prompt, request.projectId, signal, onProgress);
@@ -171,6 +180,7 @@ export class AgentOrchestrator {
           signal,
           '拆梗报告',
           '你是小说桥段拆解 Agent。把用户给出的桥段或爆点拆成：核心承诺、冲突来源、人物动机、情绪节奏、爽点/反转、可原创改写的 3 个版本。禁止照搬已有小说剧情。',
+          onProgress,
         );
         break;
       case 'cliche_guard':
@@ -182,13 +192,14 @@ export class AgentOrchestrator {
           signal,
           '避俗报告',
           '你是小说俗套风险审查 Agent。检查用户构思里的老套点、动机漏洞、反派脸谱化、主角成长跳跃和假爽点，并给出更原创的替代方案。输出 Markdown。',
+          onProgress,
         );
         break;
       case 'chapter_diagnosis':
-        result = await this.runChapterDiagnosis(config, prompt, request.projectId, request.chapterId, signal);
+        result = await this.runChapterDiagnosis(config, prompt, request.projectId, request.chapterId, signal, onProgress);
         break;
       case 'workspace_review':
-        result = await this.runWorkspaceReview(config, request.projectId!, signal);
+        result = await this.runWorkspaceReview(config, request.projectId!, signal, onProgress);
         break;
       case 'auto_next':
         result = await this.runAutoNext(
@@ -197,6 +208,7 @@ export class AgentOrchestrator {
           request.projectId!,
           request.options?.targetWords ?? 2000,
           signal,
+          onProgress,
         );
         break;
       case 'full_novel':
@@ -207,6 +219,17 @@ export class AgentOrchestrator {
           request.options?.chapters ?? FULL_NOVEL_LIMITS.defaultChapters,
           request.options?.targetWords ?? FULL_NOVEL_LIMITS.defaultTargetWords,
           request.options?.totalChapters,
+          request.options?.planSummary,
+          signal,
+          onProgress,
+        );
+        break;
+      case 'long_novel':
+        result = await this.runLongNovel(
+          config,
+          prompt,
+          request.projectId,
+          request.options,
           signal,
           onProgress,
         );
@@ -239,6 +262,18 @@ export class AgentOrchestrator {
     return rule;
   }
 
+  private emitProgress(
+    onProgress: ((event: AgentProgressEvent) => void) | undefined,
+    event: AgentProgressEvent,
+  ): void {
+    if (!onProgress) return;
+    try {
+      onProgress(event);
+    } catch {
+      // UI progress must never break the writing path.
+    }
+  }
+
   private async runOnboard(
     config: ModelConfig,
     prompt: string,
@@ -246,18 +281,26 @@ export class AgentOrchestrator {
     projectId: Id | undefined,
     signal: AbortSignal,
     variant: 'novel' | 'title',
+    onProgress?: (event: AgentProgressEvent) => void,
   ): Promise<AgentRunResult> {
     const steps: string[] = [];
+    const emit = (message: string, phase: AgentProgressEvent['phase'] = 'setup', current?: number, total?: number): void => {
+      this.emitProgress(onProgress, { phase, message, current, total });
+    };
+
+    emit(variant === 'title' ? '正在按标题建项目…' : '正在创建小说项目…', 'setup', 1, 7);
     const { projectId: pid, projectCreated, projectTitle } = await this.resolveProject(
       projectId,
       variant === 'title' ? prompt : prompt,
     );
     steps.push(projectCreated ? '已自动创建小说项目。' : '已复用当前小说项目。');
+    emit(projectCreated ? `已创建项目「${projectTitle}」` : `已复用项目「${projectTitle}」`, 'setup', 1, 7);
 
-    const pack = await this.generatePack(config, prompt, mode, variant, signal);
+    const pack = await this.generatePack(config, prompt, mode, variant, signal, onProgress);
     steps.push('已生成控稿参考包（世界 / 人物 / 大纲分步写入）。');
 
     const artifacts: AgentArtifact[] = [{ kind: 'project', id: pid, title: projectTitle }];
+    emit('正在保存世界观 / 人物 / 大纲…', 'setup', 5, 7);
     const world = await this.store.createWorldSetting(pid, pack.title, pack.world);
     artifacts.push({ kind: 'world', id: world.id, title: world.title });
     steps.push('已保存世界观。');
@@ -271,8 +314,10 @@ export class AgentOrchestrator {
     steps.push('已保存章节大纲。');
 
     await this.seedMemoryFromPack(pid, pack);
+    emit('设定已写入项目，正在准备首章…', 'setup', 5, 7);
 
     if (mode === 'reference') {
+      emit('参考方案已完成。', 'info', 7, 7);
       return {
         task: variant,
         mode,
@@ -288,12 +333,16 @@ export class AgentOrchestrator {
     artifacts.push({ kind: 'chapter', id: chapter.id, title: chapter.title });
     steps.push('已创建首章。');
 
+    emit(`正在写「${chapterTitle}」正文（这一步较久）…`, 'chapter', 6, 7);
     const draft = await this.generateDraft(config, prompt, pack, pid, signal);
     await this.store.updateChapterContent(chapter.id, draft);
     steps.push('已生成并保存首章正文。');
+    emit(`首章正文已保存（约 ${draft.length} 字），正在反思记忆…`, 'chapter', 6, 7);
 
+    emit('反思子 Agent 正在沉淀长期记忆…', 'reflect', 7, 7);
     await this.reflectAndRemember(config, pid, chapter.id, chapterTitle, draft, signal);
-    steps.push('已反思首章并写入长期记忆（摘要 / 事实 / 风格）。');
+    steps.push('已反思首章并写入长期记忆（摘要 / 事实 / 风格 / 伏笔）。');
+    emit('首章生成完成。', 'info', 7, 7);
 
     return {
       task: variant,
@@ -311,12 +360,14 @@ export class AgentOrchestrator {
     prompt: string,
     projectId: Id | undefined,
     signal: AbortSignal,
+    onProgress?: (event: AgentProgressEvent) => void,
   ): Promise<AgentRunResult> {
     const steps: string[] = [];
+    this.emitProgress(onProgress, { phase: 'setup', message: '正在准备大纲与设定…', current: 1, total: 4 });
     const { projectId: pid, projectCreated, projectTitle } = await this.resolveProject(projectId, prompt);
     steps.push(projectCreated ? '已自动创建小说项目。' : '已复用当前小说项目。');
 
-    const pack = await this.generatePack(config, prompt, 'reference', 'novel', signal);
+    const pack = await this.generatePack(config, prompt, 'reference', 'novel', signal, onProgress);
     const artifacts: AgentArtifact[] = [{ kind: 'project', id: pid, title: projectTitle }];
 
     const world = await this.store.createWorldSetting(pid, pack.title, pack.world);
@@ -346,7 +397,9 @@ export class AgentOrchestrator {
     projectId: Id | undefined,
     chapterId: Id | undefined,
     signal: AbortSignal,
+    onProgress?: (event: AgentProgressEvent) => void,
   ): Promise<AgentRunResult> {
+    this.emitProgress(onProgress, { phase: 'setup', message: '正在润写…' });
     const steps: string[] = ['已解析润写需求。'];
     let pid = projectId;
     if (pid === undefined || pid.trim().length === 0) {
@@ -418,6 +471,7 @@ export class AgentOrchestrator {
     prompt: string,
     projectId: Id | undefined,
     signal: AbortSignal,
+    onProgress?: (event: AgentProgressEvent) => void,
   ): Promise<AgentRunResult> {
     if (projectId === undefined || projectId.trim().length === 0) {
       throw ServiceError.validation('综合测试需要先选择项目。');
@@ -425,6 +479,7 @@ export class AgentOrchestrator {
     const project = await this.store.getProject(projectId);
     if (!project) throw ServiceError.notFound(`项目不存在：${projectId}`);
 
+    this.emitProgress(onProgress, { phase: 'inspect', message: '正在汇总项目并诊断…' });
     const steps: string[] = ['已汇总项目结构与章节进度。'];
     const chapters = await this.store.listChapters(projectId);
     const characters = await this.store.listCharacters(projectId);
@@ -532,7 +587,9 @@ export class AgentOrchestrator {
     signal: AbortSignal,
     reportTitle: string,
     systemPrompt: string,
+    onProgress?: (event: AgentProgressEvent) => void,
   ): Promise<AgentRunResult> {
+    this.emitProgress(onProgress, { phase: 'setup', message: `正在生成${reportTitle}…` });
     const { projectId: pid, projectCreated, projectTitle } = await this.resolveProject(projectId, prompt);
     const report = await this.generateText(
       config,
@@ -573,12 +630,14 @@ export class AgentOrchestrator {
     projectId: Id | undefined,
     chapterId: Id | undefined,
     signal: AbortSignal,
+    onProgress?: (event: AgentProgressEvent) => void,
   ): Promise<AgentRunResult> {
     if (chapterId === undefined || chapterId.trim().length === 0) {
       throw ServiceError.validation('章节诊断需要先选择一个章节。');
     }
     const chapter = await this.store.getChapter(chapterId);
     if (!chapter) throw ServiceError.notFound(`章节不存在：${chapterId}`);
+    this.emitProgress(onProgress, { phase: 'inspect', message: `正在诊断「${chapter.title}」…` });
     const pid = projectId ?? chapter.projectId;
     const project = await this.store.getProject(pid);
     if (!project) throw ServiceError.notFound(`项目不存在：${pid}`);
@@ -637,9 +696,11 @@ export class AgentOrchestrator {
     config: ModelConfig,
     projectId: Id,
     signal: AbortSignal,
+    onProgress?: (event: AgentProgressEvent) => void,
   ): Promise<AgentRunResult> {
     const project = await this.store.getProject(projectId);
     if (!project) throw ServiceError.notFound(`项目不存在：${projectId}`);
+    this.emitProgress(onProgress, { phase: 'inspect', message: `正在审阅项目「${project.name}」…` });
 
     const [chapters, characters, worlds, outlines] = await Promise.all([
       this.store.listChapters(projectId),
@@ -705,6 +766,7 @@ export class AgentOrchestrator {
     projectId: Id,
     targetWords: number,
     signal: AbortSignal,
+    onProgress?: (event: AgentProgressEvent) => void,
   ): Promise<AgentRunResult> {
     const project = await this.store.getProject(projectId);
     if (!project) throw ServiceError.notFound(`项目不存在：${projectId}`);
@@ -714,6 +776,12 @@ export class AgentOrchestrator {
     const nextNum = chapters.length + 1;
     const newTitle = `第${nextNum}章`;
     steps.push(`已推断下一章：${newTitle}`);
+    this.emitProgress(onProgress, {
+      phase: 'setup',
+      message: `正在准备「${newTitle}」…`,
+      current: 1,
+      total: 4,
+    });
 
     const chapter = await this.store.createChapter(projectId, newTitle);
     steps.push('已创建章节骨架。');
@@ -722,13 +790,27 @@ export class AgentOrchestrator {
       prompt.length > 0 ? prompt : '顺接上一章剧情，推进主线并留下章节钩子。';
     // 把长期记忆（前情 + 设定事实 + 风格）注入蓝图需求，保证跨章节连贯。
     const memoryContext = this.memory.buildContext(projectId, scaledMemoryOptions(nextNum));
+    const transferPrompt = this.referenceService?.buildActiveTransferPrompt(projectId) ?? '';
+    const extraBlocks = [
+      memoryContext.length > 0 ? `=== 须严格遵循的故事记忆 ===\n${memoryContext}` : '',
+      transferPrompt.length > 0 ? `=== 参考写作方法（禁止抄袭原文） ===\n${transferPrompt}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n');
     const requirement =
-      memoryContext.length > 0
-        ? `${baseRequirement}\n\n=== 须严格遵循的故事记忆 ===\n${memoryContext}`
-        : baseRequirement;
+      extraBlocks.length > 0 ? `${baseRequirement}\n\n${extraBlocks}` : baseRequirement;
     if (memoryContext.length > 0) {
       steps.push('已回灌长期记忆（前情 / 设定 / 风格）到本章规划。');
     }
+    if (transferPrompt.length > 0) {
+      steps.push('已注入参考小说迁移方法（不含参考原文）。');
+    }
+    this.emitProgress(onProgress, {
+      phase: 'setup',
+      message: '正在生成章节蓝图…',
+      current: 2,
+      total: 4,
+    });
     await this.blueprintService.generate(
       chapter.id,
       { targetWords, requirement },
@@ -736,12 +818,24 @@ export class AgentOrchestrator {
     );
     steps.push('已生成章节蓝图与场景列表。');
 
+    this.emitProgress(onProgress, {
+      phase: 'chapter',
+      message: `正在分场景写「${newTitle}」正文…`,
+      current: 3,
+      total: 4,
+    });
     for await (const _event of this.chapterWriter.streamChapter(chapter.id, signal)) {
       if (signal.aborted) break;
     }
     steps.push('已按场景顺序写完并合并整章正文。');
 
     const saved = await this.store.getChapter(chapter.id);
+    this.emitProgress(onProgress, {
+      phase: 'reflect',
+      message: '正文完成，正在反思并更新记忆…',
+      current: 4,
+      total: 4,
+    });
     await this.reflectAndRemember(
       config,
       projectId,
@@ -750,7 +844,18 @@ export class AgentOrchestrator {
       saved?.content ?? '',
       signal,
     );
-    steps.push('已反思本章并更新长期记忆。');
+    const openFs = this.memory.listOpenForeshadows(projectId).length;
+    steps.push(
+      openFs > 0
+        ? `已反思本章并更新长期记忆与伏笔台账（未回收 ${openFs} 条）。`
+        : '已反思本章并更新长期记忆与伏笔台账。',
+    );
+    this.emitProgress(onProgress, {
+      phase: 'info',
+      message: `「${newTitle}」已完成。`,
+      current: 4,
+      total: 4,
+    });
     return {
       task: 'auto_next',
       mode: 'draft',
@@ -780,56 +885,143 @@ export class AgentOrchestrator {
   }
 
   /**
-   * 一键生成整本（小说）：建项目 → 设定包 → 循环写 N 章，每章都注入长期记忆并写完后反思。
-   * 这是 Agent 的「长程自动循环」：上一章的反思沉淀会成为下一章的上下文，逐章累积连贯性。
+   * 长篇小说模式（SPEC V1）：多子代理运行时。
+   *
+   * 子代理阶段：
+   * PlanningDirector → Worldbuilding → Character → Outline
+   * → Chapter 循环（写 → 格式/剧情/一致性 Gate → 可选自动修订 → 记忆/伏笔）
+   *
+   * 自动化等级控制本批章数、是否自动修订、硬冲突是否暂停。
    */
-  private async runFullNovel(
+  private async runLongNovel(
     config: ModelConfig,
     prompt: string,
     projectId: Id | undefined,
-    chapters: number,
-    targetWords: number,
-    totalChapters: number | undefined,
+    options: AgentRunRequest['options'] | undefined,
     signal: AbortSignal,
     onProgress?: (event: AgentProgressEvent) => void,
   ): Promise<AgentRunResult> {
-    const { chapterCount, wordsPerChapter } = normalizeFullNovelOptions(chapters, targetWords);
-    const plannedTotalChapters = clampInteger(
-      totalChapters ?? chapterCount,
+    const automationLevel: LongNovelAutomationLevel =
+      options?.automationLevel === 'assistant' ||
+      options?.automationLevel === 'semi_auto' ||
+      options?.automationLevel === 'auto' ||
+      options?.automationLevel === 'unattended'
+        ? options.automationLevel
+        : 'semi_auto';
+
+    const perChapter = clampInteger(
+      options?.targetWords ?? FULL_NOVEL_LIMITS.defaultTargetWords,
+      FULL_NOVEL_LIMITS.minTargetWords,
+      FULL_NOVEL_LIMITS.maxTargetWords,
+    );
+    const requestedBatch = clampInteger(
+      options?.chapters ?? (automationLevel === 'assistant' ? 1 : 3),
       FULL_NOVEL_LIMITS.minChapters,
       FULL_NOVEL_LIMITS.maxChapters,
     );
-    const plannedWords = plannedTotalChapters * wordsPerChapter;
-    const emit = (event: AgentProgressEvent): void => {
-      try {
-        onProgress?.(event);
-      } catch {
-        // 进度回调不应影响主流程。
-      }
-    };
-    const steps: string[] = [];
-    emit({ phase: 'setup', message: '正在准备项目…' });
-    const { projectId: pid, projectCreated, projectTitle } = await this.resolveProject(projectId, prompt);
-    steps.push(projectCreated ? '已自动创建小说项目。' : '已复用当前小说项目。');
-    steps.push(
-      `长篇参数：本批 ${chapterCount} 章 x ${wordsPerChapter} 字；总计划 ${plannedTotalChapters} 章，约 ${plannedWords.toLocaleString()} 字。`,
+    const totalWords = Math.max(10_000, options?.totalWords ?? 200_000);
+    const plannedTotalChapters = clampInteger(
+      options?.totalChapters ?? options?.planSummary?.chapterCount ?? Math.ceil(totalWords / perChapter),
+      FULL_NOVEL_LIMITS.minChapters,
+      FULL_NOVEL_LIMITS.maxChapters,
     );
 
+    const modeConfig: LongNovelModeConfig = defaultLongNovelConfig({
+      automationLevel,
+      targetWords: totalWords,
+      targetChapters: plannedTotalChapters,
+      targetWordsPerChapter: perChapter,
+      minWordsPerChapter: options?.minWordsPerChapter,
+      maxChaptersPerRun: requestedBatch,
+    });
+    // assistant 强制单章；unattended 允许更大批次但受 options.chapters 限制
+    const chapterCount = Math.min(requestedBatch, modeConfig.maxChaptersPerRun);
+
+    const emit = (event: AgentProgressEvent): void => {
+      this.emitProgress(onProgress, event);
+    };
+    const steps: string[] = [];
+    const subAgents: string[] = [];
+
+    emit({
+      phase: 'setup',
+      message: `【主 Agent】启动长篇小说模式（${automationLevel}）…`,
+    });
+    if (automationLevel === 'unattended') {
+      steps.push('⚠ 无人值守模式：将连续生成多章并自动审校，可能消耗大量 Token。');
+    }
+
+    const projectSeed = options?.planSummary?.title?.trim() || prompt;
+    const { projectId: pid, projectCreated, projectTitle } = await this.resolveProject(
+      projectId,
+      projectSeed,
+    );
+    steps.push(projectCreated ? '已创建长篇小说项目。' : '已复用当前项目。');
+    steps.push(
+      `长篇配置：自动化=${automationLevel}；本批 ${chapterCount} 章×${perChapter} 字；总计划 ${plannedTotalChapters} 章 / 约 ${totalWords.toLocaleString()} 字。`,
+    );
+
+    if (this.longNovelConfigStore) {
+      await this.longNovelConfigStore.save(pid, modeConfig);
+      steps.push('已保存长篇小说模式配置。');
+    }
+
     const artifacts: AgentArtifact[] = [{ kind: 'project', id: pid, title: projectTitle }];
-    let pack = projectCreated ? undefined : await this.loadExistingPack(pid, prompt, artifacts);
+    const packPrompt = appendPlanContextToPrompt(prompt, options?.planSummary);
+    const transferPrompt = this.referenceService?.buildActiveTransferPrompt(pid) ?? '';
+    const directorBrief = [
+      packPrompt,
+      transferPrompt ? `\n# 已启用参考方法（禁止抄原文）\n${transferPrompt}` : '',
+      `\n# 长篇目标\n全书约 ${totalWords} 字，计划 ${plannedTotalChapters} 章，每章约 ${perChapter} 字。自动化：${automationLevel}。`,
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    // —— 多子代理规划阶段 ——
+    emit({ phase: 'setup', message: '【PlanningDirector】确认故事核心与创作边界…' });
+    subAgents.push('PlanningDirector');
+    let pack = projectCreated ? undefined : await this.loadExistingPack(pid, directorBrief, artifacts);
     if (pack) {
-      steps.push('已复用现有世界观 / 人物护栏 / 大纲，继续长篇批处理。');
-      emit({ phase: 'setup', message: '已复用现有设定包，开始继续写作。' });
-    } else {
-      emit({ phase: 'setup', message: '正在生成世界观 / 人物 / 大纲设定包…' });
-      pack = await this.generatePack(config, prompt, 'draft', 'novel', signal);
+      steps.push('【PlanningDirector】复用已有设定包，跳过完整规划。');
+    } else if (modeConfig.planningEnabled) {
+      emit({ phase: 'setup', message: '【WorldbuildingAgent】生成世界规则…' });
+      subAgents.push('WorldbuildingAgent');
+      emit({ phase: 'setup', message: '【CharacterAgent】生成人物护栏…' });
+      subAgents.push('CharacterAgent');
+      emit({ phase: 'setup', message: '【OutlineAgent】生成卷纲与章节锚点…' });
+      subAgents.push('OutlineAgent');
+      pack = await this.generatePack(config, directorBrief, 'draft', 'novel', signal, onProgress);
+      if (options?.planSummary?.title?.trim()) {
+        pack = { ...pack, title: options.planSummary.title.trim() };
+      }
       const world = await this.store.createWorldSetting(pid, pack.title, pack.world);
       artifacts.push({ kind: 'world', id: world.id, title: world.title });
       const character = await this.store.createCharacter(pid, '人物与口吻护栏', pack.characters);
       artifacts.push({ kind: 'character', id: character.id, title: character.name });
       const outline = await this.store.createOutline(pid, `${pack.title}：大纲`, pack.outline);
       artifacts.push({ kind: 'outline', id: outline.id, title: outline.title });
-      steps.push('已生成并保存世界观 / 人物护栏 / 大纲。');
+      steps.push('已完成多子代理规划：世界 / 人物 / 大纲。');
+    } else {
+      pack = await this.generatePack(config, directorBrief, 'draft', 'novel', signal, onProgress);
+      const world = await this.store.createWorldSetting(pid, pack.title, pack.world);
+      artifacts.push({ kind: 'world', id: world.id, title: world.title });
+      const character = await this.store.createCharacter(pid, '人物与口吻护栏', pack.characters);
+      artifacts.push({ kind: 'character', id: character.id, title: character.name });
+      const outline = await this.store.createOutline(pid, `${pack.title}：大纲`, pack.outline);
+      artifacts.push({ kind: 'outline', id: outline.id, title: outline.title });
+    }
+
+    if (options?.planSummary) {
+      emit({ phase: 'setup', message: '【PlanningDirector】采纳计划分章大纲与创作规则…' });
+      pack = await this.adoptPlanMaterials(
+        pid,
+        pack,
+        options.planSummary,
+        plannedTotalChapters,
+        perChapter,
+        artifacts,
+        steps,
+      );
     }
 
     await this.purgeEmptyChapterShells(pid);
@@ -840,7 +1032,339 @@ export class AgentOrchestrator {
       config,
       pid,
       pack,
-      prompt,
+      directorBrief,
+      plannedFinalChapter,
+      perChapter,
+      signal,
+      emit,
+      artifacts,
+      steps,
+    );
+
+    const seedResult = await this.seedProjectMemory(pid, pack, options?.planSummary, {
+      seedPack: projectCreated || completedBefore === 0,
+    });
+    if (seedResult.seededPack) {
+      steps.push('【MemoryAgent】已写入初始 Canon / 计划事实。');
+      subAgents.push('MemoryAgent');
+    } else if (seedResult.seededPlan) {
+      steps.push('【MemoryAgent】已将计划约束写入故事记忆。');
+      subAgents.push('MemoryAgent');
+    }
+
+    // 模式配置落档到大纲，便于作者查看
+    const cfgDoc = await this.store.createOutline(
+      pid,
+      '长篇小说模式配置',
+      [
+        '# 长篇小说模式配置',
+        '',
+        `- 自动化等级：${automationLevel}`,
+        `- 全书目标：约 ${totalWords.toLocaleString()} 字 / ${plannedTotalChapters} 章`,
+        `- 每章：${modeConfig.minWordsPerChapter}–${modeConfig.maxWordsPerChapter}（目标 ${perChapter}）`,
+        `- 本批：${chapterCount} 章`,
+        `- 自动修订：${modeConfig.autoRevisionEnabled ? '开' : '关'}`,
+        `- 硬冲突暂停：${modeConfig.stopOnCanonConflict ? '开' : '关'}`,
+        `- 子代理：${[...new Set(subAgents)].join(' → ')} → ChapterAgent → ContinuityAgent → MemoryAgent`,
+      ].join('\n'),
+    );
+    artifacts.push({ kind: 'outline', id: cfgDoc.id, title: cfgDoc.title });
+
+    if (!modeConfig.chapterLoopEnabled) {
+      return {
+        task: 'long_novel',
+        mode: 'draft',
+        projectId: pid,
+        summary: '长篇规划已完成（章节循环未启用）。',
+        steps,
+        artifacts,
+        metrics: emptyMetrics(plannedTotalChapters * perChapter, 0),
+      };
+    }
+
+    // —— 章节循环 ——
+    emit({ phase: 'setup', message: '【ChapterAgent】设定就绪，进入章节生成循环…' });
+    subAgents.push('ChapterAgent', 'ContinuityAgent');
+    const outlineByNumber = indexPlanChapterOutlines(options?.planSummary?.chapterOutlines);
+    let lastChapterId: Id | undefined;
+    let completedChapters = 0;
+    let consecutiveFailures = 0;
+    let stoppedReason: string | undefined;
+
+    for (let i = 0; i < chapterCount; i += 1) {
+      if (signal.aborted) {
+        stoppedReason = '用户中止';
+        break;
+      }
+      const num = completedBefore + i + 1;
+      const planChapter = outlineByNumber.get(num);
+      const title = planChapter?.title?.trim()
+        ? `第${num}章 ${planChapter.title.trim()}`
+        : `第${num}章`;
+
+      emit({
+        phase: 'chapter',
+        message: `【ChapterAgent】装配上下文并撰写「${title}」…`,
+        current: i + 1,
+        total: chapterCount,
+      });
+      const chapter = await this.store.createChapter(pid, title);
+      artifacts.push({ kind: 'chapter', id: chapter.id, title });
+      lastChapterId = chapter.id;
+
+      let content = await this.generateChapterWithMemory(
+        config,
+        pid,
+        pack,
+        num,
+        plannedFinalChapter,
+        directorBrief,
+        perChapter,
+        signal,
+      );
+
+      // Gate 1 格式（预检）
+      let gates = runChapterQualityGates({
+        content,
+        minWords: modeConfig.minWordsPerChapter,
+        maxWords: modeConfig.maxWordsPerChapter,
+        targetWords: perChapter,
+        chapterTitle: title,
+      });
+      const formatNeedsRewrite =
+        gates.hardFail ||
+        gates.findings.some((f) => f.gate === 'format' && f.autoFixable && f.severity !== 'pass');
+      if (modeConfig.autoRevisionEnabled && formatNeedsRewrite) {
+        emit({
+          phase: 'chapter',
+          message: `【ChapterAgent】格式 Gate 未过，尝试重写「${title}」…`,
+          current: i + 1,
+          total: chapterCount,
+        });
+        content = await this.generateChapterWithMemory(
+          config,
+          pid,
+          pack,
+          num,
+          plannedFinalChapter,
+          `${directorBrief}\n\n# 修订要求\n上一稿格式不合格：${gates.findings.map((f) => f.message).join('；')}`,
+          perChapter,
+          signal,
+        );
+      }
+
+      await this.store.updateChapterContent(chapter.id, content);
+
+      // 审校 → 可选修订 → 再检 → 仅对终稿应用结论与反思
+      const processed = await this.processChapterDraft(
+        config,
+        pid,
+        pack,
+        num,
+        chapter.id,
+        title,
+        directorBrief,
+        content,
+        perChapter,
+        plannedFinalChapter,
+        signal,
+        emit,
+        {
+          autoRevisionEnabled: modeConfig.autoRevisionEnabled,
+          qualityGates: {
+            minWords: modeConfig.minWordsPerChapter,
+            maxWords: modeConfig.maxWordsPerChapter,
+            targetWords: perChapter,
+          },
+          labels: {
+            inspect: (t) => `【ContinuityAgent】审校「${t}」…`,
+            revise: (t) => `【ReviewAgent】自动修订「${t}」…`,
+            reflect: (t) => `【MemoryAgent】提取「${t}」记忆与伏笔…`,
+          },
+          progress: { current: i + 1, total: chapterCount },
+        },
+      );
+      const finalContent = processed.finalContent;
+      const finalInspection = processed.finalInspection;
+      gates = processed.gates ?? gates;
+      if (processed.revised) {
+        steps.push(`【ReviewAgent】已修订「${title}」。`);
+      }
+
+      // 检查点大纲（每 N 章）
+      if (
+        modeConfig.checkpointInterval > 0 &&
+        (completedChapters + 1) % modeConfig.checkpointInterval === 0
+      ) {
+        const cp = await this.store.createOutline(
+          pid,
+          `检查点：第${num}章`,
+          [
+            `# 检查点`,
+            `章：${title}`,
+            `字数：${finalContent.length}`,
+            `一致性分：${finalInspection.score0to100}`,
+            `Gate：${gates.findings.map((f) => `[${f.gate}] ${f.message}`).join('；') || '通过'}`,
+            `时间：${new Date().toISOString()}`,
+          ].join('\n'),
+        );
+        artifacts.push({ kind: 'outline', id: cp.id, title: cp.title });
+        steps.push(`已创建检查点（第${num}章）。`);
+      }
+
+      if (gates.hardFail && modeConfig.stopOnCanonConflict) {
+        consecutiveFailures += 1;
+        steps.push(
+          `【Gate】「${title}」硬冲突：${gates.findings
+            .filter((f) => f.severity === 'hard')
+            .map((f) => f.message)
+            .join('；')}`,
+        );
+        if (
+          consecutiveFailures >= modeConfig.maxConsecutiveFailures ||
+          automationLevel === 'semi_auto' ||
+          automationLevel === 'assistant'
+        ) {
+          stoppedReason = `一致性/格式硬冲突，已暂停（${title}）`;
+          emit({
+            phase: 'info',
+            message: `【主 Agent】${stoppedReason}`,
+            current: i + 1,
+            total: chapterCount,
+          });
+          completedChapters += 1;
+          break;
+        }
+      } else {
+        consecutiveFailures = 0;
+      }
+
+      completedChapters += 1;
+      steps.push(
+        `【ChapterAgent】完成「${title}」（${finalContent.length} 字，检测 ${finalInspection.score0to100}）。`,
+      );
+      emit({
+        phase: 'chapter',
+        message: `「${title}」已通过章节循环`,
+        current: i + 1,
+        total: chapterCount,
+      });
+    }
+
+    const plannedWords = plannedTotalChapters * perChapter;
+    const summary = stoppedReason
+      ? `长篇小说模式已暂停：完成 ${completedChapters}/${chapterCount} 章。原因：${stoppedReason}`
+      : `长篇小说模式本批完成 ${completedChapters}/${chapterCount} 章（自动化=${automationLevel}；多子代理：规划→写作→审校→记忆）。`;
+
+    emit({ phase: 'info', message: summary });
+    return {
+      task: 'long_novel',
+      mode: 'draft',
+      projectId: pid,
+      chapterId: lastChapterId,
+      summary,
+      steps: [
+        `参与子代理：${[...new Set(subAgents)].join('、')}`,
+        ...steps,
+      ],
+      artifacts,
+      metrics: emptyMetrics(plannedWords, completedChapters),
+    };
+  }
+
+  /**
+   * 一键生成整本（小说）：建项目 → 设定包 → 循环写 N 章，每章都注入长期记忆并写完后反思。
+   * 这是 Agent 的「长程自动循环」：上一章的反思沉淀会成为下一章的上下文，逐章累积连贯性。
+   *
+   * 若携带 planSummary（计划模式 / StoryForge 风格采纳），会先把分章大纲与创作规则写入项目资料，
+   * 并作为章节锚点优先于再生成总控大纲。
+   */
+  private async runFullNovel(
+    config: ModelConfig,
+    prompt: string,
+    projectId: Id | undefined,
+    chapters: number,
+    targetWords: number,
+    totalChapters: number | undefined,
+    planSummary: NovelPlanSummary | undefined,
+    signal: AbortSignal,
+    onProgress?: (event: AgentProgressEvent) => void,
+  ): Promise<AgentRunResult> {
+    // 计划规模优先于 options 默认值（用户在计划模式里确认过的章数/字数）
+    const planChapters = planSummary?.chapterCount;
+    const planWords = planSummary?.wordsPerChapter;
+    const { chapterCount, wordsPerChapter } = normalizeFullNovelOptions(
+      planChapters ?? chapters,
+      planWords ?? targetWords,
+    );
+    const plannedTotalChapters = clampInteger(
+      planSummary?.chapterCount ?? totalChapters ?? chapterCount,
+      FULL_NOVEL_LIMITS.minChapters,
+      FULL_NOVEL_LIMITS.maxChapters,
+    );
+    const plannedWords =
+      planSummary?.totalWords ?? plannedTotalChapters * wordsPerChapter;
+    const emit = (event: AgentProgressEvent): void => {
+      this.emitProgress(onProgress, event);
+    };
+    const steps: string[] = [];
+    emit({ phase: 'setup', message: '正在准备项目…' });
+    const projectSeedName = planSummary?.title?.trim() || prompt;
+    const { projectId: pid, projectCreated, projectTitle } = await this.resolveProject(
+      projectId,
+      projectSeedName,
+    );
+    steps.push(projectCreated ? '已自动创建小说项目。' : '已复用当前小说项目。');
+    steps.push(
+      `长篇参数：本批 ${chapterCount} 章 x ${wordsPerChapter} 字；总计划 ${plannedTotalChapters} 章，约 ${plannedWords.toLocaleString()} 字。`,
+    );
+
+    const artifacts: AgentArtifact[] = [{ kind: 'project', id: pid, title: projectTitle }];
+    const packPrompt = appendPlanContextToPrompt(prompt, planSummary);
+
+    let pack = projectCreated ? undefined : await this.loadExistingPack(pid, packPrompt, artifacts);
+    if (pack) {
+      steps.push('已复用现有世界观 / 人物护栏 / 大纲，继续长篇批处理。');
+      emit({ phase: 'setup', message: '已复用现有设定包，开始继续写作。' });
+    } else {
+      emit({ phase: 'setup', message: '正在生成世界观 / 人物 / 大纲设定包…' });
+      pack = await this.generatePack(config, packPrompt, 'draft', 'novel', signal);
+      // 计划书名覆盖模型生成的临时标题
+      if (planSummary?.title?.trim()) {
+        pack = { ...pack, title: planSummary.title.trim() };
+      }
+      const world = await this.store.createWorldSetting(pid, pack.title, pack.world);
+      artifacts.push({ kind: 'world', id: world.id, title: world.title });
+      const character = await this.store.createCharacter(pid, '人物与口吻护栏', pack.characters);
+      artifacts.push({ kind: 'character', id: character.id, title: character.name });
+      const outline = await this.store.createOutline(pid, `${pack.title}：大纲`, pack.outline);
+      artifacts.push({ kind: 'outline', id: outline.id, title: outline.title });
+      steps.push('已生成并保存世界观 / 人物护栏 / 大纲。');
+    }
+
+    // StoryForge 风格：把计划模式产出的分章大纲 / 创作规则写入项目，并注入 pack
+    if (planSummary) {
+      emit({ phase: 'setup', message: '正在采纳计划资料（分章大纲 / 创作规则）…' });
+      pack = await this.adoptPlanMaterials(
+        pid,
+        pack,
+        planSummary,
+        plannedTotalChapters,
+        wordsPerChapter,
+        artifacts,
+        steps,
+      );
+    }
+
+    await this.purgeEmptyChapterShells(pid);
+    const existing = await this.store.listChapters(pid);
+    const completedBefore = existing.filter((ch) => ch.content.trim().length > 0).length;
+    const plannedFinalChapter = Math.max(completedBefore + chapterCount, plannedTotalChapters);
+    pack = await this.ensureFullNovelControlOutline(
+      config,
+      pid,
+      pack,
+      packPrompt,
       plannedFinalChapter,
       wordsPerChapter,
       signal,
@@ -848,18 +1372,26 @@ export class AgentOrchestrator {
       artifacts,
       steps,
     );
-    if (projectCreated) {
-      await this.seedMemoryFromPack(pid, pack);
+    const seedResult = await this.seedProjectMemory(pid, pack, planSummary, {
+      seedPack: projectCreated || completedBefore === 0,
+    });
+    if (seedResult.seededPack) {
       steps.push('已写入初始故事记忆（设定事实）。');
+    } else if (seedResult.seededPlan) {
+      steps.push('已将计划约束写入故事记忆。');
     }
 
     emit({ phase: 'setup', message: '设定、总控大纲与初始记忆就绪，开始逐章写作。' });
+    const outlineByNumber = indexPlanChapterOutlines(planSummary?.chapterOutlines);
     let lastChapterId: Id | undefined;
     let completedChapters = 0;
     for (let i = 0; i < chapterCount; i += 1) {
       if (signal.aborted) break;
       const num = completedBefore + i + 1;
-      const title = `第${num}章`;
+      const planChapter = outlineByNumber.get(num);
+      const title = planChapter?.title?.trim()
+        ? `第${num}章 ${planChapter.title.trim()}`
+        : `第${num}章`;
       emit({ phase: 'chapter', message: `正在写「${title}」正文…`, current: i + 1, total: chapterCount });
       const chapter = await this.store.createChapter(pid, title);
       artifacts.push({ kind: 'chapter', id: chapter.id, title });
@@ -871,48 +1403,47 @@ export class AgentOrchestrator {
         pack,
         num,
         plannedFinalChapter,
-        prompt,
+        packPrompt,
         wordsPerChapter,
         signal,
       );
       await this.store.updateChapterContent(chapter.id, content);
-      emit({
-        phase: 'inspect',
-        message: `写作子 Agent 已完成「${title}」，检测子 Agent 并行审查中…`,
-        current: i + 1,
-        total: chapterCount,
-      });
-      const post = await runReflectionAndInspectionParallel(
-        () => this.reflectAndRemember(config, pid, chapter.id, title, content, signal),
-        () => this.inspectChapterDraft(config, pid, num, title, content, signal),
+      // 审校 → 可选修订 → 再检 → 仅对终稿应用结论与反思
+      const processed = await this.processChapterDraft(
+        config,
+        pid,
+        pack,
+        num,
+        chapter.id,
+        title,
+        packPrompt,
+        content,
+        wordsPerChapter,
+        plannedFinalChapter,
+        signal,
+        emit,
+        {
+          autoRevisionEnabled: true,
+          qualityGates: null,
+          labels: {
+            inspect: (t) => `写作子 Agent 已完成「${t}」，检测子 Agent 审查中…`,
+            revise: (t) => `检测子 Agent 要求修订「${t}」…`,
+          },
+          progress: { current: i + 1, total: chapterCount },
+        },
       );
-      await this.applyInspectorFindings(pid, post.inspection);
-      let finalContent = content;
-      if (post.inspection.recommendRevision && post.inspection.revisionHints.length > 0) {
-        emit({ phase: 'chapter', message: `检测子 Agent 要求修订「${title}」…`, current: i + 1, total: chapterCount });
-        finalContent = await this.reviseChapterWithHints(
-          config,
-          pid,
-          pack,
-          num,
-          plannedFinalChapter,
-          prompt,
-          wordsPerChapter,
-          finalContent,
-          post.inspection.revisionHints,
-          signal,
-        );
-        await this.store.updateChapterContent(chapter.id, finalContent);
-        await this.reflectAndRemember(config, pid, chapter.id, title, finalContent, signal);
+      const finalContent = processed.finalContent;
+      const finalInspection = processed.finalInspection;
+      if (processed.revised) {
         steps.push(`检测子 Agent 已触发修订「${title}」。`);
       }
       completedChapters += 1;
       steps.push(
-        `已写完「${title}」（${finalContent.length} 字）；检测评分 ${post.inspection.score0to100}。`,
+        `已写完「${title}」（${finalContent.length} 字）；检测评分 ${finalInspection.score0to100}。`,
       );
       emit({
         phase: 'chapter',
-        message: `「${title}」已完成（${content.length} 字）`,
+        message: `「${title}」已完成（${finalContent.length} 字）`,
         current: i + 1,
         total: chapterCount,
       });
@@ -924,7 +1455,9 @@ export class AgentOrchestrator {
       mode: 'draft',
       projectId: pid,
       chapterId: lastChapterId,
-      summary: `已一键生成整本草稿：完成 ${completedChapters}/${chapterCount} 章，全程带长期记忆与逐章反思自我进化。`,
+      summary: planSummary
+        ? `已按计划生成整本草稿：完成 ${completedChapters}/${chapterCount} 章（分章大纲与创作规则已采纳），全程带长期记忆与逐章反思。`
+        : `已一键生成整本草稿：完成 ${completedChapters}/${chapterCount} 章，全程带长期记忆与逐章反思自我进化。`,
       steps,
       artifacts,
       metrics: {
@@ -954,23 +1487,42 @@ export class AgentOrchestrator {
     targetWords: number,
     signal: AbortSignal,
   ): Promise<string> {
-    const memoryContext = this.memory.buildContext(projectId, scaledMemoryOptions(chapterNumber));
-    const memoryBlock = memoryContext.length > 0 ? `\n\n${memoryContext}` : '';
+    const progressRatio = totalChapters > 0 ? chapterNumber / totalChapters : 0;
+    const memoryContext = this.memory.buildContext(projectId, {
+      ...scaledMemoryOptions(chapterNumber),
+      progressRatio,
+    });
+    const transferPrompt = this.referenceService?.buildActiveTransferPrompt(projectId) ?? '';
+    const memoryBlock = [
+      memoryContext.length > 0 ? memoryContext : '',
+      transferPrompt.length > 0 ? transferPrompt : '',
+    ]
+      .filter(Boolean)
+      .map((block) => `\n\n${block}`)
+      .join('');
     const chapterOutline = extractChapterOutline(pack.outline, chapterNumber);
     const chapterOutlineBlock =
       chapterOutline ??
       `总大纲未提供第 ${chapterNumber} 章独立条目。请按当前进度承接总大纲，不得提前回收后续重大伏笔。`;
     const positionHint =
       chapterNumber === 1
-        ? '这是开篇第一章：交代主角与世界、抛出核心冲突与悬念。'
+        ? '这是开篇第一章：交代主角与世界、抛出核心冲突与悬念；可埋设 1～2 条可回收伏笔。'
         : chapterNumber >= totalChapters
-          ? '这是收尾章：推进到高潮并给出结局或强力收束，呼应前情。'
-          : '这是中段章节：顺接前情、推进主线、深化人物，并留下章末钩子。';
+          ? '这是收尾章：推进到高潮并给出结局或强力收束，优先回收未决伏笔，呼应前情。'
+          : progressRatio >= 0.75
+            ? '这是后段章节：推进主线并开始自然回收高优先伏笔，章末仍可留轻钩子。'
+            : '这是中段章节：顺接前情、推进主线、深化人物；可呼应旧伏笔并留下章末钩子。';
+    const openCount = this.memory.listOpenForeshadows(projectId).length;
+    const foreshadowHint =
+      openCount > 0
+        ? `当前未回收伏笔 ${openCount} 条，写作时须遵守记忆中的「伏笔台账」指引。`
+        : '可按章纲适度埋设新伏笔，便于后文回收。';
     const system = [
       `你是长篇小说正文写作子 Agent，正在连续创作《${pack.title}》。`,
       '只输出本章正文，不要输出大纲、解释或总结。',
-      '务必与下列设定、人物护栏、整卷大纲、章节锚点和前情保持严格一致。',
+      '务必与下列设定、人物护栏、整卷大纲、章节锚点、伏笔台账和前情保持严格一致。',
       '本章必须优先执行「本章大纲锚点」；只能补足必要场景，不得跳到后续章节重大剧情。',
+      foreshadowHint,
       '',
       pack.world,
       '',
@@ -1094,7 +1646,53 @@ export class AgentOrchestrator {
     );
   }
 
-  /** 从设定包抽取初始故事事实写入记忆（无需额外模型调用）。 */
+  /**
+   * StoryForge 风格「计划采纳」：
+   * 把计划模式产出的创作规则、分章大纲写入项目资料，并合并进当前设定包，
+   * 使后续逐章写作优先执行用户确认过的章纲（而非再盲生成）。
+   */
+  private async adoptPlanMaterials(
+    projectId: Id,
+    pack: GeneratedPack,
+    plan: NovelPlanSummary,
+    totalChapters: number,
+    wordsPerChapter: number,
+    artifacts: AgentArtifact[],
+    steps: string[],
+  ): Promise<GeneratedPack> {
+    let next = pack;
+    const rulesText = formatPlanCreationRules(plan);
+    if (rulesText) {
+      const rules = await this.store.createWorldSetting(projectId, '创作规则（计划采纳）', rulesText);
+      artifacts.push({ kind: 'world', id: rules.id, title: rules.title });
+      next = {
+        ...next,
+        world: `${next.world.trim()}\n\n${rulesText}`,
+      };
+      steps.push('已采纳并保存创作规则。');
+    }
+
+    const outlines = plan.chapterOutlines ?? [];
+    if (outlines.length > 0) {
+      const controlOutline = buildControlOutlineFromPlan(outlines, totalChapters, wordsPerChapter);
+      const saved = await this.store.createOutline(
+        projectId,
+        `${next.title}：分章大纲（计划采纳）`,
+        controlOutline,
+      );
+      artifacts.push({ kind: 'outline', id: saved.id, title: saved.title });
+      next = {
+        ...next,
+        outline: `${next.outline.trim()}\n\n${controlOutline}`,
+      };
+      steps.push(`已采纳分章大纲（${outlines.length} 章锚点）。`);
+    } else {
+      steps.push('计划中无分章大纲，将继续生成总控锚点。');
+    }
+
+    return next;
+  }
+
   private async loadExistingPack(
     projectId: Id,
     prompt: string,
@@ -1105,19 +1703,217 @@ export class AgentOrchestrator {
       this.store.listCharacters(projectId),
       this.store.listOutlines(projectId),
     ]);
-    const world = worlds.at(-1);
+    // 创作规则可能作为 world 条目；优先取非「创作规则」的世界观
+    const world =
+      [...worlds].reverse().find((w) => !w.title.includes('创作规则')) ?? worlds.at(-1);
     const character = characters.at(-1);
-    const outline = outlines.at(-1);
-    if (!world || !character || !outline) return undefined;
+    // 排除伏笔台账 / 诊断报告等非叙事大纲，再合并长篇控制大纲
+    const storyOutlines = outlines.filter((o) => !isMetaOutlineTitle(o.title));
+    if (!world || !character || storyOutlines.length === 0) return undefined;
+
+    const primary =
+      storyOutlines.find((o) => o.title.includes('大纲') && !o.title.includes('控制')) ??
+      storyOutlines[0]!;
+    const control = [...storyOutlines]
+      .reverse()
+      .find((o) => o.title.includes('控制大纲') || o.title.includes('分章大纲'));
+    const outlineBody =
+      control && control.id !== primary.id
+        ? `${primary.content.trim()}\n\n${control.content.trim()}`
+        : primary.content;
+
     artifacts.push({ kind: 'world', id: world.id, title: world.title });
     artifacts.push({ kind: 'character', id: character.id, title: character.name });
-    artifacts.push({ kind: 'outline', id: outline.id, title: outline.title });
+    artifacts.push({ kind: 'outline', id: primary.id, title: primary.title });
+    if (control && control.id !== primary.id) {
+      artifacts.push({ kind: 'outline', id: control.id, title: control.title });
+    }
     return {
       title: inferProjectName(prompt),
       world: withHeading('世界与规则', world.content),
       characters: withHeading('人物与口吻护栏', character.description),
-      outline: withHeading('第一卷大纲', outline.content),
+      outline: withHeading('第一卷大纲', outlineBody),
     };
+  }
+
+  /**
+   * 统一初始记忆播种：新建/空项目写 pack（+可选 plan）；续写仅在有 plan 时补计划约束。
+   * 调用方根据返回值自行拼装进度文案，保持 long/full 任务 UX 独立。
+   */
+  private async seedProjectMemory(
+    projectId: Id,
+    pack: GeneratedPack,
+    planSummary: NovelPlanSummary | undefined,
+    opts: { seedPack: boolean },
+  ): Promise<{ seededPack: boolean; seededPlan: boolean }> {
+    let seededPack = false;
+    let seededPlan = false;
+    if (opts.seedPack) {
+      await this.seedMemoryFromPack(projectId, pack);
+      seededPack = true;
+      if (planSummary) {
+        await this.seedMemoryFromPlan(projectId, planSummary);
+        seededPlan = true;
+      }
+    } else if (planSummary) {
+      await this.seedMemoryFromPlan(projectId, planSummary);
+      seededPlan = true;
+    }
+    return { seededPack, seededPlan };
+  }
+
+  /**
+   * 章节草稿后的共享后处理：审校 →（可选）修订 → 再检 → 应用结论 → 反思一次。
+   * 不在修订前 reflect，避免草稿污染记忆；质量 Gate 仅在 qualityGates 提供时启用。
+   */
+  private async processChapterDraft(
+    config: ModelConfig,
+    projectId: Id,
+    pack: GeneratedPack,
+    chapterNumber: number,
+    chapterId: Id,
+    chapterTitle: string,
+    seedPrompt: string,
+    content: string,
+    targetWords: number,
+    totalChapters: number,
+    signal: AbortSignal,
+    emit: (event: AgentProgressEvent) => void,
+    options: {
+      autoRevisionEnabled: boolean;
+      /** 提供时走 long_novel Gate；null/undefined 走 full_novel（仅 recommendRevision+hints 修订）。 */
+      qualityGates?: { minWords: number; maxWords: number; targetWords: number } | null;
+      labels?: {
+        inspect?: (title: string) => string;
+        revise?: (title: string) => string;
+        reflect?: (title: string) => string;
+      };
+      progress?: { current?: number; total?: number };
+    },
+  ): Promise<{
+    finalContent: string;
+    finalInspection: InspectorReport;
+    gates?: GateResult;
+    revised: boolean;
+  }> {
+    const progress = options.progress;
+    const labels = options.labels;
+
+    emit({
+      phase: 'inspect',
+      message: labels?.inspect?.(chapterTitle) ?? `审校「${chapterTitle}」…`,
+      current: progress?.current,
+      total: progress?.total,
+    });
+
+    // 先只做审校，不反思：避免修订前草稿污染记忆/伏笔
+    const inspection = await this.inspectChapterDraft(
+      config,
+      projectId,
+      chapterNumber,
+      chapterTitle,
+      content,
+      signal,
+    );
+
+    let gates: GateResult | undefined;
+    if (options.qualityGates) {
+      gates = runChapterQualityGates({
+        content,
+        minWords: options.qualityGates.minWords,
+        maxWords: options.qualityGates.maxWords,
+        targetWords: options.qualityGates.targetWords,
+        chapterTitle,
+        inspectorScore: inspection.score0to100,
+        recommendRevision: inspection.recommendRevision,
+        revisionHints: inspection.revisionHints,
+      });
+    }
+
+    let finalContent = content;
+    let finalInspection = inspection;
+    let revised = false;
+
+    let shouldRevise = false;
+    let hints: string[] = [];
+    if (options.qualityGates) {
+      shouldRevise =
+        options.autoRevisionEnabled &&
+        (inspection.recommendRevision ||
+          Boolean(gates?.findings.some((f) => f.autoFixable && f.severity !== 'pass')));
+      if (shouldRevise) {
+        hints = [
+          ...inspection.revisionHints,
+          ...(gates?.findings.filter((f) => f.severity !== 'pass').map((f) => f.message) ?? []),
+        ].slice(0, 8);
+        shouldRevise = hints.length > 0;
+      }
+    } else if (
+      options.autoRevisionEnabled &&
+      inspection.recommendRevision &&
+      inspection.revisionHints.length > 0
+    ) {
+      shouldRevise = true;
+      hints = inspection.revisionHints;
+    }
+
+    if (shouldRevise) {
+      emit({
+        phase: 'chapter',
+        message: labels?.revise?.(chapterTitle) ?? `修订「${chapterTitle}」…`,
+        current: progress?.current,
+        total: progress?.total,
+      });
+      finalContent = await this.reviseChapterWithHints(
+        config,
+        projectId,
+        pack,
+        chapterNumber,
+        totalChapters,
+        seedPrompt,
+        targetWords,
+        finalContent,
+        hints,
+        signal,
+      );
+      await this.store.updateChapterContent(chapterId, finalContent);
+      // 修订后重检；若启用 Gate 则用新分数重跑（避免旧低分误 hardFail）
+      finalInspection = await this.inspectChapterDraft(
+        config,
+        projectId,
+        chapterNumber,
+        chapterTitle,
+        finalContent,
+        signal,
+      );
+      if (options.qualityGates) {
+        gates = runChapterQualityGates({
+          content: finalContent,
+          minWords: options.qualityGates.minWords,
+          maxWords: options.qualityGates.maxWords,
+          targetWords: options.qualityGates.targetWords,
+          chapterTitle,
+          inspectorScore: finalInspection.score0to100,
+          recommendRevision: finalInspection.recommendRevision,
+          revisionHints: finalInspection.revisionHints,
+        });
+      }
+      revised = true;
+    }
+
+    // 仅对最终正文应用检测结论与反思记忆
+    await this.applyInspectorFindings(projectId, finalInspection);
+    if (labels?.reflect) {
+      emit({
+        phase: 'inspect',
+        message: labels.reflect(chapterTitle),
+        current: progress?.current,
+        total: progress?.total,
+      });
+    }
+    await this.reflectAndRemember(config, projectId, chapterId, chapterTitle, finalContent, signal);
+
+    return { finalContent, finalInspection, gates, revised };
   }
 
   /** 从设定包抽取初始故事事实写入记忆（无需额外模型调用）。 */
@@ -1132,6 +1928,72 @@ export class AgentOrchestrator {
     if (characters.length > 0) facts.push({ kind: 'character', text: `人物护栏：${characters}` });
     if (outline.length > 0) facts.push({ kind: 'plot', text: `主线大纲：${outline}` });
     if (facts.length > 0) await this.memory.recordFacts(projectId, facts);
+  }
+
+  /** 把计划摘要中的硬约束写入长期记忆（StoryForge 伏笔/设定级事实）。 */
+  private async seedMemoryFromPlan(projectId: Id, plan: NovelPlanSummary): Promise<void> {
+    const facts: Array<{ kind: 'character' | 'world' | 'plot'; text: string }> = [];
+    if (plan.protagonist?.trim()) {
+      facts.push({ kind: 'character', text: `主角设定：${plan.protagonist.trim()}` });
+    }
+    if (plan.genre?.trim()) {
+      facts.push({ kind: 'world', text: `题材赛道：${plan.genre.trim()}` });
+    }
+    if (plan.tone?.trim()) {
+      facts.push({ kind: 'world', text: `叙事基调：${plan.tone.trim()}` });
+    }
+    if (plan.hook?.trim()) {
+      facts.push({ kind: 'plot', text: `核心钩子：${plan.hook.trim()}` });
+    }
+    if (plan.title?.trim()) {
+      facts.push({ kind: 'plot', text: `书名向：${plan.title.trim()}` });
+    }
+    for (const c of plan.constraints ?? []) {
+      const text = c.trim();
+      if (text.length > 0) {
+        facts.push({ kind: 'plot', text: `创作约束：${text}` });
+      }
+    }
+    for (const ch of (plan.chapterOutlines ?? []).slice(0, 12)) {
+      facts.push({
+        kind: 'plot',
+        text: `第${ch.number}章计划：${ch.title} — ${ch.goal}`.slice(0, 280),
+      });
+    }
+    if (facts.length > 0) await this.memory.recordFacts(projectId, facts);
+
+    // 核心钩子与章纲悬念预埋进伏笔台账，后续写作会回灌提醒
+    const plants: Array<{
+      title: string;
+      detail: string;
+      urgency: 'low' | 'medium' | 'high';
+      suggestPayoffBy?: string;
+    }> = [];
+    if (plan.hook?.trim()) {
+      plants.push({
+        title: '核心钩子',
+        detail: plan.hook.trim(),
+        urgency: 'high',
+        suggestPayoffBy: '全书高潮前必须兑现',
+      });
+    }
+    for (const ch of (plan.chapterOutlines ?? []).slice(0, 8)) {
+      const goal = ch.goal.trim();
+      if (goal.length < 8) continue;
+      // 仅把明显带悬念词的目标预埋，避免台账过噪
+      if (/悬念|伏笔|秘密|真相|身份|失踪|背叛|预言|未知|谜|意外|隐藏/.test(goal)) {
+        plants.push({
+          title: `第${ch.number}章伏笔：${ch.title}`.slice(0, 40),
+          detail: goal.slice(0, 200),
+          urgency: 'medium',
+          suggestPayoffBy: `第${Math.min((plan.chapterCount ?? ch.number) || ch.number, ch.number + 5)}章前后`,
+        });
+      }
+    }
+    if (plants.length > 0) {
+      await this.memory.plantForeshadows(projectId, plants);
+      await this.syncForeshadowLedgerOutline(projectId);
+    }
   }
 
   /** Drop chapter shells left by interrupted runs so resume continues at the right number. */
@@ -1238,7 +2100,7 @@ export class AgentOrchestrator {
 
   /**
    * 反思子 Agent（自我进化核心）：读章节正文，产出
-   * { summary, facts[], learning } 并写入长期记忆。
+   * { summary, facts[], learning, foreshadows[] } 并写入长期记忆。
    * 模型未按 JSON 返回时降级：用正文截断作摘要，保证记忆始终被更新、流程不中断。
    */
   private async reflectAndRemember(
@@ -1256,6 +2118,16 @@ export class AgentOrchestrator {
     let summary = fallbackSummary;
     let facts: Array<{ kind: 'character' | 'world' | 'plot'; text: string }> = [];
     let learning = '';
+    let foreshadowOps: ParsedForeshadowOp[] = [];
+
+    const openLedger = this.memory.listOpenForeshadows(projectId);
+    const openLedgerHint =
+      openLedger.length === 0
+        ? '（当前无未回收伏笔）'
+        : openLedger
+            .slice(0, 12)
+            .map((f) => `- ${f.title}：${f.detail}`)
+            .join('\n');
 
     try {
       const raw = await this.generateText(
@@ -1264,10 +2136,18 @@ export class AgentOrchestrator {
           {
             role: 'system',
             content: [
-              '你是小说连贯性「反思子 Agent」。阅读给定章节正文，提炼可供后续章节复用的记忆。',
+              '你是小说连贯性「反思子 Agent」。阅读给定章节正文，提炼可供后续章节复用的记忆与伏笔台账变更。',
               '只输出一个 JSON 对象，不要输出任何额外文字或代码块标记，结构：',
-              '{"summary":"本章 100 字内剧情摘要","facts":[{"kind":"character|world|plot","text":"应保持一致的设定/状态，一句话"}],"learning":"一条可复用的写作风格经验"}',
+              '{"summary":"本章 100 字内剧情摘要","facts":[{"kind":"character|world|plot","text":"应保持一致的设定/状态，一句话"}],"learning":"一条可复用的写作风格经验","foreshadows":[{"action":"plant|echo|resolve","title":"短标题","detail":"一句话说明","urgency":"low|medium|high","suggestPayoffBy":"建议回收窗口可选"}]}',
               'facts 至多 5 条，聚焦人物状态变化、世界规则、关键剧情进展。',
+              'foreshadows 至多 4 条：',
+              '- plant：本章新埋设的悬念/暗示/未解释物件或人物秘密；',
+              '- echo：再次点到但未完全揭晓的旧伏笔（title 尽量对应下列未回收列表）；',
+              '- resolve：本章明确回收/揭晓的旧伏笔。',
+              '若本章无新伏笔也无呼应回收，foreshadows 可为 []。',
+              '',
+              '# 当前未回收伏笔',
+              openLedgerHint,
             ].join('\n'),
           },
           { role: 'user', content: `章节标题：${chapterTitle}\n\n正文：\n${text.slice(0, 6000)}` },
@@ -1279,6 +2159,7 @@ export class AgentOrchestrator {
       if (parsed.summary.length > 0) summary = parsed.summary;
       facts = parsed.facts;
       learning = parsed.learning;
+      foreshadowOps = parsed.foreshadows;
     } catch {
       // 反思失败：保留 fallback 摘要，记忆仍前进，不中断主流程。
     }
@@ -1290,6 +2171,53 @@ export class AgentOrchestrator {
     });
     if (facts.length > 0) await this.memory.recordFacts(projectId, facts);
     if (learning.length > 0) await this.memory.recordLearning(projectId, learning);
+
+    // StoryForge 风格伏笔台账：埋设 / 呼应 / 回收
+    const plants = foreshadowOps.filter((op) => op.action === 'plant');
+    const touches = foreshadowOps.filter((op) => op.action === 'echo' || op.action === 'resolve');
+    if (plants.length > 0) {
+      await this.memory.plantForeshadows(
+        projectId,
+        plants.map((op) => ({
+          title: op.title,
+          detail: op.detail || op.title,
+          urgency: op.urgency,
+          suggestPayoffBy: op.suggestPayoffBy,
+          plantedChapterId: chapterId,
+          plantedChapterTitle: chapterTitle,
+        })),
+      );
+    }
+    if (touches.length > 0) {
+      await this.memory.touchForeshadows(
+        projectId,
+        touches.map((op) => ({
+          match: op.title || op.detail,
+          note: op.detail,
+          status: op.action === 'resolve' ? 'resolved' : 'echoed',
+          chapterId,
+          chapterTitle,
+        })),
+      );
+    }
+    await this.syncForeshadowLedgerOutline(projectId);
+  }
+
+  /** 把伏笔台账同步到项目大纲资料，便于作者在 UI 侧边栏查看。 */
+  private async syncForeshadowLedgerOutline(projectId: Id): Promise<void> {
+    const content = this.memory.formatForeshadowLedger(projectId);
+    const title = '伏笔台账';
+    try {
+      const outlines = await this.store.listOutlines(projectId);
+      const existing = outlines.find((o) => o.title === title);
+      if (existing) {
+        await this.store.updateOutline(existing.id, { content });
+      } else {
+        await this.store.createOutline(projectId, title, content);
+      }
+    } catch {
+      // 资料同步失败不阻断写作主流程。
+    }
   }
 
   private async generatePack(
@@ -1298,6 +2226,7 @@ export class AgentOrchestrator {
     mode: AgentRunMode,
     variant: 'novel' | 'title',
     signal: AbortSignal,
+    onProgress?: (event: AgentProgressEvent) => void,
   ): Promise<GeneratedPack> {
     const title = inferProjectName(prompt);
     const modeHint = mode === 'draft' ? '直接成文前置控稿' : '参考方案';
@@ -1309,6 +2238,12 @@ export class AgentOrchestrator {
       `用户需求：${prompt}`,
     ].join('\n');
 
+    this.emitProgress(onProgress, {
+      phase: 'setup',
+      message: '子 Agent 正在写世界观（可能需数十秒）…',
+      current: 2,
+      total: 7,
+    });
     const world = await this.generateText(
       config,
       [
@@ -1324,6 +2259,12 @@ export class AgentOrchestrator {
       signal,
     );
 
+    this.emitProgress(onProgress, {
+      phase: 'setup',
+      message: '世界观完成，正在写人物护栏…',
+      current: 3,
+      total: 7,
+    });
     const characters = await this.generateText(
       config,
       [
@@ -1336,6 +2277,12 @@ export class AgentOrchestrator {
       signal,
     );
 
+    this.emitProgress(onProgress, {
+      phase: 'setup',
+      message: '人物完成，正在写第一卷大纲…',
+      current: 4,
+      total: 7,
+    });
     const outline = await this.generateText(
       config,
       [
@@ -1348,6 +2295,12 @@ export class AgentOrchestrator {
       signal,
     );
 
+    this.emitProgress(onProgress, {
+      phase: 'setup',
+      message: '设定包生成完毕。',
+      current: 4,
+      total: 7,
+    });
     return {
       title,
       world: world.startsWith('#') ? world : `# 世界与规则\n\n${world}`,
@@ -1490,6 +2443,22 @@ export class AgentOrchestrator {
   }
 }
 
+function emptyMetrics(plannedWords: number, completedChapters: number): AgentRunMetrics {
+  return {
+    modelCalls: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    cacheHitRatePct: 0,
+    localCacheHits: 0,
+    localCacheMisses: 0,
+    localCacheHitRatePct: 0,
+    plannedWords,
+    completedChapters,
+  };
+}
+
 function clampInteger(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min;
   return Math.min(max, Math.max(min, Math.floor(value)));
@@ -1544,6 +2513,22 @@ function inferProjectName(prompt: string): string {
   return chars.slice(0, 18).join('') || '未命名小说';
 }
 
+/** 侧边栏辅助资料（伏笔/报告/诊断/参考档案）不当作故事大纲加载。 */
+function isMetaOutlineTitle(title: string): boolean {
+  const t = title.trim();
+  return (
+    t === '伏笔台账' ||
+    t.includes('诊断') ||
+    t.includes('审阅') ||
+    t.includes('报告') ||
+    t.includes('润写建议') ||
+    t.includes('拆梗') ||
+    t.includes('避俗') ||
+    t.includes('参考创作档案') ||
+    t.includes('参考写作方法')
+  );
+}
+
 function normalizeControlOutlineChunk(raw: string, startChapter: number, endChapter: number, totalChapters: number): string {
   const text = raw.trim();
   const lines = text.length > 0 ? [text] : [];
@@ -1569,6 +2554,112 @@ function fallbackChapterAnchor(chapter: number, totalChapters: number): string {
     `### 第${chapter}章：第${chapter}章`,
     `本章锚点：${phase}阶段，承接前情推进主线，更新人物状态并保留后续伏笔。`,
   ].join('\n');
+}
+
+/** 把计划摘要拼进生成 prompt，设定包与正文共用同一份已确认意图。 */
+function appendPlanContextToPrompt(prompt: string, plan: NovelPlanSummary | undefined): string {
+  if (!plan) return prompt;
+  const lines: string[] = ['# 已确认创作计划（必须严格遵守）'];
+  if (plan.title?.trim()) lines.push(`- 书名向：${plan.title.trim()}`);
+  if (plan.genre?.trim()) lines.push(`- 赛道：${plan.genre.trim()}`);
+  if (plan.protagonist?.trim()) lines.push(`- 主角：${plan.protagonist.trim()}`);
+  if (plan.hook?.trim()) lines.push(`- 钩子：${plan.hook.trim()}`);
+  if (plan.tone?.trim()) lines.push(`- 基调：${plan.tone.trim()}`);
+  if (plan.chapterCount) lines.push(`- 计划章数：${plan.chapterCount}`);
+  if (plan.wordsPerChapter) lines.push(`- 每章字数：约 ${plan.wordsPerChapter}`);
+  if (plan.totalWords) lines.push(`- 全书约：${plan.totalWords} 字`);
+  if (plan.constraints && plan.constraints.length > 0) {
+    lines.push(`- 约束：${plan.constraints.join('；')}`);
+  }
+  if (plan.chapterOutlines && plan.chapterOutlines.length > 0) {
+    lines.push('', '## 分章大纲（写作时优先执行）');
+    for (const ch of plan.chapterOutlines) {
+      lines.push(
+        `- 第${ch.number}章《${ch.title}》：${ch.goal}` +
+          (ch.estimatedWords ? `（约${ch.estimatedWords}字）` : ''),
+      );
+    }
+  }
+  if (lines.length <= 1) return prompt;
+  return `${prompt.trim()}\n\n${lines.join('\n')}`;
+}
+
+/** StoryForge 创作规则：风格、基调、禁忌、规模等可采纳结构。 */
+function formatPlanCreationRules(plan: NovelPlanSummary): string | undefined {
+  const lines: string[] = ['# 创作规则（计划采纳）', ''];
+  if (plan.title?.trim()) lines.push(`- 书名向：${plan.title.trim()}`);
+  if (plan.genre?.trim()) lines.push(`- 题材赛道：${plan.genre.trim()}`);
+  if (plan.protagonist?.trim()) lines.push(`- 主角：${plan.protagonist.trim()}`);
+  if (plan.hook?.trim()) lines.push(`- 核心钩子：${plan.hook.trim()}`);
+  if (plan.tone?.trim()) lines.push(`- 叙事基调：${plan.tone.trim()}`);
+  if (plan.chapterCount || plan.wordsPerChapter || plan.totalWords) {
+    const parts = [
+      plan.chapterCount ? `${plan.chapterCount} 章` : null,
+      plan.wordsPerChapter ? `每章约 ${plan.wordsPerChapter} 字` : null,
+      plan.totalWords ? `全书约 ${plan.totalWords.toLocaleString()} 字` : null,
+    ].filter(Boolean);
+    lines.push(`- 规模：${parts.join(' · ')}`);
+  }
+  if (plan.constraints && plan.constraints.length > 0) {
+    lines.push('- 禁忌与一致性约束：');
+    for (const c of plan.constraints) {
+      if (c.trim()) lines.push(`  - ${c.trim()}`);
+    }
+  }
+  lines.push('', '写作时必须遵守以上规则；不得偏离赛道、基调与已确认约束。');
+  // 仅有标题行时视为空
+  return lines.length > 3 ? lines.join('\n') : undefined;
+}
+
+/**
+ * 将计划分章大纲格式化为 extractChapterOutline 可解析的控制大纲。
+ * 缺失章节用 fallback 锚点补齐，避免 ensureFullNovelControlOutline 再调模型重做。
+ */
+export function buildControlOutlineFromPlan(
+  outlines: NovelPlanChapterOutline[],
+  totalChapters: number,
+  wordsPerChapter: number,
+): string {
+  const byNum = indexPlanChapterOutlines(outlines);
+  const sections: string[] = [];
+  const end = Math.max(totalChapters, ...byNum.keys(), 0);
+  for (let chapter = 1; chapter <= end; chapter += 1) {
+    const o = byNum.get(chapter);
+    if (o) {
+      const wordsHint = o.estimatedWords
+        ? `（约${o.estimatedWords}字）`
+        : wordsPerChapter > 0
+          ? `（约${wordsPerChapter}字）`
+          : '';
+      sections.push(
+        [`### 第${chapter}章：${o.title.trim() || `第${chapter}章`}`, `本章锚点：${o.goal.trim()}${wordsHint}`].join(
+          '\n',
+        ),
+      );
+    } else {
+      sections.push(fallbackChapterAnchor(chapter, totalChapters));
+    }
+  }
+  return [
+    '# 长篇章节控制大纲（计划采纳）',
+    '',
+    `总章数：${totalChapters}`,
+    `每章目标：约 ${wordsPerChapter} 字`,
+    '',
+    sections.join('\n\n'),
+  ].join('\n');
+}
+
+function indexPlanChapterOutlines(
+  outlines: NovelPlanChapterOutline[] | undefined,
+): Map<number, NovelPlanChapterOutline> {
+  const map = new Map<number, NovelPlanChapterOutline>();
+  for (const o of outlines ?? []) {
+    if (Number.isInteger(o.number) && o.number > 0) {
+      map.set(o.number, o);
+    }
+  }
+  return map;
 }
 
 function parseChapterHeading(line: string): number | undefined {
@@ -1619,15 +2710,24 @@ function chineseNumeralToNumber(text: string): number {
   return section + digit;
 }
 
+interface ParsedForeshadowOp {
+  action: 'plant' | 'echo' | 'resolve';
+  title: string;
+  detail: string;
+  urgency: 'low' | 'medium' | 'high';
+  suggestPayoffBy?: string;
+}
+
 interface ParsedReflection {
   summary: string;
   facts: Array<{ kind: 'character' | 'world' | 'plot'; text: string }>;
   learning: string;
+  foreshadows: ParsedForeshadowOp[];
 }
 
 /** 从反思子 Agent 的原始输出里稳健解析 JSON（容忍 ```json 包裹与前后噪声）。 */
-function parseReflection(raw: string): ParsedReflection {
-  const empty: ParsedReflection = { summary: '', facts: [], learning: '' };
+export function parseReflection(raw: string): ParsedReflection {
+  const empty: ParsedReflection = { summary: '', facts: [], learning: '', foreshadows: [] };
   if (raw.trim().length === 0) return empty;
   const start = raw.indexOf('{');
   const end = raw.lastIndexOf('}');
@@ -1654,5 +2754,31 @@ function parseReflection(raw: string): ParsedReflection {
       facts.push({ kind, text });
     }
   }
-  return { summary, facts, learning };
+  const foreshadows: ParsedForeshadowOp[] = [];
+  if (Array.isArray(obj.foreshadows)) {
+    for (const item of obj.foreshadows.slice(0, 4)) {
+      if (typeof item !== 'object' || item === null) continue;
+      const f = item as Record<string, unknown>;
+      const action =
+        f.action === 'plant' || f.action === 'echo' || f.action === 'resolve' ? f.action : null;
+      if (!action) continue;
+      const title = typeof f.title === 'string' ? f.title.trim() : '';
+      const detail = typeof f.detail === 'string' ? f.detail.trim() : '';
+      if (title.length === 0 && detail.length === 0) continue;
+      const urgency =
+        f.urgency === 'low' || f.urgency === 'medium' || f.urgency === 'high' ? f.urgency : 'medium';
+      const suggestPayoffBy =
+        typeof f.suggestPayoffBy === 'string' && f.suggestPayoffBy.trim().length > 0
+          ? f.suggestPayoffBy.trim()
+          : undefined;
+      foreshadows.push({
+        action,
+        title: title || detail.slice(0, 24),
+        detail: detail || title,
+        urgency,
+        suggestPayoffBy,
+      });
+    }
+  }
+  return { summary, facts, learning, foreshadows };
 }

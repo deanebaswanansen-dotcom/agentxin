@@ -40,10 +40,22 @@ import type {
   ImportNovelResult,
   ModelConfig,
   ModelConfigView,
+  NovelPlanTurnRequest,
+  NovelPlanTurnResponse,
   Outline,
   PacingReport,
   Project,
+  ReferenceAnalyzeRequest,
+  ReferenceAnalyzeResult,
+  ReferenceImportRequest,
+  ReferenceImportResult,
+  ReferenceNovelDetail,
+  ReferenceNovelSummary,
+  ReferenceTransferRequest,
+  ReferenceTransferResult,
   RewriteSceneBody,
+  SimilarityCheckRequest,
+  SimilarityCheckResult,
   WordCountReport,
   WorldSetting,
   WritingRequestBody,
@@ -63,7 +75,52 @@ import { ReasoningArtifactFilter } from '../lib/reasoningSanitizer.js';
 const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
 const DEFAULT_BASE_URL = (env?.VITE_API_BASE_URL ?? '/api').replace(/\/$/, '');
 
-let volatileModelConfig: ModelConfig | null = null;
+/** Browser-local persistence so API Key survives refresh (local-dev tool UX). */
+const MODEL_CONFIG_STORAGE_KEY = 'nwa.modelConfig.v1';
+
+function isModelConfig(value: unknown): value is ModelConfig {
+  if (typeof value !== 'object' || value === null) return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.baseUrl === 'string' &&
+    typeof row.apiKey === 'string' &&
+    typeof row.modelName === 'string'
+  );
+}
+
+function loadStoredModelConfig(): ModelConfig | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(MODEL_CONFIG_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isModelConfig(parsed)) return null;
+    return {
+      baseUrl: parsed.baseUrl,
+      apiKey: parsed.apiKey,
+      modelName: parsed.modelName,
+      temperature: typeof parsed.temperature === 'number' ? parsed.temperature : undefined,
+      topP: typeof parsed.topP === 'number' ? parsed.topP : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function persistModelConfig(config: ModelConfig | null): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (config === null) {
+      window.localStorage.removeItem(MODEL_CONFIG_STORAGE_KEY);
+    } else {
+      window.localStorage.setItem(MODEL_CONFIG_STORAGE_KEY, JSON.stringify(config));
+    }
+  } catch {
+    // Storage may be blocked; runtime still works with in-memory config.
+  }
+}
+
+let volatileModelConfig: ModelConfig | null = loadStoredModelConfig();
 
 function toModelConfigView(config: ModelConfig | null): ModelConfigView {
   if (config === null) {
@@ -96,6 +153,22 @@ function modelConfigHeader(): Record<string, string> {
   return {
     'X-Agentxin-Model-Config': encodeURIComponent(JSON.stringify(volatileModelConfig)),
   };
+}
+
+/** Best-effort mirror to backend store (masked GET only; raw key stays local + request header). */
+async function mirrorModelConfigToBackend(baseUrl: string, config: ModelConfig): Promise<void> {
+  try {
+    await fetch(`${baseUrl}/model-config`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        ...modelConfigHeader(),
+      },
+      body: JSON.stringify(config),
+    });
+  } catch {
+    // Backend mirror is optional; local persistence is the primary UX fix.
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -396,47 +469,67 @@ async function streamSse(
   let buffer = '';
   let full = '';
 
+  const consumeEvents = (events: SseEvent[]): 'done' | 'continue' => {
+    for (const ev of events) {
+      if (ev.event === 'error') {
+        throw sseErrorToApiClientError(ev.data);
+      }
+      if (ev.event === 'done') {
+        const tail = reasoningFilter.flush();
+        if (tail.length > 0) {
+          full += tail;
+          options?.onDelta?.(tail);
+        }
+        return 'done';
+      }
+      // Let callers consume custom frames (e.g. `scene` / agent `result`) before delta handling.
+      if (onSseEvent?.(ev) === true) {
+        continue;
+      }
+      // Thinking/reasoning event (model chain-of-thought) — forward to onThinking only.
+      if (ev.event === 'thinking') {
+        const thinkingDelta = decodeDelta(ev.data);
+        if (thinkingDelta.length > 0) {
+          options?.onThinking?.(thinkingDelta);
+        }
+        continue;
+      }
+      // Default / `delta` event carries a text increment.
+      const delta = reasoningFilter.push(decodeDelta(ev.data));
+      if (delta.length > 0) {
+        full += delta;
+        options?.onDelta?.(delta);
+      }
+    }
+    return 'continue';
+  };
+
   try {
     for (;;) {
       const { value, done } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
-      const { events, rest } = parseSseEvents(buffer);
-      buffer = rest;
-      for (const ev of events) {
-        if (ev.event === 'error') {
-          throw sseErrorToApiClientError(ev.data);
-        }
-        if (ev.event === 'done') {
-          const tail = reasoningFilter.flush();
-          if (tail.length > 0) {
-            full += tail;
-            options?.onDelta?.(tail);
-          }
-          return full;
-        }
-        // Let callers consume custom frames (e.g. `scene`) before delta handling.
-        if (onSseEvent?.(ev) === true) {
-          continue;
-        }
-        // Thinking/reasoning event (model chain-of-thought) — forward to onThinking only.
-        if (ev.event === 'thinking') {
-          const thinkingDelta = decodeDelta(ev.data);
-          if (thinkingDelta.length > 0) {
-            options?.onThinking?.(thinkingDelta);
-          }
-          continue;
-        }
-        // Default / `delta` event carries a text increment.
-        const delta = reasoningFilter.push(decodeDelta(ev.data));
-        if (delta.length > 0) {
-          full += delta;
-          options?.onDelta?.(delta);
-        }
+      const parsed = parseSseEvents(buffer);
+      buffer = parsed.rest;
+      if (consumeEvents(parsed.events) === 'done') {
+        return full;
       }
     }
+    // Stream closed: flush decoder + any trailing SSE frame without a final blank line.
+    buffer += decoder.decode();
+    if (buffer.trim().length > 0 && !buffer.endsWith('\n\n')) {
+      buffer += '\n\n';
+    }
+    const trailing = parseSseEvents(buffer);
+    if (consumeEvents(trailing.events) === 'done') {
+      return full;
+    }
   } finally {
-    reader.releaseLock();
+    try {
+      reader.releaseLock();
+    } catch {
+      // Reader may already be released after a clean return.
+    }
   }
 
   const tail = reasoningFilter.flush();
@@ -488,7 +581,14 @@ async function streamAgentRun(
   options?: AgentRunStreamOptions,
 ): Promise<AgentRunResult> {
   let result: AgentRunResult | undefined;
-  await streamSse(
+  let settleAfterResult: ReturnType<typeof setTimeout> | undefined;
+  let resolveEarly: (() => void) | undefined;
+
+  const earlyDone = new Promise<void>((resolve) => {
+    resolveEarly = resolve;
+  });
+
+  const streamPromise = streamSse(
     `${baseUrl}/agent/run-stream`,
     body,
     { signal: options?.signal },
@@ -507,11 +607,36 @@ async function streamAgentRun(
         } catch {
           // 解析失败时下方统一抛错。
         }
+        // 已有最终结果时不再死等 done：部分代理会吞掉最后的 done/end，导致 UI 永久「生成中」。
+        if (result !== undefined && settleAfterResult === undefined) {
+          settleAfterResult = setTimeout(() => {
+            resolveEarly?.();
+          }, 800);
+        }
         return true;
+      }
+      if (ev.event === 'done') {
+        resolveEarly?.();
       }
       return false;
     },
-  );
+  ).finally(() => {
+    if (settleAfterResult !== undefined) {
+      clearTimeout(settleAfterResult);
+    }
+    resolveEarly?.();
+  });
+
+  // Avoid unhandled rejection if we leave the stream running after early settle.
+  void streamPromise.catch(() => undefined);
+
+  // Wait for either the full stream, or a short grace period after `result`.
+  await Promise.race([streamPromise, earlyDone]);
+
+  if (result === undefined) {
+    await streamPromise;
+  }
+
   if (result === undefined) {
     throw new ApiClientError(
       { error: { code: 'PROVIDER_ERROR', message: 'Agent 流未返回最终结果。' } },
@@ -582,6 +707,8 @@ export interface ApiClient {
   agent: {
     run(body: AgentRunRequest, signal?: AbortSignal): Promise<AgentRunResult>;
     runStream(body: AgentRunRequest, options?: AgentRunStreamOptions): Promise<AgentRunResult>;
+    /** 开局计划模式：多轮追问 / 收束 brief。 */
+    planTurn(body: NovelPlanTurnRequest, signal?: AbortSignal): Promise<NovelPlanTurnResponse>;
   };
   projects: {
     list(signal?: AbortSignal): Promise<Pick<Project, 'id' | 'name'>[]>;
@@ -657,6 +784,28 @@ export interface ApiClient {
       signal?: AbortSignal,
     ): Promise<ImportNovelResult>;
   };
+  references: {
+    list(signal?: AbortSignal): Promise<ReferenceNovelSummary[]>;
+    get(id: Id, signal?: AbortSignal): Promise<ReferenceNovelDetail>;
+    import(body: ReferenceImportRequest, signal?: AbortSignal): Promise<ReferenceImportResult>;
+    analyze(
+      id: Id,
+      body?: ReferenceAnalyzeRequest,
+      signal?: AbortSignal,
+    ): Promise<ReferenceAnalyzeResult>;
+    transfer(
+      projectId: Id,
+      body: ReferenceTransferRequest,
+      signal?: AbortSignal,
+    ): Promise<ReferenceTransferResult>;
+    checkSimilarity(
+      projectId: Id,
+      body: SimilarityCheckRequest,
+      signal?: AbortSignal,
+    ): Promise<SimilarityCheckResult>;
+    purgeRaw(id: Id, signal?: AbortSignal): Promise<ReferenceNovelSummary>;
+    remove(id: Id, signal?: AbortSignal): Promise<void>;
+  };
   write(
     projectId: Id,
     chapterId: Id,
@@ -725,6 +874,7 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
     agent: {
       run: (body, signal) => request(b, 'POST', '/agent/run', body, { signal }),
       runStream: (body, options) => streamAgentRun(b, body, options),
+      planTurn: (body, signal) => request(b, 'POST', '/agent/plan/turn', body, { signal }),
     },
     projects: {
       list: (signal) => request(b, 'GET', '/projects', undefined, { signal }),
@@ -779,13 +929,22 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
       },
     },
     modelConfig: {
-      get: async (_signal) => toModelConfigView(volatileModelConfig),
+      get: async (_signal) => {
+        if (volatileModelConfig === null) {
+          volatileModelConfig = loadStoredModelConfig();
+        }
+        return toModelConfigView(volatileModelConfig);
+      },
       save: async (config, _signal) => {
         volatileModelConfig = { ...config };
+        persistModelConfig(volatileModelConfig);
+        // Fire-and-forget server mirror so restarts / other clients can still use store fallback.
+        void mirrorModelConfigToBackend(b, volatileModelConfig);
         return toModelConfigView(volatileModelConfig);
       },
       clear: () => {
         volatileModelConfig = null;
+        persistModelConfig(null);
       },
     },
     cacheStats: {
@@ -795,6 +954,21 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
     imports: {
       organizeNovel: (projectId, body, signal) =>
         request(b, 'POST', `/projects/${seg(projectId)}/import/novel`, body, { signal }),
+    },
+    references: {
+      list: (signal) => request(b, 'GET', '/references', undefined, { signal }),
+      get: (id, signal) => request(b, 'GET', `/references/${seg(id)}`, undefined, { signal }),
+      import: (body, signal) => request(b, 'POST', '/references/import', body, { signal }),
+      analyze: (id, body, signal) =>
+        request(b, 'POST', `/references/${seg(id)}/analyze`, body ?? {}, { signal }),
+      transfer: (projectId, body, signal) =>
+        request(b, 'POST', `/projects/${seg(projectId)}/reference-transfer`, body, { signal }),
+      checkSimilarity: (projectId, body, signal) =>
+        request(b, 'POST', `/projects/${seg(projectId)}/similarity/check`, body, { signal }),
+      purgeRaw: (id, signal) =>
+        request(b, 'POST', `/references/${seg(id)}/purge-raw`, undefined, { signal }),
+      remove: (id, signal) =>
+        request(b, 'DELETE', `/references/${seg(id)}`, undefined, { signal }),
     },
     write: (projectId, chapterId, body, options) =>
       streamWrite(b, projectId, chapterId, body, options),

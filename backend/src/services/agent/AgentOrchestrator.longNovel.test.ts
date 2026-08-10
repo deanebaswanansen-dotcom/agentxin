@@ -3,7 +3,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { extractChapterOutline, normalizeFullNovelOptions, AgentOrchestrator } from './AgentOrchestrator.js';
+import {
+  buildControlOutlineFromPlan,
+  extractChapterOutline,
+  normalizeFullNovelOptions,
+  parseReflection,
+  AgentOrchestrator,
+} from './AgentOrchestrator.js';
 import type { ModelProxy, StreamCompletionOptions } from '../../proxy/ModelProxy.js';
 import type { DataStore } from '../../store/DataStore.js';
 import { FileDataStore } from '../../store/FileDataStore.js';
@@ -57,7 +63,20 @@ class CaptureProxy implements ModelProxy {
       this.chapterSystems.push(system);
       text = '# 正文\n\n洛言继续推进代码御剑主线。';
     } else if (system.includes('反思子 Agent')) {
-      text = '{"summary":"洛言推进代码御剑主线","facts":[{"kind":"character","text":"洛言保持谨慎稳定"}],"learning":"保持代码御剑风格"}';
+      text = JSON.stringify({
+        summary: '洛言推进代码御剑主线',
+        facts: [{ kind: 'character', text: '洛言保持谨慎稳定' }],
+        learning: '保持代码御剑风格',
+        foreshadows: [
+          {
+            action: 'plant',
+            title: '热数据坟场',
+            detail: '学院深处存在被封锁的热数据坟场',
+            urgency: 'high',
+            suggestPayoffBy: '中后期',
+          },
+        ],
+      });
     }
     return (async function* () {
       yield { kind: 'content' as const, text };
@@ -188,6 +207,184 @@ describe('normalizeFullNovelOptions', () => {
     expect(proxy.chapterSystems[0]).toContain('第 1 / 500 章');
     expect(proxy.chapterSystems[1]).toContain('第 2 / 500 章');
     expect(result.metrics?.plannedWords).toBe(1_000_000);
+  });
+
+  it('parses foreshadow ops from reflection JSON', () => {
+    const parsed = parseReflection(
+      JSON.stringify({
+        summary: '开篇',
+        facts: [],
+        learning: '短句',
+        foreshadows: [
+          { action: 'plant', title: '神秘芯片', detail: '袖口闪过芯片', urgency: 'high' },
+          { action: 'resolve', title: '神秘芯片', detail: '是监工信标' },
+          { action: 'noop', title: '无效' },
+        ],
+      }),
+    );
+    expect(parsed.foreshadows).toHaveLength(2);
+    expect(parsed.foreshadows[0]).toMatchObject({ action: 'plant', title: '神秘芯片', urgency: 'high' });
+    expect(parsed.foreshadows[1]?.action).toBe('resolve');
+  });
+
+  it('formats plan chapter outlines into extractable control anchors', () => {
+    const control = buildControlOutlineFromPlan(
+      [
+        { number: 1, title: '黑户入学', goal: '陆辞潜入学院', estimatedWords: 2000 },
+        { number: 2, title: '第一堂课', goal: '用漏洞完成聚灵阵' },
+      ],
+      3,
+      2000,
+    );
+    expect(extractChapterOutline(control, 1)).toContain('陆辞潜入学院');
+    expect(extractChapterOutline(control, 2)).toContain('用漏洞完成聚灵阵');
+    expect(extractChapterOutline(control, 3)).toContain('本章锚点');
+  });
+
+  it('adopts planSummary chapter outlines instead of regenerating control outline', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-plan-'));
+    const store = await FileDataStore.create(join(tempDir, 'store.json'));
+    await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock-model' });
+    const memory = new MemoryService(await MemoryStore.create(join(tempDir, 'memory.json')));
+    const proxy = new CaptureProxy();
+    const orchestrator = new AgentOrchestrator(
+      store,
+      new ModelConfigService(store),
+      proxy,
+      undefined as never,
+      undefined as never,
+      memory,
+    );
+
+    const result = await orchestrator.run(
+      {
+        task: 'full_novel',
+        mode: 'draft',
+        prompt: '代码御剑长篇',
+        options: {
+          chapters: 2,
+          targetWords: 800,
+          planSummary: {
+            title: '代码御剑',
+            genre: '赛博修仙',
+            protagonist: '陆辞',
+            hook: '写代码御剑',
+            tone: '硬核爽文',
+            constraints: ['不写后宫', '不降智反派'],
+            chapterCount: 2,
+            wordsPerChapter: 800,
+            totalWords: 1600,
+            chapterOutlines: [
+              { number: 1, title: '黑户入学', goal: '陆辞绕过身份验证进入学院。' },
+              { number: 2, title: '第一堂课', goal: '陆辞用低算力漏洞完成聚灵阵。' },
+            ],
+          },
+        },
+      },
+      new AbortController().signal,
+    );
+
+    // 计划已提供全部分章锚点，不应再调用总控策划 LLM
+    expect(proxy.controlSystems).toHaveLength(0);
+    const outlines = await store.listOutlines(result.projectId);
+    expect(outlines.some((o) => o.title.includes('分章大纲（计划采纳）'))).toBe(true);
+    const worlds = await store.listWorldSettings(result.projectId);
+    expect(worlds.some((w) => w.title.includes('创作规则'))).toBe(true);
+    const chapters = await store.listChapters(result.projectId);
+    expect(chapters[0]?.title).toContain('黑户入学');
+    expect(chapters[1]?.title).toContain('第一堂课');
+    expect(proxy.chapterSystems[0]).toContain('陆辞绕过身份验证进入学院');
+    expect(result.summary).toContain('按计划');
+    expect(result.steps.some((s) => s.includes('已采纳分章大纲'))).toBe(true);
+  });
+
+  it('runs long_novel multi-subagent pipeline with gates and config outline', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-longmode-'));
+    const store = await FileDataStore.create(join(tempDir, 'store.json'));
+    await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock-model' });
+    const memory = new MemoryService(await MemoryStore.create(join(tempDir, 'memory.json')));
+    const proxy = new CaptureProxy();
+    // 正文写长一点，避免格式 Gate 字数 soft 干扰
+    const orig = proxy.streamCompletion.bind(proxy);
+    proxy.streamCompletion = (config, messages, signal, options) => {
+      const system = messages[0]?.content ?? '';
+      if (system.includes('正文写作子 Agent')) {
+        proxy.chapterSystems.push(system);
+        const text =
+          '林远推开门，雨砸在锈蚀的招牌上。他说：“跟我来。”空气里有机油与血腥。他们却发现地图是假的，真正的危机才刚开始。'.repeat(
+            8,
+          );
+        return (async function* () {
+          yield { kind: 'content' as const, text };
+        })();
+      }
+      return orig(config, messages, signal, options);
+    };
+    const orchestrator = new AgentOrchestrator(
+      store,
+      new ModelConfigService(store),
+      proxy,
+      undefined as never,
+      undefined as never,
+      memory,
+    );
+
+    const result = await orchestrator.run(
+      {
+        task: 'long_novel',
+        mode: 'draft',
+        prompt: '赛博修仙学院，主角靠写代码御剑',
+        options: {
+          chapters: 2,
+          targetWords: 500,
+          totalWords: 100_000,
+          automationLevel: 'semi_auto',
+        },
+      },
+      new AbortController().signal,
+    );
+
+    expect(result.task).toBe('long_novel');
+    expect(result.steps.some((s) => s.includes('PlanningDirector') || s.includes('多子代理'))).toBe(
+      true,
+    );
+    const outlines = await store.listOutlines(result.projectId);
+    expect(outlines.some((o) => o.title.includes('长篇小说模式配置'))).toBe(true);
+    expect((result.metrics?.completedChapters ?? 0) >= 1).toBe(true);
+  });
+
+  it('plants foreshadows during reflection and injects open ledger into later chapters', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-foreshadow-'));
+    const store = await FileDataStore.create(join(tempDir, 'store.json'));
+    await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock-model' });
+    const memory = new MemoryService(await MemoryStore.create(join(tempDir, 'memory.json')));
+    const proxy = new CaptureProxy();
+    const orchestrator = new AgentOrchestrator(
+      store,
+      new ModelConfigService(store),
+      proxy,
+      undefined as never,
+      undefined as never,
+      memory,
+    );
+
+    const result = await orchestrator.run(
+      {
+        task: 'full_novel',
+        mode: 'draft',
+        prompt: '代码御剑',
+        options: { chapters: 2, targetWords: 500 },
+      },
+      new AbortController().signal,
+    );
+
+    const open = memory.listOpenForeshadows(result.projectId);
+    expect(open.some((f) => f.title.includes('热数据坟场'))).toBe(true);
+    const outlines = await store.listOutlines(result.projectId);
+    expect(outlines.some((o) => o.title === '伏笔台账')).toBe(true);
+    // 第 2 章写作时应回灌第 1 章埋下的伏笔
+    expect(proxy.chapterSystems[1]).toContain('伏笔台账');
+    expect(proxy.chapterSystems[1]).toContain('热数据坟场');
   });
 });
 

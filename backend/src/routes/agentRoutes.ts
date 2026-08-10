@@ -2,7 +2,15 @@ import type { FastifyInstance } from 'fastify';
 
 import type { AgentService } from '../services/agent/AgentService.js';
 import { ServiceError } from '../services/ServiceError.js';
-import type { AgentProgressEvent, AgentRunMode, AgentRunRequest, AgentTask } from '../types/index.js';
+import type {
+  AgentProgressEvent,
+  AgentRunMode,
+  AgentRunRequest,
+  AgentTask,
+  LongNovelAutomationLevel,
+  NovelPlanChapterOutline,
+  NovelPlanSummary,
+} from '../types/index.js';
 import { toErrorResponse } from './errorMapping.js';
 
 const AGENT_TASKS: readonly AgentTask[] = [
@@ -18,6 +26,7 @@ const AGENT_TASKS: readonly AgentTask[] = [
   'workspace_review',
   'auto_next',
   'full_novel',
+  'long_novel',
   // New blueprint-centric tasks (Python LangGraph core)
   'plan_blueprint',
   'write_scene',
@@ -35,6 +44,92 @@ interface RunAgentBody {
 
 function isAgentTask(value: unknown): value is AgentTask {
   return typeof value === 'string' && (AGENT_TASKS as readonly string[]).includes(value);
+}
+
+function asOptionalString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function asOptionalPositiveInt(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
+  const n = Math.round(value);
+  return n > 0 ? n : undefined;
+}
+
+/** 宽松解析计划摘要（StoryForge 风格计划采纳），非法字段丢弃。 */
+function parsePlanSummary(raw: unknown): NovelPlanSummary | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const obj = raw as Record<string, unknown>;
+  const constraints = Array.isArray(obj.constraints)
+    ? obj.constraints.filter((c): c is string => typeof c === 'string' && c.trim().length > 0).map((c) => c.trim())
+    : undefined;
+  const chapterOutlines: NovelPlanChapterOutline[] | undefined = Array.isArray(obj.chapterOutlines)
+    ? obj.chapterOutlines
+        .map((item): NovelPlanChapterOutline | null => {
+          if (!item || typeof item !== 'object') return null;
+          const ch = item as Record<string, unknown>;
+          const number = asOptionalPositiveInt(ch.number);
+          const title = asOptionalString(ch.title);
+          const goal = asOptionalString(ch.goal);
+          if (number === undefined || !title || !goal) return null;
+          return {
+            number,
+            title,
+            goal,
+            estimatedWords: asOptionalPositiveInt(ch.estimatedWords),
+          };
+        })
+        .filter((x): x is NovelPlanChapterOutline => x !== null)
+    : undefined;
+
+  const summary: NovelPlanSummary = {
+    title: asOptionalString(obj.title),
+    genre: asOptionalString(obj.genre),
+    protagonist: asOptionalString(obj.protagonist),
+    hook: asOptionalString(obj.hook),
+    tone: asOptionalString(obj.tone),
+    constraints: constraints && constraints.length > 0 ? constraints : undefined,
+    totalWords: asOptionalPositiveInt(obj.totalWords),
+    wordsPerChapter: asOptionalPositiveInt(obj.wordsPerChapter),
+    chapterCount: asOptionalPositiveInt(obj.chapterCount),
+    chapterOutlines: chapterOutlines && chapterOutlines.length > 0 ? chapterOutlines : undefined,
+  };
+
+  const hasAny = Object.values(summary).some((v) => v !== undefined);
+  return hasAny ? summary : undefined;
+}
+
+function parseAutomationLevel(value: unknown): LongNovelAutomationLevel | undefined {
+  if (
+    value === 'assistant' ||
+    value === 'semi_auto' ||
+    value === 'auto' ||
+    value === 'unattended'
+  ) {
+    return value;
+  }
+  return undefined;
+}
+
+function parseAgentOptions(raw: unknown): AgentRunRequest['options'] | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const obj = raw as Record<string, unknown>;
+  const options: NonNullable<AgentRunRequest['options']> = {};
+  const targetWords = asOptionalPositiveInt(obj.targetWords);
+  const chapters = asOptionalPositiveInt(obj.chapters);
+  const totalChapters = asOptionalPositiveInt(obj.totalChapters);
+  const totalWords = asOptionalPositiveInt(obj.totalWords);
+  const minWordsPerChapter = asOptionalPositiveInt(obj.minWordsPerChapter);
+  const planSummary = parsePlanSummary(obj.planSummary);
+  const automationLevel = parseAutomationLevel(obj.automationLevel);
+  if (targetWords !== undefined) options.targetWords = targetWords;
+  if (chapters !== undefined) options.chapters = chapters;
+  if (totalChapters !== undefined) options.totalChapters = totalChapters;
+  if (totalWords !== undefined) options.totalWords = totalWords;
+  if (minWordsPerChapter !== undefined) options.minWordsPerChapter = minWordsPerChapter;
+  if (planSummary !== undefined) options.planSummary = planSummary;
+  if (automationLevel !== undefined) options.automationLevel = automationLevel;
+  return Object.keys(options).length > 0 ? options : undefined;
 }
 
 /**
@@ -71,10 +166,7 @@ function parseAgentBody(raw: RunAgentBody): AgentRunRequest {
     prompt: raw.prompt,
     projectId: raw.projectId,
     chapterId: raw.chapterId,
-    options:
-      raw.options && typeof raw.options === 'object'
-        ? (raw.options as { targetWords?: number; chapters?: number; totalChapters?: number })
-        : undefined,
+    options: parseAgentOptions(raw.options),
   };
 }
 
@@ -121,11 +213,29 @@ export function registerAgentRoutes(app: FastifyInstance, agentService: AgentSer
   app.post<{ Body: RunAgentBody }>('/api/agent/run-stream', async (request, reply) => {
     reply.hijack();
     const raw = reply.raw;
+    // Disable Nagle-ish buffering so progress frames reach the browser promptly.
     raw.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
       Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
     });
+    if (typeof (raw as { flushHeaders?: () => void }).flushHeaders === 'function') {
+      (raw as { flushHeaders: () => void }).flushHeaders();
+    }
+
+    const writeFrame = (frame: string): void => {
+      if (raw.writableEnded) return;
+      raw.write(frame);
+      const maybeFlush = (raw as { flush?: () => void }).flush;
+      if (typeof maybeFlush === 'function') {
+        try {
+          maybeFlush.call(raw);
+        } catch {
+          // flush is best-effort on Node HTTP responses.
+        }
+      }
+    };
 
     const controller = new AbortController();
     const onClose = (): void => {
@@ -137,20 +247,24 @@ export function registerAgentRoutes(app: FastifyInstance, agentService: AgentSer
 
     try {
       const parsed = parseAgentBody(request.body ?? {});
+      // Immediate heartbeat so the UI leaves "等待输出" even before first agent step.
+      writeFrame(sseFrame('progress', JSON.stringify({
+        phase: 'setup',
+        message: 'Agent 已接收任务，正在编排…',
+      } satisfies AgentProgressEvent)));
+
       const onProgress = (event: AgentProgressEvent): void => {
-        if (!raw.writableEnded) {
-          raw.write(sseFrame('progress', JSON.stringify(event)));
-        }
+        writeFrame(sseFrame('progress', JSON.stringify(event)));
       };
       const result = await agentService.run(parsed, controller.signal, onProgress);
       if (!raw.writableEnded) {
-        raw.write(sseFrame('result', JSON.stringify(result)));
-        raw.write(sseFrame('done'));
+        writeFrame(sseFrame('result', JSON.stringify(result)));
+        writeFrame(sseFrame('done'));
       }
     } catch (err) {
       if (!controller.signal.aborted && !raw.writableEnded) {
         const { body: apiError } = toErrorResponse(err);
-        raw.write(sseFrame('error', JSON.stringify(apiError)));
+        writeFrame(sseFrame('error', JSON.stringify(apiError)));
       }
     } finally {
       raw.removeListener('close', onClose);

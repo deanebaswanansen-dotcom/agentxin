@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import JSZip from 'jszip';
-import { parseReaderFile, parseReaderFolder, replaceFirstSelection, splitReaderChapters } from './readerImport.js';
+import {
+  parseReaderFile,
+  parseReaderFolder,
+  readerBookToReferenceText,
+  replaceFirstSelection,
+  splitReaderChapters,
+} from './readerImport.js';
 
 describe('readerImport', () => {
   it('splits plain text novels into chapters', () => {
@@ -41,7 +47,10 @@ describe('readerImport', () => {
       '<item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/>',
       '</manifest><spine><itemref idref="c1"/></spine></package>',
     ].join(''));
-    zip.file('OEBPS/ch1.xhtml', '<html><body><h1>第1章 EPUB</h1><p>EPUB 正文</p></body></html>');
+    zip.file(
+      'OEBPS/ch1.xhtml',
+      '<html><body><h1>第1章 EPUB</h1><p>EPUB 正文用于参考分析，这里写得稍长一点以满足最短字数要求，方便联调。</p><p>第二段继续补充情节线索与环境描写，确保导出文本足够长。</p></body></html>',
+    );
     const blob = await zip.generateAsync({ type: 'blob', mimeType: 'application/epub+zip' });
 
     const book = await parseReaderFile(new File([blob], 'demo.epub', { type: 'application/epub+zip' }));
@@ -50,6 +59,10 @@ describe('readerImport', () => {
     expect(book.title).toBe('EPUB 测试');
     expect(book.chapters[0]?.title).toBe('第1章 EPUB');
     expect(book.chapters[0]?.content).toContain('EPUB 正文');
+
+    const refText = readerBookToReferenceText(book);
+    expect(refText).toContain('第1章 EPUB');
+    expect(refText).toContain('EPUB 正文');
   });
 
   it('parses CBZ files into ordered comic pages', async () => {

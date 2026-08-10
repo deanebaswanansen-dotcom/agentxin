@@ -107,16 +107,22 @@ function parseOutlineTree(outlines: Outline[]): OutlineTreeItem[] {
 
 function parseCharacterAttributeView(characters: Character[]): CharacterAttributeView {
   const columns: string[] = [];
+  const markdownAttributeKeys = new Set(['人物定位', '身份', '目标', '动机', '性格特征']);
   const rows = characters.map((character) => {
     const values: Record<string, string> = {};
     character.description.split(/\r?\n/).forEach((rawLine) => {
       const line = rawLine.trim();
-      const match = line.match(/^([^:：]{1,12})\s*[:：]\s*(.+)$/);
+      const markdownMatch = line.match(/^[-*]\s+\*\*([^*]{1,12})\*\*\s*[:：]\s*(.+)$/);
+      const plainMatch = line.startsWith('- ') || line.startsWith('* ')
+        ? null
+        : line.match(/^([^:：#]{1,12})\s*[:：]\s*(.+)$/);
+      const match = markdownMatch ?? plainMatch;
       if (!match) return;
 
       const key = match[1].trim();
       const value = match[2].trim();
       if (key.length === 0 || value.length === 0 || key === '关系') return;
+      if (markdownMatch && !markdownAttributeKeys.has(key)) return;
 
       values[key] = value;
       if (!columns.includes(key)) columns.push(key);

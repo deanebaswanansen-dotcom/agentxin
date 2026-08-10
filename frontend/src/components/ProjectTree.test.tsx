@@ -64,7 +64,7 @@ describe('ProjectTree', () => {
     );
 
     expect(await screen.findByText('旧项目')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: '删除项目 旧项目' }));
+    fireEvent.click(screen.getByRole('button', { name: '删除 旧项目' }));
     fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
 
     await waitFor(() => expect(client.projects.remove).toHaveBeenCalledWith('p-1'));
@@ -88,6 +88,6 @@ describe('ProjectTree', () => {
     );
 
     await waitFor(() => expect(onError).toHaveBeenCalled());
-    expect(screen.getByText('还没有项目，输入名称创建第一个吧。')).toBeInTheDocument();
+    expect(screen.getByText('还没有项目')).toBeInTheDocument();
   });
 });

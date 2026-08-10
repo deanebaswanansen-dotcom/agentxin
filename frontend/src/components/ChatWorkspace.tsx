@@ -21,7 +21,26 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import apiClient from '../api/apiClient.js';
 import applyAdoption, { type AdoptionTarget } from '../lib/applyAdoption.js';
-import type { AgentArtifact, AgentRunResult, Id } from '../types/index.js';
+import {
+  isReferenceImportFileName,
+  parseReaderFile,
+  readerBookToReferenceText,
+} from '../lib/readerImport.js';
+import type {
+  AgentArtifact,
+  AgentRunResult,
+  AgentTask,
+  Id,
+  NovelPlanAnswer,
+  NovelPlanDepth,
+  NovelPlanHistoryTurn,
+  NovelPlanQuestion,
+  NovelPlanSummary,
+  NovelPlanTurnResponse,
+  LongNovelAutomationLevel,
+  ReferenceAnalysisDepth,
+  ReferenceTransferDimension,
+} from '../types/index.js';
 import type { EditorSelection } from './ChapterEditor.js';
 import { ChatMessageView } from './ChatMessageView.js';
 import { EmptyIllustration } from './EmptyIllustration.js';
@@ -36,6 +55,7 @@ import {
   type FreeChatContext,
   type WritingOperation,
 } from './chat/types.js';
+import { makeId } from './chat/types-shared.js';
 import { useAgentEngine } from './chat/useAgentEngine.js';
 import { useChatEngine } from './chat/useChatEngine.js';
 import './components.css';
@@ -60,6 +80,16 @@ function resolveAdoptionTarget(editorContent: string, selection?: EditorSelectio
   return { mode: 'insert', position: selection?.start ?? editorContent.length };
 }
 
+/** 从阅读器/外部一键送入的参考书 payload。 */
+export interface PendingReferenceImport {
+  title: string;
+  text: string;
+  /** 可选来源说明（如「书架」「EPUB」）。 */
+  sourceLabel?: string;
+  /** 递增 token，同一本书重复发送也能触发。 */
+  token: number;
+}
+
 export interface ChatWorkspaceProps {
   projectId: Id | null;
   projectName?: string;
@@ -79,6 +109,10 @@ export interface ChatWorkspaceProps {
   onJumpToArtifact?: (artifact: AgentArtifact) => void;
   /** 点击"在编辑器中打开"（打开章节抽屉）。 */
   onOpenChapter?: (chapterId: Id) => void;
+  /** 从阅读器一键送入的参考书（导入后出现章节勾选卡）。 */
+  pendingReferenceImport?: PendingReferenceImport | null;
+  /** 消费掉 pending 后回调，避免重复导入。 */
+  onPendingReferenceConsumed?: () => void;
 }
 
 export function ChatWorkspace({
@@ -94,6 +128,8 @@ export function ChatWorkspace({
   onAgentCompleted,
   onJumpToArtifact,
   onOpenChapter,
+  pendingReferenceImport = null,
+  onPendingReferenceConsumed,
 }: ChatWorkspaceProps): JSX.Element {
   const isWritingMode = chapterId != null;
 
@@ -120,6 +156,7 @@ export function ChatWorkspace({
     projectId,
     chapterId,
     onError,
+    onStreamingChange,
     onCompleted: (result) => {
       chat.carryNextSession();
       onAgentCompleted?.(result);
@@ -140,6 +177,14 @@ export function ChatWorkspace({
   const [mockDone, setMockDone] = useState(false);
   const [confirmClearOpen, setConfirmClearOpen] = useState(false);
 
+  // —— 计划模式会话（/计划） ——
+  const [planBusy, setPlanBusy] = useState(false);
+  const [planSeed, setPlanSeed] = useState('');
+  const [planDepth, setPlanDepth] = useState<NovelPlanDepth | undefined>(undefined);
+  const [planHistory, setPlanHistory] = useState<NovelPlanHistoryTurn[]>([]);
+  const [activePlanQuestions, setActivePlanQuestions] = useState<NovelPlanQuestion[]>([]);
+  const planAbortRef = useRef<AbortController | null>(null);
+
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -147,6 +192,12 @@ export function ChatWorkspace({
   useEffect(() => {
     setPendingTask(null);
   }, [chapterId, projectId]);
+
+  useEffect(() => {
+    return () => {
+      planAbortRef.current?.abort();
+    };
+  }, []);
 
   // 自动滚到底
   useEffect(() => {
@@ -186,19 +237,543 @@ export function ChatWorkspace({
     setInput('');
   }, []);
 
+  const formatAnswersForHistory = useCallback(
+    (answers: NovelPlanAnswer[], questions: NovelPlanQuestion[]): string => {
+      return answers
+        .map((a) => {
+          const q = questions.find((item) => item.id === a.questionId);
+          const labels = a.selectedOptionIds
+            .map((id) => q?.options.find((o) => o.id === id)?.label ?? id)
+            .join('、');
+          const custom = a.customText?.trim();
+          const parts = [labels || null, custom ? `补充：${custom}` : null].filter(Boolean);
+          return `${q?.question ?? a.questionId} → ${parts.join('；') || '（跳过）'}`;
+        })
+        .join('\n');
+    },
+    [],
+  );
+
+  const applyPlanResponse = useCallback(
+    (response: NovelPlanTurnResponse, historyAfter: NovelPlanHistoryTurn[]) => {
+      setPlanHistory(historyAfter);
+      setActivePlanQuestions(response.status === 'asking' ? response.questions ?? [] : []);
+      if (response.depth) setPlanDepth(response.depth);
+      chat.appendMessage({
+        id: makeId(),
+        role: 'assistant',
+        kind: 'plan-turn',
+        status: response.status,
+        round: response.round,
+        message: response.message,
+        questions: response.questions,
+        brief: response.brief,
+        planSummary: response.planSummary,
+        resolved: false,
+        generated: false,
+        depth: response.depth,
+        depthRoundRange: response.depthRoundRange,
+      });
+    },
+    [chat],
+  );
+
+  const startPlanMode = useCallback(
+    async (seed: string) => {
+      const seedPrompt = seed.trim();
+      if (!seedPrompt || planBusy || agent.running || chat.streaming) return;
+      setPlanBusy(true);
+      setPlanSeed(seedPrompt);
+      setPlanDepth(undefined);
+      setPlanHistory([]);
+      setActivePlanQuestions([]);
+      chat.appendMessage({
+        id: makeId(),
+        role: 'user',
+        kind: 'text',
+        content: `/计划 ${seedPrompt}`,
+      });
+      const controller = new AbortController();
+      planAbortRef.current = controller;
+      try {
+        // 首轮不传 depth → 后端返回「轻量 / 中等 / 极限」三选一
+        const response = await apiClient.agent.planTurn(
+          {
+            seedPrompt,
+            targetTask: 'long_novel',
+            history: [],
+          },
+          controller.signal,
+        );
+        const historyAfter: NovelPlanHistoryTurn[] = [
+          { role: 'user', content: `灵感：${seedPrompt}` },
+          { role: 'assistant', content: response.message },
+        ];
+        applyPlanResponse(response, historyAfter);
+      } catch (error) {
+        if (!(error instanceof DOMException && error.name === 'AbortError')) {
+          onError?.(error);
+        }
+      } finally {
+        setPlanBusy(false);
+        planAbortRef.current = null;
+      }
+    },
+    [agent.running, applyPlanResponse, chat, onError, planBusy],
+  );
+
+  const submitPlanAnswers = useCallback(
+    async (messageId: string, answers: NovelPlanAnswer[], forceReady: boolean) => {
+      if (planBusy || agent.running || chat.streaming) return;
+      const seed = planSeed.trim();
+      if (!seed) return;
+
+      // 标记本轮已提交
+      chat.updateMessage(messageId, (prev) => {
+        if (prev.kind !== 'plan-turn') return prev;
+        return { ...prev, resolved: true };
+      });
+
+      // 若本轮是选深度，立刻写入本地 depth，后续请求带上
+      let nextDepth = planDepth;
+      const depthAns = answers.find((a) => a.questionId === 'plan_depth');
+      if (depthAns) {
+        const id = depthAns.selectedOptionIds[0];
+        if (id === 'light' || id === 'standard' || id === 'deep') {
+          nextDepth = id;
+          setPlanDepth(id);
+        }
+      }
+
+      setPlanBusy(true);
+      const controller = new AbortController();
+      planAbortRef.current = controller;
+      try {
+        const historyForApi = planHistory;
+        const userLine = formatAnswersForHistory(answers, activePlanQuestions);
+        const response = await apiClient.agent.planTurn(
+          {
+            seedPrompt: seed,
+            targetTask: 'long_novel',
+            depth: nextDepth,
+            history: historyForApi,
+            answers,
+            forceReady,
+          },
+          controller.signal,
+        );
+        if (response.depth) setPlanDepth(response.depth);
+        const historyAfter: NovelPlanHistoryTurn[] = [
+          ...historyForApi,
+          {
+            role: 'user',
+            content:
+              depthAns && nextDepth
+                ? `plan_depth: ${nextDepth}（${nextDepth === 'light' ? '轻量模式' : nextDepth === 'deep' ? '极限详细模式' : '中等模式'}）\n${userLine}`
+                : userLine,
+          },
+          { role: 'assistant', content: response.message },
+        ];
+        applyPlanResponse(response, historyAfter);
+      } catch (error) {
+        chat.updateMessage(messageId, (prev) => {
+          if (prev.kind !== 'plan-turn') return prev;
+          return { ...prev, resolved: false };
+        });
+        if (!(error instanceof DOMException && error.name === 'AbortError')) {
+          onError?.(error);
+        }
+      } finally {
+        setPlanBusy(false);
+        planAbortRef.current = null;
+      }
+    },
+    [
+      activePlanQuestions,
+      agent.running,
+      applyPlanResponse,
+      chat,
+      formatAnswersForHistory,
+      onError,
+      planBusy,
+      planDepth,
+      planHistory,
+      planSeed,
+    ],
+  );
+
+  const parseLongNovelInput = useCallback((raw: string): {
+    prompt: string;
+    chapters?: number;
+    targetWords?: number;
+    totalWords?: number;
+    automationLevel?: LongNovelAutomationLevel;
+  } => {
+    const lines = raw.replace(/\r\n/g, '\n').split('\n');
+    const first = lines[0]?.trim() ?? '';
+    let chapters: number | undefined;
+    let targetWords: number | undefined;
+    let totalWords: number | undefined;
+    let automationLevel: LongNovelAutomationLevel | undefined;
+    let bodyStart = 0;
+    if (/自动|章数|每章|总字|automation/i.test(first) && first.length < 120) {
+      bodyStart = 1;
+      const auto = first.match(/(?:自动|automation)\s*[:：]?\s*(assistant|semi_auto|auto|unattended|辅助|半自动|自动|无人)/i);
+      if (auto) {
+        const v = auto[1]!.toLowerCase();
+        automationLevel =
+          v === 'assistant' || v === '辅助'
+            ? 'assistant'
+            : v === 'auto' || v === '自动'
+              ? 'auto'
+              : v === 'unattended' || v === '无人'
+                ? 'unattended'
+                : 'semi_auto';
+      }
+      const ch = first.match(/章数\s*[:：]?\s*(\d{1,3})/);
+      if (ch) chapters = Number(ch[1]);
+      const tw = first.match(/每章\s*[:：]?\s*(\d{3,5})/);
+      if (tw) targetWords = Number(tw[1]);
+      const total = first.match(/总字\s*[:：]?\s*(\d{4,8})/);
+      if (total) totalWords = Number(total[1]);
+    }
+    const prompt = lines.slice(bodyStart).join('\n').trim() || raw.trim();
+    return { prompt, chapters, targetWords, totalWords, automationLevel };
+  }, []);
+
+  const parseReferenceInput = useCallback((raw: string): {
+    title?: string;
+    depth: ReferenceAnalysisDepth;
+    text: string;
+  } => {
+    const lines = raw.replace(/\r\n/g, '\n').split('\n');
+    let title: string | undefined;
+    let depth: ReferenceAnalysisDepth = 'standard';
+    let bodyStart = 0;
+    for (let i = 0; i < Math.min(lines.length, 6); i += 1) {
+      const line = lines[i]!.trim();
+      if (!line) {
+        bodyStart = i + 1;
+        break;
+      }
+      const nameMatch = line.match(/^(?:名称|书名|标题)[:：]\s*(.+)$/);
+      if (nameMatch) {
+        title = nameMatch[1]!.trim();
+        bodyStart = i + 1;
+        continue;
+      }
+      const depthMatch = line.match(/^(?:深度|分析深度)[:：]\s*(quick|standard|deep|快速|标准|深度)\s*$/i);
+      if (depthMatch) {
+        const v = depthMatch[1]!.toLowerCase();
+        depth = v === 'quick' || v === '快速' ? 'quick' : v === 'deep' || v === '深度' ? 'deep' : 'standard';
+        bodyStart = i + 1;
+        continue;
+      }
+      // 首行很短且不像正文标题，当作书名
+      if (i === 0 && line.length <= 40 && !/^第.+[章节]/.test(line) && lines.length > 2) {
+        title = line;
+        bodyStart = 1;
+      }
+      break;
+    }
+    const text = lines.slice(bodyStart).join('\n').trim() || raw.trim();
+    return { title, depth, text };
+  }, []);
+
+  const runReferenceImport = useCallback(
+    async (raw: string, sourceLabel?: string) => {
+      const { title, depth, text } = parseReferenceInput(raw);
+      if (text.length < 80) {
+        onError?.(new Error('参考正文过短，请粘贴更多内容或选择更大的文件。'));
+        return;
+      }
+      setPlanBusy(true);
+      chat.appendMessage({
+        id: makeId(),
+        role: 'user',
+        kind: 'text',
+        content: `/参考 ${title ?? sourceLabel ?? '（未命名）'} · ${depth}\n（已提交 ${text.length.toLocaleString()} 字${sourceLabel ? ` · ${sourceLabel}` : ''}）`,
+      });
+      const progressId = makeId();
+      chat.appendMessage({
+        id: progressId,
+        role: 'assistant',
+        kind: 'text',
+        content: '正在导入整本并识别章节（支持几十～上百章）…',
+      });
+      try {
+        const imported = await apiClient.references.import({
+          title: title ?? sourceLabel,
+          text,
+          depth,
+          isCompleteWork: true,
+        });
+        chat.removeMessage(progressId);
+        chat.appendMessage({
+          id: makeId(),
+          role: 'assistant',
+          kind: 'reference-import',
+          reference: imported.reference,
+          message: imported.message,
+          chapters: imported.chapters,
+          depth: imported.reference.depth,
+          resolved: false,
+        });
+      } catch (error) {
+        chat.removeMessage(progressId);
+        if (!(error instanceof DOMException && error.name === 'AbortError')) {
+          onError?.(error);
+        }
+      } finally {
+        setPlanBusy(false);
+      }
+    },
+    [chat, onError, parseReferenceInput],
+  );
+
+  const analyzeReferenceChapters = useCallback(
+    async (
+      messageId: string,
+      referenceId: string,
+      chapterIds: string[],
+      depth: ReferenceAnalysisDepth,
+    ) => {
+      if (planBusy || agent.running) return;
+      if (chapterIds.length === 0) {
+        onError?.(new Error('请至少勾选一章。'));
+        return;
+      }
+      setPlanBusy(true);
+      chat.updateMessage(messageId, (prev) =>
+        prev.kind === 'reference-import' ? { ...prev, resolved: true, depth } : prev,
+      );
+      const progressId = makeId();
+      chat.appendMessage({
+        id: progressId,
+        role: 'assistant',
+        kind: 'text',
+        content: `正在分析已选 ${chapterIds.length} 章（深度 ${depth}）…`,
+      });
+      try {
+        const analyzed = await apiClient.references.analyze(referenceId, {
+          chapterIds,
+          depth,
+        });
+        chat.removeMessage(progressId);
+        chat.appendMessage({
+          id: makeId(),
+          role: 'assistant',
+          kind: 'reference-result',
+          reference: analyzed.reference,
+          profile: analyzed.profile,
+          message: analyzed.message,
+          transferred: false,
+        });
+        onAgentCompleted?.({
+          task: 'outline',
+          mode: 'reference',
+          projectId: analyzed.analysisProjectId,
+          summary: `已创建/更新拆解项目「${analyzed.analysisProjectName}」`,
+          steps: [
+            '按原书顺序写入全部章节与正文',
+            '提取原作人物与人物关系',
+            '整理世界观、势力、规则与地点',
+            '整理剧情大纲、冲突爽点、伏笔反转与主题',
+          ],
+          artifacts: analyzed.artifacts,
+        });
+      } catch (error) {
+        chat.updateMessage(messageId, (prev) =>
+          prev.kind === 'reference-import' ? { ...prev, resolved: false } : prev,
+        );
+        chat.removeMessage(progressId);
+        onError?.(error);
+      } finally {
+        setPlanBusy(false);
+      }
+    },
+    [agent.running, chat, onAgentCompleted, onError, planBusy],
+  );
+
+  const handleReferenceFilePick = useCallback(
+    async (fileList: FileList | null) => {
+      if (!fileList || fileList.length === 0) return;
+      const file = fileList[0]!;
+      if (!isReferenceImportFileName(file.name)) {
+        onError?.(new Error('支持 .txt / .md / .html / .epub。'));
+        return;
+      }
+      if (file.size > 20 * 1024 * 1024) {
+        onError?.(new Error('文件过大（上限约 20MB）。请拆分或先导出部分章节。'));
+        return;
+      }
+      try {
+        const book = await parseReaderFile(file);
+        const text = readerBookToReferenceText(book);
+        const meta =
+          `名称：${book.title}\n深度：standard\n\n${text}`;
+        await runReferenceImport(meta, `${book.title}（${book.format.toUpperCase()}）`);
+      } catch (error) {
+        onError?.(error);
+      }
+    },
+    [onError, runReferenceImport],
+  );
+
+  // 阅读器一键送入：自动导入并弹出章节勾选
+  useEffect(() => {
+    if (!pendingReferenceImport) return;
+    const { title, text, sourceLabel } = pendingReferenceImport;
+    if (!text.trim()) {
+      onPendingReferenceConsumed?.();
+      return;
+    }
+    void (async () => {
+      try {
+        const header = `名称：${title}\n深度：standard\n\n${text}`;
+        await runReferenceImport(header, sourceLabel ?? title);
+      } finally {
+        onPendingReferenceConsumed?.();
+      }
+    })();
+    // token 变化即触发；runReferenceImport 稳定依赖
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingReferenceImport?.token]);
+
+  const transferReference = useCallback(
+    async (messageId: string, referenceId: string, dimensions: ReferenceTransferDimension[]) => {
+      if (!projectId) {
+        onError?.(new Error('请先在左侧选择或创建一个原创项目，再应用参考维度。'));
+        return;
+      }
+      if (planBusy || agent.running) return;
+      setPlanBusy(true);
+      try {
+        const result = await apiClient.references.transfer(projectId, {
+          referenceId,
+          dimensions,
+        });
+        chat.updateMessage(messageId, (prev) =>
+          prev.kind === 'reference-result' ? { ...prev, transferred: true } : prev,
+        );
+        chat.appendMessage({
+          id: makeId(),
+          role: 'assistant',
+          kind: 'text',
+          content: `${result.summary}\n\n已写入项目资料「参考创作档案 / 参考写作方法」。后续 /整本 与 /下一章 会注入方法参数，不会加载参考原文。`,
+        });
+        onAgentCompleted?.({
+          task: 'outline',
+          mode: 'reference',
+          projectId: result.projectId,
+          summary: result.summary,
+          steps: [result.summary],
+          artifacts: result.artifacts,
+        });
+      } catch (error) {
+        onError?.(error);
+      } finally {
+        setPlanBusy(false);
+      }
+    },
+    [agent.running, chat, onAgentCompleted, onError, planBusy, projectId],
+  );
+
+  const generateFromPlanBrief = useCallback(
+    async (
+      messageId: string,
+      brief: string,
+      scale?: { chapters?: number; targetWords?: number; totalWords?: number },
+      planSummary?: NovelPlanSummary,
+      taskOverride?: AgentTask,
+    ) => {
+      const text = brief.trim();
+      if (!text || agent.running || planBusy) return;
+      chat.updateMessage(messageId, (prev) => {
+        if (prev.kind !== 'plan-turn') return prev;
+        return { ...prev, generated: true };
+      });
+      const chapters = Math.min(
+        500,
+        Math.max(1, Math.round(scale?.chapters ?? fullNovelChapters ?? 3)),
+      );
+      const targetWords = Math.min(
+        8000,
+        Math.max(300, Math.round(scale?.targetWords ?? fullNovelWords ?? 2000)),
+      );
+      const totalWords = scale?.totalWords ?? planSummary?.totalWords;
+      // 单章 → novel；多章默认 long_novel（质量门控）。按钮可覆盖为 full_novel。
+      let task: AgentTask;
+      if (taskOverride === 'full_novel' || taskOverride === 'long_novel' || taskOverride === 'novel') {
+        task = taskOverride;
+      } else if (chapters <= 1) {
+        task = 'novel';
+      } else {
+        task = 'long_novel';
+      }
+      if (chapters > 1) {
+        setFullNovelChapters(chapters);
+        setFullNovelWords(targetWords);
+      }
+      await agent.run({
+        task,
+        prompt: text,
+        chapters,
+        targetWords,
+        totalWords,
+        automationLevel: task === 'long_novel' ? 'semi_auto' : undefined,
+        planSummary,
+      });
+    },
+    [agent, chat, fullNovelChapters, fullNovelWords, planBusy],
+  );
+
   // —— 发送 ——
   const handleSend = useCallback(async () => {
     const text = input.trim();
-    if (chat.streaming || agent.running) return;
+    if (chat.streaming || agent.running || planBusy) return;
 
     // Agent 任务模式
     if (pendingTask) {
+      // /计划 → 头脑风暴，不直接猛写
+      if (pendingTask.key === 'plan') {
+        if (text.length === 0) return;
+        setPendingTask(null);
+        setInput('');
+        await startPlanMode(text);
+        return;
+      }
+      // /参考 → 导入整本，再勾选章节分析
+      if (pendingTask.key === 'reference') {
+        if (text.length === 0) return;
+        setPendingTask(null);
+        setInput('');
+        await runReferenceImport(text);
+        return;
+      }
       const needsProject = pendingTask.needsProject === true;
       const needsChapter = pendingTask.needsChapter === true;
       if (needsProject && projectId === null) return;
       if (needsChapter && chapterId === null) return;
+
+      // /长篇：解析「自动:xx 章数:n 每章:n 总字:n」前缀
+      if (pendingTask.key === 'long_novel') {
+        const parsed = parseLongNovelInput(text);
+        setPendingTask(null);
+        setInput('');
+        await agent.run({
+          task: 'long_novel',
+          prompt: parsed.prompt,
+          chapters: parsed.chapters ?? fullNovelChapters,
+          targetWords: parsed.targetWords ?? fullNovelWords,
+          totalWords: parsed.totalWords,
+          automationLevel: parsed.automationLevel,
+        });
+        return;
+      }
+
       await agent.run({
-        task: pendingTask.key,
+        task: pendingTask.key as AgentTask,
         prompt: text,
         chapters: fullNovelChapters,
         targetWords: fullNovelWords,
@@ -221,13 +796,17 @@ export function ChatWorkspace({
     fullNovelChapters,
     fullNovelWords,
     chapterId,
+    planBusy,
+    startPlanMode,
+    runReferenceImport,
   ]);
 
-  const busy = chat.streaming || agent.running;
+  const busy = chat.streaming || agent.running || planBusy;
 
   const handleStop = useCallback(() => {
     chat.stop();
     agent.stop();
+    planAbortRef.current?.abort();
   }, [chat, agent]);
 
   const handleClear = useCallback(() => {
@@ -286,14 +865,23 @@ export function ChatWorkspace({
       : '输入消息开始对话，或输入 / 选择创作任务…';
 
   // 空状态提示
-  const isEmpty = chat.messages.length === 0 && !chat.streaming && !agent.running;
+  const isEmpty = chat.messages.length === 0 && !chat.streaming && !agent.running && !planBusy;
 
   // 当前模式标签
   const modeLabel = useMemo(() => {
+    if (planBusy) return '计划模式 · 责编思考中';
+    if (pendingTask?.key === 'plan') return '计划模式 · 输入灵感后开始追问';
     if (pendingTask) return `任务：${pendingTask.title}`;
     if (isWritingMode) return `写作模式 · ${chapterTitle ?? ''}`;
     return projectName ? `自由讨论 · ${projectName}` : '自由讨论';
-  }, [pendingTask, isWritingMode, chapterTitle, projectName]);
+  }, [pendingTask, isWritingMode, chapterTitle, projectName, planBusy]);
+
+  const placeholderTextPlanAware = useMemo(() => {
+    if (pendingTask?.key === 'plan') {
+      return '先写一句话灵感，例如：写一本修仙小说…（Enter 开始计划追问）';
+    }
+    return placeholderText;
+  }, [pendingTask, placeholderText]);
 
   return (
     <div className="nwa-chat-workspace">
@@ -423,8 +1011,8 @@ export function ChatWorkspace({
               {isWritingMode
                 ? '向 AI 提出续写、改写、润色或提问。选中正文片段可针对性改写/润色。'
                 : projectName
-                  ? `在「${projectName}」中讨论剧情、角色、世界观，或输入 / 让 AI 帮你建项目、写章节、生成大纲。`
-                  : '输入 / 选择创作任务（一键新书、整本、大纲…），或直接开始对话。没有 API Key？输入 / 选「演示模式」。'}
+                  ? `在「${projectName}」中讨论剧情、角色、世界观；输入 /计划 先头脑风暴，或 /新书 直接生成。`
+                  : '输入 /计划 写「写一本修仙小说」会先追问对齐；或 /新书 直接开写。没有 API Key？输入 / 选「演示模式」。'}
             </p>
           </div>
         ) : (
@@ -437,8 +1025,31 @@ export function ChatWorkspace({
                 onAdoptPreview={(id) => chat.adoptPreview(id)}
                 onJumpToArtifact={onJumpToArtifact}
                 onOpenChapter={(cid) => onOpenChapter?.(cid as Id)}
+                onPlanSubmit={(id, answers, forceReady) => {
+                  void submitPlanAnswers(id, answers, forceReady);
+                }}
+                onPlanGenerate={(id, brief, scale, planSummary, taskOverride) => {
+                  void generateFromPlanBrief(id, brief, scale, planSummary, taskOverride);
+                }}
+                onReferenceTransfer={(id, referenceId, dimensions) => {
+                  void transferReference(id, referenceId, dimensions);
+                }}
+                onReferenceAnalyze={(id, referenceId, chapterIds, depth) => {
+                  void analyzeReferenceChapters(id, referenceId, chapterIds, depth);
+                }}
               />
             ))}
+            {planBusy ? (
+              <div className="nwa-chat__msg nwa-chat__msg--assistant">
+                <span className="nwa-chat__role"><Icon name="brain" /> 处理中</span>
+                <div className="nwa-chat__content nwa-chat__typing">
+                  <span className="nwa-chat__dot" />
+                  <span className="nwa-chat__dot" />
+                  <span className="nwa-chat__dot" />
+                  <span className="nwa-muted" style={{ marginLeft: '0.5rem' }}>计划 / 参考分析进行中…</span>
+                </div>
+              </div>
+            ) : null}
             {/* 流式实时消息 */}
             {chat.streaming && chat.liveText.length === 0 && chat.liveThinking.length === 0 ? (
               <div className="nwa-chat__msg nwa-chat__msg--assistant">
@@ -481,7 +1092,7 @@ export function ChatWorkspace({
               <Icon name="x" />
             </button>
           </span>
-          {pendingTask.key === 'full_novel' ? (
+          {pendingTask.key === 'full_novel' || pendingTask.key === 'long_novel' ? (
             <span className="nwa-chat-pending__params">
               <label className="nwa-chat-pending__param">
                 章节数
@@ -517,24 +1128,41 @@ export function ChatWorkspace({
               </span>
             </span>
           ) : null}
+          {pendingTask.key === 'reference' ? (
+            <span className="nwa-chat-pending__params">
+              <label className="nwa-button nwa-button--ghost nwa-button--sm" style={{ cursor: 'pointer' }}>
+                选择文件导入整本
+                <input
+                  type="file"
+                  accept=".txt,.md,.markdown,.html,.htm,.epub,text/plain,text/markdown,application/epub+zip"
+                  style={{ display: 'none' }}
+                  disabled={busy}
+                  onChange={(e) => {
+                    void handleReferenceFilePick(e.target.files);
+                    e.target.value = '';
+                  }}
+                />
+              </label>
+              <span className="nwa-muted">支持 TXT / MD / HTML / EPUB，或粘贴正文；导入后勾选章节分析</span>
+            </span>
+          ) : null}
         </div>
       ) : null}
 
       {/* —— Mock 提示 + NEW-01 强引导 —— */}
       {mockDone ? (
         <div className="nwa-chat-mock-hint">
-          <span className="nwa-muted"><Icon name="check" /> 已切换到演示模式，可直接执行任务</span>
+          <span className="nwa-muted"><Icon name="check" /> 演示模式已开启</span>
         </div>
       ) : (
         <button
           type="button"
-          className="nwa-button nwa-button--ghost"
+          className="nwa-button nwa-button--ghost nwa-button--sm nwa-chat-mock-entry"
           disabled={mockBusy}
           onClick={() => void handleSelectMock()}
-          style={{ alignSelf: 'flex-start', fontSize: '0.8rem', padding: '0.25rem 0.6rem' }}
-          title="无需 Key，一键切换本地演示模式，立即可用全部功能包括蓝图分场景"
+          title="无需 API Key 的本地演示模式"
         >
-          {mockBusy ? '切换中…' : '🚀 一键启用 Mock (本地演示) —— 首次无 Key 快速入口'}
+          {mockBusy ? '切换中…' : '演示模式'}
         </button>
       )}
 
@@ -554,7 +1182,7 @@ export function ChatWorkspace({
           ref={inputRef}
           className="nwa-chat-input"
           rows={2}
-          placeholder={placeholderText}
+          placeholder={placeholderTextPlanAware}
           value={input}
           disabled={busy || mockBusy}
           onChange={(e) => setInput(e.target.value)}
@@ -563,7 +1191,13 @@ export function ChatWorkspace({
         />
         <div className="nwa-chat-input-actions">
           <span className="nwa-muted nwa-chat-input-hint">
-            {pendingTask ? 'Enter 执行任务，Esc 取消' : 'Enter 发送，Shift+Enter 换行'}
+            {pendingTask?.key === 'plan'
+              ? 'Enter 开始计划追问，Esc 取消'
+              : pendingTask?.key === 'reference'
+                ? '选文件或粘贴全书 → Enter 导入 → 勾选章节再分析'
+                : pendingTask
+                  ? 'Enter 执行任务，Esc 取消'
+                  : 'Enter 发送 · /参考 导入整本分析 · /计划 头脑风暴'}
           </span>
           {busy ? (
             <button

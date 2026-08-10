@@ -11,9 +11,9 @@
  * 状态所有权沿用旧 App：selectedProjectId/Chapter、streamingState、workspaceTab 等。
  * 采用链路：ChatWorkspace onAdoptContent → handleAdoptContent → editorContent 受控更新 + 落库。
  */
-import { useCallback, useEffect, useState, type CSSProperties } from 'react';
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
 import apiClient from './api/apiClient.js';
-import { ChatWorkspace } from './components/ChatWorkspace.js';
+import { ChatWorkspace, type PendingReferenceImport } from './components/ChatWorkspace.js';
 import { ChapterEditor } from './components/ChapterEditor.js';
 import { ChapterToolsDrawer } from './components/ChapterToolsDrawer.js';
 import { ResourceDrawer } from './components/ResourceDrawer.js';
@@ -251,18 +251,38 @@ function Workbench(): JSX.Element {
 
   const openAgentMode = useCallback(() => {
     setAppMode('agent');
-  }, []);
+    setChatCollapsed(false);
+  }, [setChatCollapsed]);
 
   const openReaderMode = useCallback(() => {
     setDrawer('none');
     setAppMode('reader');
   }, []);
 
+  const [pendingReferenceImport, setPendingReferenceImport] =
+    useState<PendingReferenceImport | null>(null);
+  const referenceImportTokenRef = useRef(0);
+
+  const handleSendToReferenceAnalysis = useCallback(
+    (payload: { title: string; text: string; sourceLabel?: string }) => {
+      referenceImportTokenRef.current += 1;
+      setPendingReferenceImport({
+        title: payload.title,
+        text: payload.text,
+        sourceLabel: payload.sourceLabel,
+        token: referenceImportTokenRef.current,
+      });
+      setAppMode('agent');
+      setChatCollapsed(false);
+    },
+    [setChatCollapsed],
+  );
+
   const handleLogout = useCallback(() => {
     apiClient.modelConfig.clear();
     setShowSettings(false);
     setDrawer('none');
-    reportError('已登出，本次 API Key 已清除。');
+    reportError('已登出，本地保存的 API Key 已清除。');
   }, [reportError]);
 
   // ESC 关闭当前浮层或回到 Agent 模式
@@ -411,6 +431,7 @@ function Workbench(): JSX.Element {
                 onSelectProject={selectProject}
                 onSelectChapter={(id) => void handleSelectChapter(id)}
                 onProjectDeleted={clearSelectedProject}
+                onChapterDeleted={clearSelectedChapter}
                 refreshToken={projectListVersion}
                 onError={reportError}
               />
@@ -499,6 +520,7 @@ function Workbench(): JSX.Element {
               </div>
             </div>
             <div className="nwa-editor-board__content">
+              {/* 编辑器始终保留；流式状态用可关闭浮层，避免卡在「生成中」整页遮罩。 */}
               <ChapterEditor
                 chapter={selectedChapter}
                 contentOverride={editorContent}
@@ -509,6 +531,34 @@ function Workbench(): JSX.Element {
                 onError={reportError}
                 autoSaveDelayMs={1500}
               />
+              {streamingState.streaming ? (
+                <div className="nwa-streaming-dock" aria-live="polite" aria-label="实时生成预览">
+                  <div className="nwa-streaming-header">
+                    <span className="nwa-streaming-indicator">生成中 · 实时输出</span>
+                    <div className="nwa-streaming-header__actions">
+                      <span className="nwa-muted">右侧对话栏同步</span>
+                      <button
+                        type="button"
+                        className="nwa-button nwa-button--ghost nwa-button--sm"
+                        onClick={() => setStreamingState({ streaming: false, content: '', thinking: '' })}
+                      >
+                        收起
+                      </button>
+                    </div>
+                  </div>
+                  {streamingState.thinking ? (
+                    <details className="nwa-thinking-details" open>
+                      <summary className="nwa-thinking-summary">
+                        <Icon name="brain" /> 当前阶段 / 思考
+                      </summary>
+                      <div className="nwa-thinking-content">{streamingState.thinking}</div>
+                    </details>
+                  ) : null}
+                  <div className="nwa-streaming-content nwa-stream nwa-stream--typing">
+                    {streamingState.content || '等待模型输出…'}
+                  </div>
+                </div>
+              ) : null}
             </div>
           </div>
         </section>
@@ -563,6 +613,8 @@ function Workbench(): JSX.Element {
                 void loadChapter(selectedProjectId, chapterId);
               }
             }}
+            pendingReferenceImport={pendingReferenceImport}
+            onPendingReferenceConsumed={() => setPendingReferenceImport(null)}
           />
           </aside>
         ) : null}
@@ -580,6 +632,7 @@ function Workbench(): JSX.Element {
               selectProject(projectId);
             }}
             onChapterUpdated={handleSaved}
+            onSendToReferenceAnalysis={handleSendToReferenceAnalysis}
           />
         </main>
       )}
@@ -641,8 +694,6 @@ function Workbench(): JSX.Element {
         </div>
       ) : null}
 
-      {/* streamingState 占位（保留以兼容未来中央预览；当前对话流内已实时显示） */}
-      {streamingState.streaming ? null : null}
     </div>
   );
 }

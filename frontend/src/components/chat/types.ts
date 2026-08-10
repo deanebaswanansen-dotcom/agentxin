@@ -6,6 +6,7 @@
  *  - Agent 任务结果（携带 summary / steps / artifacts / 章节预览）
  *  - 章节正文预览（写作模式生成后内联展示，可"采用"写回抽屉编辑器）
  *  - Agent 实时进度（流式期间的占位消息，承载 SSE progress 事件）
+ *  - 计划模式追问（/计划 头脑风暴选择题 + brief）
  */
 
 import type {
@@ -13,7 +14,15 @@ import type {
   AgentRunMetrics,
   AgentProgressEvent,
   Chapter,
+  NovelPlanChapterOutline,
+  NovelPlanQuestion,
+  NovelPlanSummary,
+  ReferenceCreativeProfile,
+  ReferenceNovelSummary,
+  ReferenceTransferDimension,
 } from '../../types/index.js';
+
+export type { NovelPlanChapterOutline };
 
 export type ChatRole = 'user' | 'assistant';
 
@@ -41,7 +50,7 @@ export interface AgentResultMessage {
   chapterPreview?: Pick<Chapter, 'id' | 'title' | 'content'> | null;
 }
 
-/** 章节正文预览消息（写作模式续写/改写/润色生成后展示，可"采用"）。 */
+/** 章节正文预览消息（写作模式生成后展示，可"采用"）。 */
 export interface ChapterPreviewMessage {
   id: string;
   role: 'assistant';
@@ -63,11 +72,76 @@ export interface AgentProgressMessage {
   events: AgentProgressEvent[];
 }
 
+/**
+ * 计划模式一轮追问 / 收束 brief（/计划）。
+ * 用户点选选项或补充文字后，由 ChatWorkspace 提交下一轮。
+ */
+export interface PlanTurnMessage {
+  id: string;
+  role: 'assistant';
+  kind: 'plan-turn';
+  status: 'asking' | 'ready';
+  round: number;
+  message: string;
+  questions?: NovelPlanQuestion[];
+  brief?: string;
+  planSummary?: NovelPlanSummary;
+  /** 本轮是否已提交（禁用继续点选）。 */
+  resolved?: boolean;
+  /** 是否已用 brief 触发下游生成。 */
+  generated?: boolean;
+  /** 计划深度 light | standard | deep */
+  depth?: 'light' | 'standard' | 'deep';
+  /** 深度轮次区间，如 [8, 10] */
+  depthRoundRange?: [number, number];
+}
+
+/**
+ * 参考小说导入后的章节勾选卡片：整本/部分分析。
+ */
+export interface ReferenceImportMessage {
+  id: string;
+  role: 'assistant';
+  kind: 'reference-import';
+  reference: ReferenceNovelSummary;
+  message: string;
+  chapters: Array<{
+    id: string;
+    number: number;
+    title: string;
+    wordCount: number;
+    contentPreview: string;
+  }>;
+  depth: 'quick' | 'standard' | 'deep';
+  /** 是否已提交分析（禁用重复勾选）。 */
+  resolved?: boolean;
+}
+
+/**
+ * 参考小说分析完成卡片（/参考）。
+ * 用户勾选迁移维度后应用到当前原创项目。
+ */
+export interface ReferenceResultMessage {
+  id: string;
+  role: 'assistant';
+  kind: 'reference-result';
+  reference: ReferenceNovelSummary;
+  profile: ReferenceCreativeProfile;
+  message: string;
+  /** 是否已迁移到项目。 */
+  transferred?: boolean;
+}
+
 export type ChatMessage =
   | TextMessage
   | AgentResultMessage
   | ChapterPreviewMessage
-  | AgentProgressMessage;
+  | AgentProgressMessage
+  | PlanTurnMessage
+  | ReferenceImportMessage
+  | ReferenceResultMessage;
+
+export type { ReferenceTransferDimension };
 
 /** 自由讨论主题上下文（与 freeChat 接口对齐）。 */
 export type FreeChatContext = 'plot' | 'character' | 'world' | 'writing' | null;

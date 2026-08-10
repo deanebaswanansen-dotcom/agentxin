@@ -239,6 +239,36 @@ describe('ProjectWorkspaceView', () => {
     expect(screen.getByText('宿敌')).toBeInTheDocument();
   });
 
+  it('keeps reference-analysis markdown actions out of character table columns', async () => {
+    const client = makeClient({
+      characters: [
+        {
+          id: 'c-reference',
+          projectId: 'p-1',
+          name: '顾停舟',
+          description: [
+            '# 顾停舟',
+            '- **人物定位**：主角',
+            '- **身份**：司灯人',
+            '- **目标**：找回失去的名字',
+            '## 关键行动',
+            '- 第一章 空灯：顾停舟发现无名灯',
+            '- **顾停舟 → 祝青岚**：同伴',
+          ].join('\n'),
+        },
+      ],
+    });
+
+    render(<ProjectWorkspaceView {...baseProps} onSelectChapter={vi.fn()} client={client} />);
+    fireEvent.click(screen.getByRole('tab', { name: '人物' }));
+
+    expect(await screen.findByRole('columnheader', { name: '人物定位' })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: '身份' })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: '目标' })).toBeInTheDocument();
+    expect(screen.queryByRole('columnheader', { name: /第一章/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('columnheader', { name: /顾停舟 → 祝青岚/ })).not.toBeInTheDocument();
+  });
+
   it('renders a story timeline from world setting and outline lines', async () => {
     const client = makeClient({
       worldSettings: [

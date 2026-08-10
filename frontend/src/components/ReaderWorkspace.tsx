@@ -9,6 +9,7 @@ import {
   isSupportedReaderFileName,
   parseReaderFile,
   parseReaderFolder,
+  readerBookToReferenceText,
   replaceFirstSelection,
   type ReaderBook,
   type ReaderChapter,
@@ -52,6 +53,15 @@ export interface ReaderWorkspaceProps {
   onError?: (error: unknown) => void;
   onProjectCreated?: (projectId: Id) => void;
   onChapterUpdated?: (chapterId: Id, content: string) => void;
+  /**
+   * 将文本书送去 Agent 对话做「参考小说分析」：
+   * 父组件应切到 agent 模式并把 text 交给 ChatWorkspace 导入。
+   */
+  onSendToReferenceAnalysis?: (payload: {
+    title: string;
+    text: string;
+    sourceLabel?: string;
+  }) => void;
   client?: ReaderClient;
 }
 
@@ -299,6 +309,7 @@ export function ReaderWorkspace({
   onError,
   onProjectCreated,
   onChapterUpdated,
+  onSendToReferenceAnalysis,
   client = apiClient,
 }: ReaderWorkspaceProps): JSX.Element {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -731,6 +742,32 @@ export function ReaderWorkspace({
     }
   }, [activeBook, activeChapter, activeSource, client, onChapterUpdated, onError, rewriteCandidate, selectedText, updateActiveBook]);
 
+  const handleSendBookToReference = useCallback(
+    (book: ReaderBook | null, sourceLabel?: string) => {
+      if (!book) {
+        onError?.(new Error('请先选择一本文本书。'));
+        return;
+      }
+      if (!onSendToReferenceAnalysis) {
+        onError?.(new Error('当前版本未接入参考分析通道。'));
+        return;
+      }
+      try {
+        const text = readerBookToReferenceText(book);
+        onSendToReferenceAnalysis({
+          title: book.title,
+          text,
+          sourceLabel: sourceLabel ?? `书架 · ${book.format.toUpperCase()}`,
+        });
+        setStatus(`已将《${book.title}》送去参考分析，请在对话栏勾选章节。`);
+        onOpenAgentMode();
+      } catch (error) {
+        onError?.(error);
+      }
+    },
+    [onError, onOpenAgentMode, onSendToReferenceAnalysis],
+  );
+
   const handleExtract = useCallback(async (kind: ExtractKind) => {
     if (!activeBook || !activeChapter || activeBook.mediaType !== 'text') return;
     setAgentBusy(true);
@@ -1094,6 +1131,15 @@ export function ReaderWorkspace({
                     </div>
                     <div className="nwa-reader-book-card__actions">
                       <button type="button" className="nwa-reader-primary" onClick={() => openProjectBook()}>打开</button>
+                      {projectBook.mediaType === 'text' && onSendToReferenceAnalysis ? (
+                        <button
+                          type="button"
+                          className="nwa-reader-secondary"
+                          onClick={() => handleSendBookToReference(projectBook, '当前项目')}
+                        >
+                          参考分析
+                        </button>
+                      ) : null}
                     </div>
                   </article>
                 ) : loadingProject ? (
@@ -1117,6 +1163,20 @@ export function ReaderWorkspace({
                     </div>
                     <div className="nwa-reader-book-card__actions">
                       <button type="button" className="nwa-reader-primary" onClick={() => void openShelfBook(item)}>打开</button>
+                      {item.book.mediaType === 'text' && onSendToReferenceAnalysis ? (
+                        <button
+                          type="button"
+                          className="nwa-reader-secondary"
+                          onClick={() =>
+                            handleSendBookToReference(
+                              item.book,
+                              item.origin?.path ?? item.origin?.directoryName ?? '本地书架',
+                            )
+                          }
+                        >
+                          参考分析
+                        </button>
+                      ) : null}
                       <button type="button" className="nwa-reader-secondary" onClick={() => void handleDeleteShelfItem(item.id)}>删除</button>
                     </div>
                   </article>
@@ -1153,6 +1213,15 @@ export function ReaderWorkspace({
               <div className="nwa-reader-upload-actions">
                 <button type="button" className="nwa-reader-secondary" disabled={!activeBook} onClick={() => void handleExportActiveBook('txt')}>导出 TXT</button>
                 <button type="button" className="nwa-reader-secondary" disabled={!activeBook} onClick={() => void handleExportActiveBook('html')}>导出 HTML</button>
+                <button
+                  type="button"
+                  className="nwa-reader-secondary"
+                  disabled={!activeBook || activeBook.mediaType !== 'text' || !onSendToReferenceAnalysis}
+                  onClick={() => handleSendBookToReference(activeBook, '当前阅读')}
+                  title="送去 Agent 对话做参考小说分析（可勾选章节）"
+                >
+                  送去参考分析
+                </button>
               </div>
             </article>
           </section>

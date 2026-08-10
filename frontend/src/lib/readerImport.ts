@@ -110,6 +110,40 @@ export function isSupportedReaderFileName(fileName: string): boolean {
   return SUPPORTED_READER_FILE_PATTERN.test(fileName);
 }
 
+/**
+ * 把阅读器文本书转成参考分析用的纯文本（带章节标题，便于后端分章）。
+ * 仅支持 mediaType === 'text' 且有章节正文的书。
+ */
+export function readerBookToReferenceText(book: ReaderBook): string {
+  if (book.mediaType !== 'text') {
+    throw new Error('仅文本类书籍可送去参考分析（漫画/PDF 不支持）。');
+  }
+  const chapters = book.chapters.filter((ch) => ch.content.trim().length > 0);
+  if (chapters.length === 0) {
+    throw new Error('这本书没有可用正文，无法做参考分析。');
+  }
+  const parts = chapters.map((ch, index) => {
+    const title = (ch.title || `第${index + 1}章`).trim();
+    // 保证标题行能被参考分析的章节识别命中
+    const heading = /第.+[章节卷回]|Chapter\s+\d+/i.test(title)
+      ? title
+      : `第${index + 1}章 ${title}`;
+    return `${heading}\n\n${ch.content.trim()}`;
+  });
+  const text = parts.join('\n\n');
+  // 仅拦截空书；后端 import 还有更严格的最短字数校验
+  if (text.replace(/\s/g, '').length < 20) {
+    throw new Error('正文过短，无法做参考分析。');
+  }
+  return text;
+}
+
+/** 参考分析支持的本地文件扩展名（含 EPUB）。 */
+export function isReferenceImportFileName(fileName: string): boolean {
+  const ext = extensionOf(fileName);
+  return ['txt', 'md', 'markdown', 'html', 'htm', 'epub'].includes(ext);
+}
+
 export function isImageFile(fileName: string): boolean {
   return IMAGE_FILE_PATTERN.test(String(fileName || ''));
 }

@@ -7,8 +7,11 @@
 import type { AgentRunMode, AgentTask } from '../../types/index.js';
 import type { IconName } from '../Icon.js';
 
+/** 斜杠任务 key：含仅前端的 plan / reference（不走 /agent/run）。 */
+export type SlashTaskKey = AgentTask | 'plan' | 'reference';
+
 export interface AgentTaskDef {
-  key: AgentTask;
+  key: SlashTaskKey;
   /** 斜杠命令名（不含 /）。 */
   slash: string;
   icon: IconName;
@@ -25,6 +28,27 @@ export interface AgentTaskDef {
 }
 
 export const AGENT_TASKS: AgentTaskDef[] = [
+  {
+    key: 'plan',
+    slash: '计划',
+    icon: 'brain',
+    title: '计划模式',
+    desc: '先头脑风暴追问（类型/主角/爽点/禁忌），收束 brief 后再生成，避免一顿猛写。',
+    mode: 'reference',
+    lockedMode: true,
+    placeholder: '例：写一本修仙小说 / 赛博修仙学院，主角靠写代码御剑…',
+  },
+  {
+    key: 'reference',
+    slash: '参考',
+    icon: 'bookOpen',
+    title: '小说内容拆解',
+    desc: '上传/粘贴整本 → 提取人物、关系、冲突、爽点、世界观、剧情大纲、伏笔、反转与分章人物服装。',
+    mode: 'reference',
+    lockedMode: true,
+    placeholder:
+      '可点「选择文件」导入 .txt / .md / .html / .epub，或粘贴全书。\n也可在「阅读模式」书架点「参考分析」。\n首行可选：名称：书名 深度：standard',
+  },
   {
     key: 'novel',
     slash: '新书',
@@ -43,6 +67,17 @@ export const AGENT_TASKS: AgentTaskDef[] = [
     mode: 'draft',
     lockedMode: true,
     placeholder: '例：废土机械师重建文明，节奏明快、多反转...',
+  },
+  {
+    key: 'long_novel',
+    slash: '长篇',
+    icon: 'brain',
+    title: '长篇小说模式',
+    desc: '多子代理运行时：规划→世界→人物→大纲→章节循环（Gate 审校/记忆/伏笔），支持自动化等级。',
+    mode: 'draft',
+    lockedMode: true,
+    placeholder:
+      '例：20 万字赛博修仙；或首行写「自动:semi_auto 章数:5 每章:2000」后接题材…',
   },
   {
     key: 'auto_next',
@@ -149,7 +184,16 @@ export const AGENT_TASKS: AgentTaskDef[] = [
   },
 ];
 
-export const TASK_PLANS: Record<AgentTask, string[]> = {
+export const TASK_PLANS: Record<AgentTask | 'plan' | 'reference', string[]> = {
+  plan: ['收集灵感种子', '多轮结构化追问', '补齐赛道/主角/爽点/禁忌', '收束创作 brief', '可选：用 brief 生成新书'],
+  reference: [
+    '导入参考正文（TXT/MD）',
+    '章节识别与本地统计',
+    '分层分析生成创作档案',
+    '逐章提取出场人物服装',
+    '选择可迁移维度',
+    '写入原创项目（不含原文）',
+  ],
   novel: ['创建或复用项目', '世界观子 Agent', '人物子 Agent', '大纲子 Agent', '正文子 Agent 写首章'],
   full_novel: [
     '建项目 + 设定包',
@@ -157,6 +201,13 @@ export const TASK_PLANS: Record<AgentTask, string[]> = {
     '逐章生成（回灌记忆）',
     '每章反思自我进化',
     '累积连贯整本草稿',
+  ],
+  long_novel: [
+    '主 Agent 读取配置与自动化等级',
+    'PlanningDirector / 世界 / 人物 / 大纲子代理',
+    'ChapterAgent 章节循环',
+    'ContinuityAgent + MemoryAgent 并行 Gate',
+    '硬冲突暂停 / 检查点 / 可续跑',
   ],
   title: ['按标题建项', '扩展题材与卖点', '分步写入设定', '生成开篇正文'],
   outline: ['创建或复用项目', '世界观 / 人物 / 大纲分步生成', '保存到项目资料'],

@@ -5,6 +5,8 @@ import type { BlueprintService } from '../blueprint/BlueprintService.js';
 import type { ChapterWriter } from '../blueprint/ChapterWriter.js';
 import type { ModelConfigService } from '../modelConfig/ModelConfigService.js';
 import type { MemoryService } from '../memory/MemoryService.js';
+import type { ReferenceAnalysisService } from '../reference/ReferenceAnalysisService.js';
+import type { LongNovelConfigStore } from './longNovel/LongNovelConfigStore.js';
 import { AgentOrchestrator } from './AgentOrchestrator.js';
 
 /** Facade: delegates to {@link AgentOrchestrator} (LangGraph-style multi sub-agent routing). */
@@ -18,6 +20,8 @@ export class AgentService {
     blueprintService: BlueprintService,
     chapterWriter: ChapterWriter,
     memoryService: MemoryService,
+    referenceService?: ReferenceAnalysisService,
+    longNovelConfigStore?: LongNovelConfigStore,
   ) {
     this.orchestrator = new AgentOrchestrator(
       store,
@@ -26,6 +30,8 @@ export class AgentService {
       blueprintService,
       chapterWriter,
       memoryService,
+      referenceService,
+      longNovelConfigStore,
     );
   }
 

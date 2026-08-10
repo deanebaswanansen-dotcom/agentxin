@@ -1,9 +1,10 @@
 /**
  * Settings panel for the model configuration (task 12.7, Requirement 8.5).
  *
- * Lets the user enable an in-memory model configuration (`baseUrl`, `apiKey`,
- * `modelName`) for the current page session only. The raw API key is kept in
- * browser memory and is lost on refresh, close, or explicit logout.
+ * Model config (including API Key) is persisted in browser localStorage via
+ * apiClient so refresh no longer forces re-entry. Explicit logout still clears it.
+ * The form never echoes the raw key back into the input; leave blank to keep
+ * the already-saved key.
  *
  * Backend errors are surfaced through the injected `onError` callback (wire it
  * to the global error reporter from `ErrorProvider`, Requirement 8.6). The
@@ -171,18 +172,43 @@ export function SettingsPanel({
   // Mirror the backend's non-empty validation (Requirement 4.4) for the
   // button-enabled state; the backend remains the source of truth.
   // Special case for 'mock' preset: no real API key required for local demo.
+  // If a key was already saved (masked shown), blank key field means "keep existing".
   const isMockPreset = presetId === 'mock' || baseUrl.trim() === 'mock';
+  const hasSavedKey = apiKeyMasked.trim().length > 0;
   const canSave =
-    isMockPreset || (baseUrl.trim().length > 0 && modelName.trim().length > 0 && apiKey.trim().length > 0);
+    isMockPreset ||
+    (baseUrl.trim().length > 0 &&
+      modelName.trim().length > 0 &&
+      (apiKey.trim().length > 0 || hasSavedKey));
   const recentCacheRecords = cacheStats?.recent ?? [];
 
   const handleSave = useCallback(async () => {
     if (busy || !canSave) return;
     setBusy(true);
     setSaved(false);
+    // Resolve API key: new input wins; otherwise keep previously saved raw key
+    // from localStorage-backed volatile config by re-saving with a sentinel path —
+    // client.save expects a full ModelConfig, so if user left the field blank we
+    // re-read the currently active config via a private round-trip on save body.
+    let resolvedKey = apiKey.trim();
+    if (!resolvedKey && !isMockPreset) {
+      // Keep existing key: apiClient stores full config; Settings only has mask.
+      // We pass a special keep-token that save path below expands if present in storage.
+      // Practical approach: if blank, fetch current view is masked-only, so pull from
+      // the same localStorage key apiClient uses.
+      try {
+        const raw = window.localStorage.getItem('nwa.modelConfig.v1');
+        if (raw) {
+          const parsed = JSON.parse(raw) as { apiKey?: string };
+          if (typeof parsed.apiKey === 'string') resolvedKey = parsed.apiKey;
+        }
+      } catch {
+        // ignore
+      }
+    }
     const config: ModelConfig = {
       baseUrl: baseUrl.trim(),
-      apiKey: isMockPreset ? apiKey.trim() || 'mock-key-for-demo' : apiKey.trim(),
+      apiKey: isMockPreset ? resolvedKey || 'mock-key-for-demo' : resolvedKey,
       modelName: modelName.trim(),
       temperature,
       topP,
@@ -203,8 +229,6 @@ export function SettingsPanel({
       setBusy(false);
     }
   }, [busy, canSave, baseUrl, apiKey, isMockPreset, modelName, temperature, topP, client, onSaved, handleError]);
-
-  const hasSavedKey = apiKeyMasked.trim().length > 0;
 
   const handlePresetChange = useCallback(
     (nextId: string) => {
@@ -393,7 +417,7 @@ export function SettingsPanel({
           {isMockPreset ? (
             <div className="nwa-field">
               <span className="nwa-field__label">API Key</span>
-              <div className="nwa-input" style={{ background: 'rgba(0,0,0,0.3)', color: 'var(--text-muted)' }}>
+              <div className="nwa-input nwa-input--readonly">
                 （演示模式，无需真实密钥）
               </div>
               <span className="nwa-field__hint nwa-muted">Mock 模式使用本地模拟响应，不调用任何外部 API。</span>
@@ -405,7 +429,7 @@ export function SettingsPanel({
                 className="nwa-input"
                 type="password"
                 autoComplete="off"
-                placeholder={hasSavedKey ? '本次已启用（重新输入以更新）' : '输入 API Key'}
+                placeholder={hasSavedKey ? '已保存，留空则继续使用' : '输入 API Key'}
                 aria-label="API Key"
                 value={apiKey}
                 disabled={busy}
@@ -416,7 +440,7 @@ export function SettingsPanel({
               />
               {hasSavedKey ? (
                 <span className="nwa-field__hint nwa-muted">
-                  本次已启用：<code>{apiKeyMasked}</code>
+                  已本地保存：<code>{apiKeyMasked}</code>；刷新后仍可用。留空保存=不改 Key。
                 </span>
               ) : (
                 <span className="nwa-field__hint nwa-muted">尚未配置 API Key。</span>

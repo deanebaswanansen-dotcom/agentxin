@@ -187,10 +187,41 @@ export type AgentTask =
   | 'workspace_review'
   | 'auto_next'
   | 'full_novel'
+  /** 长篇小说模式：多子代理规划 + 章节循环 + Gate（SPEC V1）。 */
+  | 'long_novel'
   // Blueprint scenario tasks delegated to Python LangGraph core (refactor spec)
   | 'plan_blueprint'
   | 'write_scene'
   | 'write_chapter_from_blueprint';
+
+/**
+ * 长篇小说自动化等级（SPEC §6）。
+ * - assistant：每步需用户发起，单次少章
+ * - semi_auto：阶段可自动，严重冲突暂停
+ * - auto：连续多章，普通问题自动修
+ * - unattended：批量长跑，成本/冲突上限暂停
+ */
+export type LongNovelAutomationLevel = 'assistant' | 'semi_auto' | 'auto' | 'unattended';
+
+export interface LongNovelModeConfig {
+  enabled: boolean;
+  automationLevel: LongNovelAutomationLevel;
+  targetWords: number;
+  targetChapters?: number;
+  minWordsPerChapter: number;
+  targetWordsPerChapter: number;
+  maxWordsPerChapter: number;
+  checkpointInterval: number;
+  maxChaptersPerRun: number;
+  maxConsecutiveFailures: number;
+  planningEnabled: boolean;
+  structuredMemoryEnabled: boolean;
+  foreshadowTrackingEnabled: boolean;
+  autoRevisionEnabled: boolean;
+  chapterLoopEnabled: boolean;
+  stopOnCanonConflict: boolean;
+  stopOnOutlineDeviation: boolean;
+}
 
 export interface AgentRunRequest {
   task: AgentTask;
@@ -200,10 +231,21 @@ export interface AgentRunRequest {
   chapterId?: Id;
   options?: {
     targetWords?: number;
-    /** full_novel：一键生成的章节数（1-500，默认 3）。 */
+    /** full_novel / long_novel：本批章节数（1-500）。 */
     chapters?: number;
-    /** full_novel：分批长跑时的最终总章数（1-500，默认等于 chapters）。 */
+    /** full_novel / long_novel：最终总章数（1-500）。 */
     totalChapters?: number;
+    /**
+     * StoryForge 风格「计划采纳」：
+     * 写正文前把分章大纲 / 创作规则写入项目资料，并注入写作上下文。
+     */
+    planSummary?: NovelPlanSummary;
+    /** long_novel：自动化等级。 */
+    automationLevel?: LongNovelAutomationLevel;
+    /** long_novel：全书目标字数。 */
+    totalWords?: number;
+    /** long_novel：每章最低字数（格式 Gate）。 */
+    minWordsPerChapter?: number;
   };
 }
 
@@ -250,6 +292,98 @@ export interface AgentProgressEvent {
 }
 
 // ---------------------------------------------------------------------------
+// Novel planning / brainstorm mode (pre-generation interview)
+// ---------------------------------------------------------------------------
+
+/** 计划模式可绑定的下游生成任务。 */
+export type NovelPlanTargetTask = 'novel' | 'full_novel' | 'long_novel' | 'outline' | 'title';
+
+/**
+ * 计划深度：
+ * - light：轻量 4～5 轮（现在的快开写）
+ * - standard：中等 8～10 轮
+ * - deep：极限详细约 20 轮
+ */
+export type NovelPlanDepth = 'light' | 'standard' | 'deep';
+
+export interface NovelPlanQuestionOption {
+  id: string;
+  label: string;
+  description?: string;
+}
+
+export interface NovelPlanQuestion {
+  id: string;
+  question: string;
+  /** 是否允许多选（默认 false）。 */
+  multiSelect?: boolean;
+  options: NovelPlanQuestionOption[];
+}
+
+export interface NovelPlanHistoryTurn {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+export interface NovelPlanAnswer {
+  questionId: string;
+  selectedOptionIds: string[];
+  /** 用户自定义补充（对应「其他」）。 */
+  customText?: string;
+}
+
+export interface NovelPlanTurnRequest {
+  seedPrompt: string;
+  targetTask?: NovelPlanTargetTask;
+  /** 计划深度；未选时首轮只返回深度选择题。 */
+  depth?: NovelPlanDepth;
+  history?: NovelPlanHistoryTurn[];
+  answers?: NovelPlanAnswer[];
+  /** 强制收束为 ready（用户点「够了，出方案」）。 */
+  forceReady?: boolean;
+}
+
+/** 计划模式下 Agent 生成的单章大纲。 */
+export interface NovelPlanChapterOutline {
+  number: number;
+  title: string;
+  /** 本章剧情目标 / 冲突 / 结尾钩子。 */
+  goal: string;
+  estimatedWords?: number;
+}
+
+export interface NovelPlanSummary {
+  title?: string;
+  genre?: string;
+  protagonist?: string;
+  hook?: string;
+  tone?: string;
+  constraints?: string[];
+  /** 全书目标总字数。 */
+  totalWords?: number;
+  /** 每章目标字数。 */
+  wordsPerChapter?: number;
+  /** 计划章节数。 */
+  chapterCount?: number;
+  /** Agent 生成的分章大纲（写正文前的章纲）。 */
+  chapterOutlines?: NovelPlanChapterOutline[];
+}
+
+export interface NovelPlanTurnResponse {
+  status: 'asking' | 'ready';
+  round: number;
+  message: string;
+  questions?: NovelPlanQuestion[];
+  /** 收束后的可直接喂给生成任务的完整需求 brief。 */
+  brief?: string;
+  planSummary?: NovelPlanSummary;
+  /** 回传当前深度（选完后每轮都带上，方便前端缓存）。 */
+  depth?: NovelPlanDepth;
+  /** 该深度的目标轮次区间，如 [8, 10]。 */
+  depthRoundRange?: [number, number];
+}
+
+// ---------------------------------------------------------------------------
 // Novel import / organization
 // ---------------------------------------------------------------------------
 
@@ -274,6 +408,328 @@ export interface ImportNovelResult {
   firstChapterId?: Id;
   summary: string;
   artifacts: AgentArtifact[];
+}
+
+// ---------------------------------------------------------------------------
+// 参考小说分析与创作迁移（Reference Novel Analyzer MVP）
+// ---------------------------------------------------------------------------
+
+/** 分析深度：快速 / 标准 / 深度。 */
+export type ReferenceAnalysisDepth = 'quick' | 'standard' | 'deep';
+
+/** 分析任务状态。 */
+export type ReferenceAnalysisStatus =
+  | 'imported'
+  | 'parsing'
+  | 'analyzing'
+  | 'ready'
+  | 'failed';
+
+/**
+ * 可迁移维度（只学方法，不抄内容）。
+ * 与 SPEC「用户选择需要学习的维度」对齐。
+ */
+export type ReferenceTransferDimension =
+  | 'pacing'
+  | 'chapter_structure'
+  | 'characterization'
+  | 'suspense'
+  | 'dialogue_density'
+  | 'description_density'
+  | 'emotion_curve'
+  | 'payoff_frequency'
+  | 'worldbuilding_delivery'
+  | 'style';
+
+export const REFERENCE_TRANSFER_DIMENSIONS: readonly ReferenceTransferDimension[] = [
+  'pacing',
+  'chapter_structure',
+  'characterization',
+  'suspense',
+  'dialogue_density',
+  'description_density',
+  'emotion_curve',
+  'payoff_frequency',
+  'worldbuilding_delivery',
+  'style',
+] as const;
+
+export interface ReferenceImportRequest {
+  title?: string;
+  author?: string;
+  /** 纯文本正文（TXT / Markdown 粘贴或前端读文件后上传）。 */
+  text: string;
+  depth?: ReferenceAnalysisDepth;
+  /** 是否完整作品（影响分卷推断提示）。 */
+  isCompleteWork?: boolean;
+}
+
+export interface ReferenceChapterMetrics {
+  wordCount: number;
+  dialogueRatio: number;
+  descriptionRatio: number;
+  avgSentenceLength: number;
+  paragraphCount: number;
+}
+
+export interface ReferenceChapterRecord {
+  id: Id;
+  number: number;
+  title: string;
+  /** 原文仅存参考库，不进创作上下文。 */
+  content: string;
+  wordCount: number;
+  metrics: ReferenceChapterMetrics;
+  /** 章节摘要（分析后填充，无大段原文）。 */
+  summary?: string;
+  functions?: string[];
+  openHook?: string;
+  endHook?: string;
+  characters?: string[];
+}
+
+export interface ReferenceStyleProfile {
+  avgSentenceLength: number;
+  avgChapterWords: number;
+  dialogueRatio: number;
+  descriptionRatio: number;
+  rhythmLabel: string;
+  notes: string[];
+}
+
+export interface ReferencePacingProfile {
+  avgChapterWords: number;
+  shortChapterRatio: number;
+  longChapterRatio: number;
+  estimatedSmallConflictEveryN: number;
+  estimatedMajorPayoffEveryN: number;
+  notes: string[];
+}
+
+export interface ReferenceTransferableMethod {
+  dimension: ReferenceTransferDimension;
+  title: string;
+  method: string;
+  /** 为何可迁移（抽象层）。 */
+  why: string;
+  /** 如何应用到原创（不得抄袭原文）。 */
+  howToApply: string;
+}
+
+export interface ReferenceCharacterProfile {
+  name: string;
+  role: string;
+  identity: string;
+  goal: string;
+  motivation: string;
+  traits: string[];
+  arc: string;
+  keyActions: string[];
+}
+
+export interface ReferenceCharacterRelationship {
+  from: string;
+  to: string;
+  relation: string;
+  evolution: string;
+}
+
+export interface ReferenceConflictProfile {
+  type: 'core' | 'external' | 'internal' | 'relationship' | 'stage';
+  parties: string[];
+  description: string;
+  stakes: string;
+  progression: string;
+}
+
+export interface ReferencePayoffProfile {
+  title: string;
+  setup: string;
+  trigger: string;
+  payoff: string;
+  impact: string;
+  chapter: string;
+}
+
+export interface ReferenceWorldbuildingProfile {
+  premise: string;
+  rules: string[];
+  factions: string[];
+  locations: string[];
+  systems: string[];
+  history: string[];
+  terminology: string[];
+}
+
+export interface ReferencePlotBeat {
+  stage: string;
+  chapters: string;
+  summary: string;
+  turningPoint: string;
+}
+
+export interface ReferenceForeshadowingProfile {
+  setup: string;
+  payoff: string;
+  status: 'unresolved' | 'partial' | 'resolved' | 'uncertain';
+}
+
+export interface ReferenceReversalProfile {
+  setup: string;
+  reversal: string;
+  effect: string;
+  chapter: string;
+}
+
+export interface ReferenceCharacterOutfitProfile {
+  name: string;
+  /** 服装概述；没有描写时固定为“正文未描写”。 */
+  outfit: string;
+  /** 简短原文依据或上下文概述，不复制长段原文。 */
+  evidence: string;
+  certainty: 'explicit' | 'inferred' | 'not_described';
+}
+
+export interface ReferenceChapterOutfitProfile {
+  chapter: string;
+  characters: ReferenceCharacterOutfitProfile[];
+}
+
+export interface ReferenceCreativeProfile {
+  oneLineSummary: string;
+  genreGuess: string;
+  coreConflict: string;
+  /** 原作主线概述；旧字段名保留以兼容已存档数据。 */
+  mainPlotAbstract: string;
+  /** 以下为原作事实性拆解，不是改写建议。旧档案可能没有这些字段。 */
+  characters?: ReferenceCharacterProfile[];
+  relationships?: ReferenceCharacterRelationship[];
+  conflicts?: ReferenceConflictProfile[];
+  payoffs?: ReferencePayoffProfile[];
+  worldbuilding?: ReferenceWorldbuildingProfile;
+  plotOutline?: ReferencePlotBeat[];
+  foreshadowing?: ReferenceForeshadowingProfile[];
+  reversals?: ReferenceReversalProfile[];
+  themes?: string[];
+  /** 按章节记录出场人物的服装；未描写也保留明确状态。 */
+  chapterCharacterOutfits?: ReferenceChapterOutfitProfile[];
+  /** 以下字段是可选的写法分析/迁移附录。 */
+  characterMethods: string[];
+  worldbuildingDelivery: string[];
+  style: ReferenceStyleProfile;
+  pacing: ReferencePacingProfile;
+  transferableMethods: ReferenceTransferableMethod[];
+  strengths: string[];
+  risks: string[];
+  /** 严禁迁移的内容提示。 */
+  doNotCopy: string[];
+  markdownReport: string;
+}
+
+export interface ReferenceNovelSummary {
+  id: Id;
+  title: string;
+  author?: string;
+  depth: ReferenceAnalysisDepth;
+  status: ReferenceAnalysisStatus;
+  chapterCount: number;
+  wordCount: number;
+  createdAt: string;
+  updatedAt: string;
+  errorMessage?: string;
+}
+
+export interface ReferenceNovelDetail extends ReferenceNovelSummary {
+  chapters: Array<Omit<ReferenceChapterRecord, 'content'> & { contentPreview: string }>;
+  profile?: ReferenceCreativeProfile;
+  /** 是否仍保留原文（可删原文只留档案）。 */
+  hasRawText: boolean;
+}
+
+export interface ReferenceImportResult {
+  reference: ReferenceNovelSummary;
+  chaptersDetected: number;
+  wordCount: number;
+  message: string;
+  /**
+   * 导入后章节清单（无正文，便于前端勾选分析范围）。
+   * content 不返回，仅 preview。
+   */
+  chapters: Array<{
+    id: Id;
+    number: number;
+    title: string;
+    wordCount: number;
+    contentPreview: string;
+  }>;
+}
+
+/** 分析请求：可指定章节子集；不传则按深度抽样全书。 */
+export interface ReferenceAnalyzeRequest {
+  /** 按章节 id 选择（优先）。 */
+  chapterIds?: Id[];
+  /** 按章节序号选择（1-based）。 */
+  chapterNumbers?: number[];
+  /** 覆盖导入时的分析深度。 */
+  depth?: ReferenceAnalysisDepth;
+  /**
+   * 最多参与模型综合的章节数（默认随深度：quick 12 / standard 30 / deep 60）。
+   * 本地统计仍覆盖所选全部章节。
+   */
+  maxModelChapters?: number;
+}
+
+export interface ReferenceAnalyzeResult {
+  reference: ReferenceNovelSummary;
+  profile: ReferenceCreativeProfile;
+  /** 自动创建/更新的左侧拆解项目。 */
+  analysisProjectId: Id;
+  analysisProjectName: string;
+  /** 可在资料抽屉中直接打开的人物、世界观与大纲资料。 */
+  artifacts: AgentArtifact[];
+  chaptersAnalyzed: number;
+  /** 用户勾选/参与本地统计的章节数。 */
+  chaptersSelected: number;
+  message: string;
+}
+
+export interface ReferenceTransferRequest {
+  referenceId: Id;
+  dimensions: ReferenceTransferDimension[];
+  /** 用户补充的原创方向（可选）。 */
+  originalBrief?: string;
+}
+
+export interface ReferenceTransferResult {
+  projectId: Id;
+  referenceId: Id;
+  dimensions: ReferenceTransferDimension[];
+  planMarkdown: string;
+  artifacts: AgentArtifact[];
+  summary: string;
+}
+
+export interface SimilarityCheckRequest {
+  referenceId: Id;
+  /** 待检文本；不传则用 chapterId 对应章节正文。 */
+  text?: string;
+  chapterId?: Id;
+}
+
+export interface SimilarityFinding {
+  severity: 'low' | 'medium' | 'high';
+  kind: 'ngram_overlap' | 'proper_noun' | 'long_span';
+  message: string;
+  evidence?: string;
+}
+
+export interface SimilarityCheckResult {
+  projectId?: Id;
+  referenceId: Id;
+  riskLevel: 'ok' | 'warn' | 'block';
+  score0to100: number;
+  findings: SimilarityFinding[];
+  summary: string;
 }
 
 // ---------------------------------------------------------------------------

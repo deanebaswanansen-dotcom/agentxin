@@ -26,45 +26,54 @@
 .nwa-theme-midnight {
   --app-bg-image: url('/bg-cyber.svg');
   --bg-base: #0e1624;
-  --bg-glass: rgba(18, 26, 38, 0.82);
-  --bg-glass-hover: rgba(28, 41, 58, 0.9);
-  --bg-surface: rgba(249, 250, 251, 0.92);
-  --bg-surface-hover: rgba(219, 234, 254, 0.72);
-  --border-subtle: rgba(148, 163, 184, 0.26);
-  --text-primary: #172033;
-  --text-secondary: #405066;
-  --text-muted: #66758a;
+  /* 工作区保持浅色纸面，保证深色正文对比；侧栏/顶栏单独用 on-dark */
+  --bg-glass: rgba(248, 250, 252, 0.96);
+  --bg-glass-hover: rgba(241, 245, 249, 0.98);
+  --bg-surface: #f8fafc;
+  --bg-surface-hover: #e8eef7;
+  --bg-panel-solid: #f8fafc;
+  --bg-editor: #ffffff;
+  --border-subtle: rgba(71, 85, 105, 0.28);
+  --text-primary: #0f172a;
+  --text-secondary: #334155;
+  --text-muted: #475569;
+  --text-on-dark: #f1f5f9;
+  --text-on-dark-muted: rgba(241, 245, 249, 0.84);
   --accent-primary: #0f766e;
-  --accent-secondary: #7c3aed;
+  --accent-secondary: #6d28d9;
   --accent-tertiary: #b45309;
-  --accent-soft: rgba(14, 165, 163, 0.12);
+  --accent-soft: rgba(14, 165, 163, 0.14);
   --accent-gradient: linear-gradient(90deg, #0f766e, #7c3aed 54%, #b45309);
   --shadow-sm: 0 8px 26px rgba(2, 8, 23, 0.18);
   background:
-    linear-gradient(90deg, rgba(7, 13, 22, 0.9), rgba(7, 13, 22, 0.3) 48%, rgba(7, 13, 22, 0.78)),
+    linear-gradient(90deg, rgba(7, 13, 22, 0.92), rgba(7, 13, 22, 0.42) 48%, rgba(7, 13, 22, 0.86)),
     var(--app-bg-image) center / cover no-repeat,
     var(--bg-base);
 }
 
 .nwa-theme-paper {
   --app-bg-image: url('/bg-study.svg');
-  --bg-base: #f7f1e7;
-  --bg-glass: rgba(255, 255, 255, 0.78);
-  --bg-glass-hover: rgba(255, 255, 255, 0.9);
-  --bg-surface: rgba(255, 252, 246, 0.96);
-  --bg-surface-hover: rgba(236, 244, 240, 0.9);
-  --border-subtle: rgba(91, 70, 48, 0.18);
-  --text-primary: #2a211b;
-  --text-secondary: #57483d;
-  --text-muted: #7a6a5b;
+  --bg-base: #f0e8db;
+  --bg-glass: rgba(255, 255, 255, 0.96);
+  --bg-glass-hover: #ffffff;
+  --bg-surface: #fffcf7;
+  --bg-surface-hover: #f0ebe3;
+  --bg-panel-solid: #fffcf7;
+  --bg-editor: #fffefb;
+  --border-subtle: rgba(91, 70, 48, 0.22);
+  --text-primary: #1f1712;
+  --text-secondary: #4a3b30;
+  --text-muted: #5c4c3e;
+  --text-on-dark: #fff8ee;
+  --text-on-dark-muted: rgba(255, 248, 238, 0.84);
   --accent-primary: #0f766e;
   --accent-secondary: #8b3f1d;
   --accent-tertiary: #475569;
-  --accent-soft: rgba(15, 118, 110, 0.1);
+  --accent-soft: rgba(15, 118, 110, 0.12);
   --accent-gradient: linear-gradient(90deg, #0f766e, #8b3f1d 56%, #475569);
   --shadow-sm: 0 8px 24px rgba(91, 70, 48, 0.1);
   background:
-    linear-gradient(90deg, rgba(247, 241, 231, 0.9), rgba(247, 241, 231, 0.48) 52%, rgba(247, 241, 231, 0.84)),
+    linear-gradient(90deg, rgba(247, 241, 231, 0.94), rgba(247, 241, 231, 0.62) 52%, rgba(247, 241, 231, 0.9)),
     var(--app-bg-image) center / cover no-repeat,
     var(--bg-base);
 }
@@ -142,7 +151,8 @@
   gap: 0.35rem;
   min-width: 0;
   overflow: hidden;
-  color: rgba(255, 247, 232, 0.72);
+  color: var(--text-on-dark-muted);
+  font-size: var(--fs-sm);
 }
 
 .nwa-breadcrumb__project,
@@ -157,7 +167,7 @@
 .nwa-breadcrumb__chapter {
   border: none;
   background: transparent;
-  color: #fff7e8;
+  color: var(--text-on-dark);
   padding: 0;
   font: inherit;
   cursor: pointer;
@@ -167,35 +177,42 @@
   display: inline-flex;
   flex: 0 0 auto;
   align-items: center;
-  color: rgba(255, 247, 232, 0.48);
+  color: rgba(255, 248, 238, 0.55);
 }
 
 .nwa-tavern-header .nwa-button--ghost,
 .nwa-tavern-header .nwa-button--icon {
-  color: #fff7e8;
-  border-color: rgba(255, 247, 232, 0.26);
+  color: var(--text-on-dark);
+  border-color: rgba(255, 248, 238, 0.32);
+  background: rgba(255, 248, 238, 0.08);
+}
+
+.nwa-tavern-header .nwa-button--ghost:hover:not(:disabled),
+.nwa-tavern-header .nwa-button--icon:hover:not(:disabled) {
+  background: rgba(255, 248, 238, 0.16);
+  color: #ffffff;
 }
 
 .nwa-app-title {
   margin: 0;
   font-family: var(--font-display);
-  font-size: 1.05rem;
+  font-size: var(--fs-md);
   font-weight: 600;
   letter-spacing: 0;
-  color: #fff7e8;
-  text-shadow: none;
+  color: var(--text-on-dark);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.28);
   white-space: nowrap;
 }
 
 .nwa-app-subtitle {
-  color: rgba(255, 247, 232, 0.72);
-  font-size: 0.825rem;
+  color: var(--text-on-dark-muted);
+  font-size: var(--fs-sm);
   font-weight: 400;
 }
 
 .nwa-header-help {
-  font-size: 0.7rem;
-  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  color: var(--text-on-dark-muted);
 }
 
 .nwa-settings-trigger {
@@ -355,8 +372,8 @@
 }
 
 .nwa-sidebar-header {
-  padding: 1rem 1rem 0.75rem;
-  border-bottom: 1px solid var(--border-subtle);
+  padding: 0.85rem 0.9rem 0.65rem;
+  border-bottom: 1px solid rgba(255, 248, 238, 0.1);
   background: transparent;
   display: flex;
   align-items: center;
@@ -366,18 +383,25 @@
 .nwa-sidebar-header h3 {
   margin: 0;
   font-family: var(--font-display);
-  font-size: 0.8rem;
+  font-size: var(--fs-sm);
   font-weight: 600;
-  color: rgba(255, 247, 232, 0.72);
+  color: var(--text-on-dark-muted);
   text-transform: uppercase;
   letter-spacing: 0;
   text-shadow: none;
 }
 
 .nwa-sidebar-content {
-  padding: 0.5rem 0 1rem;
-  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  padding: 0.35rem 0 0.5rem;
+  overflow: hidden;
   flex: 1;
+  min-height: 0;
+}
+
+.nwa-sidebar-content > .nwa-project-tree {
+  flex: 1 1 auto;
   min-height: 0;
 }
 
@@ -386,17 +410,15 @@
   border-color: rgba(255, 247, 232, 0.28);
 }
 
-.nwa-tavern-sidebar .nwa-project-tree__label,
-.nwa-tavern-sidebar .nwa-project-tree__sublabel {
-  color: rgba(255, 247, 232, 0.88);
+/* 侧栏项目树自带深色主题色，这里只校正表单输入 */
+.nwa-tavern-sidebar .nwa-muted,
+.nwa-tavern-sidebar .nwa-project-tree__hint {
+  color: var(--text-on-dark-muted);
 }
 
-.nwa-tavern-sidebar .nwa-project-tree__row:hover,
-.nwa-tavern-sidebar .nwa-project-tree__row--selected,
-.nwa-tavern-sidebar .nwa-project-tree__sublabel:hover,
-.nwa-tavern-sidebar .nwa-project-tree__sublabel--selected {
-  background: rgba(20, 184, 166, 0.16);
-  color: #fff7e8;
+.nwa-tavern-sidebar .nwa-button--ghost {
+  color: var(--text-on-dark);
+  border-color: rgba(255, 248, 238, 0.28);
 }
 
 .nwa-mt-4 {
@@ -428,8 +450,10 @@
   flex-direction: column;
   min-width: 0;
   min-height: 0;
-  background: rgba(255, 250, 240, 0.9);
+  /* 实心面板：拉伸时背景图不会透出干扰正文 */
+  background: var(--bg-panel-solid);
   border-right: 1px solid var(--border-subtle);
+  color: var(--text-primary);
 }
 
 .nwa-editor-board {
@@ -467,16 +491,18 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 0.92rem;
+  font-size: var(--fs-md);
   color: var(--text-primary);
+  line-height: var(--lh-tight);
 }
 
 .nwa-editor-board__eyebrow {
-  font-size: 0.68rem;
-  line-height: 1;
+  font-size: var(--fs-xs);
+  line-height: 1.2;
   color: var(--text-muted);
   text-transform: uppercase;
   letter-spacing: 0;
+  font-weight: 600;
 }
 
 .nwa-editor-board__actions {
@@ -487,6 +513,7 @@
 }
 
 .nwa-editor-board__content {
+  position: relative;
   flex: 1;
   min-height: 0;
   min-width: 0;
@@ -504,10 +531,11 @@
   min-height: 0;
   border-color: transparent;
   border-radius: 8px;
-  background: rgba(255, 253, 247, 0.96);
-  font-size: 1rem;
-  line-height: 1.85;
-  box-shadow: inset 0 0 0 1px rgba(98, 72, 47, 0.08), var(--shadow-sm);
+  background: var(--bg-editor);
+  color: var(--text-primary);
+  font-size: var(--fs-md);
+  line-height: var(--lh-prose);
+  box-shadow: inset 0 0 0 1px var(--border-subtle), var(--shadow-sm);
 }
 
 /* ==========================================================================
@@ -573,10 +601,9 @@
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  background: var(--bg-surface);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
+  background: var(--bg-panel-solid);
   border-left: 1px solid var(--border-subtle);
+  color: var(--text-primary);
 }
 
 .nwa-right-header {
@@ -602,10 +629,10 @@
   flex: 1;
   background: transparent;
   border: none;
-  color: var(--text-muted);
+  color: var(--text-secondary);
   font-family: var(--font-sans);
   font-weight: 500;
-  font-size: 0.825rem;
+  font-size: var(--fs-sm);
   padding: 0.5rem 0.75rem;
   border-radius: 8px;
   cursor: pointer;
@@ -706,27 +733,45 @@
    流式预览（中央面板实时显示 AI 输出）
    ========================================================================== */
 
-.nwa-streaming-preview {
-  flex: 1;
+.nwa-streaming-dock {
+  position: absolute;
+  left: 0.75rem;
+  right: 0.75rem;
+  bottom: 0.75rem;
+  z-index: var(--z-popover);
   display: flex;
   flex-direction: column;
-  padding: 1.5rem;
-  overflow-y: auto;
-  animation: fadeIn 0.3s ease-out;
+  gap: 0.55rem;
+  max-height: min(42vh, 22rem);
+  padding: 0.85rem 1rem;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--accent-primary) 35%, var(--border-subtle));
+  border-radius: 12px;
+  background: var(--bg-panel-solid);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-glass);
+  animation: fadeIn 0.25s ease-out;
 }
 
 .nwa-streaming-header {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 0.75rem;
-  margin-bottom: 1rem;
-  padding-bottom: 0.75rem;
+  flex-shrink: 0;
+  padding-bottom: 0.45rem;
   border-bottom: 1px solid var(--border-subtle);
+}
+
+.nwa-streaming-header__actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
 }
 
 .nwa-streaming-indicator {
   font-family: var(--font-display);
-  font-size: 0.95rem;
+  font-size: var(--fs-base);
   font-weight: 600;
   color: var(--accent-primary);
   animation: pulse 1.8s ease-in-out infinite;
@@ -737,12 +782,34 @@
   50% { opacity: 0.5; }
 }
 
+.nwa-streaming-dock .nwa-thinking-details {
+  flex-shrink: 0;
+  max-height: 7rem;
+  overflow: auto;
+}
+
 .nwa-streaming-content {
-  flex: 1;
-  font-size: 0.95rem;
-  line-height: 1.75;
+  flex: 1 1 auto;
+  min-height: 4rem;
+  max-height: 12rem;
+  overflow: auto;
+  font-size: var(--fs-sm);
+  line-height: var(--lh-body);
   color: var(--text-primary);
   animation: fadeIn 0.4s ease-out;
+}
+
+/* 窄对话栏：略缩小内边距，字号仍受 clamp 下限保护 */
+@media (max-width: 1100px) {
+  .nwa-editor-board__content .nwa-textarea {
+    font-size: var(--fs-base);
+    line-height: 1.8;
+  }
+
+  .nwa-chat-stream {
+    padding-left: 0.75rem;
+    padding-right: 0.75rem;
+  }
 }
 
 @keyframes fadeIn {

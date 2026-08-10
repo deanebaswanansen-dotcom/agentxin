@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
-import type { AgentRunResult } from '../types/index.js';
+import type { AgentRunResult, NovelPlanTurnResponse } from '../types/index.js';
 import { AgentCommandCenter, type AgentClient } from './AgentCommandCenter.js';
 
 function result(overrides: Partial<AgentRunResult> = {}): AgentRunResult {
@@ -14,6 +14,33 @@ function result(overrides: Partial<AgentRunResult> = {}): AgentRunResult {
     artifacts: [{ kind: 'chapter', id: 'c1', title: '第1章' }],
     ...overrides,
   };
+}
+
+function askingTurn(overrides: Partial<NovelPlanTurnResponse> = {}): NovelPlanTurnResponse {
+  return {
+    status: 'asking',
+    round: 1,
+    message: '先定赛道',
+    questions: [
+      {
+        id: 'genre_lane',
+        question: '这本书更靠近哪条赛道？',
+        options: [
+          { id: 'xuanhuan', label: '玄幻 / 修仙', description: '升级打脸' },
+          { id: 'dushi', label: '都市 / 异能' },
+        ],
+      },
+    ],
+    ...overrides,
+  };
+}
+
+/** 关闭计划模式，走原来的直接生成路径。 */
+function disablePlanMode(): void {
+  const checkbox = screen.queryByRole('checkbox');
+  if (checkbox && (checkbox as HTMLInputElement).checked) {
+    fireEvent.click(checkbox);
+  }
 }
 
 describe('AgentCommandCenter', () => {
@@ -47,6 +74,7 @@ describe('AgentCommandCenter', () => {
     const client = { agent: { run }, chapters: { list } } as unknown as AgentClient;
     render(<AgentCommandCenter client={client} onCompleted={onCompleted} />);
 
+    disablePlanMode();
     fireEvent.change(screen.getByLabelText('一句话写作需求'), {
       target: { value: '赛博修仙学院' },
     });
@@ -74,6 +102,7 @@ describe('AgentCommandCenter', () => {
     render(<AgentCommandCenter client={client} selectedProjectId="p1" onCompleted={onCompleted} />);
 
     fireEvent.click(screen.getByText('大纲和设定'));
+    disablePlanMode();
     fireEvent.change(screen.getByLabelText('一句话写作需求'), {
       target: { value: '都市异能' },
     });
@@ -96,6 +125,7 @@ describe('AgentCommandCenter', () => {
     const client = { agent: { run } } as unknown as AgentClient;
     render(<AgentCommandCenter client={client} onCompleted={vi.fn()} />);
 
+    disablePlanMode();
     fireEvent.change(screen.getByLabelText('一句话写作需求'), {
       target: { value: '赛博修仙学院' },
     });
@@ -115,6 +145,7 @@ describe('AgentCommandCenter', () => {
     const client = { agent: { runStream } } as unknown as AgentClient;
     render(<AgentCommandCenter client={client} onCompleted={vi.fn()} />);
 
+    disablePlanMode();
     fireEvent.change(screen.getByLabelText('一句话写作需求'), {
       target: { value: '赛博修仙学院' },
     });
@@ -132,6 +163,7 @@ describe('AgentCommandCenter', () => {
     const client = { agent: { run } } as unknown as AgentClient;
     render(<AgentCommandCenter client={client} onCompleted={vi.fn()} />);
 
+    disablePlanMode();
     fireEvent.change(screen.getByLabelText('一句话写作需求'), {
       target: { value: '赛博修仙学院' },
     });
@@ -183,6 +215,92 @@ describe('AgentCommandCenter', () => {
         chapterId: undefined,
         options: undefined,
       }),
+    );
+  });
+
+  it('starts brainstorm plan mode and renders questions', async () => {
+    const planTurn = vi.fn().mockResolvedValue(askingTurn());
+    const client = { agent: { run: vi.fn(), planTurn } } as unknown as AgentClient;
+    render(<AgentCommandCenter client={client} onCompleted={vi.fn()} />);
+
+    fireEvent.change(screen.getByLabelText('一句话写作需求'), {
+      target: { value: '赛博修仙学院' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '开始头脑风暴' }));
+
+    await waitFor(() =>
+      expect(planTurn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          seedPrompt: '赛博修仙学院',
+          targetTask: 'novel',
+        }),
+        expect.anything(),
+      ),
+    );
+    expect(await screen.findByText('先定赛道')).toBeInTheDocument();
+    expect(screen.getByText('这本书更靠近哪条赛道？')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /玄幻 \/ 修仙/ })).toBeInTheDocument();
+  });
+
+  it('submits plan answers and generates from ready brief', async () => {
+    const planTurn = vi
+      .fn()
+      .mockResolvedValueOnce(askingTurn())
+      .mockResolvedValueOnce({
+        status: 'ready',
+        round: 2,
+        message: '方案好了',
+        brief: '【brief】赛博修仙学院完整需求',
+        planSummary: { title: '代码御剑', genre: '赛博修仙', hook: '写代码御剑' },
+      } satisfies NovelPlanTurnResponse);
+    const run = vi.fn().mockResolvedValue(result());
+    const list = vi.fn().mockResolvedValue([
+      { id: 'c1', projectId: 'p1', title: '第1章', content: '正文', position: 0 },
+    ]);
+    const client = { agent: { run, planTurn }, chapters: { list } } as unknown as AgentClient;
+    render(<AgentCommandCenter client={client} onCompleted={vi.fn()} />);
+
+    fireEvent.change(screen.getByLabelText('一句话写作需求'), {
+      target: { value: '赛博修仙学院' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '开始头脑风暴' }));
+    expect(await screen.findByText('先定赛道')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /玄幻 \/ 修仙/ }));
+    fireEvent.click(screen.getByRole('button', { name: '提交回答，继续追问' }));
+
+    await waitFor(() => expect(planTurn).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText('方案好了')).toBeInTheDocument();
+    expect(screen.getByLabelText('生成用 brief')).toHaveTextContent('赛博修仙学院完整需求');
+
+    fireEvent.click(screen.getByRole('button', { name: '用方案生成' }));
+    await waitFor(() =>
+      expect(run).toHaveBeenCalledWith(
+        expect.objectContaining({
+          task: 'novel',
+          prompt: '【brief】赛博修仙学院完整需求',
+        }),
+      ),
+    );
+  });
+
+  it('can skip plan mode and generate directly while plan toggle is on', async () => {
+    const run = vi.fn().mockResolvedValue(result());
+    const client = { agent: { run, planTurn: vi.fn() } } as unknown as AgentClient;
+    render(<AgentCommandCenter client={client} onCompleted={vi.fn()} />);
+
+    fireEvent.change(screen.getByLabelText('一句话写作需求'), {
+      target: { value: '直接开写' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '跳过，开始生成' }));
+
+    await waitFor(() =>
+      expect(run).toHaveBeenCalledWith(
+        expect.objectContaining({
+          task: 'novel',
+          prompt: '直接开写',
+        }),
+      ),
     );
   });
 });

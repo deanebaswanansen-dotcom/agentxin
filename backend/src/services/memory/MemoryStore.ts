@@ -8,6 +8,7 @@
  * - 与 {@link FileDataStore} 一致地采用「临时文件 + 原子 rename」写入，避免写中途崩溃
  *   损坏文件。
  * - 全部内容按 projectId 分桶，删除项目时可整桶清理。
+ * - 写路径经全局 promise 链串行化，避免并发 read-modify-write 丢更新。
  */
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
@@ -44,12 +45,41 @@ export interface WorkflowEvent {
   at: string;
 }
 
+/**
+ * 伏笔台账条目（StoryForge 风格）：
+ * planted 已埋设 → echoed 再次点到 → resolved 已回收 / dropped 作废。
+ */
+export type ForeshadowStatus = 'planted' | 'echoed' | 'resolved' | 'dropped';
+export type ForeshadowUrgency = 'low' | 'medium' | 'high';
+
+export interface ForeshadowEntry {
+  id: string;
+  /** 短标题，便于匹配与展示。 */
+  title: string;
+  /** 埋设内容 / 暗示点。 */
+  detail: string;
+  status: ForeshadowStatus;
+  urgency: ForeshadowUrgency;
+  /** 建议回收窗口，如「第5-8章」「中后期」。 */
+  suggestPayoffBy?: string;
+  plantedChapterId?: string;
+  plantedChapterTitle?: string;
+  /** 最近一次呼应/回收所在章。 */
+  lastTouchedChapterId?: string;
+  lastTouchedChapterTitle?: string;
+  resolvedNote?: string;
+  at: string;
+  updatedAt: string;
+}
+
 /** 单个项目的全部记忆。 */
 export interface ProjectMemory {
   summaries: ChapterSummary[];
   facts: MemoryFact[];
   learnings: Learning[];
   workflow: WorkflowEvent[];
+  /** 伏笔台账（埋设 / 呼应 / 回收）。 */
+  foreshadows: ForeshadowEntry[];
   updatedAt: string;
 }
 
@@ -62,7 +92,14 @@ interface MemoryFile {
 export const DEFAULT_MEMORY_FILE = 'data/agent-memory.json';
 
 function emptyProjectMemory(): ProjectMemory {
-  return { summaries: [], facts: [], learnings: [], workflow: [], updatedAt: new Date().toISOString() };
+  return {
+    summaries: [],
+    facts: [],
+    learnings: [],
+    workflow: [],
+    foreshadows: [],
+    updatedAt: new Date().toISOString(),
+  };
 }
 
 function emptyFile(): MemoryFile {
@@ -73,6 +110,8 @@ export class MemoryStore {
   private readonly filePath: string;
   private readonly persistent: boolean;
   private data: MemoryFile = emptyFile();
+  /** 全局写队列：单文件多 project，串行化 write / update / clearProject，避免落盘竞态。 */
+  private writeChain: Promise<void> = Promise.resolve();
 
   constructor(filePath: string = DEFAULT_MEMORY_FILE, options: { persistent?: boolean } = {}) {
     this.filePath = resolve(filePath);
@@ -89,6 +128,19 @@ export class MemoryStore {
   /** 构造一个纯内存、不落盘的记忆存储（用于测试 / 无持久化注入场景）。 */
   static ephemeral(): MemoryStore {
     return new MemoryStore(DEFAULT_MEMORY_FILE, { persistent: false });
+  }
+
+  /**
+   * 将写操作接到全局 promise 链尾部；前序失败不阻塞后续。
+   * 所有会改 `this.data` 并可能 persist 的路径必须经此串行。
+   */
+  private enqueueWrite<T>(op: () => Promise<T>): Promise<T> {
+    const run = this.writeChain.then(op, op);
+    this.writeChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
   }
 
   private async load(): Promise<void> {
@@ -124,7 +176,7 @@ export class MemoryStore {
     await rename(tempPath, this.filePath);
   }
 
-  /** 读取某项目记忆的深拷贝（缺省返回空记忆，不写盘）。 */
+  /** 读取某项目记忆的深拷贝（缺省返回空记忆，不写盘）。旧文件缺 foreshadows 时自动补空数组。 */
   read(projectId: string): ProjectMemory {
     const mem = this.data.projects[projectId];
     if (mem === undefined) return emptyProjectMemory();
@@ -134,20 +186,43 @@ export class MemoryStore {
       facts: Array.isArray(copy.facts) ? copy.facts : [],
       learnings: Array.isArray(copy.learnings) ? copy.learnings : [],
       workflow: Array.isArray(copy.workflow) ? copy.workflow : [],
+      foreshadows: Array.isArray(copy.foreshadows) ? copy.foreshadows : [],
       updatedAt: typeof copy.updatedAt === 'string' ? copy.updatedAt : new Date().toISOString(),
     };
   }
 
-  /** 覆盖写入某项目记忆并落盘。 */
+  /** 覆盖写入某项目记忆并落盘（与其它写路径串行）。 */
   async write(projectId: string, memory: ProjectMemory): Promise<void> {
-    this.data.projects[projectId] = { ...memory, updatedAt: new Date().toISOString() };
-    await this.persist();
+    return this.enqueueWrite(async () => {
+      this.data.projects[projectId] = { ...memory, updatedAt: new Date().toISOString() };
+      await this.persist();
+    });
   }
 
-  /** 删除某项目的全部记忆（项目删除时调用）。 */
+  /**
+   * Atomic read-modify-write for one project, serialized with other writes.
+   * Mutator receives a deep-copy style working memory (same as read()); return the next state or mutate in place and return void.
+   */
+  async update(
+    projectId: string,
+    mutator: (memory: ProjectMemory) => ProjectMemory | void,
+  ): Promise<ProjectMemory> {
+    return this.enqueueWrite(async () => {
+      const memory = this.read(projectId);
+      const result = mutator(memory);
+      const next = result === undefined ? memory : result;
+      this.data.projects[projectId] = { ...next, updatedAt: new Date().toISOString() };
+      await this.persist();
+      return this.read(projectId);
+    });
+  }
+
+  /** 删除某项目的全部记忆（项目删除时调用；与其它写路径串行）。 */
   async clearProject(projectId: string): Promise<void> {
-    if (this.data.projects[projectId] === undefined) return;
-    delete this.data.projects[projectId];
-    await this.persist();
+    return this.enqueueWrite(async () => {
+      if (this.data.projects[projectId] === undefined) return;
+      delete this.data.projects[projectId];
+      await this.persist();
+    });
   }
 }

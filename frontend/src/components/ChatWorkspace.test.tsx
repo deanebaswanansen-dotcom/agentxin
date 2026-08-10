@@ -77,6 +77,15 @@ describe('ChatWorkspace', () => {
     expect(onAdoptContent).toHaveBeenCalledWith('已有替换段落');
   });
 
+  it('lists plan mode slash command', async () => {
+    render(
+      <ChatWorkspace projectId={null} onError={vi.fn()} onAgentCompleted={vi.fn()} />,
+    );
+    const input = screen.getByLabelText('对话输入');
+    fireEvent.change(input, { target: { value: '/计' } });
+    expect(await screen.findByText(/先头脑风暴追问/)).toBeInTheDocument();
+  });
+
   it('shows the selected slash task title without leaking the icon key', async () => {
     render(<ChatWorkspace projectId="p-1" projectName="测试项目" />);
 

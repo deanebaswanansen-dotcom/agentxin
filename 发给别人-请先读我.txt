@@ -1,0 +1,48 @@
+========================================
+  小说 Agent —— 拷贝给别人怎么用
+========================================
+
+【最快用法】
+1. 把整个「agentxin」文件夹拷贝给对方（U 盘 / 网盘 / 压缩包均可）
+2. 对方解压后，双击：  start.bat
+3. 首次运行会自动：
+   - 检测有没有 Node.js
+   - 没有则自动下载便携版 Node（无需管理员，装到本项目 .agentxin\node）
+   - 自动 npm install 前后端依赖
+   - 启动服务并打开浏览器
+4. 浏览器打开： http://127.0.0.1:5173
+5. 不用了双击： stop.bat
+
+【需要什么】
+- Windows 10 / 11
+- 能上网（首次装 Node 和 npm 依赖）
+- 不强制要求对方提前装好 Node（脚本会自动处理）
+
+【建议不要拷这些（可减小体积）】
+- frontend\node_modules
+- backend\node_modules
+- .agentxin\node          （对方机器会自己下）
+- logs\
+对方首次 start.bat 会自动重新安装。
+
+若你已经装好依赖再打包，也可以带上 node_modules，对方会更快启动。
+
+【API Key】
+- 设置里填自己的模型 Key（如 DeepSeek）
+- 也可先用「演示模式」不填 Key 试用
+
+【常见问题】
+Q: 杀毒软件拦截下载 Node？
+A: 允许访问 nodejs.org，或手动安装 Node 18+ 后再双击 start.bat。
+
+Q: 端口被占用？
+A: 先双击 stop.bat，再 start.bat。仍不行就重启电脑后重试。
+
+Q: PowerShell 提示禁止运行脚本？
+A: start.bat 已使用 -ExecutionPolicy Bypass，一般不用改系统策略。
+   若仍失败，右键 start.bat → 用管理员运行一次。
+
+Q: 想完全离线给同事？
+A: 在你本机先跑通 start.bat，再把整个文件夹（含 node_modules 和 .agentxin\node）一起打包。
+
+========================================
