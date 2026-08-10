@@ -58,6 +58,7 @@
  */
 import type { FastifyInstance } from 'fastify';
 
+import { corsResponseHeaders } from '../cors.js';
 import type { BlueprintService } from '../services/blueprint/BlueprintService.js';
 import type { ChapterMerger } from '../services/blueprint/ChapterMerger.js';
 import type { ChapterWriter } from '../services/blueprint/ChapterWriter.js';
@@ -199,6 +200,7 @@ async function runSceneStream(
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     Connection: 'keep-alive',
+    ...corsResponseHeaders(),
   });
 
   // 客户端断开时取消编排（及出站提供商请求）。监听 RESPONSE 套接字的 'close'，
@@ -484,6 +486,7 @@ export function registerBlueprintRoutes(
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         Connection: 'keep-alive',
+        ...corsResponseHeaders(),
       });
 
       // 客户端断开时取消整章生成。监听 RESPONSE 套接字（reply.raw）的 'close'，

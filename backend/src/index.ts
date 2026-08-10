@@ -35,6 +35,7 @@ import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
 import { pathToFileURL } from 'node:url';
 
+import { CORS_ALLOW_ORIGIN } from './cors.js';
 import type { DataStore } from './store/DataStore.js';
 import { FileDataStore } from './store/FileDataStore.js';
 import type { ModelProxy } from './proxy/ModelProxy.js';
@@ -105,14 +106,12 @@ export function buildServer(
   // a static SPA (e.g. on Netlify) that sends the per-session model config via
   // the `x-agentxin-model-config` request header, so preflight must allow it.
   // Local dev is same-origin (Vite proxy), so these headers are harmless there.
-  // Restrict with `CORS_ORIGIN` env var (e.g. https://your-site.netlify.app);
-  // defaults to `*` for a personal tool.
-  const corsAllowOrigin = process.env.CORS_ORIGIN?.trim() || '*';
+  // Hijacked SSE routes merge corsResponseHeaders() into their own writeHead.
   app.addHook('onRequest', async (request, reply) => {
-    reply.header('Access-Control-Allow-Origin', corsAllowOrigin);
+    reply.header('Access-Control-Allow-Origin', CORS_ALLOW_ORIGIN);
     reply.header('Access-Control-Allow-Headers', 'Content-Type, Accept, x-agentxin-model-config');
     reply.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-    if (request.headers.origin && corsAllowOrigin !== '*') {
+    if (request.headers.origin && CORS_ALLOW_ORIGIN !== '*') {
       reply.header('Vary', 'Origin');
     }
     if (request.method === 'OPTIONS') {

@@ -48,6 +48,7 @@
  */
 import type { FastifyInstance } from 'fastify';
 
+import { corsResponseHeaders } from '../cors.js';
 import type { WritingService } from '../services/writing/WritingService.js';
 import { ServiceError } from '../services/ServiceError.js';
 import type { Id, WritingRequestBody } from '../types/index.js';
@@ -113,6 +114,7 @@ export function registerWritingRoutes(
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         Connection: 'keep-alive',
+        ...corsResponseHeaders(),
       });
 
       // Abort the WritingService (and the outbound provider request) when the

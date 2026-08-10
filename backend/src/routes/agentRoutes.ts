@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 
+import { corsResponseHeaders } from '../cors.js';
 import type { AgentService } from '../services/agent/AgentService.js';
 import { ServiceError } from '../services/ServiceError.js';
 import type {
@@ -219,6 +220,7 @@ export function registerAgentRoutes(app: FastifyInstance, agentService: AgentSer
       'Cache-Control': 'no-cache, no-transform',
       Connection: 'keep-alive',
       'X-Accel-Buffering': 'no',
+      ...corsResponseHeaders(),
     });
     if (typeof (raw as { flushHeaders?: () => void }).flushHeaders === 'function') {
       (raw as { flushHeaders: () => void }).flushHeaders();

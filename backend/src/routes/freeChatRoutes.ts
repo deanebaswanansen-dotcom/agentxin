@@ -12,6 +12,7 @@
  */
 import type { FastifyInstance } from 'fastify';
 
+import { corsResponseHeaders } from '../cors.js';
 import type { FreeChatService } from '../services/freeChat/FreeChatService.js';
 import { ServiceError } from '../services/ServiceError.js';
 import type { FreeChatRequestBody, Id } from '../types/index.js';
@@ -92,6 +93,7 @@ export function registerFreeChatRoutes(
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         Connection: 'keep-alive',
+        ...corsResponseHeaders(),
       });
 
       // Abort on client disconnect
