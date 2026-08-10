@@ -30,3 +30,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Playwright MCP test artifacts
+.playwright-mcp/
