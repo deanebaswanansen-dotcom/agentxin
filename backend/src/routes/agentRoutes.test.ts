@@ -53,11 +53,11 @@ describe('agent routes', () => {
       title: '灰烬王冠',
       storyPlan: {
         metadata: { genre: '西方玄幻' },
-        premise: { oneSentence: '流亡骑士寻找王冠。', coreConflict: '记忆与权力冲突。' },
+        premise: { one_sentence: '流亡骑士寻找王冠。', core_conflict: '记忆与权力冲突。' },
         protagonist: { identity: '流亡骑士', goal: '找回王冠' },
         world: { overview: '旧帝国覆灭后的大陆。' },
-        powerSystem: { rules: ['魔法消耗记忆'] },
-        mainPlot: { beginning: '接任务', development: '被追杀', climax: '争夺王冠', ending: '封印王冠' },
+        power_system: { rules: ['魔法消耗记忆'] },
+        main_plot: { beginning: '接任务', development: '被追杀', climax: '争夺王冠', ending: '封印王冠' },
       },
     });
 

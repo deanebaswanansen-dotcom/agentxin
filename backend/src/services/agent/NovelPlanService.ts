@@ -281,14 +281,44 @@ function recordText(record: Record<string, unknown> | undefined, key: string): s
   return typeof value === 'string' ? value.trim() : '';
 }
 
+function recordTextAny(
+  record: Record<string, unknown> | undefined,
+  ...keys: string[]
+): string {
+  for (const key of keys) {
+    const value = recordText(record, key);
+    if (value) return value;
+  }
+  return '';
+}
+
+function recordArrayAny(
+  record: Record<string, unknown> | undefined,
+  ...keys: string[]
+): string[] {
+  for (const key of keys) {
+    const values = stringArray(record?.[key]);
+    if (values.length > 0) return values;
+  }
+  return [];
+}
+
 export function normalizeStoryPlan(raw: unknown): NovelStoryPlan | undefined {
   if (!isRecord(raw)) return undefined;
   const metadata = isRecord(raw.metadata) ? raw.metadata : undefined;
   const premise = isRecord(raw.premise) ? raw.premise : undefined;
   const protagonist = isRecord(raw.protagonist) ? raw.protagonist : undefined;
   const world = isRecord(raw.world) ? raw.world : undefined;
-  const powerSystem = isRecord(raw.powerSystem) ? raw.powerSystem : undefined;
-  const mainPlot = isRecord(raw.mainPlot) ? raw.mainPlot : undefined;
+  const powerSystem = isRecord(raw.powerSystem)
+    ? raw.powerSystem
+    : isRecord(raw.power_system)
+      ? raw.power_system
+      : undefined;
+  const mainPlot = isRecord(raw.mainPlot)
+    ? raw.mainPlot
+    : isRecord(raw.main_plot)
+      ? raw.main_plot
+      : undefined;
   const constraints = isRecord(raw.constraints) ? raw.constraints : undefined;
   const characters = Array.isArray(raw.characters)
     ? raw.characters
@@ -312,8 +342,8 @@ export function normalizeStoryPlan(raw: unknown): NovelStoryPlan | undefined {
           number: parsePositiveInt(volume.number) ?? index + 1,
           title: recordText(volume, 'title'),
           goal: recordText(volume, 'goal'),
-          chapterStart: parsePositiveInt(volume.chapterStart) ?? 1,
-          chapterEnd: parsePositiveInt(volume.chapterEnd) ?? 1,
+          chapterStart: parsePositiveInt(volume.chapterStart ?? volume.chapter_start) ?? 1,
+          chapterEnd: parsePositiveInt(volume.chapterEnd ?? volume.chapter_end) ?? 1,
         }))
         .filter((volume) => volume.title && volume.goal)
     : [];
@@ -321,12 +351,12 @@ export function normalizeStoryPlan(raw: unknown): NovelStoryPlan | undefined {
     metadata: {
       title: recordText(metadata, 'title') || undefined,
       genre: recordText(metadata, 'genre') || undefined,
-      targetLength: parsePositiveInt(metadata?.targetLength),
+      targetLength: parsePositiveInt(metadata?.targetLength ?? metadata?.target_length),
       tone: recordText(metadata, 'tone') || undefined,
     },
     premise: {
-      oneSentence: recordText(premise, 'oneSentence'),
-      coreConflict: recordText(premise, 'coreConflict'),
+      oneSentence: recordTextAny(premise, 'oneSentence', 'one_sentence'),
+      coreConflict: recordTextAny(premise, 'coreConflict', 'core_conflict'),
       theme: recordText(premise, 'theme') || undefined,
     },
     protagonist: {
@@ -337,7 +367,7 @@ export function normalizeStoryPlan(raw: unknown): NovelStoryPlan | undefined {
       motivation: recordText(protagonist, 'motivation'),
       goal: recordText(protagonist, 'goal'),
       weakness: recordText(protagonist, 'weakness'),
-      growthArc: recordText(protagonist, 'growthArc'),
+      growthArc: recordTextAny(protagonist, 'growthArc', 'growth_arc'),
     },
     world: {
       overview: recordText(world, 'overview'),
@@ -352,7 +382,7 @@ export function normalizeStoryPlan(raw: unknown): NovelStoryPlan | undefined {
       rules: stringArray(powerSystem?.rules),
       levels: stringArray(powerSystem?.levels),
       limitations: stringArray(powerSystem?.limitations),
-      specialCases: stringArray(powerSystem?.specialCases),
+      specialCases: recordArrayAny(powerSystem, 'specialCases', 'special_cases'),
     },
     characters,
     factions: stringArray(raw.factions),
@@ -363,13 +393,13 @@ export function normalizeStoryPlan(raw: unknown): NovelStoryPlan | undefined {
       ending: recordText(mainPlot, 'ending'),
     },
     subplots: stringArray(raw.subplots),
-    characterArcs: stringArray(raw.characterArcs),
+    characterArcs: stringArray(raw.characterArcs ?? raw.character_arcs),
     volumes,
     foreshadowing: stringArray(raw.foreshadowing),
     mysteries: stringArray(raw.mysteries),
     constraints: {
-      mustInclude: stringArray(constraints?.mustInclude),
-      mustAvoid: stringArray(constraints?.mustAvoid),
+      mustInclude: recordArrayAny(constraints, 'mustInclude', 'must_include'),
+      mustAvoid: recordArrayAny(constraints, 'mustAvoid', 'must_avoid'),
     },
   };
   const hasContent = Boolean(
@@ -663,28 +693,38 @@ function ensureStructuredStoryPlan(summary: NovelPlanSummary): NovelPlanSummary 
       weakness: protagonist?.weakness || '会在主线中付出代价的内在缺陷',
       growthArc: protagonist?.growthArc || '在冲突中修正缺陷并完成成长',
     },
-    world: current?.world ?? {
-      overview: `${summary.genre ?? '小说'}类型世界，由 Agent 按类型约定自动补全。`,
-      regions: [],
-      countries: [],
-      races: [],
-      religions: [],
-      factions: [],
-      history: [],
+    world: {
+      overview:
+        current?.world.overview ||
+        `${summary.genre ?? '小说'}类型世界，由 Agent 按类型约定自动补全。`,
+      regions: current?.world.regions ?? [],
+      countries: current?.world.countries ?? [],
+      races: current?.world.races ?? [],
+      religions: current?.world.religions ?? [],
+      factions: current?.world.factions ?? [],
+      history: current?.world.history ?? [],
     },
-    powerSystem: current?.powerSystem ?? {
-      rules: [],
-      levels: [],
-      limitations: [],
-      specialCases: [],
+    powerSystem: {
+      rules:
+        current?.powerSystem.rules.length
+          ? current.powerSystem.rules
+          : ['力量的获得、使用、代价和上限必须在全书保持一致'],
+      levels: current?.powerSystem.levels ?? [],
+      limitations: current?.powerSystem.limitations ?? [],
+      specialCases: current?.powerSystem.specialCases ?? [],
     },
     characters: current?.characters ?? [],
     factions: current?.factions ?? [],
-    mainPlot: current?.mainPlot ?? {
-      beginning: summary.chapterOutlines?.[0]?.goal ?? summary.hook ?? '建立主角与导火索',
-      development: '冲突升级，主角获得线索并承担更高代价',
-      climax: '核心矛盾正面爆发，主角作出不可逆选择',
-      ending: '兑现核心钩子并完成本阶段人物弧光',
+    mainPlot: {
+      beginning:
+        current?.mainPlot.beginning ||
+        summary.chapterOutlines?.[0]?.goal ||
+        summary.hook ||
+        '建立主角与导火索',
+      development:
+        current?.mainPlot.development || '冲突升级，主角获得线索并承担更高代价',
+      climax: current?.mainPlot.climax || '核心矛盾正面爆发，主角作出不可逆选择',
+      ending: current?.mainPlot.ending || '兑现核心钩子并完成本阶段人物弧光',
     },
     subplots: current?.subplots ?? [],
     characterArcs: current?.characterArcs ?? [],
