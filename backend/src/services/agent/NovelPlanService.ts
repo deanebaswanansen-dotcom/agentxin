@@ -748,13 +748,14 @@ function isCompleteStoryPlan(plan: NovelStoryPlan | undefined): boolean {
       plan.premise.coreConflict.length >= 8 &&
       plan.protagonist.identity.length >= 2 &&
       plan.protagonist.goal.length >= 4 &&
-      plan.world.overview.length >= 40 &&
-      plan.powerSystem.rules.length >= 2 &&
-      plan.characters.length >= 2 &&
+      plan.world.overview.length >= 80 &&
+      plan.powerSystem.rules.length >= 3 &&
+      plan.characters.length >= 4 &&
       plan.mainPlot.beginning.length >= 4 &&
       plan.mainPlot.development.length >= 4 &&
       plan.mainPlot.climax.length >= 4 &&
-      plan.mainPlot.ending.length >= 4,
+      plan.mainPlot.ending.length >= 4 &&
+      plan.foreshadowing.length >= 3,
   );
 }
 
@@ -892,8 +893,8 @@ export class NovelPlanService {
       '只有 impactScore >= 7 且同时满足“无法合理推断、显著改变主线、后期修改成本高”的问题才允许询问。',
       '国家/城市/人物姓名、货币、等级名称、普通配角、普通反派、支线和世界细节由你直接创造，禁止询问。',
       'ready 时 questions 必须为空，并返回完整 brief 与 planSummary。',
-      'planSummary JSON 字段：title, genre, protagonist, hook, tone, constraints, totalWords, wordsPerChapter, chapterCount, chapterOutlines, storyPlan。',
-      'storyPlan 必须完整包含 metadata、premise、protagonist、world、powerSystem、characters、factions、mainPlot、subplots、characterArcs、volumes、foreshadowing、mysteries、constraints；字段使用 camelCase。',
+      'planSummary JSON 字段：title, genre, protagonist, hook, tone, constraints, totalWords, wordsPerChapter, chapterCount, chapterOutlines。',
+      '本模块只做是否追问与方向收束，不生成 storyPlan；完整 Story Plan 由后续专用 Agent 一次生成。',
       'chapterOutlines 每项字段：number, title, goal, estimatedWords；goal 必须含行动、冲突/变化、章末推进。',
       `下游目标：${TARGET_LABELS[target]}。`,
       forceReady
@@ -943,6 +944,7 @@ export class NovelPlanService {
             '自动创造国家、城市、历史、种族、宗教、派系、力量体系、配角、反派、支线、伏笔和谜团。',
             'storyPlan 使用 camelCase，必须完整包含 metadata、premise、protagonist、world、powerSystem、characters、factions、mainPlot、subplots、characterArcs、volumes、foreshadowing、mysteries、constraints。',
             '质量下限：world.overview 至少 80 字；powerSystem.rules 至少 3 条；characters 至少 4 人；mainPlot 四段完整；foreshadowing 至少 3 条。',
+            '控制篇幅：整个 JSON 不超过 3500 个汉字；世界概述 80-160 字；人物 4-6 人；每个数组 3-6 项；每项只保留可执行信息。',
             '所有内容必须服从用户明确题材、人物方向、风格、禁忌与规模，不得套用其他题材模板。',
           ].join('\n'),
         },
@@ -956,9 +958,20 @@ export class NovelPlanService {
         },
       ],
       signal,
+      6000,
     );
     if (!isRecord(data)) throw new ProxyError('Story Plan Agent 未返回有效 JSON。');
-    const storyPlan = normalizeStoryPlan(data.storyPlan);
+    const nestedSummary = isRecord(data.planSummary)
+      ? data.planSummary
+      : isRecord(data.plan_summary)
+        ? data.plan_summary
+        : undefined;
+    const storyPlan = normalizeStoryPlan(
+      data.storyPlan ??
+        data.story_plan ??
+        nestedSummary?.storyPlan ??
+        nestedSummary?.story_plan,
+    );
     if (!isCompleteStoryPlan(storyPlan)) {
       throw new ProxyError('Story Plan Agent 返回的信息不完整，请重试。');
     }
@@ -1078,10 +1091,11 @@ export class NovelPlanService {
     config: ModelConfig,
     messages: ChatMessage[],
     signal: AbortSignal,
+    maxTokens?: number,
   ): Promise<unknown> {
     let firstRaw = '';
     try {
-      firstRaw = await this.collectText(config, messages, signal, true);
+      firstRaw = await this.collectText(config, messages, signal, true, maxTokens);
       return extractJsonObject(firstRaw);
     } catch (firstError) {
       if (signal.aborted) throw firstError;
@@ -1097,7 +1111,9 @@ export class NovelPlanService {
         },
       ];
       try {
-        return extractJsonObject(await this.collectText(config, repairMessages, signal, true));
+        return extractJsonObject(
+          await this.collectText(config, repairMessages, signal, true, maxTokens),
+        );
       } catch (repairError) {
         if (repairError instanceof ProxyError) throw repairError;
         throw new ProxyError('模型连续两次未返回有效 JSON，请重试。', { cause: repairError });
@@ -1110,11 +1126,13 @@ export class NovelPlanService {
     messages: ChatMessage[],
     signal: AbortSignal,
     jsonMode: boolean,
+    maxTokens?: number,
   ): Promise<string> {
     const chunks: string[] = [];
     for await (const delta of this.modelProxy.streamCompletion(config, messages, signal, {
       jsonMode,
       disableThinking: jsonMode,
+      maxTokens,
     })) {
       if (delta.kind === 'content') chunks.push(delta.text);
     }

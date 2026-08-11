@@ -78,17 +78,21 @@ function readyDecision(overrides: Record<string, unknown> = {}): string {
           goal: '封印诅咒王冠', weakness: '拒绝信任同伴', growthArc: '从独行复仇者成长为共同命运的守护者',
         },
         world: {
-          overview: '旧帝国覆灭后，教会、边境诸侯与遗迹猎人争夺失落王权，魔法以人的记忆作为不可逆代价。',
+          overview: '旧帝国覆灭后，教会、边境诸侯与遗迹猎人争夺失落王权，魔法以人的记忆作为不可逆代价。北境矿城供给封印材料，南方港邦垄断遗迹航路，教会则借清剿诅咒扩张审判权；王冠重现使三方脆弱盟约崩解，也迫使流亡者重新面对故国历史。',
           regions: [], countries: [], races: [], religions: [], factions: [], history: [],
         },
-        powerSystem: { rules: ['施法消耗记忆', '王冠放大代价'], levels: [], limitations: [], specialCases: [] },
+        powerSystem: { rules: ['施法消耗记忆', '王冠放大代价', '遗忘的记忆无法恢复'], levels: [], limitations: [], specialCases: [] },
         characters: [
           { name: '艾琳', role: '主角', traits: ['克制'] },
           { name: '罗兰', role: '对手', traits: ['虔诚'] },
+          { name: '米拉', role: '盟友', traits: ['敏锐'] },
+          { name: '格雷', role: '导师', traits: ['隐忍'] },
         ],
         factions: [],
         mainPlot: { beginning: '接下遗迹任务', development: '被教会追杀', climax: '争夺王冠', ending: '封印王冠' },
-        subplots: [], characterArcs: [], volumes: [], foreshadowing: [], mysteries: [],
+        subplots: [], characterArcs: [], volumes: [],
+        foreshadowing: ['王冠内侧刻着主角的旧名', '教堂壁画缺少一位圣徒', '导师认得王冠的封印'],
+        mysteries: [],
         constraints: { mustInclude: [], mustAvoid: [] },
       },
       ...overrides,
@@ -318,7 +322,23 @@ describe('NovelPlanService goal-driven agent', () => {
 
     expect(proxy.calls).toHaveLength(2);
     expect(proxy.calls[1][0].content).toContain('Story Plan 架构 Agent');
-    expect(result.planSummary?.storyPlan?.world.overview.length).toBeGreaterThanOrEqual(40);
+    expect(result.planSummary?.storyPlan?.world.overview.length).toBeGreaterThanOrEqual(80);
+  });
+
+  it('accepts snake_case Story Plan envelopes from model providers', async () => {
+    const storyPlan = JSON.parse(readyDecision()).planSummary.storyPlan;
+    const proxy = new QueueProxy([
+      readyDecision({ storyPlan: undefined }),
+      JSON.stringify({ story_plan: storyPlan }),
+    ]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      { seedPrompt: '西方玄幻，两章，每章1200字，流浪骑士，冒险成长，直接开始' },
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe('ready');
+    expect(result.planSummary?.storyPlan?.characters.length).toBeGreaterThanOrEqual(4);
   });
 
   it('repairs malformed JSON once and fails clearly after two invalid responses', async () => {
