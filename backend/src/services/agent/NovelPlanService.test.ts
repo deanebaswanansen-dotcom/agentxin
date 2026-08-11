@@ -144,6 +144,27 @@ describe('NovelPlanService goal-driven agent', () => {
     expect(result.planSummary).toBeUndefined();
   });
 
+  it('falls back to confirmable questions when the model returns an invalid asking shape', async () => {
+    const service = new NovelPlanService(
+      mockConfigService(),
+      new QueueProxy([
+        JSON.stringify({
+          status: 'asking',
+          message: '需要确认方向。',
+          questions: [{ id: 'direction', question: '想写什么方向？', options: [] }],
+        }),
+      ]),
+    );
+    const result = await service.turn(
+      { seedPrompt: '写本西方玄幻小说' },
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe('asking');
+    expect(result.questions).toHaveLength(2);
+    expect(result.questions?.[0]?.options[0]?.label).toContain('西方玄幻');
+  });
+
   it('keeps explicit western fantasy even when the model drifts to campus fiction', async () => {
     const proxy = new QueueProxy([
       readyDecision({

@@ -419,9 +419,15 @@ export function hasExplicitPlanningBypass(text: string): boolean {
   );
 }
 
-function consultationQuestionsFromDraft(decision: AgentDecision): NovelPlanQuestion[] {
+function consultationQuestionsFromDraft(
+  decision: AgentDecision,
+  seed: string,
+): NovelPlanQuestion[] {
   const summary = decision.planSummary;
-  const direction = summary?.hook ?? '由 Agent 根据题材设计核心冲突';
+  const genre = inferExplicitGenre(seed);
+  const direction =
+    summary?.hook ??
+    (genre ? `围绕${genre}题材，由 Agent 设计核心冲突` : '由 Agent 根据题材设计核心冲突');
   const protagonist = summary?.protagonist ?? '由 Agent 设计主角身份、目标与弱点';
   return [
     {
@@ -480,13 +486,14 @@ export class NovelPlanService {
     );
 
     if (consultationRequired) {
-      const questions =
+      const modelQuestions =
         decision.status === 'asking'
           ? decision.questions.filter((question) => !alreadyAsked(question, history))
-          : consultationQuestionsFromDraft(decision);
-      if (questions.length === 0) {
-        throw new ProxyError('计划 Agent 首轮没有返回可确认的问题，请重试。');
-      }
+          : [];
+      const questions =
+        modelQuestions.length > 0
+          ? modelQuestions
+          : consultationQuestionsFromDraft(decision, seed);
       return {
         status: 'asking',
         round,
