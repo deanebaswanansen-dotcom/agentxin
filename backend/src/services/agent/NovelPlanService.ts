@@ -716,6 +716,10 @@ const SCRIPT_BANK: ScriptRound[] = [
   },
 ];
 
+const SCRIPTED_QUESTION_ID_BY_TEXT = new Map(
+  SCRIPT_BANK.flatMap((round) => round.questions.map((question) => [question.question, question.id] as const)),
+);
+
 /** light：5 轮（每轮 2～3 题） */
 const LIGHT_INDICES = [0, 1, 2, 4, 3];
 /** standard：10 轮 */
@@ -749,6 +753,14 @@ function collectAskedQuestionIds(
     for (const m of idLines) asked.add(m[1]);
     const plainIds = h.content.matchAll(/\b(genre_lane|core_hook|protag_desire|protag_flaw|tone_pace|world_feel|world_rule|villain_type|romance_need|total_words|words_per_chapter|chapter_count|taboo_list|narration_pov|ending_type|selling_point|cast_density|power_strict|arc_shape|audience|prose_style|mystery_density|agent_autonomy|must_include|protag_job|protag_method|emotion_core|conflict_fuel|info_asymmetry|tone_secondary|first_climax_when|twist_style|side_quest|mentor|ally|betrayal|violence_level|humor_level|desc_density|theme_core|moral_gray|hope_level|cliffhanger|recap|title_style|must_have_scene|avoid_trope|ready_confirm)\b/g);
     for (const m of plainIds) asked.add(m[1]);
+    for (const line of h.content.split('\n')) {
+      const arrowIndex = line.indexOf('→');
+      if (arrowIndex < 0) continue;
+      const left = line.slice(0, arrowIndex).trim();
+      const questionText = left.includes('|') ? left.slice(left.lastIndexOf('|') + 1).trim() : left;
+      const questionId = SCRIPTED_QUESTION_ID_BY_TEXT.get(questionText);
+      if (questionId) asked.add(questionId);
+    }
   }
   return asked;
 }
@@ -952,11 +964,12 @@ export function extractScaleFromText(text: string): {
   if (totalCn) out.totalWords = Math.round(Number(totalCn[1]) * 10000);
   const totalPlain = text.match(/(?:总字数|全书|一共)[^\d]{0,6}(\d{4,7})\s*字?/);
   if (totalPlain && !out.totalWords) out.totalWords = Number(totalPlain[1]);
-  const perCn = text.match(/(?:每章|单章)[^\d]{0,6}(\d{3,5})\s*字?/);
+  const perCn = text.match(/(?:每(?:一)?章|单章)[^\d\n]{0,20}(\d{3,5})\s*字?/);
   if (perCn) out.wordsPerChapter = Number(perCn[1]);
 
   // Explicit chapter-count phrases only (avoid 第N章 / 前N章 / bare N章 from goals).
   const chapterPatterns: RegExp[] = [
+    /先规划写多少章[^\d\n]{0,20}(\d{1,3})\s*章?/,
     // 总章数 30 / 计划章节数：30 / 章节数 30 / 章数约 10
     /(?:总章数|计划章节数|章节数|章数)[^\d第前]{0,8}(\d{1,3})/,
     // 计划写30章 / 先规划30章 / 先规划写30章 / 一共30章 / 共30章 / 约30章

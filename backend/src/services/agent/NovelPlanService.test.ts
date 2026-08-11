@@ -172,6 +172,57 @@ describe('NovelPlanService depth modes', () => {
     expect(reachedReady).toBe(true);
   });
 
+  it('does not repeat questions when an already-open browser uses the legacy history format', async () => {
+    const service = new NovelPlanService(mockConfigService(undefined), mockProxy(''));
+    const signal = new AbortController().signal;
+    const seedPrompt = '写一本民俗悬疑小说';
+    const depthTurn = await service.turn({ seedPrompt, targetTask: 'long_novel' }, signal);
+    let history = [
+      { role: 'user' as const, content: `灵感：${seedPrompt}` },
+      { role: 'assistant' as const, content: depthTurn.message },
+    ];
+    let previousQuestions = depthTurn.questions ?? [];
+    let answers = [{ questionId: 'plan_depth', selectedOptionIds: ['standard'] }];
+    const seen = new Set<string>();
+    let reachedReady = false;
+
+    for (let turn = 0; turn < 10; turn += 1) {
+      const response = await service.turn(
+        { seedPrompt, targetTask: 'long_novel', depth: 'standard', history, answers },
+        signal,
+      );
+      const questions = response.questions ?? [];
+      for (const question of questions) {
+        expect(seen.has(question.id), `旧页面重复问题：${question.id}`).toBe(false);
+        seen.add(question.id);
+      }
+      if (response.status === 'ready') {
+        reachedReady = true;
+        break;
+      }
+
+      const userLine = answers
+        .map((answer) => {
+          const question = previousQuestions.find((item) => item.id === answer.questionId);
+          const optionId = answer.selectedOptionIds[0] ?? '';
+          const label = question?.options.find((item) => item.id === optionId)?.label ?? optionId;
+          return `${question?.question ?? answer.questionId} → ${label}`;
+        })
+        .join('\n');
+      history = [
+        ...history,
+        { role: 'user', content: userLine },
+        { role: 'assistant', content: response.message },
+      ];
+      previousQuestions = questions;
+      answers = questions.map((question) => ({
+        questionId: question.id,
+        selectedOptionIds: [question.options[0]?.id ?? ''],
+      }));
+    }
+    expect(reachedReady).toBe(true);
+  });
+
   it('standard depth reports 8-10 range', async () => {
     const service = new NovelPlanService(mockConfigService(undefined), mockProxy(''));
     const result = await service.turn(
@@ -241,6 +292,20 @@ describe('NovelPlanService depth modes', () => {
 });
 
 describe('extractScaleFromText chapter count', () => {
+  it('restores scale from legacy browser labels', () => {
+    expect(
+      collectScaleFromSession([
+        {
+          role: 'user',
+          content:
+            '全书目标总字数大约多少？ → 约 10 万字\n' +
+            '每一章目标字数？ → 约 2000 字\n' +
+            '先规划写多少章？ → 10 章',
+        },
+      ]),
+    ).toEqual({ totalWords: 100000, wordsPerChapter: 2000, chapterCount: 10 });
+  });
+
   it('restores scale option ids from browser-formatted history', () => {
     expect(
       collectScaleFromSession([
