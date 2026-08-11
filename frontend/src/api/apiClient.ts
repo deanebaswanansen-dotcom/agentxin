@@ -77,6 +77,29 @@ const DEFAULT_BASE_URL = (env?.VITE_API_BASE_URL ?? '/api').replace(/\/$/, '');
 
 /** Browser-local persistence so API Key survives refresh (local-dev tool UX). */
 const MODEL_CONFIG_STORAGE_KEY = 'nwa.modelConfig.v1';
+const CLIENT_ID_STORAGE_KEY = 'nwa.clientId.v1';
+const CLIENT_ID_PATTERN = /^[a-f0-9]{64}$/;
+
+function createClientId(): string {
+  const bytes = new Uint8Array(32);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
+}
+
+function loadOrCreateClientId(): string {
+  const generated = createClientId();
+  if (typeof window === 'undefined') return generated;
+  try {
+    const existing = window.localStorage.getItem(CLIENT_ID_STORAGE_KEY);
+    if (existing !== null && CLIENT_ID_PATTERN.test(existing)) return existing;
+    window.localStorage.setItem(CLIENT_ID_STORAGE_KEY, generated);
+  } catch {
+    // Storage may be blocked; keep one in-memory id for this page lifetime.
+  }
+  return generated;
+}
+
+const clientId = loadOrCreateClientId();
 
 function isModelConfig(value: unknown): value is ModelConfig {
   if (typeof value !== 'object' || value === null) return false;
@@ -149,26 +172,11 @@ function maskApiKey(apiKey: string): string {
 }
 
 function modelConfigHeader(): Record<string, string> {
-  if (volatileModelConfig === null) return {};
-  return {
-    'X-Agentxin-Model-Config': encodeURIComponent(JSON.stringify(volatileModelConfig)),
-  };
-}
-
-/** Best-effort mirror to backend store (masked GET only; raw key stays local + request header). */
-async function mirrorModelConfigToBackend(baseUrl: string, config: ModelConfig): Promise<void> {
-  try {
-    await fetch(`${baseUrl}/model-config`, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        ...modelConfigHeader(),
-      },
-      body: JSON.stringify(config),
-    });
-  } catch {
-    // Backend mirror is optional; local persistence is the primary UX fix.
+  const headers: Record<string, string> = { 'X-Agentxin-Client-Id': clientId };
+  if (volatileModelConfig !== null) {
+    headers['X-Agentxin-Model-Config'] = encodeURIComponent(JSON.stringify(volatileModelConfig));
   }
+  return headers;
 }
 
 // ---------------------------------------------------------------------------
@@ -938,8 +946,6 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
       save: async (config, _signal) => {
         volatileModelConfig = { ...config };
         persistModelConfig(volatileModelConfig);
-        // Fire-and-forget server mirror so restarts / other clients can still use store fallback.
-        void mirrorModelConfigToBackend(b, volatileModelConfig);
         return toModelConfigView(volatileModelConfig);
       },
       clear: () => {

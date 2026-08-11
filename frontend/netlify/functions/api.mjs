@@ -3,8 +3,12 @@ import { join } from 'node:path';
 
 import { buildServer } from '../../../backend/dist/index.js';
 import { MemoryService } from '../../../backend/dist/services/memory/MemoryService.js';
-import { MemoryStore } from '../../../backend/dist/services/memory/MemoryStore.js';
-import { FileDataStore } from '../../../backend/dist/store/FileDataStore.js';
+import { createClientScopedDataStore } from '../../../backend/dist/store/ClientScopedDataStore.js';
+import {
+  createClientScopedLongNovelConfigStore,
+  createClientScopedMemoryStore,
+  createClientScopedReferenceStore,
+} from '../../../backend/dist/store/ClientScopedAuxiliaryStores.js';
 
 // Netlify Functions: returning a `Response` whose body is a ReadableStream marks
 // this as a *streaming* function — 60s execution limit (vs 10s for buffered
@@ -41,11 +45,20 @@ function hydrateBackendEnv() {
 async function getApp() {
   appPromise ??= (async () => {
     hydrateBackendEnv();
-    const dataFile = readEnv('DATA_FILE', join(tmpdir(), 'agentxin-store.json'));
-    const memoryFile = readEnv('AGENT_MEMORY_FILE', join(tmpdir(), 'agentxin-memory.json'));
-    const store = await FileDataStore.create(dataFile);
-    const memoryStore = await MemoryStore.create(memoryFile);
-    return buildServer(store, undefined, new MemoryService(memoryStore));
+    const clientDataDir = readEnv('CLIENT_DATA_DIR', join(tmpdir(), 'agentxin-clients'));
+    const store = createClientScopedDataStore(join(clientDataDir, 'projects'));
+    const memoryStore = await createClientScopedMemoryStore(join(clientDataDir, 'memory'));
+    const referenceStore = await createClientScopedReferenceStore(join(clientDataDir, 'references'));
+    const longNovelStore = await createClientScopedLongNovelConfigStore(
+      join(clientDataDir, 'long-novel'),
+    );
+    return buildServer(
+      store,
+      undefined,
+      new MemoryService(memoryStore),
+      referenceStore,
+      longNovelStore,
+    );
   })();
   return appPromise;
 }

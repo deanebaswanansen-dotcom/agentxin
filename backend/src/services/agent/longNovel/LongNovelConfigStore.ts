@@ -15,7 +15,12 @@ interface FileShape {
 
 export const DEFAULT_LONG_NOVEL_CONFIG_FILE = 'data/long-novel-configs.json';
 
-export class LongNovelConfigStore {
+export interface LongNovelConfigStorePort {
+  get(projectId: Id): LongNovelModeConfig;
+  save(projectId: Id, config: LongNovelModeConfig): Promise<LongNovelModeConfig>;
+}
+
+export class LongNovelConfigStore implements LongNovelConfigStorePort {
   private readonly filePath: string;
   private readonly persistent: boolean;
   private data: FileShape = { version: 1, byProject: {} };

@@ -42,8 +42,11 @@ import {
   computeChapterMetrics,
 } from './styleMetrics.js';
 import { checkSimilarityAgainstReference } from './similarityCheck.js';
-import type { ProjectReferenceConfig, StoredReferenceNovel } from './ReferenceStore.js';
-import { ReferenceStore } from './ReferenceStore.js';
+import type {
+  ProjectReferenceConfig,
+  ReferenceStorePort,
+  StoredReferenceNovel,
+} from './ReferenceStore.js';
 
 /** 整本导入：约 150 万字量级上限（浏览器粘贴/上传）。 */
 const MAX_IMPORT_CHARS = 1_500_000;
@@ -73,7 +76,7 @@ const DIMENSION_LABELS: Record<ReferenceTransferDimension, string> = {
 
 export class ReferenceAnalysisService {
   constructor(
-    private readonly refStore: ReferenceStore,
+    private readonly refStore: ReferenceStorePort,
     private readonly dataStore: DataStore,
     private readonly modelConfigService: ModelConfigService,
     private readonly modelProxy: ModelProxy,

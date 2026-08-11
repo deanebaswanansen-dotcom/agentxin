@@ -54,6 +54,7 @@ npm test
 ## 线上部署（常驻后端，推荐）
 
 > 场景：想把工作台挂到公网供多人使用。前端（Netlify 静态站）+ 后端（常驻 Node 服务）。
+> 每个浏览器首次打开时会生成 256 位随机库标识；项目、记忆和参考库按该标识隔离，API Key 只保存在该浏览器并随请求发送，不再保存到共享后端配置。
 > 不推荐把后端塞进 Netlify Function —— 它有 ~60s 执行上限，长文/整章生成会超时（HTTP 502）。
 
 1. **部署后端**（选一个免费常驻平台，如 Render / Railway）
@@ -64,12 +65,10 @@ npm test
      | 变量 | 说明 |
      |---|---|
      | `PORT` | 平台自动注入，无需手填 |
-     | `DATA_FILE` | 数据文件路径，默认临时目录；配持久磁盘时填 `/data/agentxin-store.json` |
-     | `AGENT_MEMORY_FILE` | Agent 记忆文件，同上 |
-     | `REFERENCE_FILE` | 参考库文件，同上 |
-     | `LONG_NOVEL_CONFIG_FILE` | 长篇配置文件，同上 |
+     | `CLIENT_DATA_DIR` | 每台电脑独立库的根目录；蓝本默认 `data/clients` |
+     | `REQUIRE_CLIENT_ID` | 公网部署必须为 `1`，拒绝没有浏览器库标识的请求 |
      | `CORS_ORIGIN` | 前端站点地址，如 `https://xxx.netlify.app`；不填则允许所有来源（个人工具够用） |
-   - ⚠️ 免费档文件系统不持久：重启/重新部署会丢数据。要持久化请挂持久磁盘（Railway Volume / Render Persistent Disk），并把上述文件路径指向磁盘挂载点。
+   - ⚠️ Render 免费档空闲 15 分钟会休眠且文件系统不持久；正式使用必须挂持久磁盘，并把 `CLIENT_DATA_DIR` 设为磁盘目录，例如 `/var/data/agentxin-clients`。
 2. **前端指向后端**
    - Netlify 构建环境变量里加：`VITE_API_BASE_URL=https://<后端域名>/api`，然后重新部署前端。
    - 本地 `npm run dev` 不设此变量，仍走 Vite 代理到 `127.0.0.1:3000`，互不影响。

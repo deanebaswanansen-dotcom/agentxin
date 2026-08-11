@@ -25,7 +25,7 @@ import type {
   ProjectMemory,
   WorkflowEvent,
 } from './MemoryStore.js';
-import { MemoryStore } from './MemoryStore.js';
+import type { MemoryStorePort } from './MemoryStore.js';
 
 export interface BuildContextOptions {
   /** 最多回灌的近端章节摘要条数（默认 6）。 */
@@ -125,7 +125,7 @@ function similarity(a: string, b: string): number {
 const MERGE_THRESHOLD = 0.82;
 
 export class MemoryService {
-  constructor(private readonly store: MemoryStore) {}
+  constructor(private readonly store: MemoryStorePort) {}
 
   /** 读取某项目记忆快照（深拷贝）。 */
   get(projectId: string): ProjectMemory {

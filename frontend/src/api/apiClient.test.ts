@@ -148,6 +148,9 @@ describe('apiClient request building', () => {
     expect(init?.method).toBe('POST');
     expect(JSON.parse(String(init?.body))).toEqual({ name: '我的小说' });
     expect((init?.headers as Record<string, string>)['Content-Type']).toBe('application/json');
+    expect((init?.headers as Record<string, string>)['X-Agentxin-Client-Id']).toMatch(
+      /^[a-f0-9]{64}$/,
+    );
   });
 
   it('encodes id path segments', async () => {

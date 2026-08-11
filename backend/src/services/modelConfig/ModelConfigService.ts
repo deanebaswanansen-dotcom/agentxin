@@ -34,7 +34,10 @@ export const DEFAULT_TEMPERATURE = 1;
 export const DEFAULT_TOP_P = 1;
 
 export class ModelConfigService {
-  constructor(private readonly store: DataStore) {}
+  constructor(
+    private readonly store: DataStore,
+    private readonly options: { allowStoredConfig?: boolean } = { allowStoredConfig: true },
+  ) {}
 
   /**
    * Save (create or update) the model configuration (Requirements 4.1, 4.3).
@@ -92,9 +95,8 @@ export class ModelConfigService {
 
   /**
    * Return the FULL model configuration (including the raw API key) for the
-   * current request. Prefers the request-scoped browser header; if the client
-   * did not send a key this turn, fall back to the server-persisted config so
-   * a page refresh does not force re-entry when the key was saved earlier.
+   * current request. The key must come from the request-scoped browser header;
+   * public deployments must never fall back to another browser's saved key.
    *
    * SECURITY: the result contains the plaintext API key and MUST NOT be
    * serialized to any frontend-facing response. Use {@link getView} for that.
@@ -106,7 +108,7 @@ export class ModelConfigService {
         return fromRequest;
       }
     }
-    return this.store.getModelConfig();
+    return this.options.allowStoredConfig === true ? this.store.getModelConfig() : undefined;
   }
 }
 
