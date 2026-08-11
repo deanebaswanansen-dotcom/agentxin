@@ -51,32 +51,15 @@ npm run typecheck
 npm test
 ```
 
-## 线上部署（常驻后端，推荐）
+## 线上部署（Netlify）
 
-> 场景：想把工作台挂到公网供多人使用。前端（Netlify 静态站）+ 后端（常驻 Node 服务）。
-> 每个浏览器首次打开时会生成 256 位随机库标识；项目、记忆和参考库按该标识隔离，API Key 只保存在该浏览器并随请求发送，不再保存到共享后端配置。
-> 不推荐把后端塞进 Netlify Function —— 它有 ~60s 执行上限，长文/整章生成会超时（HTTP 502）。
+> 前端、API 和长任务可部署在同一个 Netlify 站点。每个浏览器首次打开时生成 256 位随机库标识；项目、记忆和参考库按该标识写入同一个 Netlify Blobs 站点存储。API Key 只保存在浏览器，并仅随模型任务请求进入函数内存，不写入 Blobs。
 
-1. **部署后端**（选一个免费常驻平台，如 Render / Railway）
-   - **Render 最快**：仓库根有 [`render.yaml`](render.yaml) 蓝本，Render 面板 「New + → Blueprint」连接本仓库即可自动生成配置。
-   - 或直接连接本仓库，仓库根 `Procfile` 已配置启动命令 `cd backend && node dist/index.js`。
-   - 构建命令：`npm --prefix backend install && npm --prefix backend run build`
-   - 环境变量：
-     | 变量 | 说明 |
-     |---|---|
-     | `PORT` | 平台自动注入，无需手填 |
-     | `CLIENT_DATA_DIR` | 每台电脑独立库的根目录；蓝本默认 `data/clients` |
-     | `REQUIRE_CLIENT_ID` | 公网部署必须为 `1`，拒绝没有浏览器库标识的请求 |
-     | `CORS_ORIGIN` | 前端站点地址，如 `https://xxx.netlify.app`；不填则允许所有来源（个人工具够用） |
-   - ⚠️ Render 免费档空闲 15 分钟会休眠且文件系统不持久；正式使用必须挂持久磁盘，并把 `CLIENT_DATA_DIR` 设为磁盘目录，例如 `/var/data/agentxin-clients`。
-2. **前端指向后端**
-   - Netlify 构建环境变量里加：`VITE_API_BASE_URL=https://<后端域名>/api`，然后重新部署前端。
-   - 本地 `npm run dev` 不设此变量，仍走 Vite 代理到 `127.0.0.1:3000`，互不影响。
-3. 打开前端站点，设置页填 API Key 即可使用。生成过程无超时限制。
+1. 在 Netlify 连接本仓库并部署；`netlify.toml` 已包含构建命令和 `VITE_AGENT_BACKGROUND_JOBS=true`。
+2. 普通 API 走同步函数；多步 Agent 任务自动进入后台函数，最长执行 15 分钟，前端每 750 毫秒轮询一次进度。
+3. 打开站点，在设置页选择当前模型并填写自己的 API Key。DeepSeek 官方当前可选 `deepseek-v4-flash` 或 `deepseek-v4-pro`。
 
-> 排查：若报「Agent 流未返回最终结果」，说明前端仍在走 Netlify Function（60s 上限）。
-> 打开浏览器 DevTools → Network，看 `run-stream` 请求地址——若含 `/.netlify/functions/api`，
-> 就是还没指向常驻后端，请补步骤 2 的 `VITE_API_BASE_URL` 并重新部署前端。
+可选常驻后端：仓库根的 [`render.yaml`](render.yaml) 可部署 Render 服务；此模式需把 Netlify 环境变量设为 `VITE_API_BASE_URL=https://<后端域名>/api` 和 `VITE_AGENT_BACKGROUND_JOBS=false`，正式使用时为 `CLIENT_DATA_DIR` 挂载持久磁盘。
 
 ## 模型
 

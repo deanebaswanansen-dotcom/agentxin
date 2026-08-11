@@ -74,6 +74,7 @@ import { ReasoningArtifactFilter } from '../lib/reasoningSanitizer.js';
  */
 const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
 const DEFAULT_BASE_URL = (env?.VITE_API_BASE_URL ?? '/api').replace(/\/$/, '');
+const USE_BACKGROUND_AGENT_JOBS = env?.VITE_AGENT_BACKGROUND_JOBS === 'true';
 
 /** Browser-local persistence so API Key survives refresh (local-dev tool UX). */
 const MODEL_CONFIG_STORAGE_KEY = 'nwa.modelConfig.v1';
@@ -171,8 +172,12 @@ function maskApiKey(apiKey: string): string {
   return `****${reveal}`;
 }
 
+function clientIdentityHeader(): Record<string, string> {
+  return { 'X-Agentxin-Client-Id': clientId };
+}
+
 function modelConfigHeader(): Record<string, string> {
-  const headers: Record<string, string> = { 'X-Agentxin-Client-Id': clientId };
+  const headers = clientIdentityHeader();
   if (volatileModelConfig !== null) {
     headers['X-Agentxin-Model-Config'] = encodeURIComponent(JSON.stringify(volatileModelConfig));
   }
@@ -271,6 +276,7 @@ async function readBody(res: Response): Promise<unknown> {
 
 interface RequestOptions {
   signal?: AbortSignal;
+  includeModelConfig?: boolean;
 }
 
 /**
@@ -287,11 +293,14 @@ async function request<T>(
   options?: RequestOptions,
 ): Promise<T> {
   const init: RequestInit = { method, signal: options?.signal };
+  const requestHeaders = options?.includeModelConfig === true
+    ? modelConfigHeader()
+    : clientIdentityHeader();
   if (body !== undefined) {
-    init.headers = { 'Content-Type': 'application/json', ...modelConfigHeader() };
+    init.headers = { 'Content-Type': 'application/json', ...requestHeaders };
     init.body = JSON.stringify(body);
   } else {
-    init.headers = modelConfigHeader();
+    init.headers = requestHeaders;
   }
 
   const res = await fetch(`${baseUrl}${path}`, init);
@@ -576,6 +585,102 @@ export interface AgentRunStreamOptions {
   onProgress?: (event: AgentProgressEvent) => void;
 }
 
+interface AgentJobSnapshot {
+  state: 'running' | 'completed' | 'failed';
+  events?: AgentProgressEvent[];
+  result?: AgentRunResult;
+  error?: unknown;
+}
+
+function waitForPoll(delayMs: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted === true) {
+    return Promise.reject(new DOMException('The operation was aborted.', 'AbortError'));
+  }
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, delayMs);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      reject(new DOMException('The operation was aborted.', 'AbortError'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function netlifyFunctionUrl(baseUrl: string, functionName: string): string {
+  if (/^https?:\/\//i.test(baseUrl)) {
+    return `${new URL(baseUrl).origin}/.netlify/functions/${functionName}`;
+  }
+  return `/.netlify/functions/${functionName}`;
+}
+
+/** Run long multi-agent work in a 15-minute Netlify background function. */
+export async function runAgentBackgroundJob(
+  baseUrl: string,
+  body: AgentRunRequest,
+  options?: AgentRunStreamOptions,
+): Promise<AgentRunResult> {
+  const jobId = globalThis.crypto.randomUUID();
+  const startUrl = netlifyFunctionUrl(baseUrl, 'agent-job-background');
+  const startResponse = await fetch(startUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...modelConfigHeader() },
+    body: JSON.stringify({ jobId, request: body }),
+    signal: options?.signal,
+  });
+  if (!startResponse.ok && startResponse.status !== 202) {
+    throw toApiClientError(
+      await readBody(startResponse),
+      startResponse.status,
+      startResponse.statusText,
+    );
+  }
+
+  const statusUrl = `${netlifyFunctionUrl(baseUrl, 'agent-job')}?jobId=${encodeURIComponent(jobId)}`;
+  const deadline = Date.now() + 870_000;
+  let deliveredEvents = 0;
+  for (;;) {
+    if (Date.now() >= deadline) {
+      throw new ApiClientError({
+        error: { code: 'PROVIDER_ERROR', message: '后台 Agent 超过 14 分 30 秒仍未完成。' },
+      });
+    }
+    const response = await fetch(statusUrl, {
+      headers: clientIdentityHeader(),
+      signal: options?.signal,
+      cache: 'no-store',
+    });
+    if (response.status === 404) {
+      await waitForPoll(750, options?.signal);
+      continue;
+    }
+    if (!response.ok) {
+      throw toApiClientError(await readBody(response), response.status, response.statusText);
+    }
+    const snapshot = (await response.json()) as AgentJobSnapshot;
+    const events = Array.isArray(snapshot.events) ? snapshot.events : [];
+    for (const event of events.slice(deliveredEvents)) {
+      options?.onProgress?.(event);
+    }
+    deliveredEvents = events.length;
+
+    if (snapshot.state === 'completed' && snapshot.result !== undefined) {
+      void fetch(statusUrl, {
+        method: 'DELETE',
+        headers: clientIdentityHeader(),
+      }).catch(() => undefined);
+      return snapshot.result;
+    }
+    if (snapshot.state === 'failed') {
+      throw toApiClientError(snapshot.error, 200);
+    }
+    await waitForPoll(750, options?.signal);
+  }
+}
+
 /**
  * Consume the agent SSE stream (`POST /api/agent/run-stream`). Forwards each
  * `event: progress` frame to `onProgress`, captures the final `event: result`
@@ -588,6 +693,9 @@ async function streamAgentRun(
   body: AgentRunRequest,
   options?: AgentRunStreamOptions,
 ): Promise<AgentRunResult> {
+  if (USE_BACKGROUND_AGENT_JOBS) {
+    return runAgentBackgroundJob(baseUrl, body, options);
+  }
   let result: AgentRunResult | undefined;
   let settleAfterResult: ReturnType<typeof setTimeout> | undefined;
   let resolveEarly: (() => void) | undefined;
@@ -880,9 +988,11 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
   const b = baseUrl.replace(/\/$/, '');
   return {
     agent: {
-      run: (body, signal) => request(b, 'POST', '/agent/run', body, { signal }),
+      run: (body, signal) =>
+        request(b, 'POST', '/agent/run', body, { signal, includeModelConfig: true }),
       runStream: (body, options) => streamAgentRun(b, body, options),
-      planTurn: (body, signal) => request(b, 'POST', '/agent/plan/turn', body, { signal }),
+      planTurn: (body, signal) =>
+        request(b, 'POST', '/agent/plan/turn', body, { signal, includeModelConfig: true }),
     },
     projects: {
       list: (signal) => request(b, 'GET', '/projects', undefined, { signal }),
@@ -966,9 +1076,15 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
       get: (id, signal) => request(b, 'GET', `/references/${seg(id)}`, undefined, { signal }),
       import: (body, signal) => request(b, 'POST', '/references/import', body, { signal }),
       analyze: (id, body, signal) =>
-        request(b, 'POST', `/references/${seg(id)}/analyze`, body ?? {}, { signal }),
+        request(b, 'POST', `/references/${seg(id)}/analyze`, body ?? {}, {
+          signal,
+          includeModelConfig: true,
+        }),
       transfer: (projectId, body, signal) =>
-        request(b, 'POST', `/projects/${seg(projectId)}/reference-transfer`, body, { signal }),
+        request(b, 'POST', `/projects/${seg(projectId)}/reference-transfer`, body, {
+          signal,
+          includeModelConfig: true,
+        }),
       checkSimilarity: (projectId, body, signal) =>
         request(b, 'POST', `/projects/${seg(projectId)}/similarity/check`, body, { signal }),
       purgeRaw: (id, signal) =>
@@ -994,7 +1110,7 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
           'POST',
           `/projects/_/chapters/${seg(chapterId)}/blueprint`,
           body,
-          { signal },
+          { signal, includeModelConfig: true },
         ),
       merge: (chapterId, signal) =>
         request(b, 'POST', `/chapters/${seg(chapterId)}/merge`, undefined, { signal }),
@@ -1010,7 +1126,10 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
       },
       pacing: {
         run: (chapterId, signal) =>
-          request(b, 'POST', `/chapters/${seg(chapterId)}/pacing-check`, undefined, { signal }),
+          request(b, 'POST', `/chapters/${seg(chapterId)}/pacing-check`, undefined, {
+            signal,
+            includeModelConfig: true,
+          }),
         get: (chapterId, signal) =>
           request(b, 'GET', `/chapters/${seg(chapterId)}/pacing-report`, undefined, { signal }),
       },
