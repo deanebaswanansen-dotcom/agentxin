@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { ModelProxy } from '../../proxy/ModelProxy.js';
+import type { ModelProxy, StreamCompletionOptions } from '../../proxy/ModelProxy.js';
 import { ProxyError } from '../../proxy/ProxyError.js';
 import type { ChatMessage, ModelConfig } from '../../types/index.js';
 import type { ModelConfigService } from '../modelConfig/ModelConfigService.js';
@@ -10,6 +10,7 @@ import {
   inferExplicitGenre,
   MAX_OUTLINE_CHAPTERS,
   NovelPlanService,
+  normalizeStoryPlan,
 } from './NovelPlanService.js';
 
 const CONFIG: ModelConfig = {
@@ -26,11 +27,18 @@ function mockConfigService(config: ModelConfig | undefined = CONFIG): ModelConfi
 
 class QueueProxy implements ModelProxy {
   readonly calls: ChatMessage[][] = [];
+  readonly options: Array<StreamCompletionOptions | undefined> = [];
 
   constructor(private readonly outputs: Array<string | Error>) {}
 
-  async *streamCompletion(_config: ModelConfig, messages: ChatMessage[]) {
+  async *streamCompletion(
+    _config: ModelConfig,
+    messages: ChatMessage[],
+    _signal: AbortSignal,
+    options?: StreamCompletionOptions,
+  ) {
     this.calls.push(messages);
+    this.options.push(options);
     const output = this.outputs.shift();
     if (output instanceof Error) throw output;
     yield { kind: 'content' as const, text: output ?? '' };
@@ -63,6 +71,31 @@ function readyDecision(overrides: Record<string, unknown> = {}): string {
       wordsPerChapter: 1200,
       chapterCount: 2,
       chapterOutlines: outlines(2),
+      storyPlan: {
+        metadata: { title: '灰烬王冠', genre: '西方玄幻', targetLength: 2400, tone: '史诗、阴郁' },
+        premise: { oneSentence: '流亡骑士寻找吞噬记忆的王冠。', coreConflict: '守住记忆与夺回王权的目标彼此冲突。' },
+        protagonist: {
+          name: '艾琳', identity: '流亡骑士', personality: ['克制'], motivation: '追查故国真相',
+          goal: '封印诅咒王冠', weakness: '拒绝信任同伴', growthArc: '从独行复仇者成长为共同命运的守护者',
+        },
+        world: {
+          overview: '旧帝国覆灭后，教会、边境诸侯与遗迹猎人争夺失落王权，魔法以人的记忆作为不可逆代价。北境矿城供给封印材料，南方港邦垄断遗迹航路，教会则借清剿诅咒扩张审判权；王冠重现使三方脆弱盟约崩解，也迫使流亡者重新面对故国历史。',
+          regions: [], countries: [], races: [], religions: [], factions: [], history: [],
+        },
+        powerSystem: { rules: ['施法消耗记忆', '王冠放大代价', '遗忘的记忆无法恢复'], levels: [], limitations: [], specialCases: [] },
+        characters: [
+          { name: '艾琳', role: '主角', traits: ['克制'] },
+          { name: '罗兰', role: '对手', traits: ['虔诚'] },
+          { name: '米拉', role: '盟友', traits: ['敏锐'] },
+          { name: '格雷', role: '导师', traits: ['隐忍'] },
+        ],
+        factions: [],
+        mainPlot: { beginning: '接下遗迹任务', development: '被教会追杀', climax: '争夺王冠', ending: '封印王冠' },
+        subplots: [], characterArcs: [], volumes: [],
+        foreshadowing: ['王冠内侧刻着主角的旧名', '教堂壁画缺少一位圣徒', '导师认得王冠的封印'],
+        mysteries: [],
+        constraints: { mustInclude: [], mustAvoid: [] },
+      },
       ...overrides,
     },
   });
@@ -79,7 +112,7 @@ describe('NovelPlanService goal-driven agent', () => {
     ).rejects.toMatchObject({ code: 'MODEL_NOT_CONFIGURED' });
   });
 
-  it('calls the agent immediately and asks at most two blocking questions', async () => {
+  it('calls the agent immediately and asks at most three high-impact questions', async () => {
     const proxy = new QueueProxy([
       JSON.stringify({
         status: 'asking',
@@ -114,23 +147,23 @@ describe('NovelPlanService goal-driven agent', () => {
     ]);
     const service = new NovelPlanService(mockConfigService(), proxy);
     const result = await service.turn(
-      { seedPrompt: '写一本西方玄幻，流亡骑士寻找王冠' },
+      { seedPrompt: '写一本西方玄幻，流亡骑士寻找王冠，走冒险成长主线，正统史诗风格' },
       new AbortController().signal,
     );
 
     expect(result.status).toBe('asking');
-    expect(result.questions).toHaveLength(2);
+    expect(result.questions).toHaveLength(3);
     const prompt = proxy.calls[0].map((message) => message.content).join('\n');
     expect(prompt).toContain('不是固定问卷或工作流');
     expect(prompt).toContain('已识别硬约束题材：西方玄幻');
-    expect(prompt).toContain('这是计划模式首轮，必须返回 asking');
+    expect(prompt).toContain('信息足以形成方向时可以 0 问并立即 ready');
+    expect(prompt).toContain('主动提问总预算剩余 3 题');
+    expect(proxy.options[0]).toMatchObject({ jsonMode: true, disableThinking: true });
   });
 
-  it('does not accept a ready draft before the user confirms the first-turn direction', async () => {
-    const service = new NovelPlanService(
-      mockConfigService(),
-      new QueueProxy([readyDecision()]),
-    );
+  it('uses Requirement State to ask immediately when the seed lacks core direction', async () => {
+    const proxy = new QueueProxy([readyDecision()]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
     const result = await service.turn(
       { seedPrompt: '写本西方玄幻小说' },
       new AbortController().signal,
@@ -138,13 +171,15 @@ describe('NovelPlanService goal-driven agent', () => {
 
     expect(result.status).toBe('asking');
     expect(result.questions?.map((question) => question.id)).toEqual([
-      'confirm_core_direction',
-      'confirm_protagonist',
+      'main_direction',
+      'protagonist_type',
+      'story_tone',
     ]);
     expect(result.planSummary).toBeUndefined();
+    expect(proxy.calls).toHaveLength(0);
   });
 
-  it('falls back to confirmable questions when the model returns an invalid asking shape', async () => {
+  it('rejects an invalid asking shape and tells the agent to finish', async () => {
     const service = new NovelPlanService(
       mockConfigService(),
       new QueueProxy([
@@ -153,16 +188,55 @@ describe('NovelPlanService goal-driven agent', () => {
           message: '需要确认方向。',
           questions: [{ id: 'direction', question: '想写什么方向？', options: [] }],
         }),
+        readyDecision(),
       ]),
     );
     const result = await service.turn(
-      { seedPrompt: '写本西方玄幻小说' },
+      { seedPrompt: '写西方玄幻，主角是流浪骑士，走冒险成长主线，正统史诗风格' },
       new AbortController().signal,
     );
 
-    expect(result.status).toBe('asking');
-    expect(result.questions).toHaveLength(2);
-    expect(result.questions?.[0]?.options[0]?.label).toContain('西方玄幻');
+    expect(result.status).toBe('ready');
+  });
+
+  it('asks zero questions when the user already supplied the core direction', async () => {
+    const proxy = new QueueProxy([readyDecision()]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      { seedPrompt: '写西方玄幻，主角是流浪骑士，走冒险成长主线，正统史诗风格' },
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe('ready');
+    expect(result.planSummary?.storyPlan?.metadata.genre).toBe('西方玄幻');
+    expect(proxy.calls).toHaveLength(1);
+  });
+
+  it('rejects low-value world-detail questions and tells the agent to finish', async () => {
+    const lowValue = JSON.stringify({
+      status: 'asking',
+      message: '确认细节。',
+      questions: [
+        {
+          id: 'country_name',
+          question: '第一个国家叫什么？',
+          impactScore: 9,
+          options: [
+            { id: 'a', label: '阿斯塔' },
+            { id: 'b', label: '洛伦' },
+          ],
+        },
+      ],
+    });
+    const proxy = new QueueProxy([lowValue, readyDecision()]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      { seedPrompt: '写西方玄幻，主角是流浪骑士，走冒险成长主线，正统史诗风格' },
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe('ready');
+    expect(proxy.calls).toHaveLength(2);
   });
 
   it('keeps explicit western fantasy even when the model drifts to campus fiction', async () => {
@@ -235,13 +309,66 @@ describe('NovelPlanService goal-driven agent', () => {
     expect(result.brief).toContain('第2章 灰烬之路 2');
   });
 
+  it('builds a complete Story Plan with a dedicated agent call when the draft is shallow', async () => {
+    const storyPlan = JSON.parse(readyDecision()).planSummary.storyPlan;
+    const proxy = new QueueProxy([
+      readyDecision({ storyPlan: undefined }),
+      JSON.stringify({ storyPlan }),
+    ]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      { seedPrompt: '西方玄幻，两章，每章1200字，流浪骑士，冒险成长，正统史诗，直接开始' },
+      new AbortController().signal,
+    );
+
+    expect(proxy.calls).toHaveLength(2);
+    expect(proxy.calls[1][0].content).toContain('Story Plan 架构 Agent');
+    expect(result.planSummary?.storyPlan?.world.overview.length).toBeGreaterThanOrEqual(80);
+  });
+
+  it('accepts snake_case Story Plan envelopes from model providers', async () => {
+    const storyPlan = JSON.parse(readyDecision()).planSummary.storyPlan;
+    const proxy = new QueueProxy([
+      readyDecision({ storyPlan: undefined }),
+      JSON.stringify({ story_plan: storyPlan }),
+    ]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      { seedPrompt: '西方玄幻，两章，每章1200字，流浪骑士，冒险成长，直接开始' },
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe('ready');
+    expect(result.planSummary?.storyPlan?.characters.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it('fills omitted protagonist fields from the confirmed planning summary', async () => {
+    const storyPlan = JSON.parse(readyDecision()).planSummary.storyPlan;
+    storyPlan.protagonist = { personality: [] };
+    const proxy = new QueueProxy([
+      readyDecision({ storyPlan: undefined }),
+      JSON.stringify({ storyPlan }),
+    ]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      { seedPrompt: '西方玄幻，两章，每章1200字，流浪骑士，冒险成长，直接开始' },
+      new AbortController().signal,
+    );
+
+    expect(result.planSummary?.storyPlan?.protagonist.identity).toBe('流亡骑士艾琳');
+    expect(result.planSummary?.storyPlan?.protagonist.goal).toContain('王冠');
+  });
+
   it('repairs malformed JSON once and fails clearly after two invalid responses', async () => {
     const service = new NovelPlanService(
       mockConfigService(),
       new QueueProxy(['not-json', 'still-not-json']),
     );
     await expect(
-      service.turn({ seedPrompt: '写西方玄幻' }, new AbortController().signal),
+      service.turn(
+        { seedPrompt: '写西方玄幻，主角是流浪骑士，冒险成长，正统史诗风格' },
+        new AbortController().signal,
+      ),
     ).rejects.toThrow('模型连续两次未返回有效 JSON');
   });
 
@@ -251,7 +378,10 @@ describe('NovelPlanService goal-driven agent', () => {
       new QueueProxy([new ProxyError('provider unavailable')]),
     );
     await expect(
-      service.turn({ seedPrompt: '写西方玄幻' }, new AbortController().signal),
+      service.turn(
+        { seedPrompt: '写西方玄幻，主角是流浪骑士，冒险成长，正统史诗风格' },
+        new AbortController().signal,
+      ),
     ).rejects.toThrow('provider unavailable');
   });
 
@@ -264,6 +394,43 @@ describe('NovelPlanService goal-driven agent', () => {
 });
 
 describe('planning facts', () => {
+  it('normalizes flexible provider shapes into the canonical Story Plan', () => {
+    const plan = normalizeStoryPlan({
+      metadata: { title: '灰烬远征', genre: '西方玄幻' },
+      premise: '流浪冒险者必须在拯救边境与保住自身记忆之间作出不可逆选择。',
+      protagonist: { name: '伊莱', type: '流浪冒险者', goal: '终止灰潮', arc: '从独行者成长为盟约守护者' },
+      world: {
+        overview: '旧帝国崩溃后，北境矿城、南方港邦与圣辉教会争夺封印遗产。灰潮每十年吞没一片领地，施法者必须献出记忆换取力量，各族因此形成互相依赖又彼此猜忌的盟约；失落王冠重现后，边境秩序与教会权威同时开始瓦解。',
+        geography: ['北境矿城', '南方港邦'],
+      },
+      powerSystem: { rules: [{ rule: '施法消耗记忆' }, { rule: '代价不可逆' }, { rule: '王冠放大法术' }], cost: '永久遗忘' },
+      characters: [
+        { name: '伊莱', role: '主角', type: '流浪者' },
+        { name: '赛琳', role: '盟友', affiliation: '港邦' },
+        { name: '奥德', role: '导师', affiliation: '教会' },
+        { name: '维克', role: '对手', affiliation: '北境' },
+      ],
+      mainPlot: [
+        { phase: '开端', event: '主角接受护送任务' },
+        { phase: '发展', event: '灰潮逼近并暴露教会阴谋' },
+        { phase: '高潮', event: '盟约在王冠前决裂' },
+        { phase: '结局', event: '主角献出记忆重建封印' },
+      ],
+      foreshadowing: [
+        { setup: '王冠刻着主角旧名', payoff: '揭示其血统' },
+        { setup: '壁画缺失圣徒', payoff: '揭示教会篡史' },
+        { setup: '导师害怕钟声', payoff: '揭示灰潮起源' },
+      ],
+      constraints: { mustInclude: [], mustAvoid: [] },
+    });
+
+    expect(plan?.premise.coreConflict).toContain('不可逆选择');
+    expect(plan?.protagonist.identity).toBe('流浪冒险者');
+    expect(plan?.powerSystem.rules).toHaveLength(3);
+    expect(plan?.mainPlot.ending).toContain('结局');
+    expect(plan?.foreshadowing[0]).toContain('揭示其血统');
+  });
+
   it('only skips first-turn consultation when the user explicitly authorizes it', () => {
     expect(hasExplicitPlanningBypass('题材你自己决定，直接开始')).toBe(true);
     expect(hasExplicitPlanningBypass('写一本西方玄幻小说')).toBe(false);

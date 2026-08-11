@@ -8,7 +8,7 @@
  * - 向 `${baseUrl}/chat/completions` 发起 POST；
  * - 请求头注入 `Authorization: Bearer ${apiKey}` 与 `Content-Type: application/json`；
  * - body 含 `model`、`messages`、`stream: true`；
- * - DeepSeek 官方 V4 模型自动附加 `thinking` / `reasoning_effort`；
+ * - DeepSeek 官方 V4 可按调用场景显式关闭 thinking；
  * - 解析提供商 SSE，抽取 `choices[0].delta.content` 增量并按序产出；
  * - 提供商返回非 2xx，或请求被 AbortSignal 中止/超时时，抛出 {@link ProxyError}。
  *
@@ -26,6 +26,8 @@ export interface StreamCompletionOptions {
   jsonMode?: boolean;
   /** Optional small output budget for connection probes and classifiers. */
   maxTokens?: number;
+  /** Official DeepSeek only: use non-thinking mode for bounded structured output. */
+  disableThinking?: boolean;
 }
 
 const DEFAULT_TEMPERATURE = 1;
@@ -187,7 +189,7 @@ export class OpenAiCompatibleModelProxy implements ModelProxy {
     if (options?.jsonMode === true) {
       requestBody.response_format = { type: 'json_object' };
     }
-    applyProviderRequestOptions(requestBody, config);
+    applyProviderRequestOptions(requestBody, config, options);
 
     let response: Response | undefined;
     for (let attempt = 0; attempt < FETCH_MAX_ATTEMPTS; attempt += 1) {
@@ -291,12 +293,16 @@ export class OpenAiCompatibleModelProxy implements ModelProxy {
 function applyProviderRequestOptions(
   requestBody: Record<string, unknown>,
   config: ModelConfig,
+  options?: StreamCompletionOptions,
 ): void {
   if (!isDeepSeekOfficialBaseUrl(config.baseUrl)) {
     return;
   }
   // Ask for usage chunks (drives the cache-hit stats).
   requestBody.stream_options = { include_usage: true };
+  if (options?.disableThinking === true) {
+    requestBody.thinking = { type: 'disabled' };
+  }
   // IMPORTANT: We deliberately DO NOT force `thinking: { type: 'enabled' }` or
   // `reasoning_effort: 'max'/'high'` here.
   //

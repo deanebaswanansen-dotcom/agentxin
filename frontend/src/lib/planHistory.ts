@@ -1,5 +1,18 @@
 import type { NovelPlanAnswer, NovelPlanQuestion } from '../types/index.js';
 
+export function formatPlanQuestionsForHistory(
+  message: string,
+  questions: NovelPlanQuestion[] | undefined,
+): string {
+  const lines = [message.trim()].filter(Boolean);
+  for (const question of questions ?? []) {
+    lines.push(
+      `PLAN_QUESTION[${question.id}] score=${question.impactScore ?? '-'}: ${question.question}`,
+    );
+  }
+  return lines.join('\n');
+}
+
 export function formatPlanAnswersForHistory(
   answers: NovelPlanAnswer[],
   questions: NovelPlanQuestion[],

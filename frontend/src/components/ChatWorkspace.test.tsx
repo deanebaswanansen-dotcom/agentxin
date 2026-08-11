@@ -12,7 +12,10 @@ vi.mock('../api/apiClient.js', () => ({
 }));
 
 import apiClient from '../api/apiClient.js';
-import { formatPlanAnswersForHistory } from '../lib/planHistory.js';
+import {
+  formatPlanAnswersForHistory,
+  formatPlanQuestionsForHistory,
+} from '../lib/planHistory.js';
 import { ChatWorkspace } from './ChatWorkspace.js';
 
 function mockWriteResponse(content: string): void {
@@ -38,6 +41,22 @@ describe('ChatWorkspace', () => {
         ],
       ),
     ).toBe('- words_per_chapter: wpc_2000 | 每一章目标字数？ → 约 2000 字');
+  });
+
+  it('stores asked question ids and text so later turns cannot repeat them', () => {
+    expect(
+      formatPlanQuestionsForHistory('只确认核心方向。', [
+        {
+          id: 'main_direction',
+          question: '主线更偏向哪种方向？',
+          impactScore: 9,
+          options: [
+            { id: 'adventure', label: '冒险成长' },
+            { id: 'agent', label: 'Agent 自己决定' },
+          ],
+        },
+      ]),
+    ).toContain('PLAN_QUESTION[main_direction] score=9: 主线更偏向哪种方向？');
   });
 
   it('adopts generated writing text at the caret instead of replacing the whole chapter', async () => {

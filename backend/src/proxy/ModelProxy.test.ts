@@ -191,6 +191,30 @@ describe('OpenAiCompatibleModelProxy request shape', () => {
     expect(body.reasoning_effort).toBeUndefined();
   });
 
+  it('can disable DeepSeek thinking for bounded structured output', async () => {
+    const fetchMock = vi.fn(async () => streamingResponse(buildSseWire(['{}'])));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const proxy = new OpenAiCompatibleModelProxy();
+    await collect(
+      proxy.streamCompletion(
+        {
+          ...CONFIG,
+          baseUrl: 'https://api.deepseek.com',
+          modelName: 'deepseek-v4-flash',
+        },
+        MESSAGES,
+        new AbortController().signal,
+        { jsonMode: true, disableThinking: true },
+      ),
+    );
+
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.thinking).toEqual({ type: 'disabled' });
+    expect(body.response_format).toEqual({ type: 'json_object' });
+  });
+
   it('keeps custom OpenAI-compatible endpoints free of DeepSeek-only fields', async () => {
     const fetchMock = vi.fn(async () => streamingResponse(buildSseWire(['x'])));
     vi.stubGlobal('fetch', fetchMock);
@@ -205,6 +229,7 @@ describe('OpenAiCompatibleModelProxy request shape', () => {
         },
         MESSAGES,
         new AbortController().signal,
+        { disableThinking: true },
       ),
     );
 
