@@ -1864,41 +1864,65 @@ export class AgentOrchestrator {
         current: progress?.current,
         total: progress?.total,
       });
-      finalContent = await this.reviseChapterWithHints(
-        config,
-        projectId,
-        pack,
-        chapterNumber,
-        totalChapters,
-        seedPrompt,
-        targetWords,
-        finalContent,
-        hints,
-        signal,
-      );
-      await this.store.updateChapterContent(chapterId, finalContent);
-      // 修订后重检；若启用 Gate 则用新分数重跑（避免旧低分误 hardFail）
-      finalInspection = await this.inspectChapterDraft(
-        config,
-        projectId,
-        chapterNumber,
-        chapterTitle,
-        finalContent,
-        signal,
-      );
-      if (options.qualityGates) {
-        gates = runChapterQualityGates({
-          content: finalContent,
-          minWords: options.qualityGates.minWords,
-          maxWords: options.qualityGates.maxWords,
-          targetWords: options.qualityGates.targetWords,
-          chapterTitle,
-          inspectorScore: finalInspection.score0to100,
-          recommendRevision: finalInspection.recommendRevision,
-          revisionHints: finalInspection.revisionHints,
+      let revisedContent: string | undefined;
+      try {
+        revisedContent = await this.reviseChapterWithHints(
+          config,
+          projectId,
+          pack,
+          chapterNumber,
+          totalChapters,
+          seedPrompt,
+          targetWords,
+          finalContent,
+          hints,
+          signal,
+        );
+      } catch (error) {
+        if (signal.aborted) throw error;
+        emit({
+          phase: 'info',
+          message: `【ReviewAgent】修订请求失败，已保留「${chapterTitle}」原稿并继续。`,
+          current: progress?.current,
+          total: progress?.total,
         });
       }
-      revised = true;
+      if (revisedContent !== undefined) {
+        finalContent = revisedContent;
+        await this.store.updateChapterContent(chapterId, finalContent);
+        revised = true;
+        // 修订后重检失败不撤销已保存的修订稿，继续使用首次审校结论。
+        try {
+          finalInspection = await this.inspectChapterDraft(
+            config,
+            projectId,
+            chapterNumber,
+            chapterTitle,
+            finalContent,
+            signal,
+          );
+        } catch (error) {
+          if (signal.aborted) throw error;
+          emit({
+            phase: 'info',
+            message: `【ContinuityAgent】复检请求失败，已保留「${chapterTitle}」修订稿并继续。`,
+            current: progress?.current,
+            total: progress?.total,
+          });
+        }
+        if (options.qualityGates) {
+          gates = runChapterQualityGates({
+            content: finalContent,
+            minWords: options.qualityGates.minWords,
+            maxWords: options.qualityGates.maxWords,
+            targetWords: options.qualityGates.targetWords,
+            chapterTitle,
+            inspectorScore: finalInspection.score0to100,
+            recommendRevision: finalInspection.recommendRevision,
+            revisionHints: finalInspection.revisionHints,
+          });
+        }
+      }
     }
 
     // 仅对最终正文应用检测结论与反思记忆

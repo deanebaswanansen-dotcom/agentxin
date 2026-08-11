@@ -596,6 +596,8 @@ interface AgentJobSnapshot {
   error?: unknown;
 }
 
+const BACKGROUND_CHAPTER_TASKS = new Set<AgentRunRequest['task']>(['full_novel', 'long_novel']);
+
 function waitForPoll(delayMs: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted === true) {
     return Promise.reject(new DOMException('The operation was aborted.', 'AbortError'));
@@ -621,8 +623,8 @@ function netlifyFunctionUrl(baseUrl: string, functionName: string): string {
   return `/.netlify/functions/${functionName}`;
 }
 
-/** Run long multi-agent work in a 15-minute Netlify background function. */
-export async function runAgentBackgroundJob(
+/** Run one unit of long multi-agent work in a 15-minute Netlify background function. */
+async function runSingleAgentBackgroundJob(
   baseUrl: string,
   body: AgentRunRequest,
   options?: AgentRunStreamOptions,
@@ -691,6 +693,102 @@ export async function runAgentBackgroundJob(
     }
     await waitForPoll(750, options?.signal);
   }
+}
+
+function requestedBackgroundBatches(body: AgentRunRequest): number {
+  if (!BACKGROUND_CHAPTER_TASKS.has(body.task)) return 1;
+  const chapters = body.options?.chapters;
+  return typeof chapters === 'number' && Number.isFinite(chapters)
+    ? Math.min(500, Math.max(1, Math.floor(chapters)))
+    : 1;
+}
+
+function mergeBackgroundResults(results: AgentRunResult[]): AgentRunResult {
+  const last = results.at(-1)!;
+  const artifacts = [...new Map(
+    results.flatMap((result) => result.artifacts).map((artifact) => [`${artifact.kind}:${artifact.id}`, artifact]),
+  ).values()];
+  const metrics = results.some((result) => result.metrics !== undefined)
+    ? results.reduce<NonNullable<AgentRunResult['metrics']>>(
+        (sum, result) => {
+          const next = result.metrics;
+          if (next === undefined) return sum;
+          sum.modelCalls += next.modelCalls;
+          sum.promptTokens += next.promptTokens;
+          sum.completionTokens += next.completionTokens;
+          sum.cacheHitTokens += next.cacheHitTokens;
+          sum.cacheMissTokens += next.cacheMissTokens;
+          sum.localCacheHits += next.localCacheHits;
+          sum.localCacheMisses += next.localCacheMisses;
+          sum.completedChapters = (sum.completedChapters ?? 0) + (next.completedChapters ?? 0);
+          sum.plannedWords = Math.max(sum.plannedWords ?? 0, next.plannedWords ?? 0);
+          sum.estimatedCostUsd = (sum.estimatedCostUsd ?? 0) + (next.estimatedCostUsd ?? 0);
+          return sum;
+        },
+        {
+          modelCalls: 0,
+          promptTokens: 0,
+          completionTokens: 0,
+          cacheHitTokens: 0,
+          cacheMissTokens: 0,
+          cacheHitRatePct: 0,
+          localCacheHits: 0,
+          localCacheMisses: 0,
+          localCacheHitRatePct: 0,
+        },
+      )
+    : undefined;
+  if (metrics !== undefined) {
+    const remoteTotal = metrics.cacheHitTokens + metrics.cacheMissTokens;
+    const localTotal = metrics.localCacheHits + metrics.localCacheMisses;
+    metrics.cacheHitRatePct = remoteTotal > 0 ? (metrics.cacheHitTokens / remoteTotal) * 100 : 0;
+    metrics.localCacheHitRatePct = localTotal > 0 ? (metrics.localCacheHits / localTotal) * 100 : 0;
+  }
+  return {
+    ...last,
+    summary: `长篇任务已分批完成 ${results.length}/${results.length} 章。${last.summary}`,
+    steps: results.flatMap((result) => result.steps).slice(-100),
+    artifacts,
+    metrics,
+  };
+}
+
+/**
+ * Netlify 单个后台函数最多运行 15 分钟。多章任务拆成每批一章，上一批持久化后再启动
+ * 下一批，避免在首章 ReviewAgent 附近被平台强制终止并永久显示“运行中”。
+ */
+export async function runAgentBackgroundJob(
+  baseUrl: string,
+  body: AgentRunRequest,
+  options?: AgentRunStreamOptions,
+): Promise<AgentRunResult> {
+  const batches = requestedBackgroundBatches(body);
+  if (batches === 1) return runSingleAgentBackgroundJob(baseUrl, body, options);
+
+  const results: AgentRunResult[] = [];
+  let projectId = body.projectId;
+  const totalChapters = body.options?.totalChapters ?? body.options?.planSummary?.chapterCount ?? batches;
+  for (let index = 0; index < batches; index += 1) {
+    const result = await runSingleAgentBackgroundJob(
+      baseUrl,
+      {
+        ...body,
+        projectId,
+        options: { ...body.options, chapters: 1, totalChapters },
+      },
+      {
+        ...options,
+        onProgress: (event) =>
+          options?.onProgress?.({
+            ...event,
+            ...(event.current !== undefined ? { current: index + 1, total: batches } : {}),
+          }),
+      },
+    );
+    results.push(result);
+    projectId = result.projectId;
+  }
+  return mergeBackgroundResults(results);
 }
 
 /**
