@@ -33,11 +33,19 @@
  */
 import Fastify from 'fastify';
 import type { FastifyInstance } from 'fastify';
+import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { CORS_ALLOW_ORIGIN } from './cors.js';
 import type { DataStore } from './store/DataStore.js';
 import { FileDataStore } from './store/FileDataStore.js';
+import { createClientScopedDataStore } from './store/ClientScopedDataStore.js';
+import {
+  createClientScopedLongNovelConfigStore,
+  createClientScopedMemoryStore,
+  createClientScopedReferenceStore,
+} from './store/ClientScopedAuxiliaryStores.js';
+import { registerClientScope } from './services/client/clientScope.js';
 import type { ModelProxy } from './proxy/ModelProxy.js';
 import { OpenAiCompatibleModelProxy } from './proxy/ModelProxy.js';
 import { CachingModelProxy } from './proxy/CachingModelProxy.js';
@@ -58,9 +66,12 @@ import { PacingChecker } from './services/blueprint/PacingChecker.js';
 import { SceneExpander } from './services/blueprint/SceneExpander.js';
 import { SceneRewriter } from './services/blueprint/SceneRewriter.js';
 import { NovelImportService } from './services/import/NovelImportService.js';
-import { ReferenceStore } from './services/reference/ReferenceStore.js';
+import { ReferenceStore, type ReferenceStorePort } from './services/reference/ReferenceStore.js';
 import { ReferenceAnalysisService } from './services/reference/ReferenceAnalysisService.js';
-import { LongNovelConfigStore } from './services/agent/longNovel/LongNovelConfigStore.js';
+import {
+  LongNovelConfigStore,
+  type LongNovelConfigStorePort,
+} from './services/agent/longNovel/LongNovelConfigStore.js';
 import { registerRequestModelConfig } from './services/modelConfig/requestModelConfig.js';
 import { registerProjectRoutes } from './routes/projectRoutes.js';
 import { registerChapterRoutes } from './routes/chapterRoutes.js';
@@ -97,8 +108,8 @@ export function buildServer(
   store: DataStore,
   modelProxy?: ModelProxy,
   memoryService?: MemoryService,
-  referenceStore?: ReferenceStore,
-  longNovelConfigStore?: LongNovelConfigStore,
+  referenceStore?: ReferenceStorePort,
+  longNovelConfigStore?: LongNovelConfigStorePort,
 ): FastifyInstance {
   const app = Fastify({ logger: false });
 
@@ -109,7 +120,10 @@ export function buildServer(
   // Hijacked SSE routes merge corsResponseHeaders() into their own writeHead.
   app.addHook('onRequest', async (request, reply) => {
     reply.header('Access-Control-Allow-Origin', CORS_ALLOW_ORIGIN);
-    reply.header('Access-Control-Allow-Headers', 'Content-Type, Accept, x-agentxin-model-config');
+    reply.header(
+      'Access-Control-Allow-Headers',
+      'Content-Type, Accept, x-agentxin-model-config, x-agentxin-client-id',
+    );
     reply.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
     if (request.headers.origin && CORS_ALLOW_ORIGIN !== '*') {
       reply.header('Vary', 'Origin');
@@ -120,6 +134,8 @@ export function buildServer(
       return reply;
     }
   });
+
+  registerClientScope(app);
 
   // Domain services — all built from the single shared store (Req 7.1, 7.2).
   // Shared model proxy: default to the real OpenAI-compatible proxy wrapped in a
@@ -135,7 +151,7 @@ export function buildServer(
   const projectService = new ProjectService(store);
   const chapterService = new ChapterService(store);
   const settingService = new SettingService(store);
-  const modelConfigService = new ModelConfigService(store);
+  const modelConfigService = new ModelConfigService(store, { allowStoredConfig: false });
   const writingService = new WritingService(store, modelConfigService, proxy);
   const freeChatService = new FreeChatService(store, modelConfigService, proxy);
   const referenceService = new ReferenceAnalysisService(
@@ -226,16 +242,20 @@ export function buildServer(
  */
 export async function start(): Promise<FastifyInstance> {
   // Startup recovery: load persisted data before serving requests (Req 7.3).
-  const store = await FileDataStore.create(process.env.DATA_FILE ?? undefined);
-  // Load persisted Agent long-term memory so reflections/summaries survive restarts.
-  const memoryStore = await MemoryStore.create(process.env.AGENT_MEMORY_FILE ?? undefined);
+  const clientRoot = process.env.CLIENT_DATA_DIR;
+  const store = clientRoot
+    ? createClientScopedDataStore(join(clientRoot, 'projects'))
+    : await FileDataStore.create(process.env.DATA_FILE ?? undefined);
+  const memoryStore = clientRoot
+    ? await createClientScopedMemoryStore(join(clientRoot, 'memory'))
+    : await MemoryStore.create(process.env.AGENT_MEMORY_FILE ?? undefined);
   const memory = new MemoryService(memoryStore);
-  const referenceStore = await ReferenceStore.create(
-    process.env.REFERENCE_FILE ?? undefined,
-  );
-  const longNovelConfigStore = await LongNovelConfigStore.create(
-    process.env.LONG_NOVEL_CONFIG_FILE ?? undefined,
-  );
+  const referenceStore = clientRoot
+    ? await createClientScopedReferenceStore(join(clientRoot, 'references'))
+    : await ReferenceStore.create(process.env.REFERENCE_FILE ?? undefined);
+  const longNovelConfigStore = clientRoot
+    ? await createClientScopedLongNovelConfigStore(join(clientRoot, 'long-novel'))
+    : await LongNovelConfigStore.create(process.env.LONG_NOVEL_CONFIG_FILE ?? undefined);
   const app = buildServer(store, undefined, memory, referenceStore, longNovelConfigStore);
 
   const port = Number(process.env.PORT ?? 3000);

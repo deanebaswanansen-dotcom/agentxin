@@ -66,7 +66,10 @@ describe('agent routes', () => {
     expect(body.artifacts).toHaveLength(5);
     expect(await store.listWorldSettings(body.projectId)).toHaveLength(1);
     expect(await store.listCharacters(body.projectId)).toHaveLength(1);
-    expect(await store.listOutlines(body.projectId)).toHaveLength(1);
+    const outlines = await store.listOutlines(body.projectId);
+    expect(outlines).toHaveLength(2);
+    expect(outlines.some((outline) => outline.title.endsWith('：大纲'))).toBe(true);
+    expect(outlines.some((outline) => outline.title === '伏笔台账')).toBe(true);
     const chapter = await store.getChapter(body.chapterId);
     expect(chapter?.content).toBe('自动控稿输出');
     expect(proxy.calls.length).toBeGreaterThanOrEqual(2);

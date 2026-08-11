@@ -88,6 +88,16 @@ interface MemoryFile {
   projects: Record<string, ProjectMemory>;
 }
 
+export interface MemoryStorePort {
+  read(projectId: string): ProjectMemory;
+  write(projectId: string, memory: ProjectMemory): Promise<void>;
+  update(
+    projectId: string,
+    mutator: (memory: ProjectMemory) => ProjectMemory | void,
+  ): Promise<ProjectMemory>;
+  clearProject(projectId: string): Promise<void>;
+}
+
 /** 默认记忆文件位置（相对后端进程 cwd），与 store.json 同目录。 */
 export const DEFAULT_MEMORY_FILE = 'data/agent-memory.json';
 
@@ -106,7 +116,7 @@ function emptyFile(): MemoryFile {
   return { version: 1, projects: {} };
 }
 
-export class MemoryStore {
+export class MemoryStore implements MemoryStorePort {
   private readonly filePath: string;
   private readonly persistent: boolean;
   private data: MemoryFile = emptyFile();

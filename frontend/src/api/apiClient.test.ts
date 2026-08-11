@@ -5,9 +5,16 @@ import {
   createApiClient,
   isApiClientError,
   parseSseEvents,
+  runAgentBackgroundJob,
   type SseEvent,
 } from './apiClient.js';
-import type { ApiError, ModelConfig, WritingRequestBody } from '../types/index.js';
+import type {
+  AgentRunRequest,
+  AgentRunResult,
+  ApiError,
+  ModelConfig,
+  WritingRequestBody,
+} from '../types/index.js';
 
 // ---------------------------------------------------------------------------
 // fetch mocking helpers
@@ -90,7 +97,6 @@ describe('apiClient request building', () => {
       temperature: 1,
       topP: 1,
     });
-    // save also mirrors to backend via PUT (best-effort)
     const mock = installFetch((url) => {
       if (String(url).includes('/model-config')) {
         return jsonResponse({
@@ -114,8 +120,14 @@ describe('apiClient request building', () => {
 
     await api.projects.list();
     const listCall = mock.mock.calls.find((call) => String(call[0]).includes('/projects'));
-    const headers = listCall?.[1]?.headers as Record<string, string>;
-    expect(JSON.parse(decodeURIComponent(headers['X-Agentxin-Model-Config']))).toEqual(config);
+    const listHeaders = listCall?.[1]?.headers as Record<string, string>;
+    expect(listHeaders['X-Agentxin-Model-Config']).toBeUndefined();
+    expect(listHeaders['X-Agentxin-Client-Id']).toMatch(/^[a-f0-9]{64}$/);
+
+    await api.agent.run({ task: 'novel', mode: 'draft', prompt: '测试模型任务' });
+    const agentCall = mock.mock.calls.find((call) => String(call[0]).endsWith('/agent/run'));
+    const agentHeaders = agentCall?.[1]?.headers as Record<string, string>;
+    expect(JSON.parse(decodeURIComponent(agentHeaders['X-Agentxin-Model-Config']))).toEqual(config);
 
     // New client instance still hydrates from localStorage
     const api2 = createApiClient('/api');
@@ -148,6 +160,9 @@ describe('apiClient request building', () => {
     expect(init?.method).toBe('POST');
     expect(JSON.parse(String(init?.body))).toEqual({ name: '我的小说' });
     expect((init?.headers as Record<string, string>)['Content-Type']).toBe('application/json');
+    expect((init?.headers as Record<string, string>)['X-Agentxin-Client-Id']).toMatch(
+      /^[a-f0-9]{64}$/,
+    );
   });
 
   it('encodes id path segments', async () => {
@@ -222,6 +237,59 @@ describe('apiClient unified error handling', () => {
       expect(err.code).toBe(code);
       vi.unstubAllGlobals();
     }
+  });
+});
+
+describe('Netlify background Agent jobs', () => {
+  it('submits credentials once, polls by client id, and returns progress plus result', async () => {
+    const config: ModelConfig = {
+      baseUrl: 'https://api.example.com',
+      apiKey: 'sk-browser-only',
+      modelName: 'novel-model',
+    };
+    await client().modelConfig.save(config);
+    const result: AgentRunResult = {
+      task: 'novel',
+      mode: 'draft',
+      projectId: 'p1',
+      summary: '完成',
+      steps: ['完成'],
+      artifacts: [],
+    };
+    const progress = vi.fn();
+    const mock = installFetch((url, init) => {
+      if (url.endsWith('/agent-job-background')) {
+        return new Response(null, { status: 202 });
+      }
+      if (init?.method === 'DELETE') {
+        return new Response(null, { status: 204 });
+      }
+      return jsonResponse({
+        state: 'completed',
+        events: [{ phase: 'setup', message: '后台已启动' }],
+        result,
+      });
+    });
+    const request: AgentRunRequest = {
+      task: 'novel',
+      mode: 'draft',
+      prompt: '测试',
+    };
+
+    await expect(runAgentBackgroundJob('/api', request, { onProgress: progress })).resolves.toEqual(
+      result,
+    );
+    expect(progress).toHaveBeenCalledWith({ phase: 'setup', message: '后台已启动' });
+
+    const start = mock.mock.calls.find((call) => String(call[0]).endsWith('/agent-job-background'));
+    const poll = mock.mock.calls.find(
+      (call) => String(call[0]).includes('/agent-job?jobId=') && call[1]?.method !== 'DELETE',
+    );
+    expect((start?.[1]?.headers as Record<string, string>)['X-Agentxin-Model-Config']).toBeDefined();
+    expect((poll?.[1]?.headers as Record<string, string>)['X-Agentxin-Model-Config']).toBeUndefined();
+    expect((poll?.[1]?.headers as Record<string, string>)['X-Agentxin-Client-Id']).toMatch(
+      /^[a-f0-9]{64}$/,
+    );
   });
 });
 

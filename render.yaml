@@ -20,4 +20,8 @@ services:
     healthCheckPath: /health
     envVars:
       - key: CORS_ORIGIN
-        sync: false
+        value: https://agentxin.netlify.app
+      - key: REQUIRE_CLIENT_ID
+        value: "1"
+      - key: CLIENT_DATA_DIR
+        value: data/clients

@@ -55,7 +55,17 @@ function emptyFile(): ReferenceFile {
   return { version: 1, novels: {}, projectConfigs: {} };
 }
 
-export class ReferenceStore {
+export interface ReferenceStorePort {
+  listNovels(): StoredReferenceNovel[];
+  getNovel(id: Id): StoredReferenceNovel | undefined;
+  saveNovel(novel: StoredReferenceNovel): Promise<void>;
+  deleteNovel(id: Id): Promise<boolean>;
+  getProjectConfig(projectId: Id): ProjectReferenceConfig | undefined;
+  saveProjectConfig(config: ProjectReferenceConfig): Promise<void>;
+  clearProjectConfig(projectId: Id): Promise<void>;
+}
+
+export class ReferenceStore implements ReferenceStorePort {
   private readonly filePath: string;
   private readonly persistent: boolean;
   private data: ReferenceFile = emptyFile();

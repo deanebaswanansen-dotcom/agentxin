@@ -240,6 +240,10 @@ export function registerAgentRoutes(app: FastifyInstance, agentService: AgentSer
     };
 
     const controller = new AbortController();
+    const heartbeat = setInterval(() => {
+      writeFrame(': heartbeat\n\n');
+    }, 10_000);
+    heartbeat.unref();
     const onClose = (): void => {
       if (!raw.writableEnded) {
         controller.abort();
@@ -269,6 +273,7 @@ export function registerAgentRoutes(app: FastifyInstance, agentService: AgentSer
         writeFrame(sseFrame('error', JSON.stringify(apiError)));
       }
     } finally {
+      clearInterval(heartbeat);
       raw.removeListener('close', onClose);
       if (!raw.writableEnded) {
         raw.end();

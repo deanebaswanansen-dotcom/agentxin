@@ -3,8 +3,17 @@ import { join } from 'node:path';
 
 import { buildServer } from '../../../backend/dist/index.js';
 import { MemoryService } from '../../../backend/dist/services/memory/MemoryService.js';
-import { MemoryStore } from '../../../backend/dist/services/memory/MemoryStore.js';
-import { FileDataStore } from '../../../backend/dist/store/FileDataStore.js';
+import { createClientScopedDataStore } from '../../../backend/dist/store/ClientScopedDataStore.js';
+import {
+  createClientScopedLongNovelConfigStore,
+  createClientScopedMemoryStore,
+  createClientScopedReferenceStore,
+} from '../../../backend/dist/store/ClientScopedAuxiliaryStores.js';
+import {
+  hydrateClientData,
+  persistClientData,
+  readClientId,
+} from './_shared/netlifyData.mjs';
 
 // Netlify Functions: returning a `Response` whose body is a ReadableStream marks
 // this as a *streaming* function — 60s execution limit (vs 10s for buffered
@@ -16,8 +25,8 @@ import { FileDataStore } from '../../../backend/dist/store/FileDataStore.js';
 // 10s synchronous timeout (HTTP 502). If the sandbox disallows binding a
 // listener we fall back to the old `inject()` transport.
 
-let appPromise;
-let runtimePromise;
+const appPromises = new Map();
+const runtimePromises = new Map();
 
 // Keep this function inside the frontend base directory so Netlify deploys it
 // with the same site that serves the Vite SPA.
@@ -38,37 +47,58 @@ function hydrateBackendEnv() {
   process.env.NODE_ENV ??= 'production';
 }
 
-async function getApp() {
-  appPromise ??= (async () => {
+async function getApp(clientId) {
+  let appPromise = appPromises.get(clientId);
+  if (appPromise === undefined) {
+    appPromise = (async () => {
     hydrateBackendEnv();
-    const dataFile = readEnv('DATA_FILE', join(tmpdir(), 'agentxin-store.json'));
-    const memoryFile = readEnv('AGENT_MEMORY_FILE', join(tmpdir(), 'agentxin-memory.json'));
-    const store = await FileDataStore.create(dataFile);
-    const memoryStore = await MemoryStore.create(memoryFile);
-    return buildServer(store, undefined, new MemoryService(memoryStore));
-  })();
+    const clientDataDir = readEnv('CLIENT_DATA_DIR', join(tmpdir(), 'agentxin-clients'));
+    if (clientId !== 'invalid') {
+      await hydrateClientData(clientDataDir, clientId);
+    }
+    const store = createClientScopedDataStore(join(clientDataDir, 'projects'));
+    const memoryStore = await createClientScopedMemoryStore(join(clientDataDir, 'memory'));
+    const referenceStore = await createClientScopedReferenceStore(join(clientDataDir, 'references'));
+    const longNovelStore = await createClientScopedLongNovelConfigStore(
+      join(clientDataDir, 'long-novel'),
+    );
+      const app = buildServer(
+        store,
+        undefined,
+        new MemoryService(memoryStore),
+        referenceStore,
+        longNovelStore,
+      );
+      return { app, clientDataDir };
+    })();
+    appPromises.set(clientId, appPromise);
+  }
   return appPromise;
 }
 
 // Start the Fastify app on an ephemeral loopback port so the function can stream
 // through it. Falls back to the buffered inject() transport if the sandbox
 // disallows listening sockets.
-async function getRuntime() {
-  runtimePromise ??= (async () => {
-    const app = await getApp();
+async function getRuntime(clientId) {
+  let runtimePromise = runtimePromises.get(clientId);
+  if (runtimePromise === undefined) {
+    runtimePromise = (async () => {
+    const { app, clientDataDir } = await getApp(clientId);
     try {
       await app.listen({ port: 0, host: '127.0.0.1' });
       const address = app.server.address();
       const port = typeof address === 'object' && address !== null ? address.port : 0;
-      if (port > 0) return { kind: 'proxy', port };
+      if (port > 0) return { kind: 'proxy', port, app, clientDataDir };
     } catch (err) {
       console.error(
         '[api] internal listener unavailable, falling back to inject():',
         err?.message ?? err,
       );
     }
-    return { kind: 'inject' };
-  })();
+    return { kind: 'inject', app, clientDataDir };
+    })();
+    runtimePromises.set(clientId, runtimePromise);
+  }
   return runtimePromise;
 }
 
@@ -139,6 +169,53 @@ async function proxyRequest(req, target, port) {
   });
 }
 
+/** Keep the function alive until the proxied stream ends, then snapshot data. */
+function persistAfterStream(response, persist) {
+  if (response.body === null) {
+    return persist().then(() => response);
+  }
+  const reader = response.body.getReader();
+  let finalized = false;
+  const finalize = async () => {
+    if (finalized) return;
+    finalized = true;
+    await persist();
+  };
+  const body = new ReadableStream({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          await finalize();
+          controller.close();
+        } else {
+          controller.enqueue(value);
+        }
+      } catch (error) {
+        try {
+          await finalize();
+        } finally {
+          controller.error(error);
+        }
+      }
+    },
+    async cancel(reason) {
+      try {
+        await reader.cancel(reason);
+      } finally {
+        await finalize();
+      }
+    },
+  });
+  return Promise.resolve(
+    new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    }),
+  );
+}
+
 // Buffered fallback (previous behavior) for sandboxes without a listener.
 async function injectRequest(app, req, target) {
   const payload =
@@ -160,15 +237,24 @@ async function injectRequest(app, req, target) {
 }
 
 export default async (req) => {
-  const app = await getApp();
-  const runtime = await getRuntime();
+  const suppliedClientId = readClientId(req);
+  const clientId = suppliedClientId ?? 'invalid';
+  const runtime = await getRuntime(clientId);
   const url = new URL(req.url);
   const target = `${apiPathFromRequest(url)}${url.search}`;
+  const persist = async () => {
+    if (suppliedClientId !== undefined) {
+      await persistClientData(runtime.clientDataDir, suppliedClientId);
+    }
+  };
 
   if (runtime.kind === 'proxy') {
-    return proxyRequest(req, target, runtime.port);
+    const response = await proxyRequest(req, target, runtime.port);
+    return persistAfterStream(response, persist);
   }
-  return injectRequest(app, req, target);
+  const response = await injectRequest(runtime.app, req, target);
+  await persist();
+  return response;
 };
 
 export const config = {

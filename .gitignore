@@ -18,6 +18,7 @@ backend/data/
 dist/
 frontend/dist/
 backend/dist/
+*.tsbuildinfo
 
 # env / secrets
 .env
@@ -33,3 +34,6 @@ Thumbs.db
 
 # Playwright MCP test artifacts
 .playwright-mcp/
+
+# Local Netlify folder
+.netlify

@@ -27,7 +27,7 @@ import { scaledMemoryOptions } from '../memory/MemoryService.js';
 import type { ReferenceAnalysisService } from '../reference/ReferenceAnalysisService.js';
 import { MaterialResearchService } from '../research/MaterialResearchService.js';
 import { stripReasoningArtifacts } from '../text/reasoningSanitizer.js';
-import type { LongNovelConfigStore } from './longNovel/LongNovelConfigStore.js';
+import type { LongNovelConfigStorePort } from './longNovel/LongNovelConfigStore.js';
 import { defaultLongNovelConfig, runChapterQualityGates, type GateResult } from './longNovel/qualityGates.js';
 import {
   ContinuityInspectorSubAgent,
@@ -121,7 +121,7 @@ export class AgentOrchestrator {
     private readonly chapterWriter: ChapterWriter,
     private readonly memory: MemoryService,
     private readonly referenceService?: ReferenceAnalysisService,
-    private readonly longNovelConfigStore?: LongNovelConfigStore,
+    private readonly longNovelConfigStore?: LongNovelConfigStorePort,
   ) {
     this.inspector = new ContinuityInspectorSubAgent(modelProxy);
   }
