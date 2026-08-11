@@ -70,6 +70,27 @@ function readyDecision(overrides: Record<string, unknown> = {}): string {
       wordsPerChapter: 1200,
       chapterCount: 2,
       chapterOutlines: outlines(2),
+      storyPlan: {
+        metadata: { title: '灰烬王冠', genre: '西方玄幻', targetLength: 2400, tone: '史诗、阴郁' },
+        premise: { oneSentence: '流亡骑士寻找吞噬记忆的王冠。', coreConflict: '守住记忆与夺回王权的目标彼此冲突。' },
+        protagonist: {
+          name: '艾琳', identity: '流亡骑士', personality: ['克制'], motivation: '追查故国真相',
+          goal: '封印诅咒王冠', weakness: '拒绝信任同伴', growthArc: '从独行复仇者成长为共同命运的守护者',
+        },
+        world: {
+          overview: '旧帝国覆灭后，教会、边境诸侯与遗迹猎人争夺失落王权，魔法以人的记忆作为不可逆代价。',
+          regions: [], countries: [], races: [], religions: [], factions: [], history: [],
+        },
+        powerSystem: { rules: ['施法消耗记忆', '王冠放大代价'], levels: [], limitations: [], specialCases: [] },
+        characters: [
+          { name: '艾琳', role: '主角', traits: ['克制'] },
+          { name: '罗兰', role: '对手', traits: ['虔诚'] },
+        ],
+        factions: [],
+        mainPlot: { beginning: '接下遗迹任务', development: '被教会追杀', climax: '争夺王冠', ending: '封印王冠' },
+        subplots: [], characterArcs: [], volumes: [], foreshadowing: [], mysteries: [],
+        constraints: { mustInclude: [], mustAvoid: [] },
+      },
       ...overrides,
     },
   });
@@ -281,6 +302,23 @@ describe('NovelPlanService goal-driven agent', () => {
     expect(result.planSummary?.chapterOutlines).toHaveLength(2);
     expect(proxy.calls[1][0].content).toContain('必须连续生成 2 章');
     expect(result.brief).toContain('第2章 灰烬之路 2');
+  });
+
+  it('builds a complete Story Plan with a dedicated agent call when the draft is shallow', async () => {
+    const storyPlan = JSON.parse(readyDecision()).planSummary.storyPlan;
+    const proxy = new QueueProxy([
+      readyDecision({ storyPlan: undefined }),
+      JSON.stringify({ storyPlan }),
+    ]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      { seedPrompt: '西方玄幻，两章，每章1200字，流浪骑士，冒险成长，正统史诗，直接开始' },
+      new AbortController().signal,
+    );
+
+    expect(proxy.calls).toHaveLength(2);
+    expect(proxy.calls[1][0].content).toContain('Story Plan 架构 Agent');
+    expect(result.planSummary?.storyPlan?.world.overview.length).toBeGreaterThanOrEqual(40);
   });
 
   it('repairs malformed JSON once and fails clearly after two invalid responses', async () => {

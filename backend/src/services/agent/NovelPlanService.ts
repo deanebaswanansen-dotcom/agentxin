@@ -741,6 +741,23 @@ function ensureStructuredStoryPlan(summary: NovelPlanSummary): NovelPlanSummary 
   return { ...summary, storyPlan: plan };
 }
 
+function isCompleteStoryPlan(plan: NovelStoryPlan | undefined): boolean {
+  return Boolean(
+    plan &&
+      plan.premise.oneSentence.length >= 8 &&
+      plan.premise.coreConflict.length >= 8 &&
+      plan.protagonist.identity.length >= 2 &&
+      plan.protagonist.goal.length >= 4 &&
+      plan.world.overview.length >= 40 &&
+      plan.powerSystem.rules.length >= 2 &&
+      plan.characters.length >= 2 &&
+      plan.mainPlot.beginning.length >= 4 &&
+      plan.mainPlot.development.length >= 4 &&
+      plan.mainPlot.climax.length >= 4 &&
+      plan.mainPlot.ending.length >= 4,
+  );
+}
+
 export class NovelPlanService {
   constructor(
     private readonly modelConfigService: ModelConfigService,
@@ -820,15 +837,27 @@ export class NovelPlanService {
       throw new ProxyError('策划 Agent 没有形成可执行方案，请重试本轮。');
     }
     decision = enforceUserIntent(decision, seed, history, request.answers, target);
-    decision = await this.ensureChapterOutlines(
-      config,
-      decision,
-      seed,
-      history,
-      request.answers,
-      target,
-      signal,
-    );
+    const [storyDecision, outlineDecision] = await Promise.all([
+      this.ensureStoryPlan(config, decision, seed, history, request.answers, signal),
+      this.ensureChapterOutlines(
+        config,
+        decision,
+        seed,
+        history,
+        request.answers,
+        target,
+        signal,
+      ),
+    ]);
+    const mergedSummary = ensureStructuredStoryPlan({
+      ...outlineDecision.planSummary,
+      storyPlan: storyDecision.planSummary?.storyPlan,
+    });
+    decision = {
+      ...decision,
+      planSummary: mergedSummary,
+      brief: this.buildFinalBrief(seed, decision.brief, mergedSummary),
+    };
     return {
       status: 'ready',
       round,
@@ -891,6 +920,49 @@ export class NovelPlanService {
       signal,
     );
     return normalizeDecision(data);
+  }
+
+  private async ensureStoryPlan(
+    config: ModelConfig,
+    decision: AgentDecision,
+    seed: string,
+    history: NovelPlanHistoryTurn[],
+    answers: NovelPlanAnswer[] | undefined,
+    signal: AbortSignal,
+  ): Promise<AgentDecision> {
+    const summary = decision.planSummary!;
+    if (isCompleteStoryPlan(summary.storyPlan)) return decision;
+    const data = await this.collectJson(
+      config,
+      [
+        {
+          role: 'system',
+          content: [
+            '你是 Story Plan 架构 Agent。只输出 JSON：{"storyPlan":{...}}，不要输出分章大纲或正文。',
+            '用户已决定“想看什么”，你负责完整决定“怎么写”；禁止向用户追加问题。',
+            '自动创造国家、城市、历史、种族、宗教、派系、力量体系、配角、反派、支线、伏笔和谜团。',
+            'storyPlan 使用 camelCase，必须完整包含 metadata、premise、protagonist、world、powerSystem、characters、factions、mainPlot、subplots、characterArcs、volumes、foreshadowing、mysteries、constraints。',
+            '质量下限：world.overview 至少 80 字；powerSystem.rules 至少 3 条；characters 至少 4 人；mainPlot 四段完整；foreshadowing 至少 3 条。',
+            '所有内容必须服从用户明确题材、人物方向、风格、禁忌与规模，不得套用其他题材模板。',
+          ].join('\n'),
+        },
+        {
+          role: 'user',
+          content: [
+            sessionText(seed, history, answers),
+            '已确认策划摘要：',
+            JSON.stringify({ ...summary, storyPlan: undefined }, null, 2),
+          ].join('\n\n'),
+        },
+      ],
+      signal,
+    );
+    if (!isRecord(data)) throw new ProxyError('Story Plan Agent 未返回有效 JSON。');
+    const storyPlan = normalizeStoryPlan(data.storyPlan);
+    if (!isCompleteStoryPlan(storyPlan)) {
+      throw new ProxyError('Story Plan Agent 返回的信息不完整，请重试。');
+    }
+    return { ...decision, planSummary: { ...summary, storyPlan } };
   }
 
   private async ensureChapterOutlines(
