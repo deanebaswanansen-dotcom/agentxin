@@ -1703,6 +1703,21 @@ export class AgentOrchestrator {
       steps.push('已采纳并保存创作规则。');
     }
 
+    if (plan.storyPlan) {
+      const storyPlanText = JSON.stringify(plan.storyPlan, null, 2);
+      const savedStoryPlan = await this.upsertWorldSettingByTitle(
+        projectId,
+        'Story Plan（计划锁定）',
+        storyPlanText,
+      );
+      artifacts.push({
+        kind: 'world',
+        id: savedStoryPlan.id,
+        title: savedStoryPlan.title,
+      });
+      steps.push('已保存结构化 Story Plan，供后续 Agent 共用。');
+    }
+
     const outlines = plan.chapterOutlines ?? [];
     if (outlines.length > 0) {
       const controlOutline = buildControlOutlineFromPlan(outlines, totalChapters, wordsPerChapter);
@@ -2177,6 +2192,7 @@ export class AgentOrchestrator {
   /** 把计划摘要中的硬约束写入长期记忆（StoryForge 伏笔/设定级事实）。 */
   private async seedMemoryFromPlan(projectId: Id, plan: NovelPlanSummary): Promise<void> {
     const facts: Array<{ kind: 'character' | 'world' | 'plot'; text: string }> = [];
+    const story = plan.storyPlan;
     if (plan.protagonist?.trim()) {
       facts.push({ kind: 'character', text: `主角设定：${plan.protagonist.trim()}` });
     }
@@ -2204,6 +2220,30 @@ export class AgentOrchestrator {
         text: `第${ch.number}章计划：${ch.title} — ${ch.goal}`.slice(0, 280),
       });
     }
+    if (story?.world.overview.trim()) {
+      facts.push({ kind: 'world', text: `Story Plan 世界：${story.world.overview.trim()}` });
+    }
+    for (const rule of story?.powerSystem.rules.slice(0, 6) ?? []) {
+      facts.push({ kind: 'world', text: `力量规则：${rule}` });
+    }
+    for (const character of story?.characters.slice(0, 12) ?? []) {
+      facts.push({
+        kind: 'character',
+        text: `${character.name}（${character.role}）：${[
+          character.identity,
+          character.goal,
+          character.arc,
+        ]
+          .filter(Boolean)
+          .join('；')}`.slice(0, 300),
+      });
+    }
+    if (story) {
+      facts.push({
+        kind: 'plot',
+        text: `主线四段：开端=${story.mainPlot.beginning}；发展=${story.mainPlot.development}；高潮=${story.mainPlot.climax}；结局=${story.mainPlot.ending}`.slice(0, 600),
+      });
+    }
     if (facts.length > 0) await this.memory.recordFacts(projectId, facts);
 
     // 核心钩子与章纲悬念预埋进伏笔台账，后续写作会回灌提醒
@@ -2219,6 +2259,14 @@ export class AgentOrchestrator {
         detail: plan.hook.trim(),
         urgency: 'high',
         suggestPayoffBy: '全书高潮前必须兑现',
+      });
+    }
+    for (const [index, detail] of (story?.foreshadowing ?? []).slice(0, 8).entries()) {
+      plants.push({
+        title: `Story Plan 伏笔 ${index + 1}`,
+        detail: detail.slice(0, 240),
+        urgency: 'medium',
+        suggestPayoffBy: '按 Story Plan 的章节因果链兑现',
       });
     }
     for (const ch of (plan.chapterOutlines ?? []).slice(0, 8)) {
@@ -2879,6 +2927,10 @@ function appendPlanContextToPrompt(prompt: string, plan: NovelPlanSummary | unde
       );
     }
   }
+  if (plan.storyPlan) {
+    lines.push('', '## 结构化 Story Plan（所有下游 Agent 共用）');
+    lines.push(JSON.stringify(plan.storyPlan, null, 2));
+  }
   if (lines.length <= 1) return prompt;
   return `${prompt.trim()}\n\n${lines.join('\n')}`;
 }
@@ -2904,6 +2956,10 @@ function formatPlanCreationRules(plan: NovelPlanSummary): string | undefined {
     for (const c of plan.constraints) {
       if (c.trim()) lines.push(`  - ${c.trim()}`);
     }
+  }
+  if (plan.storyPlan) {
+    lines.push('- Story Plan 已锁定：正文、人物、世界观、伏笔和分卷必须共同遵守。');
+    lines.push('```json', JSON.stringify(plan.storyPlan, null, 2), '```');
   }
   lines.push('', '写作时必须遵守以上规则；不得偏离赛道、基调与已确认约束。');
   // 仅有标题行时视为空

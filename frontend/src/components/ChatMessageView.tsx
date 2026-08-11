@@ -294,6 +294,44 @@ function PlanTurnCard({
               ) : null}
             </dl>
           ) : null}
+          {message.planSummary?.storyPlan ? (
+            <details className="nwa-plan-chat__brief-details" open>
+              <summary>结构化 Story Plan</summary>
+              <dl className="nwa-plan-chat__summary">
+                <dt>一句话前提</dt>
+                <dd>{message.planSummary.storyPlan.premise.oneSentence}</dd>
+                <dt>核心冲突</dt>
+                <dd>{message.planSummary.storyPlan.premise.coreConflict}</dd>
+                <dt>主角弧光</dt>
+                <dd>
+                  {message.planSummary.storyPlan.protagonist.identity}；目标：
+                  {message.planSummary.storyPlan.protagonist.goal}；成长：
+                  {message.planSummary.storyPlan.protagonist.growthArc}
+                </dd>
+                <dt>世界</dt>
+                <dd>{message.planSummary.storyPlan.world.overview}</dd>
+                <dt>主线四段</dt>
+                <dd>
+                  开端：{message.planSummary.storyPlan.mainPlot.beginning}；发展：
+                  {message.planSummary.storyPlan.mainPlot.development}；高潮：
+                  {message.planSummary.storyPlan.mainPlot.climax}；结局：
+                  {message.planSummary.storyPlan.mainPlot.ending}
+                </dd>
+                {message.planSummary.storyPlan.powerSystem.rules.length > 0 ? (
+                  <>
+                    <dt>力量规则</dt>
+                    <dd>{message.planSummary.storyPlan.powerSystem.rules.join('；')}</dd>
+                  </>
+                ) : null}
+                {message.planSummary.storyPlan.foreshadowing.length > 0 ? (
+                  <>
+                    <dt>伏笔</dt>
+                    <dd>{message.planSummary.storyPlan.foreshadowing.join('；')}</dd>
+                  </>
+                ) : null}
+              </dl>
+            </details>
+          ) : null}
           {message.planSummary?.chapterOutlines && message.planSummary.chapterOutlines.length > 0 ? (
             <div className="nwa-plan-chat__chapters" aria-label="分章大纲">
               <strong className="nwa-plan-chat__chapters-title">分章大纲（Agent 生成）</strong>

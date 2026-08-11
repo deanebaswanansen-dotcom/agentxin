@@ -21,7 +21,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import apiClient from '../api/apiClient.js';
 import applyAdoption, { type AdoptionTarget } from '../lib/applyAdoption.js';
-import { formatPlanAnswersForHistory } from '../lib/planHistory.js';
+import {
+  formatPlanAnswersForHistory,
+  formatPlanQuestionsForHistory,
+} from '../lib/planHistory.js';
 import {
   isReferenceImportFileName,
   parseReaderFile,
@@ -290,7 +293,10 @@ export function ChatWorkspace({
         );
         const historyAfter: NovelPlanHistoryTurn[] = [
           { role: 'user', content: `灵感：${seedPrompt}` },
-          { role: 'assistant', content: response.message },
+          {
+            role: 'assistant',
+            content: formatPlanQuestionsForHistory(response.message, response.questions),
+          },
         ];
         applyPlanResponse(response, historyAfter);
       } catch (error) {
@@ -339,7 +345,10 @@ export function ChatWorkspace({
             role: 'user',
             content: userLine,
           },
-          { role: 'assistant', content: response.message },
+          {
+            role: 'assistant',
+            content: formatPlanQuestionsForHistory(response.message, response.questions),
+          },
         ];
         applyPlanResponse(response, historyAfter);
       } catch (error) {

@@ -315,6 +315,8 @@ export interface NovelPlanQuestionOption {
 export interface NovelPlanQuestion {
   id: string;
   question: string;
+  /** 内部高影响评分（0-10）；低于 7 的问题不得主动询问。 */
+  impactScore?: number;
   /** 是否允许多选（默认 false）。 */
   multiSelect?: boolean;
   options: NovelPlanQuestionOption[];
@@ -360,6 +362,78 @@ export interface NovelPlanChapterOutline {
   estimatedWords?: number;
 }
 
+/** 可被正文、剧本、人物分析和分镜模块共同消费的结构化故事计划。 */
+export interface NovelStoryPlan {
+  metadata: {
+    title?: string;
+    genre?: string;
+    targetLength?: number;
+    tone?: string;
+  };
+  premise: {
+    oneSentence: string;
+    coreConflict: string;
+    theme?: string;
+  };
+  protagonist: {
+    name?: string;
+    age?: number;
+    identity: string;
+    personality: string[];
+    motivation: string;
+    goal: string;
+    weakness: string;
+    growthArc: string;
+  };
+  world: {
+    overview: string;
+    regions: string[];
+    countries: string[];
+    races: string[];
+    religions: string[];
+    factions: string[];
+    history: string[];
+  };
+  powerSystem: {
+    rules: string[];
+    levels: string[];
+    limitations: string[];
+    specialCases: string[];
+  };
+  characters: Array<{
+    name: string;
+    role: string;
+    identity?: string;
+    traits: string[];
+    motivation?: string;
+    goal?: string;
+    weakness?: string;
+    arc?: string;
+  }>;
+  factions: string[];
+  mainPlot: {
+    beginning: string;
+    development: string;
+    climax: string;
+    ending: string;
+  };
+  subplots: string[];
+  characterArcs: string[];
+  volumes: Array<{
+    number: number;
+    title: string;
+    goal: string;
+    chapterStart: number;
+    chapterEnd: number;
+  }>;
+  foreshadowing: string[];
+  mysteries: string[];
+  constraints: {
+    mustInclude: string[];
+    mustAvoid: string[];
+  };
+}
+
 export interface NovelPlanSummary {
   title?: string;
   genre?: string;
@@ -375,6 +449,8 @@ export interface NovelPlanSummary {
   chapterCount?: number;
   /** Agent 生成的分章大纲（写正文前的章纲）。 */
   chapterOutlines?: NovelPlanChapterOutline[];
+  /** 完整结构化 Story Plan，供所有下游 Agent 复用。 */
+  storyPlan?: NovelStoryPlan;
 }
 
 export interface NovelPlanTurnResponse {

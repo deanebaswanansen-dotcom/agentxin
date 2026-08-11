@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 
 import { corsResponseHeaders } from '../cors.js';
 import type { AgentService } from '../services/agent/AgentService.js';
+import { normalizeStoryPlan } from '../services/agent/NovelPlanService.js';
 import { ServiceError } from '../services/ServiceError.js';
 import type {
   AgentProgressEvent,
@@ -58,7 +59,7 @@ function asOptionalPositiveInt(value: unknown): number | undefined {
 }
 
 /** 宽松解析计划摘要（StoryForge 风格计划采纳），非法字段丢弃。 */
-function parsePlanSummary(raw: unknown): NovelPlanSummary | undefined {
+export function parsePlanSummary(raw: unknown): NovelPlanSummary | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const obj = raw as Record<string, unknown>;
   const constraints = Array.isArray(obj.constraints)
@@ -94,6 +95,7 @@ function parsePlanSummary(raw: unknown): NovelPlanSummary | undefined {
     wordsPerChapter: asOptionalPositiveInt(obj.wordsPerChapter),
     chapterCount: asOptionalPositiveInt(obj.chapterCount),
     chapterOutlines: chapterOutlines && chapterOutlines.length > 0 ? chapterOutlines : undefined,
+    storyPlan: normalizeStoryPlan(obj.storyPlan),
   };
 
   const hasAny = Object.values(summary).some((v) => v !== undefined);

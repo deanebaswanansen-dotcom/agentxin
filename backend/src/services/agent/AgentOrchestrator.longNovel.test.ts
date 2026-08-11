@@ -19,8 +19,46 @@ import { FileDataStore } from '../../store/FileDataStore.js';
 import { MemoryService } from '../memory/MemoryService.js';
 import { MemoryStore } from '../memory/MemoryStore.js';
 import { ModelConfigService } from '../modelConfig/ModelConfigService.js';
-import type { ChatMessage, ModelConfig } from '../../types/index.js';
+import type { ChatMessage, ModelConfig, NovelStoryPlan } from '../../types/index.js';
 import type { StreamDelta } from '../../proxy/sseParser.js';
+
+const STORY_PLAN: NovelStoryPlan = {
+  metadata: { title: '代码御剑', genre: '赛博修仙', targetLength: 1600, tone: '硬核爽文' },
+  premise: { oneSentence: '程序员用漏洞修仙。', coreConflict: '个人自由与学院垄断冲突。' },
+  protagonist: {
+    name: '陆辞',
+    identity: '黑户程序员',
+    personality: ['冷静'],
+    motivation: '摆脱追捕',
+    goal: '破解聚灵网络',
+    weakness: '不信任他人',
+    growthArc: '从独行到承担团队责任',
+  },
+  world: {
+    overview: '灵气由学院垄断的赛博修仙世界。',
+    regions: [],
+    countries: [],
+    races: [],
+    religions: [],
+    factions: ['中央学院'],
+    history: [],
+  },
+  powerSystem: {
+    rules: ['代码可改写阵法'],
+    levels: [],
+    limitations: ['算力有限'],
+    specialCases: [],
+  },
+  characters: [],
+  factions: ['中央学院'],
+  mainPlot: { beginning: '潜入学院', development: '破解阵法', climax: '公开漏洞', ending: '打破垄断' },
+  subplots: [],
+  characterArcs: [],
+  volumes: [],
+  foreshadowing: ['神秘芯片来源'],
+  mysteries: [],
+  constraints: { mustInclude: ['阵法漏洞'], mustAvoid: ['后宫'] },
+};
 
 class CaptureProxy implements ModelProxy {
   chapterSystems: string[] = [];
@@ -277,6 +315,7 @@ describe('normalizeFullNovelOptions', () => {
             chapterCount: 2,
             wordsPerChapter: 800,
             totalWords: 1600,
+            storyPlan: STORY_PLAN,
             chapterOutlines: [
               { number: 1, title: '黑户入学', goal: '陆辞绕过身份验证进入学院。' },
               { number: 2, title: '第一堂课', goal: '陆辞用低算力漏洞完成聚灵阵。' },
@@ -293,6 +332,9 @@ describe('normalizeFullNovelOptions', () => {
     expect(outlines.some((o) => o.title.includes('分章大纲（计划采纳）'))).toBe(true);
     const worlds = await store.listWorldSettings(result.projectId);
     expect(worlds.some((w) => w.title.includes('创作规则'))).toBe(true);
+    expect(worlds.find((w) => w.title === 'Story Plan（计划锁定）')?.content).toContain(
+      '代码可改写阵法',
+    );
     const chapters = await store.listChapters(result.projectId);
     expect(chapters[0]?.title).toContain('黑户入学');
     expect(chapters[1]?.title).toContain('第一堂课');

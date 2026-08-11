@@ -79,7 +79,7 @@ describe('NovelPlanService goal-driven agent', () => {
     ).rejects.toMatchObject({ code: 'MODEL_NOT_CONFIGURED' });
   });
 
-  it('calls the agent immediately and asks at most two blocking questions', async () => {
+  it('calls the agent immediately and asks at most three high-impact questions', async () => {
     const proxy = new QueueProxy([
       JSON.stringify({
         status: 'asking',
@@ -119,11 +119,12 @@ describe('NovelPlanService goal-driven agent', () => {
     );
 
     expect(result.status).toBe('asking');
-    expect(result.questions).toHaveLength(2);
+    expect(result.questions).toHaveLength(3);
     const prompt = proxy.calls[0].map((message) => message.content).join('\n');
     expect(prompt).toContain('不是固定问卷或工作流');
     expect(prompt).toContain('已识别硬约束题材：西方玄幻');
-    expect(prompt).toContain('这是计划模式首轮，必须返回 asking');
+    expect(prompt).toContain('信息足以形成方向时可以 0 问并立即 ready');
+    expect(prompt).toContain('主动提问总预算剩余 3 题');
   });
 
   it('does not accept a ready draft before the user confirms the first-turn direction', async () => {
@@ -138,8 +139,9 @@ describe('NovelPlanService goal-driven agent', () => {
 
     expect(result.status).toBe('asking');
     expect(result.questions?.map((question) => question.id)).toEqual([
-      'confirm_core_direction',
-      'confirm_protagonist',
+      'main_direction',
+      'protagonist_type',
+      'story_tone',
     ]);
     expect(result.planSummary).toBeUndefined();
   });
@@ -161,8 +163,48 @@ describe('NovelPlanService goal-driven agent', () => {
     );
 
     expect(result.status).toBe('asking');
-    expect(result.questions).toHaveLength(2);
-    expect(result.questions?.[0]?.options[0]?.label).toContain('西方玄幻');
+    expect(result.questions).toHaveLength(3);
+    expect(result.questions?.[0]?.id).toBe('main_direction');
+  });
+
+  it('asks zero questions when the user already supplied the core direction', async () => {
+    const proxy = new QueueProxy([readyDecision()]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      { seedPrompt: '写西方玄幻，主角是流浪骑士，走冒险成长主线，正统史诗风格' },
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe('ready');
+    expect(result.planSummary?.storyPlan?.metadata.genre).toBe('西方玄幻');
+    expect(proxy.calls).toHaveLength(1);
+  });
+
+  it('rejects low-value world-detail questions and tells the agent to finish', async () => {
+    const lowValue = JSON.stringify({
+      status: 'asking',
+      message: '确认细节。',
+      questions: [
+        {
+          id: 'country_name',
+          question: '第一个国家叫什么？',
+          impactScore: 9,
+          options: [
+            { id: 'a', label: '阿斯塔' },
+            { id: 'b', label: '洛伦' },
+          ],
+        },
+      ],
+    });
+    const proxy = new QueueProxy([lowValue, readyDecision()]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      { seedPrompt: '写西方玄幻，主角是流浪骑士，走冒险成长主线，正统史诗风格' },
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe('ready');
+    expect(proxy.calls).toHaveLength(2);
   });
 
   it('keeps explicit western fantasy even when the model drifts to campus fiction', async () => {

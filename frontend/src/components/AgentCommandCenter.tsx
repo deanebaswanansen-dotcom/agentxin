@@ -16,7 +16,10 @@ import type {
   NovelPlanTargetTask,
   NovelPlanTurnResponse,
 } from '../types/index.js';
-import { formatPlanAnswersForHistory } from '../lib/planHistory.js';
+import {
+  formatPlanAnswersForHistory,
+  formatPlanQuestionsForHistory,
+} from '../lib/planHistory.js';
 import { buildAgentRunOptions } from './chat/buildAgentRunOptions.js';
 import { Icon, type IconName } from './Icon.js';
 import { LottieMotion } from './LottieMotion.js';
@@ -462,6 +465,9 @@ export function AgentCommandCenter({
       return {
         questionId: q.id,
         selectedOptionIds: local.selectedOptionIds,
+        selectedOptionLabels: local.selectedOptionIds
+          .map((optionId) => q.options.find((option) => option.id === optionId)?.label)
+          .filter((label): label is string => Boolean(label)),
         customText: local.customText.trim() || undefined,
       };
     });
@@ -501,7 +507,10 @@ export function AgentCommandCenter({
       } else if (params.history.length === 0) {
         historyAfter.push({ role: 'user', content: `灵感：${params.seedPrompt}` });
       }
-      historyAfter.push({ role: 'assistant', content: response.message });
+      historyAfter.push({
+        role: 'assistant',
+        content: formatPlanQuestionsForHistory(response.message, response.questions),
+      });
       applyPlanResponse(response, historyAfter);
     } catch (error) {
       if (!isAbort(error)) {
@@ -877,6 +886,14 @@ export function AgentCommandCenter({
                       </>
                     ) : null}
                   </dl>
+                ) : null}
+                {planSummary?.storyPlan ? (
+                  <details className="nwa-plan-chat__brief-details">
+                    <summary>结构化 Story Plan</summary>
+                    <pre className="nwa-plan__brief">
+                      {JSON.stringify(planSummary.storyPlan, null, 2)}
+                    </pre>
+                  </details>
                 ) : null}
                 {planBrief ? (
                   <pre className="nwa-plan__brief" aria-label="生成用 brief">{planBrief}</pre>

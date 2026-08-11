@@ -8,6 +8,7 @@ import type { ModelProxy } from '../proxy/ModelProxy.js';
 import type { StreamDelta } from '../proxy/sseParser.js';
 import { FileDataStore } from '../store/FileDataStore.js';
 import type { ChatMessage, ModelConfig } from '../types/index.js';
+import { parsePlanSummary } from './agentRoutes.js';
 
 class FakeProxy implements ModelProxy {
   calls: ChatMessage[][] = [];
@@ -45,6 +46,23 @@ describe('agent routes', () => {
 
   afterEach(async () => {
     await rm(dir, { recursive: true, force: true });
+  });
+
+  it('preserves the structured Story Plan in downstream agent options', () => {
+    const parsed = parsePlanSummary({
+      title: '灰烬王冠',
+      storyPlan: {
+        metadata: { genre: '西方玄幻' },
+        premise: { oneSentence: '流亡骑士寻找王冠。', coreConflict: '记忆与权力冲突。' },
+        protagonist: { identity: '流亡骑士', goal: '找回王冠' },
+        world: { overview: '旧帝国覆灭后的大陆。' },
+        powerSystem: { rules: ['魔法消耗记忆'] },
+        mainPlot: { beginning: '接任务', development: '被追杀', climax: '争夺王冠', ending: '封印王冠' },
+      },
+    });
+
+    expect(parsed?.storyPlan?.premise.coreConflict).toBe('记忆与权力冲突。');
+    expect(parsed?.storyPlan?.powerSystem.rules).toEqual(['魔法消耗记忆']);
   });
 
   it('runs draft automation from one sentence and persists project artifacts', async () => {
