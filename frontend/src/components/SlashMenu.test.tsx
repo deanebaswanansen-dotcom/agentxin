@@ -35,6 +35,7 @@ describe('SlashMenu', () => {
       <SlashMenu
         query="/mock"
         hasProject={false}
+        showMock
         onSelectTask={vi.fn()}
         onSelectMock={vi.fn()}
         onClose={vi.fn()}

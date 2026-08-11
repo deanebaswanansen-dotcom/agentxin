@@ -207,7 +207,7 @@ export function buildServer(
   registerProjectRoutes(app, projectService);
   registerChapterRoutes(app, chapterService);
   registerSettingRoutes(app, settingService);
-  registerModelConfigRoutes(app, modelConfigService);
+  registerModelConfigRoutes(app, modelConfigService, proxy);
   registerWritingRoutes(app, writingService);
   registerAgentRoutes(app, agentService);
   registerPlanRoutes(app, novelPlanService);

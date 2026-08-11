@@ -162,24 +162,17 @@ function PlanTurnCard({
     questions.map((q) => ({
       questionId: q.id,
       selectedOptionIds: selected[q.id] ?? [],
+      selectedOptionLabels: (selected[q.id] ?? [])
+        .map((optionId) => q.options.find((option) => option.id === optionId)?.label)
+        .filter((label): label is string => Boolean(label)),
       customText: custom[q.id]?.trim() || undefined,
     }));
 
   return (
     <div className="nwa-chat__msg nwa-chat__msg--assistant nwa-chat__msg--plan" aria-label="计划模式追问">
       <span className="nwa-chat__role">
-        <Icon name="brain" /> 计划模式
-        {message.depth === 'light'
-          ? ' · 轻量'
-          : message.depth === 'standard'
-            ? ' · 中等'
-            : message.depth === 'deep'
-              ? ' · 极限详细'
-              : ' · 选深度'}
-        {message.round > 0 ? ` · 第 ${message.round} 轮` : ''}
-        {message.depthRoundRange
-          ? `（目标 ${message.depthRoundRange[0]}～${message.depthRoundRange[1]} 轮）`
-          : ''}
+        <Icon name="brain" /> Agent 策划
+        {message.round > 0 ? ` · 第 ${message.round} 次决策` : ''}
       </span>
       <div className="nwa-chat__content nwa-plan-chat__message">{message.message}</div>
 
@@ -228,7 +221,7 @@ function PlanTurnCard({
               disabled={!canSubmit}
               onClick={() => onPlanSubmit?.(message.id, buildAnswers(), false)}
             >
-              提交回答，继续追问
+              提交补充，让 Agent 决策
             </button>
             <button
               type="button"

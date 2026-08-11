@@ -4,6 +4,7 @@ import {
   ApiClientError,
   createApiClient,
   isApiClientError,
+  migrateStoredModelConfig,
   parseSseEvents,
   runAgentBackgroundJob,
   type SseEvent,
@@ -80,6 +81,23 @@ const client = () => createApiClient('/api');
 // ---------------------------------------------------------------------------
 
 describe('apiClient request building', () => {
+  it('migrates retired DeepSeek model aliases without touching custom gateways', () => {
+    expect(
+      migrateStoredModelConfig({
+        baseUrl: 'https://api.deepseek.com/v1',
+        apiKey: 'secret',
+        modelName: 'deepseek-chat',
+      }),
+    ).toMatchObject({ baseUrl: 'https://api.deepseek.com', modelName: 'deepseek-v4-flash' });
+    expect(
+      migrateStoredModelConfig({
+        baseUrl: 'https://gateway.example.com/v1',
+        apiKey: 'secret',
+        modelName: 'deepseek-chat',
+      }).modelName,
+    ).toBe('deepseek-chat');
+  });
+
   it('persists model config to localStorage, sends it as a request header, and clears it', async () => {
     const api = client();
     const config: ModelConfig = {
@@ -128,6 +146,12 @@ describe('apiClient request building', () => {
     const agentCall = mock.mock.calls.find((call) => String(call[0]).endsWith('/agent/run'));
     const agentHeaders = agentCall?.[1]?.headers as Record<string, string>;
     expect(JSON.parse(decodeURIComponent(agentHeaders['X-Agentxin-Model-Config']))).toEqual(config);
+
+    await api.modelConfig.test();
+    const testCall = mock.mock.calls.find((call) => String(call[0]).endsWith('/model-config/test'));
+    const testHeaders = testCall?.[1]?.headers as Record<string, string>;
+    expect(JSON.parse(decodeURIComponent(testHeaders['X-Agentxin-Model-Config']))).toEqual(config);
+    expect(testCall?.[1]?.body).toBe('{}');
 
     // New client instance still hydrates from localStorage
     const api2 = createApiClient('/api');

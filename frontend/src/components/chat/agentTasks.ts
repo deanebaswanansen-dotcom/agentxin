@@ -33,10 +33,10 @@ export const AGENT_TASKS: AgentTaskDef[] = [
     slash: '计划',
     icon: 'brain',
     title: '计划模式',
-    desc: '先头脑风暴追问（类型/主角/爽点/禁忌），收束 brief 后再生成，避免一顿猛写。',
+    desc: 'Agent 先理解目标与硬约束；仅在方向真正分叉时追问，否则直接给出可执行方案。',
     mode: 'reference',
     lockedMode: true,
-    placeholder: '例：写一本修仙小说 / 赛博修仙学院，主角靠写代码御剑…',
+    placeholder: '例：西方玄幻，衰落骑士护送被诅咒的王储穿越北境…',
   },
   {
     key: 'reference',
@@ -185,7 +185,7 @@ export const AGENT_TASKS: AgentTaskDef[] = [
 ];
 
 export const TASK_PLANS: Record<AgentTask | 'plan' | 'reference', string[]> = {
-  plan: ['收集灵感种子', '多轮结构化追问', '补齐赛道/主角/爽点/禁忌', '收束创作 brief', '可选：用 brief 生成新书'],
+  plan: ['理解目标与硬约束', '识别真正阻塞项', '自主补足可推断细节', '生成故事规格与分章方案', '交给写作 Agent 执行'],
   reference: [
     '导入参考正文（TXT/MD）',
     '章节识别与本地统计',

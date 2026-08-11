@@ -99,7 +99,7 @@ describe('ChatWorkspace', () => {
     );
     const input = screen.getByLabelText('对话输入');
     fireEvent.change(input, { target: { value: '/计' } });
-    expect(await screen.findByText(/先头脑风暴追问/)).toBeInTheDocument();
+    expect(await screen.findByText(/Agent 先理解目标与硬约束/)).toBeInTheDocument();
   });
 
   it('shows the selected slash task title without leaking the icon key', async () => {

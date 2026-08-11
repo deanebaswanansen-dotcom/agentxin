@@ -23,6 +23,8 @@ export interface SlashMenuProps {
   onSelectTask: (task: AgentTaskDef) => void;
   /** 选择 Mock 演示模式。 */
   onSelectMock: () => void;
+  /** Mock is a developer-only test provider and is hidden in production. */
+  showMock?: boolean;
   /** 关闭菜单（Esc 或失焦）。 */
   onClose: () => void;
 }
@@ -33,11 +35,12 @@ export function SlashMenu({
   hasChapter = false,
   onSelectTask,
   onSelectMock,
+  showMock = false,
   onClose,
 }: SlashMenuProps): JSX.Element | null {
   // query 形如 "/新书" 或 "/新"；提取过滤词
   const filterText = query.startsWith('/') ? query.slice(1).trim().toLowerCase() : '';
-  const mockMatches =
+  const mockMatches = showMock &&
     filterText.length === 0 ||
     'mock'.includes(filterText) ||
     '演示模式'.includes(filterText);

@@ -328,14 +328,22 @@ export interface NovelPlanHistoryTurn {
 export interface NovelPlanAnswer {
   questionId: string;
   selectedOptionIds: string[];
+  /** Human-readable option labels, so the planning agent receives the actual choice. */
+  selectedOptionLabels?: string[];
   /** 用户自定义补充（对应「其他」）。 */
   customText?: string;
+}
+
+export interface ModelConnectionResult {
+  ok: true;
+  modelName: string;
+  receivedOutput: boolean;
 }
 
 export interface NovelPlanTurnRequest {
   seedPrompt: string;
   targetTask?: NovelPlanTargetTask;
-  /** 计划深度；未选时首轮只返回深度选择题。 */
+  /** Optional decision budget retained for older clients; no fixed survey is used. */
   depth?: NovelPlanDepth;
   history?: NovelPlanHistoryTurn[];
   answers?: NovelPlanAnswer[];

@@ -2480,6 +2480,8 @@ export class AgentOrchestrator {
       `你是一名小说策划子 Agent。模式：${modeHint}。`,
       `任务类型：${variant === 'title' ? '按书名/章节名扩展' : '一句话开书'}`,
       `用户需求：${prompt}`,
+      '用户需求中明确出现的题材、时代、地域、文化和人物身份是最高优先级硬约束。',
+      '不得以常见校园、都市、修仙或其他模板替换用户指定的核心类型。',
     ].join('\n');
 
     this.emitProgress(onProgress, {

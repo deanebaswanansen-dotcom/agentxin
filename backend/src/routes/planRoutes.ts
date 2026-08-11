@@ -65,12 +65,22 @@ function parseAnswers(raw: unknown): NovelPlanAnswer[] | undefined {
     if (!Array.isArray(row.selectedOptionIds) || !row.selectedOptionIds.every((x) => typeof x === 'string')) {
       throw ServiceError.validation(`answers[${index}].selectedOptionIds 必须为字符串数组。`);
     }
+    if (
+      row.selectedOptionLabels !== undefined &&
+      (!Array.isArray(row.selectedOptionLabels) ||
+        !row.selectedOptionLabels.every((x) => typeof x === 'string'))
+    ) {
+      throw ServiceError.validation(`answers[${index}].selectedOptionLabels 必须为字符串数组。`);
+    }
     if (row.customText !== undefined && typeof row.customText !== 'string') {
       throw ServiceError.validation(`answers[${index}].customText 必须为字符串。`);
     }
     return {
       questionId: row.questionId,
       selectedOptionIds: row.selectedOptionIds as string[],
+      selectedOptionLabels: Array.isArray(row.selectedOptionLabels)
+        ? (row.selectedOptionLabels as string[])
+        : undefined,
       customText: typeof row.customText === 'string' ? row.customText : undefined,
     };
   });
