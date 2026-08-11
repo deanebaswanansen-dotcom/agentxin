@@ -1,3 +1,4 @@
+# Production merges must always publish; deploy-preview trees are not a safe diff baseline.
 [build]
   base = "frontend"
   command = "npm --prefix ../backend install && npm --prefix ../backend run build && npm run build"
