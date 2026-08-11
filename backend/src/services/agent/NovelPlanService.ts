@@ -727,6 +727,14 @@ export class NovelPlanService {
       1 + history.filter((turn) => turn.role === 'user').length,
     );
     const mustFinish = bypass || request.forceReady === true || questionBudget === 0 || round >= MAX_AGENT_ROUNDS;
+    if (!mustFinish && coreFallback.length > 0) {
+      return {
+        status: 'asking',
+        round,
+        message: '只确认会改变整本小说方向的决定；其他设定由 Agent 自动完成。',
+        questions: coreFallback,
+      };
+    }
     let decision = await this.generateDecision(
       config,
       seed,
@@ -752,15 +760,6 @@ export class NovelPlanService {
           questions,
         };
       }
-    }
-
-    if (!mustFinish && coreFallback.length > 0) {
-      return {
-        status: 'asking',
-        round,
-        message: '只确认会改变整本小说方向的决定；其他设定由 Agent 自动完成。',
-        questions: coreFallback,
-      };
     }
 
     if (decision.status !== 'ready' || !decision.planSummary) {
@@ -1003,6 +1002,7 @@ export class NovelPlanService {
     const chunks: string[] = [];
     for await (const delta of this.modelProxy.streamCompletion(config, messages, signal, {
       jsonMode,
+      disableThinking: jsonMode,
     })) {
       if (delta.kind === 'content') chunks.push(delta.text);
     }

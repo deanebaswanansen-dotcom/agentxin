@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { ModelProxy } from '../../proxy/ModelProxy.js';
+import type { ModelProxy, StreamCompletionOptions } from '../../proxy/ModelProxy.js';
 import { ProxyError } from '../../proxy/ProxyError.js';
 import type { ChatMessage, ModelConfig } from '../../types/index.js';
 import type { ModelConfigService } from '../modelConfig/ModelConfigService.js';
@@ -26,11 +26,18 @@ function mockConfigService(config: ModelConfig | undefined = CONFIG): ModelConfi
 
 class QueueProxy implements ModelProxy {
   readonly calls: ChatMessage[][] = [];
+  readonly options: Array<StreamCompletionOptions | undefined> = [];
 
   constructor(private readonly outputs: Array<string | Error>) {}
 
-  async *streamCompletion(_config: ModelConfig, messages: ChatMessage[]) {
+  async *streamCompletion(
+    _config: ModelConfig,
+    messages: ChatMessage[],
+    _signal: AbortSignal,
+    options?: StreamCompletionOptions,
+  ) {
     this.calls.push(messages);
+    this.options.push(options);
     const output = this.outputs.shift();
     if (output instanceof Error) throw output;
     yield { kind: 'content' as const, text: output ?? '' };
@@ -114,7 +121,7 @@ describe('NovelPlanService goal-driven agent', () => {
     ]);
     const service = new NovelPlanService(mockConfigService(), proxy);
     const result = await service.turn(
-      { seedPrompt: '写一本西方玄幻，流亡骑士寻找王冠' },
+      { seedPrompt: '写一本西方玄幻，流亡骑士寻找王冠，走冒险成长主线，正统史诗风格' },
       new AbortController().signal,
     );
 
@@ -125,13 +132,12 @@ describe('NovelPlanService goal-driven agent', () => {
     expect(prompt).toContain('已识别硬约束题材：西方玄幻');
     expect(prompt).toContain('信息足以形成方向时可以 0 问并立即 ready');
     expect(prompt).toContain('主动提问总预算剩余 3 题');
+    expect(proxy.options[0]).toMatchObject({ jsonMode: true, disableThinking: true });
   });
 
-  it('does not accept a ready draft before the user confirms the first-turn direction', async () => {
-    const service = new NovelPlanService(
-      mockConfigService(),
-      new QueueProxy([readyDecision()]),
-    );
+  it('uses Requirement State to ask immediately when the seed lacks core direction', async () => {
+    const proxy = new QueueProxy([readyDecision()]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
     const result = await service.turn(
       { seedPrompt: '写本西方玄幻小说' },
       new AbortController().signal,
@@ -144,9 +150,10 @@ describe('NovelPlanService goal-driven agent', () => {
       'story_tone',
     ]);
     expect(result.planSummary).toBeUndefined();
+    expect(proxy.calls).toHaveLength(0);
   });
 
-  it('falls back to confirmable questions when the model returns an invalid asking shape', async () => {
+  it('rejects an invalid asking shape and tells the agent to finish', async () => {
     const service = new NovelPlanService(
       mockConfigService(),
       new QueueProxy([
@@ -155,16 +162,15 @@ describe('NovelPlanService goal-driven agent', () => {
           message: '需要确认方向。',
           questions: [{ id: 'direction', question: '想写什么方向？', options: [] }],
         }),
+        readyDecision(),
       ]),
     );
     const result = await service.turn(
-      { seedPrompt: '写本西方玄幻小说' },
+      { seedPrompt: '写西方玄幻，主角是流浪骑士，走冒险成长主线，正统史诗风格' },
       new AbortController().signal,
     );
 
-    expect(result.status).toBe('asking');
-    expect(result.questions).toHaveLength(3);
-    expect(result.questions?.[0]?.id).toBe('main_direction');
+    expect(result.status).toBe('ready');
   });
 
   it('asks zero questions when the user already supplied the core direction', async () => {
@@ -283,7 +289,10 @@ describe('NovelPlanService goal-driven agent', () => {
       new QueueProxy(['not-json', 'still-not-json']),
     );
     await expect(
-      service.turn({ seedPrompt: '写西方玄幻' }, new AbortController().signal),
+      service.turn(
+        { seedPrompt: '写西方玄幻，主角是流浪骑士，冒险成长，正统史诗风格' },
+        new AbortController().signal,
+      ),
     ).rejects.toThrow('模型连续两次未返回有效 JSON');
   });
 
@@ -293,7 +302,10 @@ describe('NovelPlanService goal-driven agent', () => {
       new QueueProxy([new ProxyError('provider unavailable')]),
     );
     await expect(
-      service.turn({ seedPrompt: '写西方玄幻' }, new AbortController().signal),
+      service.turn(
+        { seedPrompt: '写西方玄幻，主角是流浪骑士，冒险成长，正统史诗风格' },
+        new AbortController().signal,
+      ),
     ).rejects.toThrow('provider unavailable');
   });
 
