@@ -6,6 +6,7 @@ import type { ModelConfigService } from '../modelConfig/ModelConfigService.js';
 import {
   collectScaleFromSession,
   extractScaleFromText,
+  hasExplicitPlanningBypass,
   inferExplicitGenre,
   MAX_OUTLINE_CHAPTERS,
   NovelPlanService,
@@ -122,6 +123,25 @@ describe('NovelPlanService goal-driven agent', () => {
     const prompt = proxy.calls[0].map((message) => message.content).join('\n');
     expect(prompt).toContain('不是固定问卷或工作流');
     expect(prompt).toContain('已识别硬约束题材：西方玄幻');
+    expect(prompt).toContain('这是计划模式首轮，必须返回 asking');
+  });
+
+  it('does not accept a ready draft before the user confirms the first-turn direction', async () => {
+    const service = new NovelPlanService(
+      mockConfigService(),
+      new QueueProxy([readyDecision()]),
+    );
+    const result = await service.turn(
+      { seedPrompt: '写本西方玄幻小说' },
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe('asking');
+    expect(result.questions?.map((question) => question.id)).toEqual([
+      'confirm_core_direction',
+      'confirm_protagonist',
+    ]);
+    expect(result.planSummary).toBeUndefined();
   });
 
   it('keeps explicit western fantasy even when the model drifts to campus fiction', async () => {
@@ -134,7 +154,7 @@ describe('NovelPlanService goal-driven agent', () => {
     ]);
     const service = new NovelPlanService(mockConfigService(), proxy);
     const result = await service.turn(
-      { seedPrompt: '西方玄幻，两章，每章1200字，流亡女骑士寻找诅咒王冠' },
+      { seedPrompt: '西方玄幻，两章，每章1200字，流亡女骑士寻找诅咒王冠，直接开始' },
       new AbortController().signal,
     );
 
@@ -185,7 +205,7 @@ describe('NovelPlanService goal-driven agent', () => {
     const proxy = new QueueProxy([first, second]);
     const service = new NovelPlanService(mockConfigService(), proxy);
     const result = await service.turn(
-      { seedPrompt: '西方玄幻，计划写2章，每章1200字' },
+      { seedPrompt: '西方玄幻，计划写2章，每章1200字，直接开始' },
       new AbortController().signal,
     );
 
@@ -223,6 +243,11 @@ describe('NovelPlanService goal-driven agent', () => {
 });
 
 describe('planning facts', () => {
+  it('only skips first-turn consultation when the user explicitly authorizes it', () => {
+    expect(hasExplicitPlanningBypass('题材你自己决定，直接开始')).toBe(true);
+    expect(hasExplicitPlanningBypass('写一本西方玄幻小说')).toBe(false);
+  });
+
   it('recognizes explicit genres without collapsing western fantasy into generic fantasy', () => {
     expect(inferExplicitGenre('写一本西方玄幻')).toBe('西方玄幻');
     expect(inferExplicitGenre('中式修仙门派')).toBe('仙侠');

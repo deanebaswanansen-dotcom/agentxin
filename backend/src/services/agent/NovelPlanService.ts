@@ -413,6 +413,36 @@ function enforceUserIntent(
   return { ...decision, brief, planSummary };
 }
 
+export function hasExplicitPlanningBypass(text: string): boolean {
+  return /(?:你|由你|让你)?(?:自己|自行|全权)决定|无需(?:再)?提问|不用(?:再)?问|别问|直接(?:开始|生成|写)|跳过(?:提问|询问)/.test(
+    text,
+  );
+}
+
+function consultationQuestionsFromDraft(decision: AgentDecision): NovelPlanQuestion[] {
+  const summary = decision.planSummary;
+  const direction = summary?.hook ?? '由 Agent 根据题材设计核心冲突';
+  const protagonist = summary?.protagonist ?? '由 Agent 设计主角身份、目标与弱点';
+  return [
+    {
+      id: 'confirm_core_direction',
+      question: 'Agent 暂定的核心故事方向是否符合你的想法？',
+      options: [
+        { id: 'accept_direction', label: `沿用：${direction.slice(0, 80)}` },
+        { id: 'change_direction', label: '调整方向（请补充你的想法）' },
+      ],
+    },
+    {
+      id: 'confirm_protagonist',
+      question: '主角方案是否沿用？',
+      options: [
+        { id: 'accept_protagonist', label: `沿用：${protagonist.slice(0, 80)}` },
+        { id: 'change_protagonist', label: '调整主角（请补充身份或目标）' },
+      ],
+    },
+  ];
+}
+
 export class NovelPlanService {
   constructor(
     private readonly modelConfigService: ModelConfigService,
@@ -428,11 +458,16 @@ export class NovelPlanService {
     }
     const history = Array.isArray(request.history) ? request.history : [];
     const target = request.targetTask ?? 'long_novel';
+    const consultationRequired =
+      history.length === 0 &&
+      (request.answers?.length ?? 0) === 0 &&
+      !hasExplicitPlanningBypass(seed);
     const round = Math.min(
       MAX_AGENT_ROUNDS,
       1 + history.filter((turn) => turn.role === 'user').length,
     );
-    const mustFinish = request.forceReady === true || round >= MAX_AGENT_ROUNDS;
+    const mustFinish =
+      (!consultationRequired && request.forceReady === true) || round >= MAX_AGENT_ROUNDS;
     let decision = await this.generateDecision(
       config,
       seed,
@@ -440,8 +475,28 @@ export class NovelPlanService {
       history,
       request.answers,
       mustFinish,
+      consultationRequired,
       signal,
     );
+
+    if (consultationRequired) {
+      const questions =
+        decision.status === 'asking'
+          ? decision.questions.filter((question) => !alreadyAsked(question, history))
+          : consultationQuestionsFromDraft(decision);
+      if (questions.length === 0) {
+        throw new ProxyError('计划 Agent 首轮没有返回可确认的问题，请重试。');
+      }
+      return {
+        status: 'asking',
+        round,
+        message:
+          decision.status === 'asking'
+            ? decision.message
+            : '先确认两项会改变全书方向的决定；确认后 Agent 再形成完整方案。',
+        questions: questions.slice(0, MAX_QUESTIONS_PER_TURN),
+      };
+    }
 
     if (decision.status === 'asking' && !mustFinish) {
       const questions = decision.questions.filter((question) => !alreadyAsked(question, history));
@@ -460,6 +515,7 @@ export class NovelPlanService {
         history,
         request.answers,
         true,
+        false,
         signal,
       );
     }
@@ -493,6 +549,7 @@ export class NovelPlanService {
     history: NovelPlanHistoryTurn[],
     answers: NovelPlanAnswer[] | undefined,
     forceReady: boolean,
+    consultationRequired: boolean,
     signal: AbortSignal,
   ): Promise<AgentDecision> {
     const explicitGenre = inferExplicitGenre(
@@ -512,6 +569,8 @@ export class NovelPlanService {
       `下游目标：${TARGET_LABELS[target]}。`,
       forceReady
         ? '本轮必须 ready。信息不足时采用清晰、可修改的专业默认值，不得继续提问。'
+        : consultationRequired
+          ? '这是计划模式首轮，必须返回 asking，并提出 1-2 个会改变全书方向的问题；即使你已经能拟定方案，也要先让用户确认。'
         : '信息足以形成方向时立即 ready；不要为了凑轮数而提问。',
       explicitGenre ? `已识别硬约束题材：${explicitGenre}。planSummary.genre 必须完全保持。` : '',
     ]
