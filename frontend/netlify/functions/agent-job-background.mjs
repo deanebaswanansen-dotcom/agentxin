@@ -46,6 +46,20 @@ function failure(message) {
   return { error: { code: 'PROVIDER_ERROR', message } };
 }
 
+function boundedRunRequest(runRequest) {
+  if (runRequest?.task !== 'long_novel' && runRequest?.task !== 'full_novel') {
+    return runRequest;
+  }
+  const requested = Number(runRequest?.options?.chapters ?? 1);
+  if (!Number.isFinite(requested) || requested <= 1) return runRequest;
+  const totalChapters =
+    runRequest?.options?.totalChapters ?? runRequest?.options?.planSummary?.chapterCount ?? requested;
+  return {
+    ...runRequest,
+    options: { ...runRequest.options, chapters: 1, totalChapters },
+  };
+}
+
 async function createApp(clientDataDir) {
   const store = createClientScopedDataStore(join(clientDataDir, 'projects'));
   const memoryStore = await createClientScopedMemoryStore(join(clientDataDir, 'memory'));
@@ -113,7 +127,9 @@ export default async (request) => {
         'X-Agentxin-Client-Id': clientId,
         'X-Agentxin-Model-Config': modelConfig,
       },
-      body: JSON.stringify(runRequest),
+      // Compatibility guard for already-open tabs running older frontend code.
+      // One Netlify background invocation must never try to write an entire book.
+      body: JSON.stringify(boundedRunRequest(runRequest)),
     });
     if (!response.ok || response.body === null) {
       throw new Error(`后台 Agent 请求失败（HTTP ${response.status}）。`);

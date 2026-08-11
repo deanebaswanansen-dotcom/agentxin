@@ -296,6 +296,62 @@ describe('Netlify background Agent jobs', () => {
     );
     expect((refresh?.[1]?.headers as Record<string, string>)['X-Agentxin-Refresh-Data']).toBe('true');
   });
+
+  it('splits a multi-chapter run into one persisted Netlify job per chapter', async () => {
+    await client().modelConfig.save({
+      baseUrl: 'https://api.example.com',
+      apiKey: 'sk-browser-only',
+      modelName: 'novel-model',
+    });
+    let starts = 0;
+    const startedBodies: AgentRunRequest[] = [];
+    const progress = vi.fn();
+    installFetch(async (url, init) => {
+      if (url.endsWith('/agent-job-background')) {
+        starts += 1;
+        startedBodies.push(JSON.parse(String(init?.body)).request as AgentRunRequest);
+        return new Response(null, { status: 202 });
+      }
+      if (url.endsWith('/api/projects')) return jsonResponse([]);
+      if (init?.method === 'DELETE') return new Response(null, { status: 204 });
+      return jsonResponse({
+        state: 'completed',
+        events: [{ phase: 'chapter', message: '本章完成', current: 1, total: 1 }],
+        result: {
+          task: 'long_novel',
+          mode: 'draft',
+          projectId: 'p1',
+          chapterId: `c${starts}`,
+          summary: '本批完成',
+          steps: [`第${starts}章完成`],
+          artifacts: [{ kind: 'chapter', id: `c${starts}`, title: `第${starts}章` }],
+        },
+      });
+    });
+
+    const result = await runAgentBackgroundJob(
+      '/api',
+      {
+        task: 'long_novel',
+        mode: 'draft',
+        prompt: '测试',
+        options: { chapters: 3, totalChapters: 10 },
+      },
+      { onProgress: progress },
+    );
+
+    expect(starts).toBe(3);
+    expect(startedBodies.map((body) => body.options?.chapters)).toEqual([1, 1, 1]);
+    expect(startedBodies.map((body) => body.options?.totalChapters)).toEqual([10, 10, 10]);
+    expect(startedBodies.slice(1).map((body) => body.projectId)).toEqual(['p1', 'p1']);
+    expect(progress.mock.calls.map(([event]) => [event.current, event.total])).toEqual([
+      [1, 3],
+      [2, 3],
+      [3, 3],
+    ]);
+    expect(result.artifacts).toHaveLength(3);
+    expect(result.summary).toContain('3/3');
+  });
 });
 
 // ---------------------------------------------------------------------------
