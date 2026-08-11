@@ -84,13 +84,14 @@ export default async (request) => {
   const modelConfig = request.headers.get('x-agentxin-model-config');
   const payload = await request.json().catch(() => undefined);
   const jobId = payload?.jobId;
-  const runRequest = payload?.request;
+  const jobRequest = payload?.request;
+  const jobKind = payload?.kind === 'plan' ? 'plan' : 'agent';
   if (
     clientId === undefined ||
     typeof modelConfig !== 'string' ||
     !JOB_ID_PATTERN.test(jobId ?? '') ||
-    typeof runRequest !== 'object' ||
-    runRequest === null
+    typeof jobRequest !== 'object' ||
+    jobRequest === null
   ) {
     return;
   }
@@ -100,6 +101,7 @@ export default async (request) => {
   const clientDataDir = join(tmpdir(), 'agentxin-background', jobId);
   const state = {
     state: 'running',
+    kind: jobKind,
     events: [],
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -119,7 +121,8 @@ export default async (request) => {
     const port = typeof address === 'object' && address !== null ? address.port : 0;
     if (port === 0) throw new Error('后台 Agent 服务启动失败。');
 
-    const response = await fetch(`http://127.0.0.1:${port}/api/agent/run-stream`, {
+    const route = jobKind === 'plan' ? '/api/agent/plan/turn-stream' : '/api/agent/run-stream';
+    const response = await fetch(`http://127.0.0.1:${port}${route}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -129,7 +132,7 @@ export default async (request) => {
       },
       // Compatibility guard for already-open tabs running older frontend code.
       // One Netlify background invocation must never try to write an entire book.
-      body: JSON.stringify(boundedRunRequest(runRequest)),
+      body: JSON.stringify(jobKind === 'plan' ? jobRequest : boundedRunRequest(jobRequest)),
     });
     if (!response.ok || response.body === null) {
       throw new Error(`后台 Agent 请求失败（HTTP ${response.status}）。`);
@@ -181,7 +184,7 @@ export default async (request) => {
       state.error = streamError;
     } else if (!done || result === undefined) {
       state.state = 'failed';
-      state.error = failure('后台 Agent 流未返回最终结果。');
+      state.error = failure(`后台${jobKind === 'plan' ? '计划 ' : ' '}Agent 流未返回最终结果。`);
     } else {
       state.state = 'completed';
       state.result = result;

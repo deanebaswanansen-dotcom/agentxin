@@ -584,6 +584,39 @@ async function streamSse(
   return full;
 }
 
+async function streamPlanTurn(
+  baseUrl: string,
+  body: NovelPlanTurnRequest,
+  signal?: AbortSignal,
+): Promise<NovelPlanTurnResponse> {
+  let result: NovelPlanTurnResponse | undefined;
+  await streamSse(
+    `${baseUrl}/agent/plan/turn-stream`,
+    body,
+    { signal },
+    (event) => {
+      if (event.event === 'progress') return true;
+      if (event.event === 'result') {
+        try {
+          result = JSON.parse(event.data) as NovelPlanTurnResponse;
+        } catch {
+          throw new ApiClientError({
+            error: { code: 'PROVIDER_ERROR', message: '计划 Agent 返回了无效结果。' },
+          });
+        }
+        return true;
+      }
+      return false;
+    },
+  );
+  if (result === undefined) {
+    throw new ApiClientError({
+      error: { code: 'PROVIDER_ERROR', message: '计划 Agent 数据流结束，但没有返回决策结果。' },
+    });
+  }
+  return result;
+}
+
 /**
  * Consume the writing SSE stream for a chapter. Thin wrapper over
  * {@link streamSse} preserving the original `write()` behavior and signature.
@@ -616,6 +649,12 @@ interface AgentJobSnapshot {
   state: 'running' | 'completed' | 'failed';
   events?: AgentProgressEvent[];
   result?: AgentRunResult;
+  error?: unknown;
+}
+
+interface PlanJobSnapshot {
+  state: 'running' | 'completed' | 'failed';
+  result?: NovelPlanTurnResponse;
   error?: unknown;
 }
 
@@ -715,6 +754,63 @@ async function runSingleAgentBackgroundJob(
       throw toApiClientError(snapshot.error, 200);
     }
     await waitForPoll(750, options?.signal);
+  }
+}
+
+/** Run one planning decision in Netlify's 15-minute background runtime. */
+export async function runPlanBackgroundJob(
+  baseUrl: string,
+  body: NovelPlanTurnRequest,
+  signal?: AbortSignal,
+): Promise<NovelPlanTurnResponse> {
+  const jobId = globalThis.crypto.randomUUID();
+  const startUrl = netlifyFunctionUrl(baseUrl, 'agent-job-background');
+  const startResponse = await fetch(startUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...modelConfigHeader() },
+    body: JSON.stringify({ jobId, kind: 'plan', request: body }),
+    signal,
+  });
+  if (!startResponse.ok && startResponse.status !== 202) {
+    throw toApiClientError(
+      await readBody(startResponse),
+      startResponse.status,
+      startResponse.statusText,
+    );
+  }
+
+  const statusUrl = `${netlifyFunctionUrl(baseUrl, 'agent-job')}?jobId=${encodeURIComponent(jobId)}`;
+  const deadline = Date.now() + 870_000;
+  for (;;) {
+    if (Date.now() >= deadline) {
+      throw new ApiClientError({
+        error: { code: 'PROVIDER_ERROR', message: '后台计划 Agent 超过 14 分 30 秒仍未完成。' },
+      });
+    }
+    const response = await fetch(statusUrl, {
+      headers: clientIdentityHeader(),
+      signal,
+      cache: 'no-store',
+    });
+    if (response.status === 404) {
+      await waitForPoll(750, signal);
+      continue;
+    }
+    if (!response.ok) {
+      throw toApiClientError(await readBody(response), response.status, response.statusText);
+    }
+    const snapshot = (await response.json()) as PlanJobSnapshot;
+    if (snapshot.state === 'completed' && snapshot.result !== undefined) {
+      void fetch(statusUrl, {
+        method: 'DELETE',
+        headers: clientIdentityHeader(),
+      }).catch(() => undefined);
+      return snapshot.result;
+    }
+    if (snapshot.state === 'failed') {
+      throw toApiClientError(snapshot.error, 200);
+    }
+    await waitForPoll(750, signal);
   }
 }
 
@@ -1126,7 +1222,9 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
         request(b, 'POST', '/agent/run', body, { signal, includeModelConfig: true }),
       runStream: (body, options) => streamAgentRun(b, body, options),
       planTurn: (body, signal) =>
-        request(b, 'POST', '/agent/plan/turn', body, { signal, includeModelConfig: true }),
+        USE_BACKGROUND_AGENT_JOBS
+          ? runPlanBackgroundJob(b, body, signal)
+          : streamPlanTurn(b, body, signal),
     },
     projects: {
       list: (signal) => request(b, 'GET', '/projects', undefined, { signal }),

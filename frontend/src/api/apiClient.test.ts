@@ -7,6 +7,7 @@ import {
   migrateStoredModelConfig,
   parseSseEvents,
   runAgentBackgroundJob,
+  runPlanBackgroundJob,
   type SseEvent,
 } from './apiClient.js';
 import type {
@@ -81,6 +82,70 @@ const client = () => createApiClient('/api');
 // ---------------------------------------------------------------------------
 
 describe('apiClient request building', () => {
+  it('runs production planning in a background job and polls the result', async () => {
+    const result = {
+      status: 'ready' as const,
+      round: 1,
+      message: '已形成方案。',
+      brief: '西方玄幻计划',
+      planSummary: { genre: '西方玄幻', chapterCount: 10 },
+    };
+    const mock = installFetch((url, init) => {
+      if (url.endsWith('/agent-job-background')) {
+        return jsonResponse(undefined, { status: 202 });
+      }
+      if (url.includes('/agent-job?jobId=') && init?.method === 'DELETE') {
+        return jsonResponse(undefined, { status: 204 });
+      }
+      if (url.includes('/agent-job?jobId=')) {
+        return jsonResponse({ state: 'completed', result });
+      }
+      return jsonResponse({ error: { code: 'NOT_FOUND', message: 'unexpected path' } }, { status: 404 });
+    });
+
+    await expect(
+      runPlanBackgroundJob('/api', { seedPrompt: '西方玄幻' }),
+    ).resolves.toEqual(result);
+    const start = mock.mock.calls.find((call) => String(call[0]).endsWith('/agent-job-background'));
+    expect(JSON.parse(String(start?.[1]?.body))).toMatchObject({
+      kind: 'plan',
+      request: { seedPrompt: '西方玄幻' },
+    });
+  });
+
+  it('consumes planning decisions over SSE so long model waits stay active', async () => {
+    const result = {
+      status: 'asking' as const,
+      round: 1,
+      message: '只补一个关键问题。',
+      questions: [
+        {
+          id: 'ending_cost',
+          question: '胜利需要付出什么代价？',
+          options: [
+            { id: 'memory', label: '失去记忆' },
+            { id: 'title', label: '失去爵位' },
+          ],
+        },
+      ],
+    };
+    const mock = installFetch(() =>
+      sseResponse([
+        ': heartbeat\n\n',
+        'event: progress\ndata: {"message":"决策中"}\n\n',
+        `event: result\ndata: ${JSON.stringify(result)}\n\n`,
+        'event: done\n\n',
+      ]),
+    );
+
+    await expect(
+      client().agent.planTurn({ seedPrompt: '西方玄幻' }),
+    ).resolves.toEqual(result);
+    const [url, init] = mock.mock.calls[0];
+    expect(url).toBe('/api/agent/plan/turn-stream');
+    expect((init?.headers as Record<string, string>).Accept).toBe('text/event-stream');
+  });
+
   it('migrates retired DeepSeek model aliases without touching custom gateways', () => {
     expect(
       migrateStoredModelConfig({

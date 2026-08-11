@@ -7,6 +7,7 @@
  */
 import type { FastifyInstance } from 'fastify';
 
+import { corsResponseHeaders } from '../cors.js';
 import type { NovelPlanService } from '../services/agent/NovelPlanService.js';
 import { ServiceError } from '../services/ServiceError.js';
 import type {
@@ -113,6 +114,11 @@ function parsePlanBody(raw: unknown): NovelPlanTurnRequest {
   };
 }
 
+function sseFrame(event: string, data?: string): string {
+  const head = `event: ${event}\n`;
+  return data === undefined ? `${head}\n` : `${head}data: ${data}\n\n`;
+}
+
 export function registerPlanRoutes(app: FastifyInstance, planService: NovelPlanService): void {
   app.post('/api/agent/plan/turn', async (request, reply) => {
     try {
@@ -134,6 +140,68 @@ export function registerPlanRoutes(app: FastifyInstance, planService: NovelPlanS
     } catch (error) {
       const { status, body } = toErrorResponse(error);
       return reply.code(status).send(body);
+    }
+  });
+
+  // Streaming planning turn. The model may spend tens of seconds deciding or
+  // generating chapter anchors, so an immediate frame plus 8-second heartbeats
+  // keep Netlify and upstream proxies from treating the response as inactive.
+  app.post('/api/agent/plan/turn-stream', async (request, reply) => {
+    reply.hijack();
+    const raw = reply.raw;
+    raw.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+      ...corsResponseHeaders(),
+    });
+    if (typeof (raw as { flushHeaders?: () => void }).flushHeaders === 'function') {
+      (raw as { flushHeaders: () => void }).flushHeaders();
+    }
+
+    const writeFrame = (frame: string): void => {
+      if (raw.writableEnded) return;
+      raw.write(frame);
+      const flush = (raw as { flush?: () => void }).flush;
+      if (typeof flush === 'function') {
+        try {
+          flush.call(raw);
+        } catch {
+          // Best effort; Netlify's streaming transport flushes each chunk.
+        }
+      }
+    };
+    const controller = new AbortController();
+    const heartbeat = setInterval(() => writeFrame(': heartbeat\n\n'), 8_000);
+    heartbeat.unref();
+    const onClose = (): void => {
+      if (!raw.writableEnded) controller.abort();
+    };
+    raw.on('close', onClose);
+
+    try {
+      const parsed = parsePlanBody(request.body ?? {});
+      writeFrame(
+        sseFrame(
+          'progress',
+          JSON.stringify({ message: '策划 Agent 已接收信息，正在判断是否需要补问…' }),
+        ),
+      );
+      const result = await planService.turn(parsed, controller.signal);
+      if (!raw.writableEnded) {
+        writeFrame(sseFrame('result', JSON.stringify(result)));
+        writeFrame(sseFrame('done'));
+      }
+    } catch (error) {
+      if (!controller.signal.aborted && !raw.writableEnded) {
+        const { body } = toErrorResponse(error);
+        writeFrame(sseFrame('error', JSON.stringify(body)));
+      }
+    } finally {
+      clearInterval(heartbeat);
+      raw.removeListener('close', onClose);
+      if (!raw.writableEnded) raw.end();
     }
   });
 }
