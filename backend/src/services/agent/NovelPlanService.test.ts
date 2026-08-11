@@ -1,398 +1,254 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { ModelProxy } from '../../proxy/ModelProxy.js';
-import type { ModelConfig } from '../../types/index.js';
+import { ProxyError } from '../../proxy/ProxyError.js';
+import type { ChatMessage, ModelConfig } from '../../types/index.js';
 import type { ModelConfigService } from '../modelConfig/ModelConfigService.js';
 import {
   collectScaleFromSession,
   extractScaleFromText,
+  inferExplicitGenre,
   MAX_OUTLINE_CHAPTERS,
   NovelPlanService,
 } from './NovelPlanService.js';
 
-function mockConfigService(config: ModelConfig | undefined): ModelConfigService {
+const CONFIG: ModelConfig = {
+  baseUrl: 'https://api.example.com',
+  apiKey: 'test-key',
+  modelName: 'test-model',
+};
+
+function mockConfigService(config: ModelConfig | undefined = CONFIG): ModelConfigService {
   return {
     getInternalConfig: vi.fn().mockResolvedValue(config),
   } as unknown as ModelConfigService;
 }
 
-function mockProxy(content: string): ModelProxy {
-  return {
-    async *streamCompletion() {
-      yield { kind: 'content' as const, text: content };
-    },
-  };
+class QueueProxy implements ModelProxy {
+  readonly calls: ChatMessage[][] = [];
+
+  constructor(private readonly outputs: Array<string | Error>) {}
+
+  async *streamCompletion(_config: ModelConfig, messages: ChatMessage[]) {
+    this.calls.push(messages);
+    const output = this.outputs.shift();
+    if (output instanceof Error) throw output;
+    yield { kind: 'content' as const, text: output ?? '' };
+  }
 }
 
-describe('NovelPlanService depth modes', () => {
-  it('first turn without depth returns depth selection (light / standard / deep)', async () => {
-    const service = new NovelPlanService(mockConfigService(undefined), mockProxy(''));
-    const result = await service.turn(
-      { seedPrompt: '写一本修仙小说', targetTask: 'full_novel' },
-      new AbortController().signal,
+function outlines(count: number) {
+  return Array.from({ length: count }, (_, index) => ({
+    number: index + 1,
+    title: `灰烬之路 ${index + 1}`,
+    goal: `骑士寻找第 ${index + 1} 枚符文，与教廷冲突并获得下一章线索。`,
+    estimatedWords: 1200,
+  }));
+}
+
+function readyDecision(overrides: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    status: 'ready',
+    message: '方向明确，开始执行。',
+    questions: [],
+    brief: '一名流亡骑士追查失落王冠。',
+    planSummary: {
+      title: '灰烬王冠',
+      genre: '西方玄幻',
+      protagonist: '流亡骑士艾琳',
+      hook: '王冠会吞噬每一位继承者的记忆。',
+      tone: '史诗、阴郁',
+      constraints: [],
+      totalWords: 2400,
+      wordsPerChapter: 1200,
+      chapterCount: 2,
+      chapterOutlines: outlines(2),
+      ...overrides,
+    },
+  });
+}
+
+describe('NovelPlanService goal-driven agent', () => {
+  it('requires a real model instead of returning a scripted questionnaire', async () => {
+    const service = new NovelPlanService(
+      { getInternalConfig: vi.fn().mockResolvedValue(undefined) } as unknown as ModelConfigService,
+      new QueueProxy([]),
     );
-    expect(result.status).toBe('asking');
-    expect(result.round).toBe(0);
-    expect(result.questions?.[0]?.id).toBe('plan_depth');
-    const ids = result.questions?.[0]?.options.map((o) => o.id) ?? [];
-    expect(ids).toEqual(expect.arrayContaining(['light', 'standard', 'deep']));
+    await expect(
+      service.turn({ seedPrompt: '写一本西方玄幻' }, new AbortController().signal),
+    ).rejects.toMatchObject({ code: 'MODEL_NOT_CONFIGURED' });
   });
 
-  it('choosing light depth starts content round 1 with 2-3 questions', async () => {
-    const service = new NovelPlanService(mockConfigService(undefined), mockProxy(''));
-    const result = await service.turn(
-      {
-        seedPrompt: '写一本修仙小说',
-        targetTask: 'full_novel',
-        history: [
-          { role: 'user', content: '灵感：写一本修仙小说' },
-          { role: 'assistant', content: '先选计划深度' },
-        ],
-        answers: [{ questionId: 'plan_depth', selectedOptionIds: ['light'] }],
-      },
-      new AbortController().signal,
-    );
-    expect(result.status).toBe('asking');
-    expect(result.depth).toBe('light');
-    expect(result.depthRoundRange).toEqual([4, 5]);
-    expect(result.round).toBe(1);
-    expect((result.questions?.length ?? 0) >= 2).toBe(true);
-    expect((result.questions?.length ?? 0) <= 3).toBe(true);
-  });
-
-  it('starts content round 1 when the browser sends depth and plan_depth together', async () => {
-    const service = new NovelPlanService(mockConfigService(undefined), mockProxy(''));
-    const result = await service.turn(
-      {
-        seedPrompt: '写一本民俗小说',
-        targetTask: 'long_novel',
-        depth: 'deep',
-        history: [
-          { role: 'user', content: '灵感：写一本民俗小说' },
-          { role: 'assistant', content: '进入计划模式前，先选追问深度。' },
-        ],
-        answers: [{ questionId: 'plan_depth', selectedOptionIds: ['deep'] }],
-      },
-      new AbortController().signal,
-    );
-
-    expect(result.round).toBe(1);
-    expect(result.questions?.map((q) => q.id)).toEqual([
-      'genre_lane',
-      'core_hook',
-      'tone_pace',
-    ]);
-  });
-
-  it('does not repeat question ids across consecutive scripted rounds', async () => {
-    const service = new NovelPlanService(mockConfigService(undefined), mockProxy(''));
-    const r1 = await service.turn(
-      {
-        seedPrompt: '写一本修仙小说',
-        depth: 'light',
-        history: [
-          { role: 'user', content: '灵感：写一本修仙小说' },
-          { role: 'assistant', content: '轻量第1轮' },
-        ],
-      },
-      new AbortController().signal,
-    );
-    const ids1 = new Set((r1.questions ?? []).map((q) => q.id));
-    const r2 = await service.turn(
-      {
-        seedPrompt: '写一本修仙小说',
-        depth: 'light',
-        history: [
-          { role: 'user', content: '灵感：写一本修仙小说' },
-          { role: 'assistant', content: '轻量第1轮' },
+  it('calls the agent immediately and asks at most two blocking questions', async () => {
+    const proxy = new QueueProxy([
+      JSON.stringify({
+        status: 'asking',
+        message: '只补充会改变主线的选择。',
+        questions: [
           {
-            role: 'user',
-            content: [...ids1].map((id) => `- ${id}: opt`).join('\n'),
+            id: 'protagonist_goal',
+            question: '主角最优先追求什么？',
+            options: [
+              { id: 'revenge', label: '复仇' },
+              { id: 'throne', label: '夺回王位' },
+            ],
           },
-          { role: 'assistant', content: '轻量第2轮提示' },
+          {
+            id: 'magic_cost',
+            question: '魔法代价采用哪一种？',
+            options: [
+              { id: 'memory', label: '消耗记忆' },
+              { id: 'life', label: '消耗寿命' },
+            ],
+          },
+          {
+            id: 'extra',
+            question: '不应出现的第三题？',
+            options: [
+              { id: 'a', label: '甲' },
+              { id: 'b', label: '乙' },
+            ],
+          },
         ],
-        answers: [...ids1].map((id) => ({ questionId: id, selectedOptionIds: ['x'] })),
-      },
-      new AbortController().signal,
-    );
-    const ids2 = (r2.questions ?? []).map((q) => q.id);
-    for (const id of ids2) {
-      expect(ids1.has(id)).toBe(false);
-    }
-    expect(ids2.length).toBeGreaterThanOrEqual(2);
-  });
-
-  it('does not repeat questions across a deep browser-formatted plan session', async () => {
-    const service = new NovelPlanService(mockConfigService(undefined), mockProxy(''));
-    const signal = new AbortController().signal;
-    const seedPrompt = '写一本民俗悬疑小说';
-    const depthTurn = await service.turn({ seedPrompt, targetTask: 'long_novel' }, signal);
-    let history = [
-      { role: 'user' as const, content: `灵感：${seedPrompt}` },
-      { role: 'assistant' as const, content: depthTurn.message },
-    ];
-    let previousQuestions = depthTurn.questions ?? [];
-    let answers = [{ questionId: 'plan_depth', selectedOptionIds: ['deep'] }];
-    const seen = new Set<string>();
-    let reachedReady = false;
-
-    for (let turn = 0; turn < 20; turn += 1) {
-      const response = await service.turn(
-        { seedPrompt, targetTask: 'long_novel', depth: 'deep', history, answers },
-        signal,
-      );
-      const questions = response.questions ?? [];
-      for (const question of questions) {
-        expect(seen.has(question.id), `重复问题：${question.id}`).toBe(false);
-        seen.add(question.id);
-      }
-      if (response.status === 'ready') {
-        reachedReady = true;
-        break;
-      }
-
-      const userLine = answers
-        .map((answer) => {
-          const question = previousQuestions.find((item) => item.id === answer.questionId);
-          const optionId = answer.selectedOptionIds[0] ?? '';
-          const label = question?.options.find((item) => item.id === optionId)?.label ?? optionId;
-          return `- ${answer.questionId}: ${optionId} | ${question?.question ?? answer.questionId} → ${label}`;
-        })
-        .join('\n');
-      history = [
-        ...history,
-        { role: 'user', content: userLine },
-        { role: 'assistant', content: response.message },
-      ];
-      previousQuestions = questions;
-      answers = questions.map((question) => ({
-        questionId: question.id,
-        selectedOptionIds: [question.options[0]?.id ?? ''],
-      }));
-    }
-    expect(reachedReady).toBe(true);
-  });
-
-  it('does not repeat questions when an already-open browser uses the legacy history format', async () => {
-    const service = new NovelPlanService(mockConfigService(undefined), mockProxy(''));
-    const signal = new AbortController().signal;
-    const seedPrompt = '写一本民俗悬疑小说';
-    const depthTurn = await service.turn({ seedPrompt, targetTask: 'long_novel' }, signal);
-    let history = [
-      { role: 'user' as const, content: `灵感：${seedPrompt}` },
-      { role: 'assistant' as const, content: depthTurn.message },
-    ];
-    let previousQuestions = depthTurn.questions ?? [];
-    let answers = [{ questionId: 'plan_depth', selectedOptionIds: ['standard'] }];
-    const seen = new Set<string>();
-    let reachedReady = false;
-
-    for (let turn = 0; turn < 10; turn += 1) {
-      const response = await service.turn(
-        { seedPrompt, targetTask: 'long_novel', depth: 'standard', history, answers },
-        signal,
-      );
-      const questions = response.questions ?? [];
-      for (const question of questions) {
-        expect(seen.has(question.id), `旧页面重复问题：${question.id}`).toBe(false);
-        seen.add(question.id);
-      }
-      if (response.status === 'ready') {
-        reachedReady = true;
-        break;
-      }
-
-      const userLine = answers
-        .map((answer) => {
-          const question = previousQuestions.find((item) => item.id === answer.questionId);
-          const optionId = answer.selectedOptionIds[0] ?? '';
-          const label = question?.options.find((item) => item.id === optionId)?.label ?? optionId;
-          return `${question?.question ?? answer.questionId} → ${label}`;
-        })
-        .join('\n');
-      history = [
-        ...history,
-        { role: 'user', content: userLine },
-        { role: 'assistant', content: response.message },
-      ];
-      previousQuestions = questions;
-      answers = questions.map((question) => ({
-        questionId: question.id,
-        selectedOptionIds: [question.options[0]?.id ?? ''],
-      }));
-    }
-    expect(reachedReady).toBe(true);
-  });
-
-  it('standard depth reports 8-10 range', async () => {
-    const service = new NovelPlanService(mockConfigService(undefined), mockProxy(''));
+      }),
+    ]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
     const result = await service.turn(
-      {
-        seedPrompt: '都市异能',
-        history: [
-          { role: 'user', content: '灵感：都市异能' },
-          { role: 'assistant', content: '选深度' },
-        ],
-        answers: [{ questionId: 'plan_depth', selectedOptionIds: ['standard'] }],
-      },
+      { seedPrompt: '写一本西方玄幻，流亡骑士寻找王冠' },
       new AbortController().signal,
     );
-    expect(result.depth).toBe('standard');
-    expect(result.depthRoundRange).toEqual([8, 10]);
+
+    expect(result.status).toBe('asking');
+    expect(result.questions).toHaveLength(2);
+    const prompt = proxy.calls[0].map((message) => message.content).join('\n');
+    expect(prompt).toContain('不是固定问卷或工作流');
+    expect(prompt).toContain('已识别硬约束题材：西方玄幻');
   });
 
-  it('deep depth reports 18-20 range', async () => {
-    const service = new NovelPlanService(mockConfigService(undefined), mockProxy(''));
+  it('keeps explicit western fantasy even when the model drifts to campus fiction', async () => {
+    const proxy = new QueueProxy([
+      readyDecision({
+        genre: '校园青春',
+        title: '校园夏日',
+        chapterOutlines: outlines(2),
+      }),
+    ]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
     const result = await service.turn(
-      {
-        seedPrompt: '科幻长篇',
-        history: [
-          { role: 'user', content: '灵感：科幻长篇' },
-          { role: 'assistant', content: '选深度' },
-        ],
-        answers: [{ questionId: 'plan_depth', selectedOptionIds: ['deep'] }],
-      },
+      { seedPrompt: '西方玄幻，两章，每章1200字，流亡女骑士寻找诅咒王冠' },
       new AbortController().signal,
     );
-    expect(result.depth).toBe('deep');
-    expect(result.depthRoundRange).toEqual([18, 20]);
-  });
 
-  it('forceReady with scale after depth yields chapter outlines', async () => {
-    const service = new NovelPlanService(mockConfigService(undefined), mockProxy(''));
-    const result = await service.turn(
-      {
-        seedPrompt: '写一本修仙小说',
-        depth: 'light',
-        history: [
-          { role: 'user', content: '灵感：写一本修仙小说' },
-          { role: 'assistant', content: '轻量模式第1轮' },
-          { role: 'user', content: '选了玄幻' },
-          { role: 'assistant', content: '轻量模式第2轮' },
-        ],
-        answers: [
-          { questionId: 'total_words', selectedOptionIds: ['total_100k'] },
-          { questionId: 'words_per_chapter', selectedOptionIds: ['wpc_2000'] },
-          { questionId: 'chapter_count', selectedOptionIds: ['ch_10'] },
-        ],
-        forceReady: true,
-      },
-      new AbortController().signal,
-    );
     expect(result.status).toBe('ready');
-    expect(result.planSummary?.chapterOutlines?.length).toBe(10);
-    expect(result.brief).toContain('分章大纲');
-  });
-
-  it('rejects empty seedPrompt', async () => {
-    const service = new NovelPlanService(mockConfigService(undefined), mockProxy(''));
-    await expect(service.turn({ seedPrompt: '   ' }, new AbortController().signal)).rejects.toMatchObject({
-      code: 'VALIDATION_ERROR',
-    });
-  });
-});
-
-describe('extractScaleFromText chapter count', () => {
-  it('restores scale from legacy browser labels', () => {
-    expect(
-      collectScaleFromSession([
-        {
-          role: 'user',
-          content:
-            '全书目标总字数大约多少？ → 约 10 万字\n' +
-            '每一章目标字数？ → 约 2000 字\n' +
-            '先规划写多少章？ → 10 章',
-        },
-      ]),
-    ).toEqual({ totalWords: 100000, wordsPerChapter: 2000, chapterCount: 10 });
-  });
-
-  it('restores scale option ids from browser-formatted history', () => {
-    expect(
-      collectScaleFromSession([
-        {
-          role: 'user',
-          content:
-            '- total_words: total_100k | 全书目标总字数大约多少？ → 约 10 万字\n' +
-            '- words_per_chapter: wpc_2000 | 每一章目标字数？ → 约 2000 字\n' +
-            '- chapter_count: ch_10 | 先规划写多少章？ → 10 章',
-        },
-      ]),
-    ).toEqual({ totalWords: 100000, wordsPerChapter: 2000, chapterCount: 10 });
-  });
-
-  it('does not treat 前N章 as chapterCount', () => {
-    expect(extractScaleFromText('前3章要精彩').chapterCount).toBeUndefined();
-    expect(extractScaleFromText('前 10 章先立人设').chapterCount).toBeUndefined();
-  });
-
-  it('does not treat 第N章 / 第N章内 as chapterCount', () => {
-    expect(extractScaleFromText('第1章内解决冲突').chapterCount).toBeUndefined();
-    expect(extractScaleFromText('第 1 章开局打脸').chapterCount).toBeUndefined();
-  });
-
-  it('does not treat bare N章 goal text as chapterCount', () => {
-    expect(extractScaleFromText('3章内大冲突').chapterCount).toBeUndefined();
-    expect(extractScaleFromText('写3章内解决冲突').chapterCount).toBeUndefined();
-  });
-
-  it('accepts explicit scale phrases', () => {
-    expect(extractScaleFromText('计划写30章').chapterCount).toBe(30);
-    expect(extractScaleFromText('一共30章').chapterCount).toBe(30);
-    expect(extractScaleFromText('共 20 章').chapterCount).toBe(20);
-    expect(extractScaleFromText('约50章').chapterCount).toBe(50);
-    expect(extractScaleFromText('总章数 15').chapterCount).toBe(15);
-    expect(extractScaleFromText('计划章节数：12').chapterCount).toBe(12);
-    expect(extractScaleFromText('先规划写10章').chapterCount).toBe(10);
-    expect(extractScaleFromText('写 10 章').chapterCount).toBe(10);
-    expect(extractScaleFromText('30章左右').chapterCount).toBe(30);
-    expect(extractScaleFromText('10章大纲').chapterCount).toBe(10);
-    expect(extractScaleFromText('20章计划').chapterCount).toBe(20);
-  });
-});
-
-describe('collectScaleFromSession', () => {
-  it('option id ch_10 still sets chapterCount to 10', () => {
-    const scale = collectScaleFromSession([], [
-      { questionId: 'chapter_count', selectedOptionIds: ['ch_10'] },
-    ]);
-    expect(scale.chapterCount).toBe(10);
-  });
-
-  it('option ids ch_3 / ch_30 still work', () => {
-    expect(
-      collectScaleFromSession([], [{ questionId: 'chapter_count', selectedOptionIds: ['ch_3'] }])
-        .chapterCount,
-    ).toBe(3);
-    expect(
-      collectScaleFromSession([], [{ questionId: 'chapter_count', selectedOptionIds: ['ch_30'] }])
-        .chapterCount,
-    ).toBe(30);
-  });
-
-  it('option id ch_50 maps to MAX_OUTLINE_CHAPTERS (outline cap)', () => {
-    const scale = collectScaleFromSession([], [
-      { questionId: 'chapter_count', selectedOptionIds: ['ch_50'] },
-    ]);
-    expect(scale.chapterCount).toBe(MAX_OUTLINE_CHAPTERS);
-    expect(scale.chapterCount).toBe(30);
-  });
-
-  it('history non-scale 前N章 does not corrupt chapterCount over explicit option', () => {
-    const scale = collectScaleFromSession(
-      [
-        { role: 'user', content: '前3章要精彩，第1章内解决冲突' },
-        { role: 'assistant', content: '继续' },
-      ],
-      [{ questionId: 'chapter_count', selectedOptionIds: ['ch_10'] }],
+    expect(result.planSummary?.genre).toBe('西方玄幻');
+    expect(result.planSummary?.constraints).toContain(
+      '题材固定为西方玄幻，不得替换成其他题材或时代背景',
     );
-    expect(scale.chapterCount).toBe(10);
+    expect(result.brief).toContain('原始需求：西方玄幻');
   });
 
-  it('explicit free-text scale in history is collected', () => {
-    const scale = collectScaleFromSession([
-      { role: 'user', content: '计划写30章，每章2000字' },
-    ]);
-    expect(scale.chapterCount).toBe(30);
-    expect(scale.wordsPerChapter).toBe(2000);
+  it('filters repeated questions and forces a ready decision', async () => {
+    const repeated = JSON.stringify({
+      status: 'asking',
+      message: '还想再问一次。',
+      questions: [
+        {
+          id: 'magic_cost',
+          question: '魔法代价采用哪一种？',
+          options: [
+            { id: 'memory', label: '消耗记忆' },
+            { id: 'life', label: '消耗寿命' },
+          ],
+        },
+      ],
+    });
+    const proxy = new QueueProxy([repeated, readyDecision()]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      {
+        seedPrompt: '写西方玄幻，两章，每章1200字',
+        history: [
+          { role: 'assistant', content: 'magic_cost: 魔法代价采用哪一种？' },
+          { role: 'user', content: 'magic_cost：消耗记忆' },
+        ],
+      },
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe('ready');
+    expect(proxy.calls).toHaveLength(2);
+    expect(proxy.calls[1][0].content).toContain('本轮必须 ready');
+  });
+
+  it('creates missing chapter outlines with a dedicated agent call', async () => {
+    const first = readyDecision({ chapterOutlines: [] });
+    const second = JSON.stringify({ chapterOutlines: outlines(2) });
+    const proxy = new QueueProxy([first, second]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      { seedPrompt: '西方玄幻，计划写2章，每章1200字' },
+      new AbortController().signal,
+    );
+
+    expect(result.planSummary?.chapterOutlines).toHaveLength(2);
+    expect(proxy.calls[1][0].content).toContain('必须连续生成 2 章');
+    expect(result.brief).toContain('第2章 灰烬之路 2');
+  });
+
+  it('repairs malformed JSON once and fails clearly after two invalid responses', async () => {
+    const service = new NovelPlanService(
+      mockConfigService(),
+      new QueueProxy(['not-json', 'still-not-json']),
+    );
+    await expect(
+      service.turn({ seedPrompt: '写西方玄幻' }, new AbortController().signal),
+    ).rejects.toThrow('模型连续两次未返回有效 JSON');
+  });
+
+  it('does not silently replace provider failures with templates', async () => {
+    const service = new NovelPlanService(
+      mockConfigService(),
+      new QueueProxy([new ProxyError('provider unavailable')]),
+    );
+    await expect(
+      service.turn({ seedPrompt: '写西方玄幻' }, new AbortController().signal),
+    ).rejects.toThrow('provider unavailable');
+  });
+
+  it('rejects an empty seed', async () => {
+    const service = new NovelPlanService(mockConfigService(), new QueueProxy([]));
+    await expect(
+      service.turn({ seedPrompt: '   ' }, new AbortController().signal),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+  });
+});
+
+describe('planning facts', () => {
+  it('recognizes explicit genres without collapsing western fantasy into generic fantasy', () => {
+    expect(inferExplicitGenre('写一本西方玄幻')).toBe('西方玄幻');
+    expect(inferExplicitGenre('中式修仙门派')).toBe('仙侠');
+  });
+
+  it('collects explicit scale labels and ids without treating 前N章 as total chapters', () => {
+    expect(
+      collectScaleFromSession([
+        {
+          role: 'user',
+          content:
+            '全书目标总字数大约多少？ → 约 10 万字\n每一章目标字数？ → 约 2000 字\n先规划写多少章？ → 10 章',
+        },
+      ]),
+    ).toEqual({ totalWords: 100000, wordsPerChapter: 2000, chapterCount: 10 });
+    expect(
+      collectScaleFromSession([], [
+        { questionId: 'chapter_count', selectedOptionIds: ['ch_50'] },
+      ]).chapterCount,
+    ).toBe(MAX_OUTLINE_CHAPTERS);
+    expect(extractScaleFromText('前3章要精彩，第1章内解决冲突').chapterCount).toBeUndefined();
+  });
+
+  it('accepts explicit chapter-count phrases', () => {
+    expect(extractScaleFromText('计划写30章').chapterCount).toBe(30);
+    expect(extractScaleFromText('写 10 章').chapterCount).toBe(10);
+    expect(extractScaleFromText('10章大纲').chapterCount).toBe(10);
   });
 });

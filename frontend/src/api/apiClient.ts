@@ -40,6 +40,7 @@ import type {
   ImportNovelResult,
   ModelConfig,
   ModelConfigView,
+  ModelConnectionResult,
   NovelPlanTurnRequest,
   NovelPlanTurnResponse,
   Outline,
@@ -112,6 +113,24 @@ function isModelConfig(value: unknown): value is ModelConfig {
   );
 }
 
+/** Upgrade browser-local provider aliases that have been retired upstream. */
+export function migrateStoredModelConfig(config: ModelConfig): ModelConfig {
+  let isOfficialDeepSeek = false;
+  try {
+    isOfficialDeepSeek = new URL(config.baseUrl).hostname.toLowerCase() === 'api.deepseek.com';
+  } catch {
+    // Custom and local OpenAI-compatible endpoints remain untouched.
+  }
+  if (!isOfficialDeepSeek) return config;
+  if (config.modelName === 'deepseek-chat') {
+    return { ...config, baseUrl: 'https://api.deepseek.com', modelName: 'deepseek-v4-flash' };
+  }
+  if (config.modelName === 'deepseek-reasoner') {
+    return { ...config, baseUrl: 'https://api.deepseek.com', modelName: 'deepseek-v4-pro' };
+  }
+  return config;
+}
+
 function loadStoredModelConfig(): ModelConfig | null {
   if (typeof window === 'undefined') return null;
   try {
@@ -119,13 +138,17 @@ function loadStoredModelConfig(): ModelConfig | null {
     if (!raw) return null;
     const parsed = JSON.parse(raw) as unknown;
     if (!isModelConfig(parsed)) return null;
-    return {
+    const config = migrateStoredModelConfig({
       baseUrl: parsed.baseUrl,
       apiKey: parsed.apiKey,
       modelName: parsed.modelName,
       temperature: typeof parsed.temperature === 'number' ? parsed.temperature : undefined,
       topP: typeof parsed.topP === 'number' ? parsed.topP : undefined,
-    };
+    });
+    if (config.baseUrl !== parsed.baseUrl || config.modelName !== parsed.modelName) {
+      window.localStorage.setItem(MODEL_CONFIG_STORAGE_KEY, JSON.stringify(config));
+    }
+    return config;
   } catch {
     return null;
   }
@@ -997,6 +1020,7 @@ export interface ApiClient {
   modelConfig: {
     get(signal?: AbortSignal): Promise<ModelConfigView>;
     save(config: ModelConfig, signal?: AbortSignal): Promise<ModelConfigView>;
+    test(signal?: AbortSignal): Promise<ModelConnectionResult>;
     clear(): void;
   };
   cacheStats: {
@@ -1168,6 +1192,11 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
         persistModelConfig(volatileModelConfig);
         return toModelConfigView(volatileModelConfig);
       },
+      test: (signal) =>
+        request(b, 'POST', '/model-config/test', {}, {
+          signal,
+          includeModelConfig: true,
+        }),
       clear: () => {
         volatileModelConfig = null;
         persistModelConfig(null);

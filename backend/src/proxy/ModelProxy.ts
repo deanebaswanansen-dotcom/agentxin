@@ -24,6 +24,8 @@ import { SseDeltaParser, type StreamDelta } from './sseParser.js';
 
 export interface StreamCompletionOptions {
   jsonMode?: boolean;
+  /** Optional small output budget for connection probes and classifiers. */
+  maxTokens?: number;
 }
 
 const DEFAULT_TEMPERATURE = 1;
@@ -67,6 +69,46 @@ function isRetryableStatus(status: number): boolean {
 
 function retryDelayMs(attempt: number): number {
   return FETCH_RETRY_BASE_MS * 2 ** attempt;
+}
+
+function sanitizeProviderDetail(value: string): string {
+  return value
+    .replace(/sk-[a-zA-Z0-9_-]{8,}/g, '[API_KEY]')
+    .replace(/Bearer\s+[^\s"']+/gi, 'Bearer [API_KEY]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 300);
+}
+
+async function providerFailureMessage(response: Response): Promise<string> {
+  let detail = '';
+  try {
+    const raw = await response.text();
+    try {
+      const parsed = JSON.parse(raw) as { error?: { message?: unknown } };
+      detail = typeof parsed.error?.message === 'string' ? parsed.error.message : raw;
+    } catch {
+      detail = raw;
+    }
+  } catch {
+    // Status-specific guidance below remains available when the body cannot be read.
+  }
+  const safeDetail = sanitizeProviderDetail(detail);
+  const guidance: Record<number, string> = {
+    400: '请求参数或模型名称不被提供商接受',
+    401: 'API Key 无效',
+    402: '模型账户余额不足',
+    403: 'API Key 没有该模型权限',
+    404: 'API 地址或模型名称不存在',
+    408: '模型提供商请求超时',
+    429: '模型提供商限流，请稍后重试',
+    500: '模型提供商内部错误',
+    502: '模型提供商网关错误',
+    503: '模型提供商暂时不可用',
+    504: '模型提供商响应超时',
+  };
+  const base = guidance[response.status] ?? `模型提供商返回 HTTP ${response.status}`;
+  return safeDetail ? `${base}：${safeDetail}` : base;
 }
 
 async function sleepMs(ms: number, signal: AbortSignal): Promise<void> {
@@ -135,7 +177,10 @@ export class OpenAiCompatibleModelProxy implements ModelProxy {
       model: config.modelName,
       messages,
       stream: true,
-      max_tokens: DEFAULT_MAX_TOKENS,
+      max_tokens:
+        typeof options?.maxTokens === 'number' && Number.isFinite(options.maxTokens)
+          ? Math.min(65536, Math.max(16, Math.round(options.maxTokens)))
+          : DEFAULT_MAX_TOKENS,
       temperature: config.temperature ?? DEFAULT_TEMPERATURE,
       top_p: config.topP ?? DEFAULT_TOP_P,
     };
@@ -185,10 +230,7 @@ export class OpenAiCompatibleModelProxy implements ModelProxy {
         continue;
       }
 
-      throw new ProxyError(
-        `模型提供商返回错误状态 ${response.status}`,
-        { status: response.status },
-      );
+      throw new ProxyError(await providerFailureMessage(response), { status: response.status });
     }
 
     if (response === undefined) {
@@ -280,14 +322,11 @@ async function* mockGenerate(prompt: string, signal?: AbortSignal): AsyncGenerat
   const p = (prompt || '默认主题').slice(0, 80);
   const canned = [
     `【MOCK DEMO】根据需求「${p}...」`,
-    '，系统已模拟生成世界观、人物关系与首章大纲。',
-    '\n\n世界观：这是一个融合都市奇幻的背景，灵气复苏的现代社会。',
-    '主角拥有特殊能力，能看到隐藏的“裂缝”。',
-    '\n\n人物：主角林辰，28岁，程序员出身，性格谨慎但有正义感。',
-    '导师“白先生”神秘，实为守序者。',
-    '\n\n第一章草稿：林辰在加班时意外触碰公司服务器的异常日志，眼前浮现一道光痕。',
-    '他推开键盘，走向天台，风中传来低语：“裂缝已开，你准备好了吗？”',
-    '\n\n（此为本地模拟输出，无真实模型调用。切换回真实提供商即可获得完整连贯长文本。）',
+    '，这里仅返回与输入主题绑定的占位结果，不补充任何未指定题材。',
+    '\n\n世界观：沿用用户输入中的时代、地域、文化和力量规则。',
+    '\n\n人物：沿用用户指定的主角身份、目标、缺陷和关系。',
+    '\n\n大纲：围绕用户输入的核心冲突推进，不自动加入校园、都市或修仙模板。',
+    '\n\n（本地测试响应；没有调用真实模型，不代表成稿质量。）',
   ];
   for (const piece of canned) {
     if (signal?.aborted) break;

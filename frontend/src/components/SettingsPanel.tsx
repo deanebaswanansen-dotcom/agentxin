@@ -40,6 +40,9 @@ interface ProviderPreset {
   modelName: string;
 }
 
+const SETTINGS_ENV = (import.meta as unknown as { env?: { DEV?: boolean } }).env;
+const SHOW_MOCK_CONTROLS = SETTINGS_ENV?.DEV === true;
+
 const PROVIDER_PRESETS: ProviderPreset[] = [
   {
     id: 'deepseek-v4-flash',
@@ -55,13 +58,17 @@ const PROVIDER_PRESETS: ProviderPreset[] = [
     baseUrl: 'https://api.deepseek.com',
     modelName: 'deepseek-v4-pro',
   },
-  {
-    id: 'mock',
-    label: 'Mock (本地演示)',
-    description: '无需 API Key，纯本地模拟响应。用于快速体验、测试和离线演示。',
-    baseUrl: 'mock',
-    modelName: 'mock-model',
-  },
+  ...(SHOW_MOCK_CONTROLS
+    ? [
+        {
+          id: 'mock',
+          label: 'Mock (开发测试)',
+          description: '仅开发环境使用，不代表真实模型质量。',
+          baseUrl: 'mock',
+          modelName: 'mock-model',
+        },
+      ]
+    : []),
   {
     id: 'openai-compatible',
     label: '自定义 OpenAI 兼容',
@@ -98,6 +105,7 @@ export function SettingsPanel({
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState<'idle' | 'testing' | 'ok' | 'failed'>('idle');
   const [cacheStats, setCacheStats] = useState<CacheStatsSummary | null>(null);
 
   const handleError = useCallback(
@@ -186,6 +194,7 @@ export function SettingsPanel({
     if (busy || !canSave) return;
     setBusy(true);
     setSaved(false);
+    setConnectionStatus('testing');
     // Resolve API key: new input wins; otherwise keep previously saved raw key
     // from localStorage-backed volatile config by re-saving with a sentinel path —
     // client.save expects a full ModelConfig, so if user left the field blank we
@@ -221,9 +230,12 @@ export function SettingsPanel({
       setTopP(view.topP ?? DEFAULT_TOP_P);
       setApiKeyMasked(view.apiKeyMasked);
       setApiKey('');
+      await client.modelConfig.test();
       setSaved(true);
+      setConnectionStatus('ok');
       onSaved?.(view);
     } catch (error) {
+      setConnectionStatus('failed');
       handleError(error);
     } finally {
       setBusy(false);
@@ -271,8 +283,7 @@ export function SettingsPanel({
         </a>
       </div>
 
-      {/* NEW-01: 显眼的一键 Mock 引导，降低首次无 Key 门槛，直接保存 mock preset */}
-      <div className="nwa-quick-mock">
+      {SHOW_MOCK_CONTROLS ? <div className="nwa-quick-mock">
         <button
           type="button"
           className="nwa-button nwa-button--ghost"
@@ -312,7 +323,7 @@ export function SettingsPanel({
           🚀 一键启用 Mock (本地演示) -- 无需任何 Key，立即体验
         </button>
         <span className="nwa-muted" style={{ fontSize: '0.75rem' }}>适合新手快速试用全部 Agent 任务与蓝图分场景流程</span>
-      </div>
+      </div> : null}
 
       {loading ? (
         <p className="nwa-muted">加载中…</p>
@@ -410,7 +421,7 @@ export function SettingsPanel({
               }}
             />
             <span className="nwa-field__hint nwa-muted">
-              可选官方模型：deepseek-v4-pro、deepseek-v4-flash；deepseek-chat / reasoner 当前映射到 Flash 且将弃用。
+              可选官方模型：deepseek-v4-pro、deepseek-v4-flash；旧 deepseek-chat / reasoner 会自动迁移。
             </span>
           </label>
 
@@ -493,9 +504,14 @@ export function SettingsPanel({
               className="nwa-button"
               disabled={busy || !canSave}
             >
-              {busy ? '启用中…' : '启用本次 API'}
+              {busy ? '保存并测试中…' : '保存并测试 API'}
             </button>
-            {saved ? <span className="nwa-muted" role="status">本次已启用</span> : null}
+            {saved && connectionStatus === 'ok' ? (
+              <span className="nwa-muted" role="status">连接成功，本机已启用</span>
+            ) : null}
+            {connectionStatus === 'failed' ? (
+              <span className="nwa-muted" role="status">配置已留在本机，但连接测试失败；请按错误提示修正。</span>
+            ) : null}
           </div>
 
           <section className="nwa-cache-panel" aria-label="缓存率">

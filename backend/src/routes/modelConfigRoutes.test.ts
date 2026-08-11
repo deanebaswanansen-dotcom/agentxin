@@ -24,6 +24,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { ModelConfigService } from '../services/modelConfig/ModelConfigService.js';
 import { FileDataStore } from '../store/FileDataStore.js';
+import type { ModelProxy } from '../proxy/ModelProxy.js';
+import { ProxyError } from '../proxy/ProxyError.js';
 import type { ModelConfig, ModelConfigView } from '../types/index.js';
 import { registerModelConfigRoutes } from './modelConfigRoutes.js';
 
@@ -36,13 +38,21 @@ const VALID_CONFIG: ModelConfig = {
 let dir: string;
 let store: FileDataStore;
 let app: FastifyInstance;
+let connectionError: Error | undefined;
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), 'model-config-routes-'));
   store = await FileDataStore.create(join(dir, 'store.json'));
+  connectionError = undefined;
 
   app = Fastify({ logger: false });
-  registerModelConfigRoutes(app, new ModelConfigService(store));
+  const proxy: ModelProxy = {
+    async *streamCompletion() {
+      if (connectionError) throw connectionError;
+      yield { kind: 'content', text: 'OK' };
+    },
+  };
+  registerModelConfigRoutes(app, new ModelConfigService(store), proxy);
   await app.ready();
 });
 
@@ -168,5 +178,32 @@ describe('GET /api/model-config', () => {
     // The raw key must not appear in the body or the masked field.
     expect(res.body).not.toContain(VALID_CONFIG.apiKey);
     expect(view.apiKeyMasked).not.toContain(VALID_CONFIG.apiKey);
+  });
+});
+
+describe('POST /api/model-config/test', () => {
+  it('runs a real proxy probe with the active config', async () => {
+    await app.inject({ method: 'PUT', url: '/api/model-config', payload: VALID_CONFIG });
+    const res = await app.inject({ method: 'POST', url: '/api/model-config/test' });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true, modelName: VALID_CONFIG.modelName, receivedOutput: true });
+    expect(res.body).not.toContain(VALID_CONFIG.apiKey);
+  });
+
+  it('returns MODEL_NOT_CONFIGURED before any config is supplied', async () => {
+    const res = await app.inject({ method: 'POST', url: '/api/model-config/test' });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error.code).toBe('MODEL_NOT_CONFIGURED');
+  });
+
+  it('returns a sanitized provider error instead of an unexplained 502', async () => {
+    await app.inject({ method: 'PUT', url: '/api/model-config', payload: VALID_CONFIG });
+    connectionError = new ProxyError('API Key 无效');
+    const res = await app.inject({ method: 'POST', url: '/api/model-config/test' });
+
+    expect(res.statusCode).toBe(502);
+    expect(res.json().error.message).toContain('API Key 无效');
+    expect(res.body).not.toContain(VALID_CONFIG.apiKey);
   });
 });

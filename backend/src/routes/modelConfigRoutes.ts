@@ -23,6 +23,8 @@
  * {@link ApiError} shape with the correct HTTP status.
  */
 import type { FastifyInstance } from 'fastify';
+import type { ModelProxy } from '../proxy/ModelProxy.js';
+import { ServiceError } from '../services/ServiceError.js';
 import type { ModelConfigService } from '../services/modelConfig/ModelConfigService.js';
 import type { ModelConfig } from '../types/index.js';
 import { toErrorResponse } from './errorMapping.js';
@@ -60,6 +62,7 @@ function asOptionalNumber(value: unknown): number | undefined {
 export function registerModelConfigRoutes(
   app: FastifyInstance,
   modelConfigService: ModelConfigService,
+  modelProxy?: ModelProxy,
 ): void {
   // PUT /api/model-config — save/update the model config (Requirements 4.1, 4.3, 4.4).
   app.put<{ Body: SaveModelConfigBody }>('/api/model-config', async (request, reply) => {
@@ -87,6 +90,34 @@ export function registerModelConfigRoutes(
     try {
       const view = await modelConfigService.getView();
       return reply.code(200).send(view);
+    } catch (error) {
+      const { status, body } = toErrorResponse(error);
+      return reply.code(status).send(body);
+    }
+  });
+
+  // POST /api/model-config/test — perform a small real provider request using
+  // the request-scoped browser config. No credential is persisted server-side.
+  app.post('/api/model-config/test', async (_request, reply) => {
+    try {
+      if (!modelProxy) throw ServiceError.validation('当前运行环境未启用模型连接测试。');
+      const config = await modelConfigService.getInternalConfig();
+      if (!config) {
+        throw ServiceError.modelNotConfigured('请先填写并保存 API 配置。');
+      }
+      let receivedOutput = false;
+      for await (const delta of modelProxy.streamCompletion(
+        config,
+        [
+          { role: 'system', content: '连接测试。请简短响应。' },
+          { role: 'user', content: '回复 OK' },
+        ],
+        AbortSignal.timeout(30_000),
+        { maxTokens: 64 },
+      )) {
+        if (delta.text.length > 0) receivedOutput = true;
+      }
+      return reply.code(200).send({ ok: true, modelName: config.modelName, receivedOutput });
     } catch (error) {
       const { status, body } = toErrorResponse(error);
       return reply.code(status).send(body);

@@ -33,7 +33,6 @@ import type {
   AgentTask,
   Id,
   NovelPlanAnswer,
-  NovelPlanDepth,
   NovelPlanHistoryTurn,
   NovelPlanQuestion,
   NovelPlanSummary,
@@ -61,11 +60,14 @@ import { useAgentEngine } from './chat/useAgentEngine.js';
 import { useChatEngine } from './chat/useChatEngine.js';
 import './components.css';
 
+const CHAT_ENV = (import.meta as unknown as { env?: { DEV?: boolean } }).env;
+const SHOW_MOCK_CONTROLS = CHAT_ENV?.DEV === true;
+
 function hasSlashCommandMatch(input: string): boolean {
   if (!input.startsWith('/')) return false;
   const query = input.slice(1).trim().toLowerCase();
   if (query.length === 0) return true;
-  if ('mock'.includes(query) || '演示模式'.includes(query)) return true;
+  if (SHOW_MOCK_CONTROLS && ('mock'.includes(query) || '演示模式'.includes(query))) return true;
   return AGENT_TASKS.some(
     (task) =>
       task.title.toLowerCase().includes(query) ||
@@ -181,7 +183,6 @@ export function ChatWorkspace({
   // —— 计划模式会话（/计划） ——
   const [planBusy, setPlanBusy] = useState(false);
   const [planSeed, setPlanSeed] = useState('');
-  const [planDepth, setPlanDepth] = useState<NovelPlanDepth | undefined>(undefined);
   const [planHistory, setPlanHistory] = useState<NovelPlanHistoryTurn[]>([]);
   const [activePlanQuestions, setActivePlanQuestions] = useState<NovelPlanQuestion[]>([]);
   const planAbortRef = useRef<AbortController | null>(null);
@@ -242,7 +243,6 @@ export function ChatWorkspace({
     (response: NovelPlanTurnResponse, historyAfter: NovelPlanHistoryTurn[]) => {
       setPlanHistory(historyAfter);
       setActivePlanQuestions(response.status === 'asking' ? response.questions ?? [] : []);
-      if (response.depth) setPlanDepth(response.depth);
       chat.appendMessage({
         id: makeId(),
         role: 'assistant',
@@ -268,7 +268,6 @@ export function ChatWorkspace({
       if (!seedPrompt || planBusy || planAbortRef.current !== null || agent.running || chat.streaming) return;
       setPlanBusy(true);
       setPlanSeed(seedPrompt);
-      setPlanDepth(undefined);
       setPlanHistory([]);
       setActivePlanQuestions([]);
       chat.appendMessage({
@@ -280,7 +279,7 @@ export function ChatWorkspace({
       const controller = new AbortController();
       planAbortRef.current = controller;
       try {
-        // 首轮不传 depth → 后端返回「轻量 / 中等 / 极限」三选一
+        // The planning agent decides whether a blocking question is needed.
         const response = await apiClient.agent.planTurn(
           {
             seedPrompt,
@@ -318,17 +317,6 @@ export function ChatWorkspace({
         return { ...prev, resolved: true };
       });
 
-      // 若本轮是选深度，立刻写入本地 depth，后续请求带上
-      let nextDepth = planDepth;
-      const depthAns = answers.find((a) => a.questionId === 'plan_depth');
-      if (depthAns) {
-        const id = depthAns.selectedOptionIds[0];
-        if (id === 'light' || id === 'standard' || id === 'deep') {
-          nextDepth = id;
-          setPlanDepth(id);
-        }
-      }
-
       setPlanBusy(true);
       const controller = new AbortController();
       planAbortRef.current = controller;
@@ -339,22 +327,17 @@ export function ChatWorkspace({
           {
             seedPrompt: seed,
             targetTask: 'long_novel',
-            depth: nextDepth,
             history: historyForApi,
             answers,
             forceReady,
           },
           controller.signal,
         );
-        if (response.depth) setPlanDepth(response.depth);
         const historyAfter: NovelPlanHistoryTurn[] = [
           ...historyForApi,
           {
             role: 'user',
-            content:
-              depthAns && nextDepth
-                ? `plan_depth: ${nextDepth}（${nextDepth === 'light' ? '轻量模式' : nextDepth === 'deep' ? '极限详细模式' : '中等模式'}）\n${userLine}`
-                : userLine,
+            content: userLine,
           },
           { role: 'assistant', content: response.message },
         ];
@@ -379,7 +362,6 @@ export function ChatWorkspace({
       chat,
       onError,
       planBusy,
-      planDepth,
       planHistory,
       planSeed,
     ],
@@ -995,7 +977,7 @@ export function ChatWorkspace({
                 ? '向 AI 提出续写、改写、润色或提问。选中正文片段可针对性改写/润色。'
                 : projectName
                   ? `在「${projectName}」中讨论剧情、角色、世界观；输入 /计划 先头脑风暴，或 /新书 直接生成。`
-                  : '输入 /计划 写「写一本修仙小说」会先追问对齐；或 /新书 直接开写。没有 API Key？输入 / 选「演示模式」。'}
+                  : '输入 /计划 后，Agent 会理解硬约束并自主决定是否需要补问；/新书 可直接开写。'}
             </p>
           </div>
         ) : (
@@ -1132,8 +1114,8 @@ export function ChatWorkspace({
         </div>
       ) : null}
 
-      {/* —— Mock 提示 + NEW-01 强引导 —— */}
-      {mockDone ? (
+      {/* Mock controls are available only in local development. */}
+      {SHOW_MOCK_CONTROLS ? (mockDone ? (
         <div className="nwa-chat-mock-hint">
           <span className="nwa-muted"><Icon name="check" /> 演示模式已开启</span>
         </div>
@@ -1147,7 +1129,7 @@ export function ChatWorkspace({
         >
           {mockBusy ? '切换中…' : '演示模式'}
         </button>
-      )}
+      )) : null}
 
       {/* —— 输入区 —— */}
       <div className="nwa-chat-input-area">
@@ -1158,6 +1140,7 @@ export function ChatWorkspace({
             hasChapter={chapterId !== null}
             onSelectTask={handleSelectTask}
             onSelectMock={() => void handleSelectMock()}
+            showMock={SHOW_MOCK_CONTROLS}
             onClose={handleCloseSlash}
           />
         ) : null}
