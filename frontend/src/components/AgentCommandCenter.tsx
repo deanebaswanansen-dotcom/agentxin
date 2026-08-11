@@ -16,6 +16,7 @@ import type {
   NovelPlanTargetTask,
   NovelPlanTurnResponse,
 } from '../types/index.js';
+import { formatPlanAnswersForHistory } from '../lib/planHistory.js';
 import { buildAgentRunOptions } from './chat/buildAgentRunOptions.js';
 import { Icon, type IconName } from './Icon.js';
 import { LottieMotion } from './LottieMotion.js';
@@ -466,27 +467,13 @@ export function AgentCommandCenter({
     });
   }, [planAnswers, planQuestions]);
 
-  const formatAnswersForHistory = useCallback((answers: NovelPlanAnswer[], questions: NovelPlanQuestion[]): string => {
-    return answers
-      .map((a) => {
-        const q = questions.find((item) => item.id === a.questionId);
-        const labels = a.selectedOptionIds
-          .map((id) => q?.options.find((o) => o.id === id)?.label ?? id)
-          .join('、');
-        const custom = a.customText?.trim();
-        const parts = [labels || null, custom ? `补充：${custom}` : null].filter(Boolean);
-        return `${q?.question ?? a.questionId} → ${parts.join('；') || '（跳过）'}`;
-      })
-      .join('\n');
-  }, []);
-
   const callPlanTurn = useCallback(async (params: {
     seedPrompt: string;
     history: NovelPlanHistoryTurn[];
     answers?: NovelPlanAnswer[];
     forceReady?: boolean;
   }) => {
-    if (!isPlanTargetTask(task)) return;
+    if (!isPlanTargetTask(task) || planAbortRef.current !== null) return;
     if (client.agent.planTurn === undefined) {
       onError?.(new Error('当前客户端未接入计划模式接口（agent.planTurn）。'));
       return;
@@ -509,7 +496,7 @@ export function AgentCommandCenter({
       if (params.answers && params.answers.length > 0) {
         historyAfter.push({
           role: 'user',
-          content: formatAnswersForHistory(params.answers, planQuestions),
+          content: formatPlanAnswersForHistory(params.answers, planQuestions),
         });
       } else if (params.history.length === 0) {
         historyAfter.push({ role: 'user', content: `灵感：${params.seedPrompt}` });
@@ -524,11 +511,11 @@ export function AgentCommandCenter({
       setPlanBusy(false);
       planAbortRef.current = null;
     }
-  }, [applyPlanResponse, client.agent, formatAnswersForHistory, onError, planQuestions, task]);
+  }, [applyPlanResponse, client.agent, onError, planQuestions, task]);
 
   const startBrainstorm = useCallback(async () => {
     const seed = prompt.trim();
-    if (!seed || planBusy || running) return;
+    if (!seed || planBusy || planAbortRef.current !== null || running) return;
     setResult(null);
     setPlanHistory([]);
     setPlanSeed(seed);
@@ -538,7 +525,7 @@ export function AgentCommandCenter({
 
   const submitPlanAnswers = useCallback(async (forceReady = false) => {
     const seed = planSeed.trim() || prompt.trim();
-    if (!seed || planBusy || running) return;
+    if (!seed || planBusy || planAbortRef.current !== null || running) return;
     const answers = buildStructuredAnswers();
     const hasAny =
       forceReady ||
