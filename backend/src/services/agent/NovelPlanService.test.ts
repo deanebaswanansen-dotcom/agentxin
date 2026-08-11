@@ -342,6 +342,23 @@ describe('NovelPlanService goal-driven agent', () => {
     expect(result.planSummary?.storyPlan?.characters.length).toBeGreaterThanOrEqual(4);
   });
 
+  it('fills omitted protagonist fields from the confirmed planning summary', async () => {
+    const storyPlan = JSON.parse(readyDecision()).planSummary.storyPlan;
+    storyPlan.protagonist = { personality: [] };
+    const proxy = new QueueProxy([
+      readyDecision({ storyPlan: undefined }),
+      JSON.stringify({ storyPlan }),
+    ]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      { seedPrompt: '西方玄幻，两章，每章1200字，流浪骑士，冒险成长，直接开始' },
+      new AbortController().signal,
+    );
+
+    expect(result.planSummary?.storyPlan?.protagonist.identity).toBe('流亡骑士艾琳');
+    expect(result.planSummary?.storyPlan?.protagonist.goal).toContain('王冠');
+  });
+
   it('repairs malformed JSON once and fails clearly after two invalid responses', async () => {
     const service = new NovelPlanService(
       mockConfigService(),

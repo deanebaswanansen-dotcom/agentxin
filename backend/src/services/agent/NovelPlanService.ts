@@ -763,22 +763,29 @@ function ensureStructuredStoryPlan(summary: NovelPlanSummary): NovelPlanSummary 
   return { ...summary, storyPlan: plan };
 }
 
+function storyPlanQualityIssues(plan: NovelStoryPlan | undefined): string[] {
+  if (!plan) return ['Story Plan 根对象'];
+  const issues: string[] = [];
+  if (plan.premise.oneSentence.length < 8) issues.push('一句话前提');
+  if (plan.premise.coreConflict.length < 8) issues.push('核心冲突');
+  if (plan.protagonist.identity.length < 2) issues.push('主角身份');
+  if (plan.protagonist.goal.length < 4) issues.push('主角目标');
+  if (plan.world.overview.length < 80) issues.push(`世界概述(${plan.world.overview.length}/80)`);
+  if (plan.powerSystem.rules.length < 3) issues.push(`力量规则(${plan.powerSystem.rules.length}/3)`);
+  if (plan.characters.length < 4) issues.push(`人物(${plan.characters.length}/4)`);
+  const plotParts = [
+    plan.mainPlot.beginning,
+    plan.mainPlot.development,
+    plan.mainPlot.climax,
+    plan.mainPlot.ending,
+  ].filter((part) => part.length >= 4).length;
+  if (plotParts < 4) issues.push(`主线四段(${plotParts}/4)`);
+  if (plan.foreshadowing.length < 3) issues.push(`伏笔(${plan.foreshadowing.length}/3)`);
+  return issues;
+}
+
 function isCompleteStoryPlan(plan: NovelStoryPlan | undefined): boolean {
-  return Boolean(
-    plan &&
-      plan.premise.oneSentence.length >= 8 &&
-      plan.premise.coreConflict.length >= 8 &&
-      plan.protagonist.identity.length >= 2 &&
-      plan.protagonist.goal.length >= 4 &&
-      plan.world.overview.length >= 80 &&
-      plan.powerSystem.rules.length >= 3 &&
-      plan.characters.length >= 4 &&
-      plan.mainPlot.beginning.length >= 4 &&
-      plan.mainPlot.development.length >= 4 &&
-      plan.mainPlot.climax.length >= 4 &&
-      plan.mainPlot.ending.length >= 4 &&
-      plan.foreshadowing.length >= 3,
-  );
+  return storyPlanQualityIssues(plan).length === 0;
 }
 
 export class NovelPlanService {
@@ -988,14 +995,20 @@ export class NovelPlanService {
       : isRecord(data.plan_summary)
         ? data.plan_summary
         : undefined;
-    const storyPlan = normalizeStoryPlan(
+    const normalizedStoryPlan = normalizeStoryPlan(
       data.storyPlan ??
         data.story_plan ??
         nestedSummary?.storyPlan ??
         nestedSummary?.story_plan,
     );
+    const storyPlan = ensureStructuredStoryPlan({
+      ...summary,
+      storyPlan: normalizedStoryPlan,
+    }).storyPlan;
     if (!isCompleteStoryPlan(storyPlan)) {
-      throw new ProxyError('Story Plan Agent 返回的信息不完整，请重试。');
+      throw new ProxyError(
+        `Story Plan Agent 返回的信息不完整：${storyPlanQualityIssues(storyPlan).join('、')}。`,
+      );
     }
     return { ...decision, planSummary: { ...summary, storyPlan } };
   }
