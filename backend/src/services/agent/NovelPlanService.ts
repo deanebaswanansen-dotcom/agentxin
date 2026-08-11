@@ -269,11 +269,23 @@ function normalizeOutlines(
 }
 
 function stringArray(raw: unknown): string[] {
-  return Array.isArray(raw)
-    ? raw
-        .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-        .map((item) => item.trim())
-    : [];
+  const itemText = (item: unknown): string => {
+    if (typeof item === 'string') return item.trim();
+    if (typeof item === 'number' || typeof item === 'boolean') return String(item);
+    if (!isRecord(item)) return '';
+    const parts: string[] = [];
+    for (const value of Object.values(item)) {
+      if (typeof value === 'string' && value.trim()) parts.push(value.trim());
+      else if (typeof value === 'number' || typeof value === 'boolean') parts.push(String(value));
+      else if (Array.isArray(value)) {
+        const nested = value.map(itemText).filter(Boolean).join('、');
+        if (nested) parts.push(nested);
+      }
+    }
+    return Array.from(new Set(parts)).join('；');
+  };
+  const values = Array.isArray(raw) ? raw : raw === undefined || raw === null ? [] : [raw];
+  return values.map(itemText).filter(Boolean);
 }
 
 function recordText(record: Record<string, unknown> | undefined, key: string): string {
@@ -307,6 +319,7 @@ export function normalizeStoryPlan(raw: unknown): NovelStoryPlan | undefined {
   if (!isRecord(raw)) return undefined;
   const metadata = isRecord(raw.metadata) ? raw.metadata : undefined;
   const premise = isRecord(raw.premise) ? raw.premise : undefined;
+  const premiseText = typeof raw.premise === 'string' ? raw.premise.trim() : '';
   const protagonist = isRecord(raw.protagonist) ? raw.protagonist : undefined;
   const world = isRecord(raw.world) ? raw.world : undefined;
   const powerSystem = isRecord(raw.powerSystem)
@@ -319,6 +332,7 @@ export function normalizeStoryPlan(raw: unknown): NovelStoryPlan | undefined {
     : isRecord(raw.main_plot)
       ? raw.main_plot
       : undefined;
+  const mainPlotStages = mainPlot ? [] : stringArray(raw.mainPlot ?? raw.main_plot);
   const constraints = isRecord(raw.constraints) ? raw.constraints : undefined;
   const characters = Array.isArray(raw.characters)
     ? raw.characters
@@ -326,12 +340,12 @@ export function normalizeStoryPlan(raw: unknown): NovelStoryPlan | undefined {
         .map((character) => ({
           name: recordText(character, 'name'),
           role: recordText(character, 'role'),
-          identity: recordText(character, 'identity') || undefined,
-          traits: stringArray(character.traits),
-          motivation: recordText(character, 'motivation') || undefined,
+          identity: recordTextAny(character, 'identity', 'type', 'background') || undefined,
+          traits: stringArray(character.traits ?? character.abilities),
+          motivation: recordTextAny(character, 'motivation', 'goal') || undefined,
           goal: recordText(character, 'goal') || undefined,
           weakness: recordText(character, 'weakness') || undefined,
-          arc: recordText(character, 'arc') || undefined,
+          arc: recordTextAny(character, 'arc', 'growthArc', 'growth_arc') || undefined,
         }))
         .filter((character) => character.name && character.role)
     : [];
@@ -355,42 +369,50 @@ export function normalizeStoryPlan(raw: unknown): NovelStoryPlan | undefined {
       tone: recordText(metadata, 'tone') || undefined,
     },
     premise: {
-      oneSentence: recordTextAny(premise, 'oneSentence', 'one_sentence'),
-      coreConflict: recordTextAny(premise, 'coreConflict', 'core_conflict'),
+      oneSentence: recordTextAny(premise, 'oneSentence', 'one_sentence') || premiseText,
+      coreConflict:
+        recordTextAny(premise, 'coreConflict', 'core_conflict') ||
+        premiseText ||
+        mainPlotStages[0] ||
+        '',
       theme: recordText(premise, 'theme') || undefined,
     },
     protagonist: {
       name: recordText(protagonist, 'name') || undefined,
       age: parsePositiveInt(protagonist?.age),
-      identity: recordText(protagonist, 'identity'),
+      identity: recordTextAny(protagonist, 'identity', 'type', 'background'),
       personality: stringArray(protagonist?.personality),
-      motivation: recordText(protagonist, 'motivation'),
+      motivation: recordTextAny(protagonist, 'motivation', 'goal'),
       goal: recordText(protagonist, 'goal'),
       weakness: recordText(protagonist, 'weakness'),
-      growthArc: recordTextAny(protagonist, 'growthArc', 'growth_arc'),
+      growthArc: recordTextAny(protagonist, 'growthArc', 'growth_arc', 'arc'),
     },
     world: {
       overview: recordText(world, 'overview'),
-      regions: stringArray(world?.regions),
+      regions: stringArray(world?.regions ?? world?.geography),
       countries: stringArray(world?.countries),
       races: stringArray(world?.races),
       religions: stringArray(world?.religions),
       factions: stringArray(world?.factions),
-      history: stringArray(world?.history),
+      history: stringArray(world?.history ?? world?.culture),
     },
     powerSystem: {
       rules: stringArray(powerSystem?.rules),
       levels: stringArray(powerSystem?.levels),
-      limitations: stringArray(powerSystem?.limitations),
+      limitations: stringArray(powerSystem?.limitations ?? powerSystem?.cost),
       specialCases: recordArrayAny(powerSystem, 'specialCases', 'special_cases'),
     },
     characters,
     factions: stringArray(raw.factions),
     mainPlot: {
-      beginning: recordText(mainPlot, 'beginning'),
-      development: recordText(mainPlot, 'development'),
-      climax: recordText(mainPlot, 'climax'),
-      ending: recordText(mainPlot, 'ending'),
+      beginning: recordText(mainPlot, 'beginning') || mainPlotStages[0] || '',
+      development:
+        recordText(mainPlot, 'development') || mainPlotStages[1] || mainPlotStages[0] || '',
+      climax:
+        recordText(mainPlot, 'climax') ||
+        mainPlotStages[Math.max(0, mainPlotStages.length - 2)] ||
+        '',
+      ending: recordText(mainPlot, 'ending') || mainPlotStages.at(-1) || '',
     },
     subplots: stringArray(raw.subplots),
     characterArcs: stringArray(raw.characterArcs ?? raw.character_arcs),

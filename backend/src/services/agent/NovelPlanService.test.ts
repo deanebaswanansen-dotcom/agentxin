@@ -10,6 +10,7 @@ import {
   inferExplicitGenre,
   MAX_OUTLINE_CHAPTERS,
   NovelPlanService,
+  normalizeStoryPlan,
 } from './NovelPlanService.js';
 
 const CONFIG: ModelConfig = {
@@ -376,6 +377,43 @@ describe('NovelPlanService goal-driven agent', () => {
 });
 
 describe('planning facts', () => {
+  it('normalizes flexible provider shapes into the canonical Story Plan', () => {
+    const plan = normalizeStoryPlan({
+      metadata: { title: '灰烬远征', genre: '西方玄幻' },
+      premise: '流浪冒险者必须在拯救边境与保住自身记忆之间作出不可逆选择。',
+      protagonist: { name: '伊莱', type: '流浪冒险者', goal: '终止灰潮', arc: '从独行者成长为盟约守护者' },
+      world: {
+        overview: '旧帝国崩溃后，北境矿城、南方港邦与圣辉教会争夺封印遗产。灰潮每十年吞没一片领地，施法者必须献出记忆换取力量，各族因此形成互相依赖又彼此猜忌的盟约；失落王冠重现后，边境秩序与教会权威同时开始瓦解。',
+        geography: ['北境矿城', '南方港邦'],
+      },
+      powerSystem: { rules: [{ rule: '施法消耗记忆' }, { rule: '代价不可逆' }, { rule: '王冠放大法术' }], cost: '永久遗忘' },
+      characters: [
+        { name: '伊莱', role: '主角', type: '流浪者' },
+        { name: '赛琳', role: '盟友', affiliation: '港邦' },
+        { name: '奥德', role: '导师', affiliation: '教会' },
+        { name: '维克', role: '对手', affiliation: '北境' },
+      ],
+      mainPlot: [
+        { phase: '开端', event: '主角接受护送任务' },
+        { phase: '发展', event: '灰潮逼近并暴露教会阴谋' },
+        { phase: '高潮', event: '盟约在王冠前决裂' },
+        { phase: '结局', event: '主角献出记忆重建封印' },
+      ],
+      foreshadowing: [
+        { setup: '王冠刻着主角旧名', payoff: '揭示其血统' },
+        { setup: '壁画缺失圣徒', payoff: '揭示教会篡史' },
+        { setup: '导师害怕钟声', payoff: '揭示灰潮起源' },
+      ],
+      constraints: { mustInclude: [], mustAvoid: [] },
+    });
+
+    expect(plan?.premise.coreConflict).toContain('不可逆选择');
+    expect(plan?.protagonist.identity).toBe('流浪冒险者');
+    expect(plan?.powerSystem.rules).toHaveLength(3);
+    expect(plan?.mainPlot.ending).toContain('结局');
+    expect(plan?.foreshadowing[0]).toContain('揭示其血统');
+  });
+
   it('only skips first-turn consultation when the user explicitly authorizes it', () => {
     expect(hasExplicitPlanningBypass('题材你自己决定，直接开始')).toBe(true);
     expect(hasExplicitPlanningBypass('写一本西方玄幻小说')).toBe(false);
