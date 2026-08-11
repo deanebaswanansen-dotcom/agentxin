@@ -163,16 +163,22 @@ function Workbench(): JSX.Element {
     async (format: ProjectExportFormat | 'docx') => {
       if (selectedProjectId === null) return;
       try {
-        const chapters = await apiClient.chapters.list(selectedProjectId);
+        const [chapters, characters, worldSettings, outlines] = await Promise.all([
+          apiClient.chapters.list(selectedProjectId),
+          apiClient.settings.characters.list(selectedProjectId),
+          apiClient.settings.worldSettings.list(selectedProjectId),
+          apiClient.settings.outlines.list(selectedProjectId),
+        ]);
+        const resources = { characters, worldSettings, outlines };
         const projectName = selectedProjectName ?? '小说项目';
         if (format === 'docx') {
           downloadBlob(
-            buildProjectDocxBlob(projectName, chapters),
+            buildProjectDocxBlob(projectName, chapters, resources),
             `${sanitizeDownloadName(projectName)}.docx`,
           );
           return;
         }
-        const content = buildProjectTextExport(projectName, chapters, format);
+        const content = buildProjectTextExport(projectName, chapters, format, resources);
         downloadBlob(
           new Blob([content], {
             type: format === 'markdown' ? 'text/markdown;charset=utf-8' : 'text/plain;charset=utf-8',

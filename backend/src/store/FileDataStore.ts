@@ -134,7 +134,61 @@ export class FileDataStore implements DataStore {
   ): Promise<FileDataStore> {
     const store = new FileDataStore(filePath);
     await store.load();
+    if (store.migrateLegacyAgentMaterials()) {
+      await store.persist();
+    }
     return store;
+  }
+
+  /** One-time repair for duplicate system documents created by legacy chapter batching. */
+  private migrateLegacyAgentMaterials(): boolean {
+    let changed = false;
+    const removeWorldIds = new Set<Id>();
+    const removeOutlineIds = new Set<Id>();
+    for (const project of this.state.projects) {
+      const rules = this.state.worldSettings.filter(
+        (item) =>
+          item.projectId === project.id && item.title === '创作规则（计划采纳）',
+      );
+      if (rules.length > 1) {
+        rules[0]!.content = rules.at(-1)!.content;
+        for (const duplicate of rules.slice(1)) removeWorldIds.add(duplicate.id);
+        changed = true;
+      }
+
+      const outlineGroups = [
+        this.state.outlines.filter(
+          (item) => item.projectId === project.id && item.title === '长篇小说模式配置',
+        ),
+        this.state.outlines.filter(
+          (item) => item.projectId === project.id && item.title === '分章人物服装表',
+        ),
+        this.state.outlines.filter(
+          (item) =>
+            item.projectId === project.id &&
+            item.title.endsWith('：分章大纲（计划采纳）'),
+        ),
+      ];
+      for (const group of outlineGroups) {
+        if (group.length <= 1) continue;
+        const latest = group.at(-1)!;
+        group[0]!.title = latest.title;
+        group[0]!.content = latest.content;
+        for (const duplicate of group.slice(1)) removeOutlineIds.add(duplicate.id);
+        changed = true;
+      }
+    }
+    if (removeWorldIds.size > 0) {
+      this.state.worldSettings = this.state.worldSettings.filter(
+        (item) => !removeWorldIds.has(item.id),
+      );
+    }
+    if (removeOutlineIds.size > 0) {
+      this.state.outlines = this.state.outlines.filter(
+        (item) => !removeOutlineIds.has(item.id),
+      );
+    }
+    return changed;
   }
 
   /**

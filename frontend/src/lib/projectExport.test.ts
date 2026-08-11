@@ -11,6 +11,12 @@ const chapters = [
   { title: '第一章', content: '开篇正文', position: 1 },
 ];
 
+const resources = {
+  characters: [{ name: '林夜', description: '基础服装：黑色校服。' }],
+  worldSettings: [{ title: '灵力规则', content: '灵力不可凭空产生。' }],
+  outlines: [{ title: '分章人物服装表', content: '第一章：黑色校服', position: 1 }],
+};
+
 function readBlobAsText(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -24,9 +30,14 @@ function readBlobAsText(blob: Blob): Promise<string> {
 
 describe('project export helpers', () => {
   it('builds ordered Markdown and TXT exports', () => {
-    expect(buildProjectTextExport('书名', chapters, 'markdown')).toContain('## 第 1 章 第一章');
-    expect(buildProjectTextExport('书名', chapters, 'markdown')).toContain('## 第 2 章 第二章');
-    expect(buildProjectTextExport('书名', chapters, 'txt')).toContain('第 1 章 第一章');
+    const markdown = buildProjectTextExport('书名', chapters, 'markdown', resources);
+    const txt = buildProjectTextExport('书名', chapters, 'txt', resources);
+    expect(markdown).toContain('## 第 1 章 第一章');
+    expect(markdown).toContain('## 第 2 章 第二章');
+    expect(markdown).toContain('#### 分章人物服装表');
+    expect(markdown).toContain('基础服装：黑色校服');
+    expect(txt).toContain('第 1 章 第一章');
+    expect(txt).toContain('大纲：分章人物服装表');
   });
 
   it('sanitizes Windows-hostile download names', () => {
@@ -35,7 +46,7 @@ describe('project export helpers', () => {
   });
 
   it('builds a valid DOCX package with document XML', async () => {
-    const blob = buildProjectDocxBlob('书名', chapters);
+    const blob = buildProjectDocxBlob('书名', chapters, resources);
     expect(blob.type).toBe('application/vnd.openxmlformats-officedocument.wordprocessingml.document');
 
     const text = await readBlobAsText(blob);
@@ -44,5 +55,7 @@ describe('project export helpers', () => {
     expect(text).toContain('word/document.xml');
     expect(text).toContain('第 1 章 第一章');
     expect(text).toContain('开篇正文');
+    expect(text).toContain('分章人物服装表');
+    expect(text).toContain('基础服装：黑色校服');
   });
 });
