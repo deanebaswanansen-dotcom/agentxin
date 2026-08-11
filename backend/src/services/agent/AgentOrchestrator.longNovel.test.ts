@@ -5,8 +5,10 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   buildControlOutlineFromPlan,
+  extractChapterOutfitPlan,
   extractChapterOutline,
   normalizeFullNovelOptions,
+  parseCharacterProfiles,
   parseReflection,
   AgentOrchestrator,
 } from './AgentOrchestrator.js';
@@ -297,6 +299,97 @@ describe('normalizeFullNovelOptions', () => {
     expect(proxy.chapterSystems[0]).toContain('陆辞绕过身份验证进入学院');
     expect(result.summary).toContain('按计划');
     expect(result.steps.some((s) => s.includes('已采纳分章大纲'))).toBe(true);
+  });
+
+  it('parses named character profiles and the chapter outfit table', () => {
+    const markdown = [
+      '# 人物与口吻护栏',
+      '## 人物：林夜',
+      '- 身份/年龄：学生，18岁',
+      '- 基础服装：黑色校服、银色袖扣',
+      '## 人物：苏青',
+      '- 身份/年龄：导师，27岁',
+      '- 基础服装：灰色风衣、短靴',
+      '## 分章人物服装连续性表',
+      '| 章节 | 人物 | 服装与配件 | 换装原因/连续性 |',
+      '| 第一章 | 林夜 | 黑色校服 | 入学 |',
+    ].join('\n');
+
+    expect(parseCharacterProfiles(markdown).map((item) => item.name)).toEqual(['林夜', '苏青']);
+    expect(parseCharacterProfiles(markdown)[0]?.description).toContain('黑色校服');
+    expect(extractChapterOutfitPlan(markdown)).toContain('第一章');
+  });
+
+  it('updates plan materials instead of duplicating them across chapter batches', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-plan-upsert-'));
+    const store = await FileDataStore.create(join(tempDir, 'store.json'));
+    await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock-model' });
+    const memory = new MemoryService(await MemoryStore.create(join(tempDir, 'memory.json')));
+    const orchestrator = new AgentOrchestrator(
+      store,
+      new ModelConfigService(store),
+      new CaptureProxy(),
+      undefined as never,
+      undefined as never,
+      memory,
+    );
+    const planSummary = {
+      title: '代码御剑',
+      protagonist: '陆辞',
+      chapterCount: 2,
+      totalWords: 1000,
+      wordsPerChapter: 500,
+      constraints: ['不写后宫'],
+      chapterOutlines: [
+        { number: 1, title: '黑户入学', goal: '陆辞潜入学院。' },
+        { number: 2, title: '第一堂课', goal: '陆辞修复聚灵阵。' },
+      ],
+    };
+
+    const first = await orchestrator.run(
+      {
+        task: 'long_novel',
+        mode: 'draft',
+        prompt: '代码御剑',
+        options: {
+          chapters: 1,
+          totalChapters: 2,
+          targetWords: 500,
+          automationLevel: 'semi_auto',
+          planSummary,
+        },
+      },
+      new AbortController().signal,
+    );
+    await orchestrator.run(
+      {
+        task: 'long_novel',
+        mode: 'draft',
+        prompt: '代码御剑',
+        projectId: first.projectId,
+        options: {
+          chapters: 1,
+          totalChapters: 2,
+          targetWords: 500,
+          automationLevel: 'semi_auto',
+          planSummary,
+        },
+      },
+      new AbortController().signal,
+    );
+
+    const worlds = await store.listWorldSettings(first.projectId);
+    const characters = await store.listCharacters(first.projectId);
+    const outlines = await store.listOutlines(first.projectId);
+    expect(characters.map((item) => item.name)).toContain('陆辞');
+    expect(characters.map((item) => item.name)).not.toContain('人物与口吻护栏');
+    expect(worlds.filter((item) => item.title === '创作规则（计划采纳）')).toHaveLength(1);
+    expect(outlines.filter((item) => item.title.endsWith('：分章大纲（计划采纳）'))).toHaveLength(1);
+    expect(outlines.filter((item) => item.title === '长篇小说模式配置')).toHaveLength(1);
+    expect(outlines.filter((item) => item.title === '分章人物服装表')).toHaveLength(1);
+    expect(outlines.find((item) => item.title === '分章人物服装表')?.content).toContain(
+      '分章人物服装连续性表',
+    );
   });
 
   it('runs long_novel multi-subagent pipeline with gates and config outline', async () => {

@@ -1,8 +1,14 @@
-import type { Chapter } from '../types/index.js';
+import type { Chapter, Character, Outline, WorldSetting } from '../types/index.js';
 
 export type ProjectExportFormat = 'markdown' | 'txt';
 
 type ExportChapter = Pick<Chapter, 'title' | 'content' | 'position'>;
+
+export interface ProjectExportResources {
+  characters?: Array<Pick<Character, 'name' | 'description'>>;
+  worldSettings?: Array<Pick<WorldSetting, 'title' | 'content'>>;
+  outlines?: Array<Pick<Outline, 'title' | 'content' | 'position'>>;
+}
 
 const DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
 
@@ -18,11 +24,17 @@ export function buildProjectTextExport(
   projectName: string,
   chapters: ExportChapter[],
   format: ProjectExportFormat,
+  resources: ProjectExportResources = {},
 ): string {
   const ordered = orderedChapters(chapters);
   if (format === 'txt') {
     return [
       projectName,
+      '',
+      '【项目资料】',
+      '',
+      ...buildPlainResourceSections(resources),
+      '【正文】',
       '',
       ...ordered.flatMap((chapter, index) => [
         `第 ${index + 1} 章 ${chapter.title}`,
@@ -35,6 +47,11 @@ export function buildProjectTextExport(
   return [
     `# ${projectName}`,
     '',
+    '## 项目资料',
+    '',
+    ...buildMarkdownResourceSections(resources),
+    '## 正文',
+    '',
     ...ordered.flatMap((chapter, index) => [
       `## 第 ${index + 1} 章 ${chapter.title}`,
       '',
@@ -42,6 +59,56 @@ export function buildProjectTextExport(
       '',
     ]),
   ].join('\n');
+}
+
+function buildPlainResourceSections(resources: ProjectExportResources): string[] {
+  return [
+    '【人物】',
+    '',
+    ...(resources.characters ?? []).flatMap((item) => [
+      `人物：${item.name}`,
+      item.description.trim() || '（无描述）',
+      '',
+    ]),
+    '【世界观】',
+    '',
+    ...(resources.worldSettings ?? []).flatMap((item) => [
+      `世界观：${item.title}`,
+      item.content.trim() || '（无内容）',
+      '',
+    ]),
+    '【大纲】',
+    '',
+    ...[...(resources.outlines ?? [])]
+      .sort((a, b) => a.position - b.position)
+      .flatMap((item) => [`大纲：${item.title}`, item.content.trim() || '（无内容）', '']),
+  ];
+}
+
+function buildMarkdownResourceSections(resources: ProjectExportResources): string[] {
+  return [
+    '### 人物',
+    '',
+    ...(resources.characters ?? []).flatMap((item) => [
+      `#### ${item.name}`,
+      '',
+      item.description.trim() || '（无描述）',
+      '',
+    ]),
+    '### 世界观',
+    '',
+    ...(resources.worldSettings ?? []).flatMap((item) => [
+      `#### ${item.title}`,
+      '',
+      item.content.trim() || '（无内容）',
+      '',
+    ]),
+    '### 大纲',
+    '',
+    ...[...(resources.outlines ?? [])]
+      .sort((a, b) => a.position - b.position)
+      .flatMap((item) => [`#### ${item.title}`, '', item.content.trim() || '（无内容）', '']),
+  ];
 }
 
 function escapeXml(value: string): string {
@@ -75,7 +142,31 @@ function contentParagraphs(content: string): string {
   return lines.map((line) => paragraph(line)).join('');
 }
 
-function buildDocumentXml(projectName: string, chapters: ExportChapter[]): string {
+function buildDocumentXml(
+  projectName: string,
+  chapters: ExportChapter[],
+  resources: ProjectExportResources,
+): string {
+  const resourceXml = [
+    paragraph('项目资料', { bold: true, size: 32 }),
+    paragraph('人物', { bold: true, size: 28 }),
+    ...(resources.characters ?? []).flatMap((item) => [
+      paragraph(item.name, { bold: true, size: 24 }),
+      contentParagraphs(item.description.trim() || '（无描述）'),
+    ]),
+    paragraph('世界观', { bold: true, size: 28 }),
+    ...(resources.worldSettings ?? []).flatMap((item) => [
+      paragraph(item.title, { bold: true, size: 24 }),
+      contentParagraphs(item.content.trim() || '（无内容）'),
+    ]),
+    paragraph('大纲', { bold: true, size: 28 }),
+    ...[...(resources.outlines ?? [])]
+      .sort((a, b) => a.position - b.position)
+      .flatMap((item) => [
+        paragraph(item.title, { bold: true, size: 24 }),
+        contentParagraphs(item.content.trim() || '（无内容）'),
+      ]),
+  ].join('');
   const chapterXml = orderedChapters(chapters)
     .map((chapter, index) => {
       const title = paragraph(`第 ${index + 1} 章 ${chapter.title}`, { bold: true, size: 28 });
@@ -88,6 +179,9 @@ function buildDocumentXml(projectName: string, chapters: ExportChapter[]): strin
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
     ${paragraph(projectName, { bold: true, size: 36, align: 'center' })}
+    ${resourceXml}
+    ${pageBreak()}
+    ${paragraph('正文', { bold: true, size: 32 })}
     ${chapterXml}
     <w:sectPr>
       <w:pgSz w:w="11906" w:h="16838"/>
@@ -223,7 +317,11 @@ function xmlEntry(name: string, xml: string): ZipEntry {
   return { name, data: textEncoder.encode(xml) };
 }
 
-export function buildProjectDocxBlob(projectName: string, chapters: ExportChapter[]): Blob {
+export function buildProjectDocxBlob(
+  projectName: string,
+  chapters: ExportChapter[],
+  resources: ProjectExportResources = {},
+): Blob {
   const now = new Date().toISOString();
   const entries = [
     xmlEntry(
@@ -246,7 +344,7 @@ export function buildProjectDocxBlob(projectName: string, chapters: ExportChapte
   <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>
 </Relationships>`,
     ),
-    xmlEntry('word/document.xml', buildDocumentXml(projectName, chapters)),
+    xmlEntry('word/document.xml', buildDocumentXml(projectName, chapters, resources)),
     xmlEntry(
       'docProps/core.xml',
       `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>

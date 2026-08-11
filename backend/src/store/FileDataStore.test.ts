@@ -484,6 +484,38 @@ describe('FileDataStore outline operations', () => {
   });
 });
 
+describe('FileDataStore legacy Agent material migration', () => {
+  it('deduplicates system materials on reload and keeps the latest content', async () => {
+    const store = await FileDataStore.create(file);
+    const project = await store.createProject('p');
+    const firstRules = await store.createWorldSetting(
+      project.id,
+      '创作规则（计划采纳）',
+      '旧规则',
+    );
+    await store.createWorldSetting(project.id, '创作规则（计划采纳）', '新规则');
+    const firstPlan = await store.createOutline(
+      project.id,
+      '旧名：分章大纲（计划采纳）',
+      '旧大纲',
+    );
+    await store.createOutline(project.id, '新名：分章大纲（计划采纳）', '新大纲');
+    await store.createOutline(project.id, '作者自定义', '版本一');
+    await store.createOutline(project.id, '作者自定义', '版本二');
+
+    const reloaded = await FileDataStore.create(file);
+    const worlds = await reloaded.listWorldSettings(project.id);
+    const outlines = await reloaded.listOutlines(project.id);
+    expect(worlds.filter((item) => item.title === '创作规则（计划采纳）')).toEqual([
+      { ...firstRules, content: '新规则' },
+    ]);
+    expect(outlines.filter((item) => item.title.endsWith('：分章大纲（计划采纳）'))).toEqual([
+      { ...firstPlan, title: '新名：分章大纲（计划采纳）', content: '新大纲' },
+    ]);
+    expect(outlines.filter((item) => item.title === '作者自定义')).toHaveLength(2);
+  });
+});
+
 describe('FileDataStore model config operations', () => {
   it('returns undefined when no config has been saved', async () => {
     const store = await FileDataStore.create(file);

@@ -305,8 +305,7 @@ export class AgentOrchestrator {
     artifacts.push({ kind: 'world', id: world.id, title: world.title });
     steps.push('已保存世界观。');
 
-    const character = await this.store.createCharacter(pid, '人物与口吻护栏', pack.characters);
-    artifacts.push({ kind: 'character', id: character.id, title: character.name });
+    await this.persistGeneratedCharacters(pid, pack.characters, artifacts);
     steps.push('已保存人物护栏。');
 
     const outline = await this.store.createOutline(pid, `${pack.title}：大纲`, pack.outline);
@@ -372,8 +371,7 @@ export class AgentOrchestrator {
 
     const world = await this.store.createWorldSetting(pid, pack.title, pack.world);
     artifacts.push({ kind: 'world', id: world.id, title: world.title });
-    const character = await this.store.createCharacter(pid, '人物与口吻护栏', pack.characters);
-    artifacts.push({ kind: 'character', id: character.id, title: character.name });
+    await this.persistGeneratedCharacters(pid, pack.characters, artifacts);
     const outline = await this.store.createOutline(pid, `${pack.title}：大纲`, pack.outline);
     artifacts.push({ kind: 'outline', id: outline.id, title: outline.title });
     steps.push('已落盘世界观、人物护栏和卷一大纲（仅参考，不写正文）。');
@@ -996,8 +994,7 @@ export class AgentOrchestrator {
       }
       const world = await this.store.createWorldSetting(pid, pack.title, pack.world);
       artifacts.push({ kind: 'world', id: world.id, title: world.title });
-      const character = await this.store.createCharacter(pid, '人物与口吻护栏', pack.characters);
-      artifacts.push({ kind: 'character', id: character.id, title: character.name });
+      await this.persistGeneratedCharacters(pid, pack.characters, artifacts);
       const outline = await this.store.createOutline(pid, `${pack.title}：大纲`, pack.outline);
       artifacts.push({ kind: 'outline', id: outline.id, title: outline.title });
       steps.push('已完成多子代理规划：世界 / 人物 / 大纲。');
@@ -1005,8 +1002,7 @@ export class AgentOrchestrator {
       pack = await this.generatePack(config, directorBrief, 'draft', 'novel', signal, onProgress);
       const world = await this.store.createWorldSetting(pid, pack.title, pack.world);
       artifacts.push({ kind: 'world', id: world.id, title: world.title });
-      const character = await this.store.createCharacter(pid, '人物与口吻护栏', pack.characters);
-      artifacts.push({ kind: 'character', id: character.id, title: character.name });
+      await this.persistGeneratedCharacters(pid, pack.characters, artifacts);
       const outline = await this.store.createOutline(pid, `${pack.title}：大纲`, pack.outline);
       artifacts.push({ kind: 'outline', id: outline.id, title: outline.title });
     }
@@ -1022,7 +1018,23 @@ export class AgentOrchestrator {
         artifacts,
         steps,
       );
+      await this.promoteLegacyCharacterRecords(
+        pid,
+        pack.characters,
+        options.planSummary.protagonist,
+        artifacts,
+      );
     }
+    pack = await this.ensureChapterOutfitPlan(
+      config,
+      pid,
+      pack,
+      plannedTotalChapters,
+      signal,
+      emit,
+      artifacts,
+      steps,
+    );
 
     await this.purgeEmptyChapterShells(pid);
     const existing = await this.store.listChapters(pid);
@@ -1053,7 +1065,7 @@ export class AgentOrchestrator {
     }
 
     // 模式配置落档到大纲，便于作者查看
-    const cfgDoc = await this.store.createOutline(
+    const cfgDoc = await this.upsertOutlineByTitle(
       pid,
       '长篇小说模式配置',
       [
@@ -1335,8 +1347,7 @@ export class AgentOrchestrator {
       }
       const world = await this.store.createWorldSetting(pid, pack.title, pack.world);
       artifacts.push({ kind: 'world', id: world.id, title: world.title });
-      const character = await this.store.createCharacter(pid, '人物与口吻护栏', pack.characters);
-      artifacts.push({ kind: 'character', id: character.id, title: character.name });
+      await this.persistGeneratedCharacters(pid, pack.characters, artifacts);
       const outline = await this.store.createOutline(pid, `${pack.title}：大纲`, pack.outline);
       artifacts.push({ kind: 'outline', id: outline.id, title: outline.title });
       steps.push('已生成并保存世界观 / 人物护栏 / 大纲。');
@@ -1354,7 +1365,23 @@ export class AgentOrchestrator {
         artifacts,
         steps,
       );
+      await this.promoteLegacyCharacterRecords(
+        pid,
+        pack.characters,
+        planSummary.protagonist,
+        artifacts,
+      );
     }
+    pack = await this.ensureChapterOutfitPlan(
+      config,
+      pid,
+      pack,
+      plannedTotalChapters,
+      signal,
+      emit,
+      artifacts,
+      steps,
+    );
 
     await this.purgeEmptyChapterShells(pid);
     const existing = await this.store.listChapters(pid);
@@ -1663,7 +1690,11 @@ export class AgentOrchestrator {
     let next = pack;
     const rulesText = formatPlanCreationRules(plan);
     if (rulesText) {
-      const rules = await this.store.createWorldSetting(projectId, '创作规则（计划采纳）', rulesText);
+      const rules = await this.upsertWorldSettingByTitle(
+        projectId,
+        '创作规则（计划采纳）',
+        rulesText,
+      );
       artifacts.push({ kind: 'world', id: rules.id, title: rules.title });
       next = {
         ...next,
@@ -1675,9 +1706,9 @@ export class AgentOrchestrator {
     const outlines = plan.chapterOutlines ?? [];
     if (outlines.length > 0) {
       const controlOutline = buildControlOutlineFromPlan(outlines, totalChapters, wordsPerChapter);
-      const saved = await this.store.createOutline(
+      const saved = await this.upsertPlanOutline(
         projectId,
-        `${next.title}：分章大纲（计划采纳）`,
+        `${plan.title?.trim() || next.title}：分章大纲（计划采纳）`,
         controlOutline,
       );
       artifacts.push({ kind: 'outline', id: saved.id, title: saved.title });
@@ -1693,6 +1724,183 @@ export class AgentOrchestrator {
     return next;
   }
 
+  private async upsertWorldSettingByTitle(
+    projectId: Id,
+    title: string,
+    content: string,
+  ) {
+    const matches = (await this.store.listWorldSettings(projectId)).filter(
+      (item) => item.title === title,
+    );
+    const keeper = matches[0];
+    const saved = keeper
+      ? await this.store.updateWorldSetting(keeper.id, { title, content })
+      : await this.store.createWorldSetting(projectId, title, content);
+    for (const duplicate of matches.slice(1)) {
+      await this.store.deleteWorldSetting(duplicate.id);
+    }
+    return saved;
+  }
+
+  private async upsertOutlineByTitle(projectId: Id, title: string, content: string) {
+    const matches = (await this.store.listOutlines(projectId)).filter(
+      (item) => item.title === title,
+    );
+    const keeper = matches[0];
+    const saved = keeper
+      ? await this.store.updateOutline(keeper.id, { title, content })
+      : await this.store.createOutline(projectId, title, content);
+    for (const duplicate of matches.slice(1)) {
+      await this.store.deleteOutline(duplicate.id);
+    }
+    return saved;
+  }
+
+  private async upsertPlanOutline(projectId: Id, title: string, content: string) {
+    const matches = (await this.store.listOutlines(projectId)).filter((item) =>
+      item.title.endsWith('：分章大纲（计划采纳）'),
+    );
+    const keeper = matches[0];
+    const saved = keeper
+      ? await this.store.updateOutline(keeper.id, { title, content })
+      : await this.store.createOutline(projectId, title, content);
+    for (const duplicate of matches.slice(1)) {
+      await this.store.deleteOutline(duplicate.id);
+    }
+    return saved;
+  }
+
+  private async upsertCharacterByName(projectId: Id, name: string, description: string) {
+    const matches = (await this.store.listCharacters(projectId)).filter(
+      (item) => item.name === name,
+    );
+    const keeper = matches[0];
+    const saved = keeper
+      ? await this.store.updateCharacter(keeper.id, { name, description })
+      : await this.store.createCharacter(projectId, name, description);
+    for (const duplicate of matches.slice(1)) {
+      await this.store.deleteCharacter(duplicate.id);
+    }
+    return saved;
+  }
+
+  private async persistGeneratedCharacters(
+    projectId: Id,
+    markdown: string,
+    artifacts: AgentArtifact[],
+  ): Promise<void> {
+    const profiles = parseCharacterProfiles(markdown);
+    if (profiles.length === 0) {
+      const character = await this.upsertCharacterByName(
+        projectId,
+        '人物与口吻护栏',
+        markdown,
+      );
+      artifacts.push({ kind: 'character', id: character.id, title: character.name });
+    } else {
+      for (const profile of profiles) {
+        const character = await this.upsertCharacterByName(
+          projectId,
+          profile.name,
+          profile.description,
+        );
+        artifacts.push({ kind: 'character', id: character.id, title: character.name });
+      }
+    }
+    const outfitPlan = extractChapterOutfitPlan(markdown);
+    if (outfitPlan) {
+      const saved = await this.upsertOutlineByTitle(projectId, '分章人物服装表', outfitPlan);
+      artifacts.push({ kind: 'outline', id: saved.id, title: saved.title });
+    }
+  }
+
+  private async promoteLegacyCharacterRecords(
+    projectId: Id,
+    markdown: string,
+    protagonist: string | undefined,
+    artifacts: AgentArtifact[],
+  ): Promise<void> {
+    const characters = await this.store.listCharacters(projectId);
+    const legacy = characters.find((item) => item.name === '人物与口吻护栏');
+    if (!legacy) return;
+    const profiles = parseCharacterProfiles(markdown);
+    if (profiles.length > 0) {
+      for (const profile of profiles) {
+        const saved = await this.upsertCharacterByName(
+          projectId,
+          profile.name,
+          profile.description,
+        );
+        artifacts.push({ kind: 'character', id: saved.id, title: saved.name });
+      }
+      await this.store.deleteCharacter(legacy.id);
+      return;
+    }
+    const name = protagonist?.trim();
+    if (!name || characters.some((item) => item.name === name)) return;
+    const saved = await this.store.updateCharacter(legacy.id, {
+      name,
+      description: markdown,
+    });
+    artifacts.push({ kind: 'character', id: saved.id, title: saved.name });
+  }
+
+  private async ensureChapterOutfitPlan(
+    config: ModelConfig,
+    projectId: Id,
+    pack: GeneratedPack,
+    totalChapters: number,
+    signal: AbortSignal,
+    emit: (event: AgentProgressEvent) => void,
+    artifacts: AgentArtifact[],
+    steps: string[],
+  ): Promise<GeneratedPack> {
+    const embedded = extractChapterOutfitPlan(pack.characters);
+    const existing = (await this.store.listOutlines(projectId)).find(
+      (outline) => outline.title === '分章人物服装表',
+    );
+    let outfitPlan = embedded ?? existing?.content.trim();
+    if (!outfitPlan) {
+      emit({ phase: 'setup', message: '【CharacterAgent】补全分章人物服装连续性表…' });
+      try {
+        const generated = await this.generateText(
+          config,
+          [
+            {
+              role: 'system',
+              content: [
+                '你是小说人物服装连续性策划。只输出 Markdown 表格，不写正文或解释。',
+                '标题固定为“## 分章人物服装连续性表”。',
+                '表头固定为“| 章节 | 人物 | 服装与配件 | 换装原因/连续性 |”。',
+                `必须覆盖第1章至第${totalChapters}章；逐章列出主要出场人物。`,
+                '服装需包含款式、颜色、材质、鞋履与关键配件；连续场景注明沿用，换装说明原因。',
+                '',
+                pack.characters.slice(0, 5000),
+                '',
+                pack.outline.slice(0, 7000),
+              ].join('\n'),
+            },
+            { role: 'user', content: `请生成全书 ${totalChapters} 章的人物服装连续性表。` },
+          ],
+          signal,
+        );
+        outfitPlan = generated.trim().startsWith('##')
+          ? generated.trim()
+          : `## 分章人物服装连续性表\n\n${generated.trim()}`;
+        steps.push('已补全分章人物服装连续性表。');
+      } catch (error) {
+        if (signal.aborted) throw error;
+        emit({ phase: 'info', message: '【CharacterAgent】服装表补全失败，正文任务继续。' });
+        return pack;
+      }
+    }
+    const saved = await this.upsertOutlineByTitle(projectId, '分章人物服装表', outfitPlan);
+    artifacts.push({ kind: 'outline', id: saved.id, title: saved.title });
+    return pack.characters.includes(outfitPlan)
+      ? pack
+      : { ...pack, characters: `${pack.characters.trim()}\n\n${outfitPlan}` };
+  }
+
   private async loadExistingPack(
     projectId: Id,
     prompt: string,
@@ -1706,10 +1914,17 @@ export class AgentOrchestrator {
     // 创作规则可能作为 world 条目；优先取非「创作规则」的世界观
     const world =
       [...worlds].reverse().find((w) => !w.title.includes('创作规则')) ?? worlds.at(-1);
-    const character = characters.at(-1);
+    const characterText = characters
+      .map((character) =>
+        character.name === '人物与口吻护栏'
+          ? character.description.trim()
+          : `## 人物：${character.name}\n${character.description.trim()}`,
+      )
+      .join('\n\n');
+    const outfitPlan = outlines.find((outline) => outline.title === '分章人物服装表');
     // 排除伏笔台账 / 诊断报告等非叙事大纲，再合并长篇控制大纲
     const storyOutlines = outlines.filter((o) => !isMetaOutlineTitle(o.title));
-    if (!world || !character || storyOutlines.length === 0) return undefined;
+    if (!world || characterText.length === 0 || storyOutlines.length === 0) return undefined;
 
     const primary =
       storyOutlines.find((o) => o.title.includes('大纲') && !o.title.includes('控制')) ??
@@ -1723,7 +1938,9 @@ export class AgentOrchestrator {
         : primary.content;
 
     artifacts.push({ kind: 'world', id: world.id, title: world.title });
-    artifacts.push({ kind: 'character', id: character.id, title: character.name });
+    for (const character of characters) {
+      artifacts.push({ kind: 'character', id: character.id, title: character.name });
+    }
     artifacts.push({ kind: 'outline', id: primary.id, title: primary.title });
     if (control && control.id !== primary.id) {
       artifacts.push({ kind: 'outline', id: control.id, title: control.title });
@@ -1731,7 +1948,10 @@ export class AgentOrchestrator {
     return {
       title: inferProjectName(prompt),
       world: withHeading('世界与规则', world.content),
-      characters: withHeading('人物与口吻护栏', character.description),
+      characters: [
+        withHeading('人物与口吻护栏', characterText),
+        outfitPlan?.content.trim() ?? '',
+      ].filter(Boolean).join('\n\n'),
       outline: withHeading('第一卷大纲', outlineBody),
     };
   }
@@ -2294,7 +2514,26 @@ export class AgentOrchestrator {
       [
         {
           role: 'system',
-          content: sharedPrefix + '\n\n你负责「人物策划」。只输出「人物与口吻护栏」Markdown 一节。\n\n已有世界观摘要：\n' + world.slice(0, 800),
+          content: sharedPrefix + [
+            '',
+            '你负责「人物策划」。只输出人物设定 Markdown，严格使用以下结构：',
+            '## 人物：姓名',
+            '- 身份/年龄：',
+            '- 外貌识别点：',
+            '- 性格与说话方式：',
+            '- 目标/动机/弱点：',
+            '- 能力与限制：',
+            '- 基础服装：款式、颜色、材质、鞋履、随身物；不得只写“校服”。',
+            '每个具名主要角色各写一节，至少覆盖主角、主要同伴和主要对手。',
+            '',
+            '## 分章人物服装连续性表',
+            '| 章节 | 人物 | 服装与配件 | 换装原因/连续性 |',
+            '| --- | --- | --- | --- |',
+            '按用户计划的全部章节逐章列出出场人物；连续场景注明“沿用上一章”，换装必须说明原因。',
+            '',
+            '已有世界观摘要：',
+            world.slice(0, 800),
+          ].join('\n'),
         },
         { role: 'user', content: '请开始生成人物设定。' },
       ],
@@ -2549,8 +2788,42 @@ function isMetaOutlineTitle(title: string): boolean {
     t.includes('拆梗') ||
     t.includes('避俗') ||
     t.includes('参考创作档案') ||
-    t.includes('参考写作方法')
+    t.includes('参考写作方法') ||
+    t === '分章人物服装表'
   );
+}
+
+export interface ParsedCharacterProfile {
+  name: string;
+  description: string;
+}
+
+export function parseCharacterProfiles(markdown: string): ParsedCharacterProfile[] {
+  const text = markdown.replace(/\r\n/g, '\n');
+  const heading = /^##\s*(?:人物|角色|主角|配角|反派)\s*[:：]\s*(.+?)\s*$/gmu;
+  const matches = [...text.matchAll(heading)];
+  return matches.flatMap((match, index) => {
+    const name = (match[1] ?? '').replace(/[*_`]/g, '').trim();
+    if (!name || name.includes('服装连续性表')) return [];
+    const start = (match.index ?? 0) + match[0].length;
+    const end = matches[index + 1]?.index ?? text.length;
+    const raw = text.slice(start, end);
+    const outfitHeading = raw.search(/^##\s*分章(?:人物)?服装/mu);
+    const description = (outfitHeading >= 0 ? raw.slice(0, outfitHeading) : raw).trim();
+    return description ? [{ name, description }] : [];
+  });
+}
+
+export function extractChapterOutfitPlan(markdown: string): string | undefined {
+  const text = markdown.replace(/\r\n/g, '\n');
+  const match = /^##\s*分章(?:人物)?服装[^\n]*$/mu.exec(text);
+  if (!match || match.index === undefined) return undefined;
+  const start = match.index;
+  const rest = text.slice(start + match[0].length);
+  const nextHeading = /^##\s+/mu.exec(rest);
+  const end = nextHeading?.index === undefined ? text.length : start + match[0].length + nextHeading.index;
+  const section = text.slice(start, end).trim();
+  return section.length > 0 ? section : undefined;
 }
 
 function normalizeControlOutlineChunk(raw: string, startChapter: number, endChapter: number, totalChapters: number): string {
