@@ -313,7 +313,7 @@ const Q = {
 
 /**
  * 每轮固定 2～3 题（规模轮 3 题）。
- * light 用前 5 包；standard 用前 10 包；deep 用全部 20 包。
+ * light 用前 5 包；standard 用前 10 包；deep 用全部 18 包。
  */
 const SCRIPT_BANK: ScriptRound[] = [
   {
@@ -642,13 +642,85 @@ const SCRIPT_BANK: ScriptRound[] = [
       },
     ],
   },
+  {
+    id: 'r17_stakes',
+    message: '补齐代价与失控边界。',
+    questions: [
+      {
+        id: 'failure_cost',
+        question: '主角失败时最痛的代价是？',
+        options: [
+          { id: 'lose_person', label: '失去重要的人' },
+          { id: 'lose_identity', label: '身份与名誉崩塌' },
+          { id: 'lose_power', label: '力量或资格被夺走' },
+          { id: 'world_cost', label: '世界承担灾难后果' },
+        ],
+      },
+      {
+        id: 'point_of_no_return',
+        question: '不可回头的节点更适合由什么触发？',
+        options: [
+          { id: 'choice', label: '主角主动选择' },
+          { id: 'betrayal_trigger', label: '背叛或误判' },
+          { id: 'public_event', label: '公开的大事件' },
+          { id: 'secret_reveal', label: '秘密被揭开' },
+        ],
+      },
+      {
+        id: 'victory_price',
+        question: '最终胜利需要付出什么？',
+        options: [
+          { id: 'clean_win', label: '可以相对圆满' },
+          { id: 'personal_price', label: '牺牲个人所得' },
+          { id: 'relationship_price', label: '关系永久改变' },
+          { id: 'world_price', label: '旧秩序必须毁掉' },
+        ],
+      },
+    ],
+  },
+  {
+    id: 'r18_scene_language',
+    message: '最后确认场景语言与叙事落点。',
+    questions: [
+      {
+        id: 'opening_image',
+        question: '第一章最先让读者看见什么？',
+        options: [
+          { id: 'character_action', label: '主角正在行动' },
+          { id: 'strange_scene', label: '异常场景或奇观' },
+          { id: 'conflict_dialogue', label: '冲突中的对话' },
+          { id: 'aftermath', label: '事件后的残局' },
+        ],
+      },
+      {
+        id: 'dialogue_texture',
+        question: '人物对话更偏哪种质感？',
+        options: [
+          { id: 'direct', label: '直接利落' },
+          { id: 'subtext', label: '潜台词较多' },
+          { id: 'banter', label: '有来有回、带机锋' },
+          { id: 'restrained', label: '克制少言' },
+        ],
+      },
+      {
+        id: 'sensory_focus',
+        question: '场景描写优先强化什么？',
+        options: [
+          { id: 'visual', label: '视觉画面' },
+          { id: 'sound', label: '声音与节奏' },
+          { id: 'body', label: '身体感受' },
+          { id: 'mixed_sense', label: '多感官均衡' },
+        ],
+      },
+    ],
+  },
 ];
 
 /** light：5 轮（每轮 2～3 题） */
 const LIGHT_INDICES = [0, 1, 2, 4, 3];
 /** standard：10 轮 */
 const STANDARD_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-/** deep：16 轮脚本（约 18～20 目标轮次中内容轮用满脚本 + 必要时补规模） */
+/** deep：18 轮脚本（满足 18～20 目标轮次且不复用问题） */
 const DEEP_INDICES = SCRIPT_BANK.map((_, i) => i);
 
 const SCALE_QUESTION_IDS = new Set(['total_words', 'words_per_chapter', 'chapter_count']);
@@ -944,25 +1016,36 @@ export function collectScaleFromSession(
       chapterCount: summary.chapterCount,
     });
   }
-  for (const h of history) chunks.push(extractScaleFromText(h.content));
+  const scaleFromOptionId = (
+    id: string,
+  ): { totalWords?: number; wordsPerChapter?: number; chapterCount?: number } | undefined => {
+    if (id === 'total_30k') return { totalWords: 30000 };
+    if (id === 'total_100k') return { totalWords: 100000 };
+    if (id === 'total_300k') return { totalWords: 300000 };
+    if (id === 'total_1m') return { totalWords: 1000000 };
+    if (id === 'wpc_1200') return { wordsPerChapter: 1200 };
+    if (id === 'wpc_2000') return { wordsPerChapter: 2000 };
+    if (id === 'wpc_3000') return { wordsPerChapter: 3000 };
+    if (id === 'wpc_5000') return { wordsPerChapter: 5000 };
+    if (id === 'ch_3') return { chapterCount: 3 };
+    if (id === 'ch_10') return { chapterCount: 10 };
+    if (id === 'ch_30' || id === 'ch_50') return { chapterCount: MAX_OUTLINE_CHAPTERS };
+    return undefined;
+  };
+  for (const h of history) {
+    chunks.push(extractScaleFromText(h.content));
+    for (const match of h.content.matchAll(/\b(total_(?:30k|100k|300k|1m)|wpc_(?:1200|2000|3000|5000)|ch_(?:3|10|30|50))\b/g)) {
+      const scale = scaleFromOptionId(match[1]);
+      if (scale) chunks.push(scale);
+    }
+  }
   if (answers) {
     for (const a of answers) {
       const blob = `${a.questionId} ${a.selectedOptionIds.join(' ')} ${a.customText ?? ''}`;
       chunks.push(extractScaleFromText(blob));
       for (const id of a.selectedOptionIds) {
-        if (id === 'total_30k') chunks.push({ totalWords: 30000 });
-        if (id === 'total_100k') chunks.push({ totalWords: 100000 });
-        if (id === 'total_300k') chunks.push({ totalWords: 300000 });
-        if (id === 'total_1m') chunks.push({ totalWords: 1000000 });
-        if (id === 'wpc_1200') chunks.push({ wordsPerChapter: 1200 });
-        if (id === 'wpc_2000') chunks.push({ wordsPerChapter: 2000 });
-        if (id === 'wpc_3000') chunks.push({ wordsPerChapter: 3000 });
-        if (id === 'wpc_5000') chunks.push({ wordsPerChapter: 5000 });
-        if (id === 'ch_3') chunks.push({ chapterCount: 3 });
-        if (id === 'ch_10') chunks.push({ chapterCount: 10 });
-        if (id === 'ch_30') chunks.push({ chapterCount: 30 });
-        // Outline generation is capped; map intentionally rather than silent clamp later.
-        if (id === 'ch_50') chunks.push({ chapterCount: MAX_OUTLINE_CHAPTERS });
+        const scale = scaleFromOptionId(id);
+        if (scale) chunks.push(scale);
       }
     }
   }
@@ -1274,7 +1357,7 @@ export class NovelPlanService {
     const assistantRounds = history.filter((h) => h.role === 'assistant').length;
     const depthAlreadyChosenInHistory = Boolean(resolveDepthFromHistory(history) || request.depth);
     // 刚在本轮 answers 里选完深度、历史里还没有内容轮
-    const justChoseDepth = Boolean(resolveDepthFromAnswers(request.answers)) && !request.depth && !resolveDepthFromHistory(history);
+    const justChoseDepth = Boolean(resolveDepthFromAnswers(request.answers)) && !resolveDepthFromHistory(history);
 
     // contentRound = 即将进行的内容追问轮次（1-based）
     let contentRound: number;
@@ -1283,7 +1366,7 @@ export class NovelPlanService {
     } else if (depthAlreadyChosenInHistory) {
       // 历史 assistant 条数 ≈ 深度选择(0或1) + 已完成内容轮
       const depthMsgCount = history.some(
-        (h) => h.role === 'assistant' && /计划深度|轻量模式|中等模式|极限详细/.test(h.content),
+        (h) => h.role === 'assistant' && /计划深度|追问深度|轻量模式|中等模式|极限详细/.test(h.content),
       )
         ? 1
         : request.depth

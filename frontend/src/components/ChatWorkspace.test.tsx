@@ -12,6 +12,7 @@ vi.mock('../api/apiClient.js', () => ({
 }));
 
 import apiClient from '../api/apiClient.js';
+import { formatPlanAnswersForHistory } from '../lib/planHistory.js';
 import { ChatWorkspace } from './ChatWorkspace.js';
 
 function mockWriteResponse(content: string): void {
@@ -22,6 +23,21 @@ describe('ChatWorkspace', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     window.localStorage.clear();
+  });
+
+  it('serializes plan question and option ids into history', () => {
+    expect(
+      formatPlanAnswersForHistory(
+        [{ questionId: 'words_per_chapter', selectedOptionIds: ['wpc_2000'] }],
+        [
+          {
+            id: 'words_per_chapter',
+            question: '每一章目标字数？',
+            options: [{ id: 'wpc_2000', label: '约 2000 字' }],
+          },
+        ],
+      ),
+    ).toBe('- words_per_chapter: wpc_2000 | 每一章目标字数？ → 约 2000 字');
   });
 
   it('adopts generated writing text at the caret instead of replacing the whole chapter', async () => {

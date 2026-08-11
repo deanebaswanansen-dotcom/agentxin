@@ -261,6 +261,9 @@ describe('Netlify background Agent jobs', () => {
       if (url.endsWith('/agent-job-background')) {
         return new Response(null, { status: 202 });
       }
+      if (url.endsWith('/api/projects')) {
+        return jsonResponse([]);
+      }
       if (init?.method === 'DELETE') {
         return new Response(null, { status: 204 });
       }
@@ -285,11 +288,13 @@ describe('Netlify background Agent jobs', () => {
     const poll = mock.mock.calls.find(
       (call) => String(call[0]).includes('/agent-job?jobId=') && call[1]?.method !== 'DELETE',
     );
+    const refresh = mock.mock.calls.find((call) => String(call[0]).endsWith('/api/projects'));
     expect((start?.[1]?.headers as Record<string, string>)['X-Agentxin-Model-Config']).toBeDefined();
     expect((poll?.[1]?.headers as Record<string, string>)['X-Agentxin-Model-Config']).toBeUndefined();
     expect((poll?.[1]?.headers as Record<string, string>)['X-Agentxin-Client-Id']).toMatch(
       /^[a-f0-9]{64}$/,
     );
+    expect((refresh?.[1]?.headers as Record<string, string>)['X-Agentxin-Refresh-Data']).toBe('true');
   });
 });
 

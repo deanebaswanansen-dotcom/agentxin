@@ -277,6 +277,7 @@ async function readBody(res: Response): Promise<unknown> {
 interface RequestOptions {
   signal?: AbortSignal;
   includeModelConfig?: boolean;
+  refreshClientData?: boolean;
 }
 
 /**
@@ -296,6 +297,9 @@ async function request<T>(
   const requestHeaders = options?.includeModelConfig === true
     ? modelConfigHeader()
     : clientIdentityHeader();
+  if (options?.refreshClientData === true) {
+    requestHeaders['X-Agentxin-Refresh-Data'] = 'true';
+  }
   if (body !== undefined) {
     init.headers = { 'Content-Type': 'application/json', ...requestHeaders };
     init.body = JSON.stringify(body);
@@ -668,6 +672,14 @@ export async function runAgentBackgroundJob(
     deliveredEvents = events.length;
 
     if (snapshot.state === 'completed' && snapshot.result !== undefined) {
+      try {
+        await request(baseUrl, 'GET', '/projects', undefined, {
+          signal: options?.signal,
+          refreshClientData: true,
+        });
+      } catch (error) {
+        console.warn('[agent] 已完成，但刷新云端项目缓存失败：', error);
+      }
       void fetch(statusUrl, {
         method: 'DELETE',
         headers: clientIdentityHeader(),

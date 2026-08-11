@@ -21,6 +21,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import apiClient from '../api/apiClient.js';
 import applyAdoption, { type AdoptionTarget } from '../lib/applyAdoption.js';
+import { formatPlanAnswersForHistory } from '../lib/planHistory.js';
 import {
   isReferenceImportFileName,
   parseReaderFile,
@@ -237,23 +238,6 @@ export function ChatWorkspace({
     setInput('');
   }, []);
 
-  const formatAnswersForHistory = useCallback(
-    (answers: NovelPlanAnswer[], questions: NovelPlanQuestion[]): string => {
-      return answers
-        .map((a) => {
-          const q = questions.find((item) => item.id === a.questionId);
-          const labels = a.selectedOptionIds
-            .map((id) => q?.options.find((o) => o.id === id)?.label ?? id)
-            .join('、');
-          const custom = a.customText?.trim();
-          const parts = [labels || null, custom ? `补充：${custom}` : null].filter(Boolean);
-          return `${q?.question ?? a.questionId} → ${parts.join('；') || '（跳过）'}`;
-        })
-        .join('\n');
-    },
-    [],
-  );
-
   const applyPlanResponse = useCallback(
     (response: NovelPlanTurnResponse, historyAfter: NovelPlanHistoryTurn[]) => {
       setPlanHistory(historyAfter);
@@ -281,7 +265,7 @@ export function ChatWorkspace({
   const startPlanMode = useCallback(
     async (seed: string) => {
       const seedPrompt = seed.trim();
-      if (!seedPrompt || planBusy || agent.running || chat.streaming) return;
+      if (!seedPrompt || planBusy || planAbortRef.current !== null || agent.running || chat.streaming) return;
       setPlanBusy(true);
       setPlanSeed(seedPrompt);
       setPlanDepth(undefined);
@@ -324,7 +308,7 @@ export function ChatWorkspace({
 
   const submitPlanAnswers = useCallback(
     async (messageId: string, answers: NovelPlanAnswer[], forceReady: boolean) => {
-      if (planBusy || agent.running || chat.streaming) return;
+      if (planBusy || planAbortRef.current !== null || agent.running || chat.streaming) return;
       const seed = planSeed.trim();
       if (!seed) return;
 
@@ -350,7 +334,7 @@ export function ChatWorkspace({
       planAbortRef.current = controller;
       try {
         const historyForApi = planHistory;
-        const userLine = formatAnswersForHistory(answers, activePlanQuestions);
+        const userLine = formatPlanAnswersForHistory(answers, activePlanQuestions);
         const response = await apiClient.agent.planTurn(
           {
             seedPrompt: seed,
@@ -393,7 +377,6 @@ export function ChatWorkspace({
       agent.running,
       applyPlanResponse,
       chat,
-      formatAnswersForHistory,
       onError,
       planBusy,
       planDepth,

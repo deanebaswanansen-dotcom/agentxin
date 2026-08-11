@@ -28,6 +28,19 @@ import {
 const appPromises = new Map();
 const runtimePromises = new Map();
 
+async function resetRuntime(clientId) {
+  const runtimePromise = runtimePromises.get(clientId);
+  runtimePromises.delete(clientId);
+  appPromises.delete(clientId);
+  if (runtimePromise === undefined) return;
+  try {
+    const runtime = await runtimePromise;
+    await runtime.app.close();
+  } catch (error) {
+    console.warn('[api] stale runtime cleanup failed:', error?.message ?? error);
+  }
+}
+
 // Keep this function inside the frontend base directory so Netlify deploys it
 // with the same site that serves the Vite SPA.
 function readEnv(name, fallback) {
@@ -239,6 +252,9 @@ async function injectRequest(app, req, target) {
 export default async (req) => {
   const suppliedClientId = readClientId(req);
   const clientId = suppliedClientId ?? 'invalid';
+  if (req.headers.get('x-agentxin-refresh-data') === 'true') {
+    await resetRuntime(clientId);
+  }
   const runtime = await getRuntime(clientId);
   const url = new URL(req.url);
   const target = `${apiPathFromRequest(url)}${url.search}`;
