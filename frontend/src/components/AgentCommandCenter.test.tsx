@@ -267,7 +267,7 @@ describe('AgentCommandCenter', () => {
     expect(await screen.findByText('先定赛道')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: /玄幻 \/ 修仙/ }));
-    fireEvent.click(screen.getByRole('button', { name: '提交回答，继续追问' }));
+    fireEvent.click(screen.getByRole('button', { name: '回答全部问题，继续追问' }));
 
     await waitFor(() => expect(planTurn).toHaveBeenCalledTimes(2));
     expect(await screen.findByText('方案好了')).toBeInTheDocument();

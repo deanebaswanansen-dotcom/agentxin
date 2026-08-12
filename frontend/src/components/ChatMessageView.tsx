@@ -140,7 +140,9 @@ function PlanTurnCard({
 
   const canSubmit = useMemo(() => {
     if (message.resolved || message.status !== 'asking' || streaming) return false;
-    return questions.some((q) => (selected[q.id]?.length ?? 0) > 0 || (custom[q.id]?.trim().length ?? 0) > 0);
+    return questions.length > 0 && questions.every((q) => (
+      (selected[q.id]?.length ?? 0) > 0 || (custom[q.id]?.trim().length ?? 0) > 0
+    ));
   }, [custom, message.resolved, message.status, questions, selected, streaming]);
 
   const toggle = (q: NovelPlanQuestion, optionId: string) => {
@@ -221,7 +223,7 @@ function PlanTurnCard({
               disabled={!canSubmit}
               onClick={() => onPlanSubmit?.(message.id, buildAnswers(), false)}
             >
-              提交补充，让 Agent 决策
+              回答全部问题，继续策划
             </button>
             <button
               type="button"
@@ -229,7 +231,7 @@ function PlanTurnCard({
               disabled={message.resolved || streaming}
               onClick={() => onPlanSubmit?.(message.id, buildAnswers(), true)}
             >
-              够了，出方案
+              跳过未答项，直接出方案
             </button>
           </div>
         </div>
@@ -271,13 +273,17 @@ function PlanTurnCard({
               ) : null}
               {message.planSummary.totalWords ||
               message.planSummary.wordsPerChapter ||
-              message.planSummary.chapterCount ? (
+              message.planSummary.chapterCount ||
+              message.planSummary.volumeCount ? (
                 <>
                   <dt>规模</dt>
                   <dd>
                     {message.planSummary.chapterCount
                       ? `${message.planSummary.chapterCount} 章`
                       : '—'}
+                    {message.planSummary.volumeCount
+                      ? ` · ${message.planSummary.volumeCount} 卷`
+                      : ''}
                     {' · '}
                     每章约{' '}
                     {(message.planSummary.wordsPerChapter ?? 0).toLocaleString() || '—'} 字
