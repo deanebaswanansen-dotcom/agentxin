@@ -489,6 +489,75 @@ describe('normalizeFullNovelOptions', () => {
     expect((result.metrics?.completedChapters ?? 0) >= 1).toBe(true);
   });
 
+  it('retries an empty ChapterAgent response before continuity review', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-empty-chapter-retry-'));
+    const store = await FileDataStore.create(join(tempDir, 'store.json'));
+    await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock-model' });
+    const memory = new MemoryService(await MemoryStore.create(join(tempDir, 'memory.json')));
+    const proxy = new CaptureProxy();
+    const original = proxy.streamCompletion.bind(proxy);
+    const chapterPipeline: string[] = [];
+    let writerAttempts = 0;
+    proxy.streamCompletion = (config, messages, signal, options) => {
+      const system = messages[0]?.content ?? '';
+      if (system.includes('正文写作子 Agent')) {
+        writerAttempts += 1;
+        chapterPipeline.push('writer');
+        const text =
+          writerAttempts < 3
+            ? ''
+            : '林远拔出断剑，雨水沿着护手滴落。他说：“誓言还没有结束。”守卫却突然封死城门，远处的钟声揭开了新的危险。'.repeat(12);
+        return (async function* () {
+          yield { kind: 'content' as const, text };
+        })();
+      }
+      if (system.includes('检测子 Agent')) {
+        chapterPipeline.push('inspector');
+        return (async function* () {
+          yield {
+            kind: 'content' as const,
+            text: JSON.stringify({
+              score0to100: 85,
+              verdict: 'pass',
+              plotCoherence: '连续',
+              fatalIssues: [],
+              earlyCharacterStatus: [],
+              recommendRevision: false,
+              revisionHints: [],
+            }),
+          };
+        })();
+      }
+      return original(config, messages, signal, options);
+    };
+    const orchestrator = new AgentOrchestrator(
+      store,
+      new ModelConfigService(store),
+      proxy,
+      undefined as never,
+      undefined as never,
+      memory,
+    );
+
+    const result = await orchestrator.run(
+      {
+        task: 'long_novel',
+        mode: 'draft',
+        prompt: '西方玄幻，断剑骑士履行誓言',
+        options: { chapters: 1, targetWords: 500, automationLevel: 'semi_auto' },
+      },
+      new AbortController().signal,
+    );
+
+    const chapters = await store.listChapters(result.projectId);
+    expect(writerAttempts).toBe(3);
+    expect(chapterPipeline.slice(0, 4)).toEqual(['writer', 'writer', 'writer', 'inspector']);
+    expect(chapters).toHaveLength(1);
+    expect(chapters[0]?.content).toContain('誓言还没有结束');
+    expect(result.metrics?.completedChapters).toBe(1);
+    expect(result.summary).not.toContain('已暂停');
+  });
+
   it('keeps the saved draft when ReviewAgent revision fails', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-review-fallback-'));
     const store = await FileDataStore.create(join(tempDir, 'store.json'));

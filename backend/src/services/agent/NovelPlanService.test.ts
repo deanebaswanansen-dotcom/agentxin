@@ -161,8 +161,24 @@ describe('NovelPlanService goal-driven agent', () => {
     expect(proxy.options[0]).toMatchObject({ jsonMode: true, disableThinking: true });
   });
 
-  it('uses Requirement State to ask immediately when the seed lacks core direction', async () => {
-    const proxy = new QueueProxy([readyDecision()]);
+  it('lets the Agent design first-turn questions instead of returning a fixed questionnaire', async () => {
+    const proxy = new QueueProxy([
+      JSON.stringify({
+        status: 'asking',
+        message: '先确认一个真正改变故事结构的选择。',
+        questions: [
+          {
+            id: 'moral_boundary',
+            question: '主角为了完成目标最不能跨越哪条底线？',
+            impactScore: 9,
+            options: [
+              { id: 'protect_innocents', label: '不能牺牲无辜者' },
+              { id: 'never_submit', label: '不能向神权屈服' },
+            ],
+          },
+        ],
+      }),
+    ]);
     const service = new NovelPlanService(mockConfigService(), proxy);
     const result = await service.turn(
       { seedPrompt: '写本西方玄幻小说' },
@@ -170,13 +186,45 @@ describe('NovelPlanService goal-driven agent', () => {
     );
 
     expect(result.status).toBe('asking');
-    expect(result.questions?.map((question) => question.id)).toEqual([
-      'main_direction',
-      'protagonist_type',
-      'story_tone',
-    ]);
+    expect(result.questions?.map((question) => question.id)).toEqual(['moral_boundary']);
     expect(result.planSummary).toBeUndefined();
-    expect(proxy.calls).toHaveLength(0);
+    expect(proxy.calls).toHaveLength(1);
+  });
+
+  it('does not lock the plan after one answer while unresolved core decisions remain', async () => {
+    const proxy = new QueueProxy([
+      readyDecision(),
+      JSON.stringify({
+        status: 'asking',
+        message: '主线已经明确，还需确认主角大方向。',
+        questions: [
+          {
+            id: 'protagonist_identity',
+            question: '主角更适合从哪一种身份进入这场冒险？',
+            impactScore: 9,
+            options: [
+              { id: 'exiled_knight', label: '流亡骑士' },
+              { id: 'wandering_mage', label: '流浪法师' },
+            ],
+          },
+        ],
+      }),
+    ]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      {
+        seedPrompt: '写本西方玄幻小说',
+        history: [
+          { role: 'assistant', content: 'PLAN_QUESTION[main_direction] score=9: 主线走什么方向？' },
+          { role: 'user', content: '- main_direction: adventure | 主线走什么方向？ → 冒险成长' },
+        ],
+      },
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe('asking');
+    expect(result.questions?.map((question) => question.id)).toEqual(['protagonist_identity']);
+    expect(proxy.calls).toHaveLength(2);
   });
 
   it('rejects an invalid asking shape and tells the agent to finish', async () => {
@@ -261,7 +309,7 @@ describe('NovelPlanService goal-driven agent', () => {
     expect(result.brief).toContain('原始需求：西方玄幻');
   });
 
-  it('filters repeated questions and forces a ready decision', async () => {
+  it('filters repeated questions and asks the Agent to reconsider unresolved core decisions', async () => {
     const repeated = JSON.stringify({
       status: 'asking',
       message: '还想再问一次。',
@@ -291,7 +339,8 @@ describe('NovelPlanService goal-driven agent', () => {
 
     expect(result.status).toBe('ready');
     expect(proxy.calls).toHaveLength(2);
-    expect(proxy.calls[1][0].content).toContain('本轮必须 ready');
+    expect(proxy.calls[1][0].content).toContain('本轮必须 asking');
+    expect(proxy.calls[1][0].content).toContain('尚未问过的高影响问题');
   });
 
   it('creates missing chapter outlines with a dedicated agent call', async () => {
