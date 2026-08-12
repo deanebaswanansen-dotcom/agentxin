@@ -630,6 +630,78 @@ describe('normalizeFullNovelOptions', () => {
     expect(result.metrics?.completedChapters).toBe(1);
   });
 
+  it('keeps the saved draft when ReviewAgent returns an empty revision', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-empty-revision-'));
+    const store = await FileDataStore.create(join(tempDir, 'store.json'));
+    await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock-model' });
+    const memory = new MemoryService(await MemoryStore.create(join(tempDir, 'memory.json')));
+    const proxy = new CaptureProxy();
+    const original = proxy.streamCompletion.bind(proxy);
+    let revisionAttempts = 0;
+    proxy.streamCompletion = (config, messages, signal, options) => {
+      const system = messages[0]?.content ?? '';
+      if (system.includes('正在修订')) {
+        revisionAttempts += 1;
+        return (async function* () {
+          yield { kind: 'content' as const, text: '' };
+        })();
+      }
+      if (system.includes('检测子 Agent')) {
+        return (async function* () {
+          yield {
+            kind: 'content' as const,
+            text: JSON.stringify({
+              score0to100: 65,
+              verdict: 'needs_revision',
+              plotCoherence: '可继续',
+              fatalIssues: [],
+              earlyCharacterStatus: [],
+              recommendRevision: true,
+              revisionHints: ['加强章末钩子'],
+            }),
+          };
+        })();
+      }
+      if (system.includes('正文写作子 Agent')) {
+        const text =
+          '林远推门走进雨夜，说：“跟我来。”他们沿着旧城前行，却发现地图暗藏秘密，真正的危险才刚刚开始。'.repeat(
+            10,
+          );
+        return (async function* () {
+          yield { kind: 'content' as const, text };
+        })();
+      }
+      return original(config, messages, signal, options);
+    };
+    const progress: string[] = [];
+    const orchestrator = new AgentOrchestrator(
+      store,
+      new ModelConfigService(store),
+      proxy,
+      undefined as never,
+      undefined as never,
+      memory,
+    );
+
+    const result = await orchestrator.run(
+      {
+        task: 'long_novel',
+        mode: 'draft',
+        prompt: '旧城悬疑',
+        options: { chapters: 1, targetWords: 500, automationLevel: 'semi_auto' },
+      },
+      new AbortController().signal,
+      (event) => progress.push(event.message),
+    );
+
+    const chapters = await store.listChapters(result.projectId);
+    expect(revisionAttempts).toBe(1);
+    expect(chapters).toHaveLength(1);
+    expect(chapters[0]?.content).toContain('真正的危险才刚刚开始');
+    expect(progress.some((message) => message.includes('返回空正文'))).toBe(true);
+    expect(result.metrics?.completedChapters).toBe(1);
+  });
+
   it('plants foreshadows during reflection and injects open ledger into later chapters', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-foreshadow-'));
     const store = await FileDataStore.create(join(tempDir, 'store.json'));
