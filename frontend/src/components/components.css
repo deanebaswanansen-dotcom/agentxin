@@ -4005,6 +4005,23 @@
   line-height: var(--lh-body);
 }
 
+.nwa-plan-chat__checklist,
+.nwa-plan__checklist {
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-surface) 90%, #fff 10%);
+  color: var(--text-primary);
+}
+
+.nwa-plan-chat__checklist summary,
+.nwa-plan__checklist summary {
+  cursor: pointer;
+  padding: 0.45rem 0.65rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
 .nwa-plan-chat__questions {
   display: flex;
   flex-direction: column;

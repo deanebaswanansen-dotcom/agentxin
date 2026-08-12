@@ -301,6 +301,7 @@ export function ChatWorkspace({
         round: response.round,
         message: response.message,
         questions: response.questions,
+        planningChecklist: response.planningChecklist,
         brief: response.brief,
         planSummary: response.planSummary,
         resolved: false,
@@ -344,7 +345,7 @@ export function ChatWorkspace({
           { role: 'user', content: `灵感：${seedPrompt}` },
           {
             role: 'assistant',
-            content: formatPlanQuestionsForHistory(response.message, response.questions),
+            content: formatPlanQuestionsForHistory(response.message, response.questions, response.planningChecklist),
           },
         ];
         applyPlanResponse(response, historyAfter);
@@ -397,7 +398,7 @@ export function ChatWorkspace({
           },
           {
             role: 'assistant',
-            content: formatPlanQuestionsForHistory(response.message, response.questions),
+            content: formatPlanQuestionsForHistory(response.message, response.questions, response.planningChecklist),
           },
         ];
         applyPlanResponse(response, historyAfter);

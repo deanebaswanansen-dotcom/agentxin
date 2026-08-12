@@ -1,10 +1,16 @@
-import type { NovelPlanAnswer, NovelPlanQuestion } from '../types/index.js';
+import type { NovelPlanAnswer, NovelPlanChecklist, NovelPlanQuestion } from '../types/index.js';
 
 export function formatPlanQuestionsForHistory(
   message: string,
   questions: NovelPlanQuestion[] | undefined,
+  checklist?: NovelPlanChecklist,
 ): string {
   const lines = [message.trim()].filter(Boolean);
+  if (checklist) {
+    lines.push(
+      `PLANNING_CHECKLIST confirmed=${checklist.confirmedFacts.join('、') || '无'} unresolved=${checklist.unresolvedDecisions.join('、') || '无'} defaults=${checklist.safeDefaults.join('、') || '无'} constraints=${checklist.hardConstraints.join('、') || '无'}`,
+    );
+  }
   for (const question of questions ?? []) {
     lines.push(
       `PLAN_QUESTION[${question.id}] score=${question.impactScore ?? '-'}: ${question.question}`,

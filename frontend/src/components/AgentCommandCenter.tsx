@@ -10,6 +10,7 @@ import type {
   Chapter,
   Id,
   NovelPlanAnswer,
+  NovelPlanChecklist,
   NovelPlanHistoryTurn,
   NovelPlanQuestion,
   NovelPlanSummary,
@@ -281,6 +282,7 @@ export function AgentCommandCenter({
   const [planRound, setPlanRound] = useState(0);
   const [planBrief, setPlanBrief] = useState('');
   const [planSummary, setPlanSummary] = useState<NovelPlanSummary | null>(null);
+  const [planChecklist, setPlanChecklist] = useState<NovelPlanChecklist | null>(null);
   const [planHistory, setPlanHistory] = useState<NovelPlanHistoryTurn[]>([]);
   const [planAnswers, setPlanAnswers] = useState<Record<string, LocalPlanAnswer>>({});
   /** 头脑风暴开始时锁定的灵感种子（避免 ready 后 brief 覆盖输入框导致 seed 丢失）。 */
@@ -323,6 +325,7 @@ export function AgentCommandCenter({
     setPlanRound(0);
     setPlanBrief('');
     setPlanSummary(null);
+    setPlanChecklist(null);
     setPlanHistory([]);
     setPlanAnswers({});
     setPlanSeed('');
@@ -332,6 +335,7 @@ export function AgentCommandCenter({
     setPlanHistory(historyAfter);
     setPlanRound(response.round);
     setPlanMessage(response.message);
+    setPlanChecklist(response.planningChecklist ?? null);
     if (response.status === 'ready') {
       setPlanPhase('ready');
       setPlanQuestions([]);
@@ -509,7 +513,7 @@ export function AgentCommandCenter({
       }
       historyAfter.push({
         role: 'assistant',
-        content: formatPlanQuestionsForHistory(response.message, response.questions),
+        content: formatPlanQuestionsForHistory(response.message, response.questions, response.planningChecklist),
       });
       applyPlanResponse(response, historyAfter);
     } catch (error) {
@@ -813,6 +817,21 @@ export function AgentCommandCenter({
             </div>
 
             {planMessage ? <p className="nwa-plan__message">{planMessage}</p> : null}
+            {planChecklist ? (
+              <details className="nwa-plan__checklist">
+                <summary>Agent 自检清单</summary>
+                <dl className="nwa-plan__summary">
+                  <dt>已确认</dt>
+                  <dd>{planChecklist.confirmedFacts.join('；') || '暂无'}</dd>
+                  <dt>待决策</dt>
+                  <dd>{planChecklist.unresolvedDecisions.join('；') || '暂无'}</dd>
+                  <dt>可自行决定</dt>
+                  <dd>{planChecklist.safeDefaults.join('；') || '暂无'}</dd>
+                  <dt>硬约束</dt>
+                  <dd>{planChecklist.hardConstraints.join('；') || '暂无'}</dd>
+                </dl>
+              </details>
+            ) : null}
 
             {planBusy && planPhase === 'idle' ? (
               <div className="nwa-plan__loading">

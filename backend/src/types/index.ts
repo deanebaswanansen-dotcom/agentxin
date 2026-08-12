@@ -317,6 +317,14 @@ export interface NovelPlanQuestion {
   options: NovelPlanQuestionOption[];
 }
 
+/** Agent 在提问或收束前输出的可审计决策清单，不包含隐藏思维链。 */
+export interface NovelPlanChecklist {
+  confirmedFacts: string[];
+  unresolvedDecisions: string[];
+  safeDefaults: string[];
+  hardConstraints: string[];
+}
+
 export interface NovelPlanHistoryTurn {
   role: 'user' | 'assistant';
   content: string;
@@ -492,6 +500,8 @@ export interface NovelPlanTurnResponse {
   round: number;
   message: string;
   questions?: NovelPlanQuestion[];
+  /** Agent 自检后的事实、未决项、默认项和硬约束。 */
+  planningChecklist?: NovelPlanChecklist;
   /** 收束后的可直接喂给生成任务的完整需求 brief。 */
   brief?: string;
   planSummary?: NovelPlanSummary;
