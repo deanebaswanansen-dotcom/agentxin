@@ -15,7 +15,7 @@
 
 - Backend：TypeScript 5.6、Fastify 4.28、Vitest 2.1。
 - Frontend：React 18.3、Vite 5.4、Vitest 2.1。
-- Hosting：Netlify Functions 与 Background Functions。
+- Hosting：阿里云 ECS 常驻 Fastify 服务 + Nginx；计划请求使用 POST SSE 流。
 
 ## Commands
 
@@ -23,7 +23,7 @@
 - Backend test：`cd backend && npm test -- --run`
 - Frontend build：`cd frontend && npm run build`
 - Frontend test：`cd frontend && npm test -- --run`
-- Netlify build：`cd frontend && npx netlify build --offline`
+- ECS production build：`cd backend && npm run build && cd ../frontend && VITE_AGENT_BACKGROUND_JOBS=false npm run build`
 
 ## Project Structure
 
@@ -48,14 +48,16 @@ const questions = decision.questions
 ## Testing Strategy
 
 - 单元测试验证 0 问、1-3 问、低价值问题拒绝、重复问题拒绝、总预算与强制收束。
+- 单元测试必须证明首轮问题来自模型决策，不得由服务端固定题库在模型调用前短路。
+- 回答一题后仍有核心方向缺口且提问预算未耗尽时，必须再次执行 Agent 决策，不得因界面轮次提前收束。
 - 集成测试验证 Story Plan 能穿过 Agent 路由并写入项目资料与长期记忆。
 - 前端测试验证题目 ID/文本进入历史、选项标签提交、Story Plan 可见。
-- 部署前执行前后端全量测试、构建和 Netlify 线上 API 回归。
+- 部署前执行前后端全量测试、构建和阿里云 `/api/agent/plan/turn-stream` SSE 回归。
 
 ## Boundaries
 
 - Always：保留用户明确题材和禁忌；运行全量测试；API Key 只保存在用户浏览器和单次请求头。
-- Ask first：新增外部依赖、改变项目存储格式、改变 Netlify 站点归属。
+- Ask first：新增外部依赖、改变项目存储格式、改变阿里云生产环境或公网入口。
 - Never：提交密钥；用固定多轮问卷替代 Agent 决策；为低风险世界细节向用户提问。
 
 ## Success Criteria
@@ -63,8 +65,9 @@ const questions = decision.questions
 - “写本西方玄幻小说”首轮返回不超过 3 个方向问题，不开始写正文。
 - 已包含题材、主角身份、主线和风格的输入可直接生成计划。
 - 同一问题 ID 在一次计划会话中只出现 1 次，总主动问题不超过 3 个。
+- 首轮不得固定返回同一组问题；Agent 应根据 Requirement State 动态生成 1-3 个高影响问题。
 - 生成任务收到完整 Story Plan，项目资料中保存 `Story Plan（计划锁定）`。
-- 正式站 Background Function 回归返回 HTTP 202 并最终进入 `asking` 或 `ready`，无 502/超时。
+- 阿里云正式站计划 SSE 必须先返回进度帧，最终进入 `asking` 或 `ready`，无 502/空结果。
 
 ## Open Questions
 

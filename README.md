@@ -2,6 +2,8 @@
 
 前后端分离的 AI 小说创作工作台。
 
+项目架构、阿里云部署、使用维护、备份排错及 Agent 交接说明见 [`docs/PROJECT_HANDBOOK.md`](docs/PROJECT_HANDBOOK.md)。
+
 ## 目录结构
 
 ```
@@ -51,7 +53,11 @@ npm run typecheck
 npm test
 ```
 
-## 线上部署（Netlify）
+## 主要线上部署（阿里云 ECS）
+
+当前生产架构为 Nginx 托管前端、Fastify 常驻后端、`/var/lib/agentxin` 持久化数据；完整部署、更新、备份和排错命令见 [`docs/PROJECT_HANDBOOK.md`](docs/PROJECT_HANDBOOK.md)。前端生产构建必须设置 `VITE_AGENT_BACKGROUND_JOBS=false`，长时间 Agent 任务直接使用 `/api` SSE，不经过短时函数。
+
+## 兼容部署（Netlify，非当前主环境）
 
 > 前端、API 和长任务可部署在同一个 Netlify 站点。每个浏览器首次打开时生成 256 位随机库标识；项目、记忆和参考库按该标识写入同一个 Netlify Blobs 站点存储。API Key 只保存在浏览器，并仅随模型任务请求进入函数内存，不写入 Blobs。
 

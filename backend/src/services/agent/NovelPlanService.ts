@@ -2,7 +2,7 @@
  * Goal-driven novel planning agent.
  *
  * The planner treats every explicit user statement as durable story state. It
- * asks at most two blocking questions per turn and never walks a fixed survey.
+ * asks at most three blocking questions in the whole session and never walks a fixed survey.
  * When the available facts are sufficient, it chooses reversible defaults and
  * returns an executable brief plus chapter-level anchors immediately.
  */
@@ -593,58 +593,6 @@ function missingCoreRequirements(text: string): CoreRequirement[] {
   return missing;
 }
 
-function fallbackCoreQuestions(seed: string, limit: number): NovelPlanQuestion[] {
-  const questions: Record<CoreRequirement, NovelPlanQuestion> = {
-    genre: {
-      id: 'genre_direction',
-      question: '这本小说的核心题材希望是哪一种？',
-      impactScore: 10,
-      options: [
-        { id: 'western_fantasy', label: '西方玄幻' },
-        { id: 'eastern_fantasy', label: '东方玄幻' },
-        { id: 'science_fiction', label: '科幻' },
-        { id: 'agent_decides', label: 'Agent 自己决定' },
-      ],
-    },
-    main_direction: {
-      id: 'main_direction',
-      question: '主线更偏向哪种方向？',
-      impactScore: 9,
-      options: [
-        { id: 'adventure_growth', label: '冒险成长' },
-        { id: 'war_conquest', label: '战争争霸' },
-        { id: 'territory_building', label: '领地经营' },
-        { id: 'agent_decides', label: 'Agent 自己决定' },
-      ],
-    },
-    protagonist_type: {
-      id: 'protagonist_type',
-      question: '主角更偏哪种核心身份？',
-      impactScore: 9,
-      options: [
-        { id: 'wanderer', label: '流浪冒险者' },
-        { id: 'knight', label: '骑士或贵族' },
-        { id: 'mage', label: '魔法师' },
-        { id: 'agent_decides', label: 'Agent 自己决定' },
-      ],
-    },
-    tone: {
-      id: 'story_tone',
-      question: '整体阅读风格希望偏哪种？',
-      impactScore: 8,
-      options: [
-        { id: 'epic', label: '正统史诗' },
-        { id: 'dark', label: '黑暗奇幻' },
-        { id: 'light', label: '轻松爽文' },
-        { id: 'agent_decides', label: 'Agent 自己决定' },
-      ],
-    },
-  };
-  return missingCoreRequirements(seed)
-    .slice(0, Math.max(0, limit))
-    .map((key) => questions[key]);
-}
-
 function alreadyAsked(question: NovelPlanQuestion, history: NovelPlanHistoryTurn[]): boolean {
   const idPattern = new RegExp(`(?:^|\\b)${question.id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\b|:)`, 'i');
   const signature = questionSignature(question.question);
@@ -847,25 +795,19 @@ export class NovelPlanService {
     }
     const history = Array.isArray(request.history) ? request.history : [];
     const target = request.targetTask ?? 'long_novel';
-    const isFirstTurn = history.length === 0 && (request.answers?.length ?? 0) === 0;
     const bypass = hasExplicitPlanningBypass(seed);
     const askedIds = askedQuestionIds(history, request.answers);
     const questionBudget = Math.max(0, TOTAL_QUESTION_BUDGET - askedIds.size);
     const knownText = sessionText(seed, history, request.answers);
-    const coreFallback = isFirstTurn && !bypass ? fallbackCoreQuestions(knownText, questionBudget) : [];
+    const missingCore = missingCoreRequirements(knownText);
     const round = Math.min(
       MAX_AGENT_ROUNDS,
       1 + history.filter((turn) => turn.role === 'user').length,
     );
-    const mustFinish = bypass || request.forceReady === true || questionBudget === 0 || round >= MAX_AGENT_ROUNDS;
-    if (!mustFinish && coreFallback.length > 0) {
-      return {
-        status: 'asking',
-        round,
-        message: '只确认会改变整本小说方向的决定；其他设定由 Agent 自动完成。',
-        questions: coreFallback,
-      };
-    }
+    // The total question budget is the only automatic finish gate. A session
+    // that asks one question per turn must still be able to use its remaining
+    // budget instead of being forced ready by the UI round number.
+    const mustFinish = bypass || request.forceReady === true || questionBudget === 0;
     let decision = await this.generateDecision(
       config,
       seed,
@@ -874,7 +816,7 @@ export class NovelPlanService {
       request.answers,
       mustFinish,
       questionBudget,
-      missingCoreRequirements(knownText),
+      missingCore,
       signal,
     );
 
@@ -890,6 +832,39 @@ export class NovelPlanService {
           message: decision.message,
           questions,
         };
+      }
+    }
+
+    // A provider can ignore the Requirement State and return ready after only
+    // one answer. Give the planning Agent one strict correction turn so the
+    // remaining high-impact decisions are considered. This is model-driven;
+    // no local fixed questionnaire is substituted.
+    if (!mustFinish && missingCore.length > 0) {
+      decision = await this.generateDecision(
+        config,
+        seed,
+        target,
+        history,
+        request.answers,
+        false,
+        questionBudget,
+        missingCore,
+        signal,
+        true,
+      );
+      if (decision.status === 'asking') {
+        const questions = decision.questions
+          .filter(isHighValueQuestion)
+          .filter((question) => !alreadyAsked(question, history))
+          .slice(0, questionBudget);
+        if (questions.length > 0) {
+          return {
+            status: 'asking',
+            round,
+            message: decision.message,
+            questions,
+          };
+        }
       }
     }
 
@@ -951,6 +926,7 @@ export class NovelPlanService {
     questionBudget: number,
     missingCore: CoreRequirement[],
     signal: AbortSignal,
+    requireQuestion = false,
   ): Promise<AgentDecision> {
     const explicitGenre = inferExplicitGenre(
       [seed, ...history.filter((turn) => turn.role === 'user').map((turn) => turn.content)].join('\n'),
@@ -972,6 +948,8 @@ export class NovelPlanService {
       `下游目标：${TARGET_LABELS[target]}。`,
       forceReady
         ? '本轮必须 ready。信息不足时采用清晰、可修改的专业默认值，不得继续提问。'
+        : requireQuestion
+          ? '本轮必须 asking：从 Requirement State 缺口中提出 1-3 个尚未问过的高影响问题，不得返回 ready。'
         : '信息足以形成方向时可以 0 问并立即 ready；不要为了凑轮数而提问。',
       missingCore.length > 0
         ? `Requirement State 尚缺核心方向：${missingCore.join('、')}。只从这些缺口中选择真正高影响的问题。`

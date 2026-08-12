@@ -298,12 +298,7 @@ export interface AgentProgressEvent {
 /** 计划模式可绑定的下游生成任务。 */
 export type NovelPlanTargetTask = 'novel' | 'full_novel' | 'long_novel' | 'outline' | 'title';
 
-/**
- * 计划深度：
- * - light：轻量 4～5 轮（现在的快开写）
- * - standard：中等 8～10 轮
- * - deep：极限详细约 20 轮
- */
+/** 兼容旧客户端的计划深度标记；当前 Agent 不按固定轮数执行问卷。 */
 export type NovelPlanDepth = 'light' | 'standard' | 'deep';
 
 export interface NovelPlanQuestionOption {

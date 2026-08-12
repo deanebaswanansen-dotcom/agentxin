@@ -34,6 +34,8 @@ import {
   type InspectorReport,
 } from './subagents/index.js';
 
+const MAX_EMPTY_CHAPTER_ATTEMPTS = 3;
+
 const TASK_MODES: Record<AgentTask, AgentRunMode | 'either'> = {
   novel: 'either',
   title: 'either',
@@ -1121,19 +1123,49 @@ export class AgentOrchestrator {
         total: chapterCount,
       });
       const chapter = await this.store.createChapter(pid, title);
+      let content = '';
+      for (let attempt = 1; attempt <= MAX_EMPTY_CHAPTER_ATTEMPTS; attempt += 1) {
+        content = await this.generateChapterWithMemory(
+          config,
+          pid,
+          pack,
+          num,
+          plannedFinalChapter,
+          attempt === 1
+            ? directorBrief
+            : `${directorBrief}\n\n# 重试要求\n上一次模型返回了空正文。本次必须直接输出完整章节正文，不得只输出思考、解释或空白。`,
+          perChapter,
+          signal,
+        );
+        if (content.trim().length > 0) break;
+        if (attempt < MAX_EMPTY_CHAPTER_ATTEMPTS) {
+          emit({
+            phase: 'chapter',
+            message: `【ChapterAgent】「${title}」返回空正文，正在重试（${attempt + 1}/${MAX_EMPTY_CHAPTER_ATTEMPTS}）…`,
+            current: i + 1,
+            total: chapterCount,
+          });
+        }
+      }
+
+      // Empty prose is a writer failure, not a continuity conflict. Never send
+      // it to ContinuityAgent/ReviewAgent, and remove the empty placeholder so
+      // a later resume can generate the same chapter number cleanly.
+      if (content.trim().length === 0) {
+        await this.store.deleteChapter(chapter.id);
+        stoppedReason = `ChapterAgent 连续 ${MAX_EMPTY_CHAPTER_ATTEMPTS} 次返回空正文，已暂停（${title}）`;
+        steps.push(`【ChapterAgent】「${title}」连续 ${MAX_EMPTY_CHAPTER_ATTEMPTS} 次未返回正文，未进入审校。`);
+        emit({
+          phase: 'info',
+          message: `【主 Agent】${stoppedReason}`,
+          current: i + 1,
+          total: chapterCount,
+        });
+        break;
+      }
+
       artifacts.push({ kind: 'chapter', id: chapter.id, title });
       lastChapterId = chapter.id;
-
-      let content = await this.generateChapterWithMemory(
-        config,
-        pid,
-        pack,
-        num,
-        plannedFinalChapter,
-        directorBrief,
-        perChapter,
-        signal,
-      );
 
       // Gate 1 格式（预检）
       let gates = runChapterQualityGates({
