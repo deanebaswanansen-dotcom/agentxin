@@ -674,6 +674,36 @@ function missingCoreRequirements(text: string): CoreRequirement[] {
   return missing;
 }
 
+function coreRequirementsQuestion(missing: CoreRequirement[]): NovelPlanQuestion {
+  const labels: Record<CoreRequirement, string> = {
+    genre: '题材类型',
+    main_direction: '核心剧情/主线目标',
+    protagonist_type: '主角身份或起点',
+  };
+  const pending = missing.map((item) => labels[item]).join('、');
+  return {
+    id: `core_requirements_${missing.join('_')}`,
+    question: `当前还没有确认${pending}。请直接在“其他 / 补充”中用自然语言填写；也可以授权 Agent 仅对未填写项使用默认值。`,
+    impactScore: 10,
+    options: [
+      {
+        id: 'user_specify',
+        label: '我来补充核心方向',
+        description: '在下方补充框直接写题材、主线或主角要求。',
+      },
+      {
+        id: 'agent_fill_defaults',
+        label: '授权 Agent 补全',
+        description: '只对未填写的核心参数使用可修改的专业默认值。',
+      },
+    ],
+  };
+}
+
+function hasAgentDefaultAuthorization(answers: NovelPlanAnswer[] | undefined): boolean {
+  return (answers ?? []).some((answer) => answer.selectedOptionIds.includes('agent_fill_defaults'));
+}
+
 function alreadyAsked(question: NovelPlanQuestion, history: NovelPlanHistoryTurn[]): boolean {
   const idPattern = new RegExp(`(?:^|\\b)${question.id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\b|:)`, 'i');
   const signature = questionSignature(question.question);
@@ -890,7 +920,7 @@ export class NovelPlanService {
     }
     const history = Array.isArray(request.history) ? request.history : [];
     const target = request.targetTask ?? 'long_novel';
-    const bypass = hasExplicitPlanningBypass(seed);
+    const bypass = hasExplicitPlanningBypass(seed) || hasAgentDefaultAuthorization(request.answers);
     const askedIds = askedQuestionIds(history, request.answers);
     const questionBudget = Math.max(0, TOTAL_QUESTION_BUDGET - askedIds.size);
     const knownText = [sessionText(seed, history, request.answers), planConfigText(request.planConfig)]
@@ -935,8 +965,7 @@ export class NovelPlanService {
     }
 
     // A provider can ignore the Requirement State, or return an invalid/low-value
-    // question. Give the planning Agent one strict correction turn. This remains
-    // model-driven; no local fixed questionnaire is substituted.
+    // question. Give the planning Agent one strict correction turn first.
     const filteredQuestionCount = decision.status === 'asking'
       ? decision.questions
           .filter(isHighValueQuestion)
@@ -970,6 +999,18 @@ export class NovelPlanService {
           };
         }
       }
+    }
+
+    // Core direction must not be silently invented. This is a consent/clarification
+    // gate, not a fixed genre questionnaire; the user may type any answer in the
+    // free-text supplement or explicitly authorize defaults.
+    if (!mustFinish && missingCore.length > 0) {
+      return {
+        status: 'asking',
+        round,
+        message: '开始生成完整计划前，需要确认会改变整本小说方向的核心参数。',
+        questions: [coreRequirementsQuestion(missingCore)].slice(0, questionBudget),
+      };
     }
 
     if (decision.status !== 'ready' || !decision.planSummary) {
