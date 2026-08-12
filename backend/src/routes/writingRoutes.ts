@@ -49,6 +49,7 @@
 import type { FastifyInstance } from 'fastify';
 
 import { corsResponseHeaders } from '../cors.js';
+import { startSseHeartbeat } from './sseHeartbeat.js';
 import type { WritingService } from '../services/writing/WritingService.js';
 import { ServiceError } from '../services/ServiceError.js';
 import type { Id, WritingRequestBody } from '../types/index.js';
@@ -114,8 +115,10 @@ export function registerWritingRoutes(
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
         ...corsResponseHeaders(),
       });
+      const stopHeartbeat = startSseHeartbeat(raw);
 
       // Abort the WritingService (and the outbound provider request) when the
       // client disconnects mid-stream. We listen on the RESPONSE socket
@@ -171,6 +174,7 @@ export function registerWritingRoutes(
           raw.write(sseFrame('error', JSON.stringify(apiError)));
         }
       } finally {
+        stopHeartbeat();
         raw.removeListener('close', onClose);
         if (!raw.writableEnded) {
           raw.end();

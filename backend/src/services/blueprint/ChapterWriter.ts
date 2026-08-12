@@ -36,6 +36,8 @@ import type { SceneWriter } from './SceneWriter.js';
 import { compareSceneId } from './mergeScenes.js';
 import { ReasoningArtifactFilter, stripReasoningArtifacts } from '../text/reasoningSanitizer.js';
 
+const MAX_EMPTY_SCENE_ATTEMPTS = 3;
+
 /**
  * 整章生成的流式事件（需求 7.1, 7.2）。
  *
@@ -111,38 +113,61 @@ export class ChapterWriter {
     for (const scene of orderedScenes) {
       const sceneId = scene.scene_id;
 
+      // A chapter is a resumable unit.  A previous successful scene draft is
+      // already a durable checkpoint, so do not spend another model call or
+      // overwrite it when a later scene is retried.
+      const existingDraft = await this.store.getSceneDraft(chapterId, sceneId);
+      if (stripReasoningArtifacts(existingDraft?.content ?? '').trim().length > 0) {
+        yield { type: 'scene', sceneId };
+        continue;
+      }
+
       // 标记场景边界，后续 delta 均归属该场景。
       yield { type: 'scene', sceneId };
 
-      // 取得该场景增量流；streamScene 内部亦会做配置 / 蓝图 / 场景校验。
-      const { stream } = await this.sceneWriter.streamScene(
-        chapterId,
-        sceneId,
-        signal,
-      );
+      let saved = false;
+      for (let attempt = 1; attempt <= MAX_EMPTY_SCENE_ATTEMPTS; attempt += 1) {
+        // 取得该场景增量流；streamScene 内部亦会做配置 / 蓝图 / 场景校验。
+        const { stream } = await this.sceneWriter.streamScene(
+          chapterId,
+          sceneId,
+          signal,
+        );
 
-      // 透传增量并累加完整正文。任一增量产出阶段抛错（提供商错误 / 超时 / 中止）将
-      // 直接向上传播，停止后续场景生成；此前已持久化的场景正文保留（需求 7.4）。
-      let fullText = '';
-      const filter = new ReasoningArtifactFilter();
-      for await (const delta of stream) {
-        if (delta.kind === 'content') {
-          const cleaned = filter.push(delta.text);
-          if (cleaned.length > 0) {
-            fullText += cleaned;
-            yield { type: 'delta', sceneId, text: cleaned };
+        // 透传增量并累加完整正文。任一增量产出阶段抛错（提供商错误 / 超时 / 中止）将
+        // 直接向上传播，停止后续场景生成；此前已持久化的场景正文保留（需求 7.4）。
+        let fullText = '';
+        const filter = new ReasoningArtifactFilter();
+        for await (const delta of stream) {
+          if (delta.kind === 'content') {
+            const cleaned = filter.push(delta.text);
+            if (cleaned.length > 0) {
+              fullText += cleaned;
+              yield { type: 'delta', sceneId, text: cleaned };
+            }
           }
         }
-      }
-      const tail = filter.flush();
-      if (tail.length > 0) {
-        fullText += tail;
-        yield { type: 'delta', sceneId, text: tail };
-      }
+        const tail = filter.flush();
+        if (tail.length > 0) {
+          fullText += tail;
+          yield { type: 'delta', sceneId, text: tail };
+        }
 
-      // 该场景流正常结束后持久化整段正文，再进入下一个场景（需求 7.2）。
-      const cleanText = stripReasoningArtifacts(fullText);
-      await this.sceneWriter.finalizeDraft(chapterId, sceneId, cleanText);
+        const cleanText = stripReasoningArtifacts(fullText).trim();
+        if (cleanText.length > 0) {
+          // 该场景流正常结束后持久化整段正文，再进入下一个场景（需求 7.2）。
+          await this.sceneWriter.finalizeDraft(chapterId, sceneId, cleanText);
+          saved = true;
+          break;
+        }
+        // Empty provider content is transient (thinking budget / gateway
+        // truncation).  Retry only this scene; prior scenes remain intact.
+      }
+      if (!saved) {
+        throw ServiceError.validation(
+          `场景「${scene.name}」连续 ${MAX_EMPTY_SCENE_ATTEMPTS} 次未返回正文，已保留已完成场景，请重试。`,
+        );
+      }
     }
 
     // 4) 全部场景完成后合并为整章正文并写入章节 content（需求 7.3）。

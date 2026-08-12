@@ -11,6 +11,10 @@ import { join } from 'node:path';
 
 const BASE = process.env.UI_BASE_URL ?? 'http://localhost:5173';
 const API_BASE = process.env.API_BASE_URL ?? 'http://localhost:3000/api';
+// Project data is scoped to a browser client id. Keep direct smoke API calls
+// in the same scope as Playwright so setup/cleanup and UI reads see one book.
+const CLIENT_ID = process.env.UI_CLIENT_ID ?? '0123456789abcdef'.repeat(4);
+const API_HEADERS = { 'X-Agentxin-Client-Id': CLIENT_ID };
 const REPORT_DIR = join(process.cwd(), 'reports', 'browser-smoke');
 const require = createRequire(new URL('../frontend/package.json', import.meta.url));
 const { chromium } = require('playwright');
@@ -30,13 +34,13 @@ async function expectThemeBackground(page, assetName, issues) {
 async function cleanupProjectByName(projectName) {
   if (!projectName) return;
   try {
-    const res = await fetch(`${API_BASE}/projects`);
+    const res = await fetch(`${API_BASE}/projects`, { headers: API_HEADERS });
     if (!res.ok) return;
     const projects = await res.json();
     const matches = Array.isArray(projects) ? projects.filter((p) => p.name === projectName) : [];
     await Promise.all(
       matches.map((project) =>
-        fetch(`${API_BASE}/projects/${encodeURIComponent(project.id)}`, { method: 'DELETE' }),
+        fetch(`${API_BASE}/projects/${encodeURIComponent(project.id)}`, { method: 'DELETE', headers: API_HEADERS }),
       ),
     );
   } catch {
@@ -45,7 +49,7 @@ async function cleanupProjectByName(projectName) {
 }
 
 async function findProjectByName(projectName) {
-  const res = await fetch(`${API_BASE}/projects`);
+  const res = await fetch(`${API_BASE}/projects`, { headers: API_HEADERS });
   if (!res.ok) return undefined;
   const projects = await res.json();
   return Array.isArray(projects) ? projects.find((project) => project.name === projectName) : undefined;
@@ -56,15 +60,18 @@ async function createMarkdownSmokeChapter(projectName) {
   if (!project?.id) return undefined;
   const createRes = await fetch(`${API_BASE}/projects/${encodeURIComponent(project.id)}/chapters`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...API_HEADERS },
     body: JSON.stringify({ title: 'Markdown 烟测章节' }),
   });
-  if (!createRes.ok) return undefined;
+  if (!createRes.ok) {
+    console.warn(`Markdown 烟测章节创建失败：HTTP ${createRes.status} ${await createRes.text()}`);
+    return undefined;
+  }
   const chapter = await createRes.json();
   if (!chapter?.id) return undefined;
   await fetch(`${API_BASE}/chapters/${encodeURIComponent(chapter.id)}/content`, {
     method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...API_HEADERS },
     body: JSON.stringify({
       content: '## 烟测标题\n普通 **重点**\n- 线索\n> 旁白',
     }),
@@ -79,9 +86,10 @@ async function main() {
   let projectName = '';
 
   try {
-    await page.addInitScript(() => {
+    await page.addInitScript((clientId) => {
       window.localStorage.setItem('nwa:theme-mode', 'tavern');
-    });
+      window.localStorage.setItem('nwa.clientId.v1', clientId);
+    }, CLIENT_ID);
     await page.goto(BASE, { waitUntil: 'networkidle', timeout: 30000 });
     await page.getByRole('heading', { name: /小说\s*Agent/ }).waitFor({ timeout: 15000 });
     await page.locator('[data-empty-illustration="project"]').waitFor({ timeout: 10000 });
@@ -95,8 +103,10 @@ async function main() {
     await page.getByRole('tab', { name: '酒馆' }).click();
     await expectThemeBackground(page, 'bg-tavern.svg', issues);
     await page.getByRole('button', { name: /Mock \(本地演示\)/ }).click();
-    await page.getByRole('button', { name: '保存配置' }).click();
-    await page.getByText('已保存').waitFor({ timeout: 10000 });
+    // The settings panel now saves and probes the provider in one action;
+    // retain compatibility with older builds whose label was just 保存配置.
+    await page.getByRole('button', { name: /保存(?:配置|并测试 API)/ }).click();
+    await page.getByText(/已保存|连接成功|配置已留在本机/).waitFor({ timeout: 10000 });
     await page.getByRole('button', { name: '关闭设置' }).click();
 
     projectName = `UI实测${Date.now().toString().slice(-5)}`;

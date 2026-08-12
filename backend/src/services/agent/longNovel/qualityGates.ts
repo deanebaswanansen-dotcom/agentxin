@@ -20,6 +20,8 @@ export interface GateInput {
   inspectorScore?: number;
   recommendRevision?: boolean;
   revisionHints?: string[];
+  /** Explicit fatal findings from the inspector; unlike a low score, these are hard evidence. */
+  fatalIssues?: string[];
 }
 
 export interface GateResult {
@@ -91,11 +93,19 @@ export function runChapterQualityGates(input: GateInput): GateResult {
   }
 
   // Gate 3 一致性（来自检测子 Agent）
+  const hasExplicitConflict = [...(input.revisionHints ?? []), ...(input.fatalIssues ?? [])].some((hint) =>
+    /死亡|复活|性别|身份|能力|设定|时间线|世界规则|硬冲突|矛盾/.test(hint),
+  );
   if (input.inspectorScore !== undefined && input.inspectorScore < 50) {
+    // A numeric score is a reviewer signal, not a deterministic conflict.  A
+    // malformed/overly conservative reviewer must not halt a whole novel;
+    // only an explicit fatal issue or structural lock failure is hard.
     findings.push({
       gate: 'continuity',
-      severity: 'hard',
-      message: `一致性评分过低（${input.inspectorScore}），暂停自动循环。`,
+      severity: hasExplicitConflict ? 'hard' : 'soft',
+      message: hasExplicitConflict
+        ? `一致性评分过低（${input.inspectorScore}），且检测到明确设定冲突。`
+        : `一致性评分过低（${input.inspectorScore}），先保留正文并记录待复核。`,
       autoFixable: Boolean(input.recommendRevision),
     });
   } else if (input.inspectorScore !== undefined && input.inspectorScore < 70) {
@@ -109,7 +119,7 @@ export function runChapterQualityGates(input: GateInput): GateResult {
   if (input.recommendRevision && (input.revisionHints?.length ?? 0) > 0) {
     findings.push({
       gate: 'continuity',
-      severity: input.inspectorScore !== undefined && input.inspectorScore < 55 ? 'hard' : 'soft',
+      severity: hasExplicitConflict ? 'hard' : 'soft',
       message: `检测子 Agent 要求修订：${input.revisionHints!.slice(0, 2).join('；')}`,
       autoFixable: true,
     });

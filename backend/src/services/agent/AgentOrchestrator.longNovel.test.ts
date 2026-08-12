@@ -558,6 +558,56 @@ describe('normalizeFullNovelOptions', () => {
     expect(result.summary).not.toContain('已暂停');
   });
 
+  it('retries transient provider errors in the direct long-chapter fallback', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-provider-retry-'));
+    const store = await FileDataStore.create(join(tempDir, 'store.json'));
+    await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock-model' });
+    const memory = new MemoryService(await MemoryStore.create(join(tempDir, 'memory.json')));
+    const proxy = new CaptureProxy();
+    const original = proxy.streamCompletion.bind(proxy);
+    let writerAttempts = 0;
+    proxy.streamCompletion = (config, messages, signal, options) => {
+      const system = messages[0]?.content ?? '';
+      if (system.includes('正文写作子 Agent')) {
+        writerAttempts += 1;
+        if (writerAttempts <= 2) {
+          return (async function* () {
+            throw new ProxyError('模型提供商暂时不可用', { status: 503 });
+          })();
+        }
+        return (async function* () {
+          yield {
+            kind: 'content' as const,
+            text: '林远推门走进雨夜，说：“跟我来。”他们发现地图暗藏秘密，真正的危险才刚刚开始。'.repeat(10),
+          };
+        })();
+      }
+      return original(config, messages, signal, options);
+    };
+
+    const orchestrator = new AgentOrchestrator(
+      store,
+      new ModelConfigService(store),
+      proxy,
+      undefined as never,
+      undefined as never,
+      memory,
+    );
+    const result = await orchestrator.run(
+      {
+        task: 'long_novel',
+        mode: 'draft',
+        prompt: '西方玄幻，断剑骑士履行誓言',
+        options: { chapters: 1, targetWords: 500, automationLevel: 'semi_auto' },
+      },
+      new AbortController().signal,
+    );
+
+    expect(writerAttempts).toBe(3);
+    expect(result.metrics?.completedChapters).toBe(1);
+    expect(result.summary).not.toContain('已暂停');
+  });
+
   it('keeps the saved draft when ReviewAgent revision fails', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-review-fallback-'));
     const store = await FileDataStore.create(join(tempDir, 'store.json'));

@@ -23,7 +23,7 @@ describe('long novel quality gates', () => {
     expect(leak.findings.some((f) => f.gate === 'format' && f.severity === 'hard')).toBe(true);
   });
 
-  it('flags low continuity scores as hard fail', () => {
+  it('keeps an unsubstantiated low reviewer score recoverable', () => {
     const body = '林远冲进雨里，却发现地图是假的。他说：“我们被骗了。”下一秒警报响起。'.repeat(30);
     const result = runChapterQualityGates({
       content: body,
@@ -33,9 +33,34 @@ describe('long novel quality gates', () => {
       chapterTitle: '第2章',
       inspectorScore: 40,
       recommendRevision: true,
-      revisionHints: ['角色已死亡却出场'],
+      revisionHints: ['加强章末钩子'],
     });
-    expect(result.hardFail).toBe(true);
+    expect(result.hardFail).toBe(false);
+    expect(result.findings.some((f) => f.severity === 'soft')).toBe(true);
+
+    const conflict = runChapterQualityGates({
+      content: body,
+      minWords: 100,
+      maxWords: 8000,
+      targetWords: 1500,
+      chapterTitle: '第2章',
+      inspectorScore: 40,
+      recommendRevision: true,
+      revisionHints: ['角色已死亡却再次出场，属于明确设定冲突'],
+    });
+    expect(conflict.hardFail).toBe(true);
+
+    const fatalFinding = runChapterQualityGates({
+      content: body,
+      minWords: 100,
+      maxWords: 8000,
+      targetWords: 1500,
+      chapterTitle: '第2章',
+      inspectorScore: 40,
+      recommendRevision: false,
+      fatalIssues: ['人物身份与 Canon 冲突'],
+    });
+    expect(fatalFinding.hardFail).toBe(true);
   });
 
   it('default config maps automation levels to max chapters per run', () => {

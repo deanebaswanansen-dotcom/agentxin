@@ -319,6 +319,7 @@ describe('apiClient unified error handling', () => {
       [404, 'NOT_FOUND'],
       [409, 'MODEL_NOT_CONFIGURED'],
       [502, 'PROVIDER_ERROR'],
+      [504, 'PROVIDER_ERROR'],
     ];
     for (const [status, code] of cases) {
       installFetch(() => jsonResponse('', { status }));
@@ -513,10 +514,22 @@ describe('apiClient.write SSE streaming', () => {
 
   it('reassembles deltas split across network chunks', async () => {
     installFetch(() =>
-      sseResponse(['event: delta\nda', 'ta: "ab"\n\nevent: del', 'ta\ndata: "cd"\n\n']),
+      sseResponse([
+        'event: delta\nda',
+        'ta: "ab"\n\nevent: del',
+        'ta\ndata: "cd"\n\nevent: done\n\n',
+      ]),
     );
     const full = await client().write('p1', 'c1', writeBody);
     expect(full).toBe('abcd');
+  });
+
+  it('rejects a truncated stream that closes without a done sentinel', async () => {
+    installFetch(() => sseResponse(['event: delta\ndata: "partial"\n\n']));
+    const err: ApiClientError = await client().write('p1', 'c1', writeBody).catch((e) => e);
+    expect(err).toBeInstanceOf(ApiClientError);
+    expect(err.code).toBe('PROVIDER_ERROR');
+    expect(err.message).toContain('提前结束');
   });
 
   it('rejects with ApiClientError on an event: error frame', async () => {

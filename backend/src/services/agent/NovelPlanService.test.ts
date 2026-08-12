@@ -186,7 +186,9 @@ describe('NovelPlanService goal-driven agent', () => {
     );
 
     expect(result.status).toBe('asking');
-    expect(result.questions?.map((question) => question.id)).toEqual(['moral_boundary']);
+    expect(result.questions?.map((question) => question.id)).toContain('moral_boundary');
+    expect(result.questions?.map((question) => question.id)).toContain('core_main_direction');
+    expect(result.questions?.map((question) => question.id)).toContain('core_protagonist_type');
     expect(result.planSummary).toBeUndefined();
     expect(proxy.calls).toHaveLength(1);
   });
@@ -223,7 +225,9 @@ describe('NovelPlanService goal-driven agent', () => {
     );
 
     expect(result.status).toBe('asking');
-    expect(result.questions?.map((question) => question.id)).toEqual(['protagonist_identity']);
+    expect(result.questions?.map((question) => question.id)).toContain('protagonist_identity');
+    expect(result.questions?.map((question) => question.id)).toContain('core_protagonist_type');
+    expect(result.questions?.map((question) => question.id)).toContain('target_total_words');
     expect(proxy.calls).toHaveLength(2);
   });
 
@@ -337,7 +341,8 @@ describe('NovelPlanService goal-driven agent', () => {
     );
 
     expect(result.status).toBe('asking');
-    expect(result.questions?.map((question) => question.id)).toEqual(['campus_conflict', 'campus_role']);
+    expect(result.questions?.map((question) => question.id)).toContain('campus_conflict');
+    expect(result.questions?.map((question) => question.id)).toContain('campus_role');
     expect(result.questions?.flatMap((question) => question.options.map((option) => option.label)).join(''))
       .not.toMatch(/魔法|修仙|骑士|王国/);
     expect(result.planningChecklist?.unresolvedDecisions).toContain('校园冲突类型');
@@ -357,6 +362,134 @@ describe('NovelPlanService goal-driven agent', () => {
     const text = result.questions?.map((question) => `${question.question} ${question.options.map((option) => option.label).join(' ')}`).join('\n') ?? '';
     expect(text).toContain('校园');
     expect(text).not.toMatch(/魔法|修仙|骑士|王国/);
+  });
+
+  it('asks the scale fields instead of allowing a one-question provider response to start planning', async () => {
+    const proxy = new QueueProxy([
+      JSON.stringify({
+        status: 'asking',
+        message: '先确认故事方向。',
+        questions: [{
+          id: 'mystery_hook',
+          question: '案件的核心谜团是什么？',
+          impactScore: 10,
+          options: [{ id: 'missing_person', label: '失踪案' }, { id: 'closed_room', label: '密室案' }],
+        }],
+      }),
+    ]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      { seedPrompt: '写一个校园推理故事' },
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe('asking');
+    const ids = result.questions?.map((question) => question.id) ?? [];
+    expect(ids).toContain('mystery_hook');
+    expect(ids).toContain('target_total_words');
+    expect(ids).toContain('target_total_chapters');
+    expect(result.planningChecklist?.unresolvedDecisions.join(' ')).toMatch(/总字数|章节数/);
+  });
+
+  it('uses genre-specific protagonist and hook questions for western fantasy', async () => {
+    const service = new NovelPlanService(
+      mockConfigService(),
+      new QueueProxy([JSON.stringify({ status: 'asking', message: '补充方向。', questions: [] })]),
+    );
+    const result = await service.turn(
+      { seedPrompt: '写一本西方玄幻小说' },
+      new AbortController().signal,
+    );
+    const text = result.questions?.map((q) => `${q.question} ${q.options.map((o) => o.label).join(' ')}`).join('\n') ?? '';
+    expect(text).toMatch(/奇幻|魔法|遗迹|王国|流亡|冒险/);
+    expect(text).not.toMatch(/校园竞赛|班主任|社团活动/);
+  });
+
+  it('rejects generic core questions that drift away from hard sci-fi', async () => {
+    const generic = JSON.stringify({
+      status: 'asking',
+      message: '先确认主线。',
+      questions: [{
+        id: 'core_main_direction',
+        question: '主线冲突优先围绕哪一种目标展开？',
+        impactScore: 10,
+        options: [
+          { id: 'adventure', label: '冒险成长' },
+          { id: 'war', label: '战争与争霸' },
+        ],
+      }],
+    });
+    const service = new NovelPlanService(
+      mockConfigService(),
+      new QueueProxy([generic, readyDecision()]),
+    );
+    const result = await service.turn(
+      { seedPrompt: '写一本硬科幻小说，火星殖民地发生资源危机，主角是维修工程师' },
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe('asking');
+    expect(result.questions?.[0]?.id).toBe('core_main_direction');
+    expect(result.questions?.[0]?.question).toContain('科幻');
+    expect(result.questions?.flatMap((question) => question.options.map((option) => option.label)).join(''))
+      .not.toContain('冒险成长');
+  });
+
+  it('keeps scale and ending decisions in separate resumable turns', async () => {
+    const seed = '写一本西方玄幻，主角是流亡骑士，主线是复仇与真相';
+    const firstProxy = new QueueProxy([
+      JSON.stringify({
+        status: 'asking',
+        message: '先确认创作规模。',
+        questions: [
+          { id: 'target_total_words', question: '全书目标总字数大约是多少？', impactScore: 8, options: [{ id: 'total_100k', label: '约10万字' }, { id: 'total_300k', label: '约30万字' }] },
+          { id: 'target_total_chapters', question: '全书计划写多少章？', impactScore: 8, options: [{ id: 'ch_50', label: '约50章' }, { id: 'ch_100', label: '约100章' }] },
+          { id: 'target_words_per_chapter', question: '每章目标字数是多少？', impactScore: 8, options: [{ id: 'wpc_2000', label: '约2000字' }, { id: 'wpc_3000', label: '约3000字' }] },
+          { id: 'target_volume_count', question: '全书分几卷？', impactScore: 8, options: [{ id: 'volumes_3', label: '三卷' }, { id: 'volumes_5', label: '五卷' }] },
+        ],
+      }),
+    ]);
+    const first = new NovelPlanService(mockConfigService(), firstProxy);
+    const firstResult = await first.turn({ seedPrompt: seed }, new AbortController().signal);
+    expect(firstResult.status).toBe('asking');
+    expect(firstResult.questions).toHaveLength(4);
+    expect(firstResult.questions?.map((question) => question.id)).toEqual([
+      'target_total_words',
+      'target_total_chapters',
+      'target_words_per_chapter',
+      'target_volume_count',
+    ]);
+
+    const history: Array<{ role: 'user' | 'assistant'; content: string }> = [
+      { role: 'user', content: `灵感：${seed}` },
+      {
+        role: 'assistant',
+        content: firstResult.questions
+          ?.map((question) => `PLAN_QUESTION[${question.id}]: ${question.question}`)
+          .join('\n') ?? '',
+      },
+    ];
+    const second = new NovelPlanService(
+      mockConfigService(),
+      new QueueProxy([readyDecision(), readyDecision()]),
+    );
+    const secondResult = await second.turn({
+      seedPrompt: seed,
+      history,
+      answers: [
+        { questionId: 'target_total_words', selectedOptionIds: ['total_100k'], selectedOptionLabels: ['约10万字'] },
+        { questionId: 'target_total_chapters', selectedOptionIds: ['ch_50'], selectedOptionLabels: ['约50章'] },
+        { questionId: 'target_words_per_chapter', selectedOptionIds: ['wpc_2000'], selectedOptionLabels: ['约2000字'] },
+        { questionId: 'target_volume_count', selectedOptionIds: ['volumes_3'], selectedOptionLabels: ['三卷'] },
+      ],
+    }, new AbortController().signal);
+
+    expect(secondResult.status).toBe('asking');
+    expect(secondResult.questions?.map((question) => question.id)).toEqual([
+      'ending_direction',
+      'writing_requirements',
+    ]);
+    expect(secondResult.questions?.map((question) => question.id)).not.toContain('target_total_words');
   });
 
   it('does not start while the Agent checklist still has unresolved decisions', async () => {
@@ -394,7 +527,9 @@ describe('NovelPlanService goal-driven agent', () => {
     );
 
     expect(result.status).toBe('asking');
-    expect(result.questions?.map((question) => question.id)).toEqual(['ending_shape']);
+    expect(result.questions?.map((question) => question.id)).toContain('ending_shape');
+    expect(result.questions?.map((question) => question.id)).toContain('target_volume_count');
+    expect(result.questions?.map((question) => question.id)).toContain('ending_direction');
     expect(proxy.calls).toHaveLength(2);
   });
 

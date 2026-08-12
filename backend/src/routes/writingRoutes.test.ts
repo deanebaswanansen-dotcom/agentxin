@@ -72,6 +72,9 @@ describe('writingRoutes', () => {
     expect(res.headers['content-type']).toContain('text/event-stream');
     const body = res.body;
 
+    // The initial comment keeps a quiet model wait alive through idle proxies.
+    expect(body).toContain(': heartbeat\n\n');
+
     // Each delta is JSON-encoded inside a `data:` line of a `delta` event.
     for (const delta of deltas) {
       expect(body).toContain(`event: delta\ndata: ${JSON.stringify(delta)}\n\n`);

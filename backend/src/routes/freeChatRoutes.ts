@@ -13,6 +13,7 @@
 import type { FastifyInstance } from 'fastify';
 
 import { corsResponseHeaders } from '../cors.js';
+import { startSseHeartbeat } from './sseHeartbeat.js';
 import type { FreeChatService } from '../services/freeChat/FreeChatService.js';
 import { ServiceError } from '../services/ServiceError.js';
 import type { FreeChatRequestBody, Id } from '../types/index.js';
@@ -93,8 +94,10 @@ export function registerFreeChatRoutes(
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
         ...corsResponseHeaders(),
       });
+      const stopHeartbeat = startSseHeartbeat(raw);
 
       // Abort on client disconnect
       const controller = new AbortController();
@@ -128,6 +131,7 @@ export function registerFreeChatRoutes(
           raw.write(sseFrame('error', JSON.stringify(apiError)));
         }
       } finally {
+        stopHeartbeat();
         raw.removeListener('close', onClose);
         if (!raw.writableEnded) {
           raw.end();

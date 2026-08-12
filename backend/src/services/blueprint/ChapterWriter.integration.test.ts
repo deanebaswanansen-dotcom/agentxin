@@ -286,6 +286,83 @@ describe('SceneWriter / ChapterWriter integration', () => {
     expect(chapter?.content).toBe(expectedMerged);
   });
 
+  it('retries an empty scene and never persists an empty checkpoint', async () => {
+    const { proxy, calls } = makeFakeProxy({
+      // The first provider response is an empty stream. The second response
+      // supplies the same scene, after which the remaining scenes are normal.
+      deltasForCall: (call) => (call === 1 ? [] : deltasForCallForRetry(call)),
+    });
+    const sceneWriter = new SceneWriter(
+      store,
+      new ModelConfigService(store),
+      proxy,
+    );
+    const chapterWriter = new ChapterWriter(
+      store,
+      new ModelConfigService(store),
+      sceneWriter,
+      new ChapterMerger(store),
+    );
+
+    const events: ChapterWriteEvent[] = [];
+    for await (const event of chapterWriter.streamChapter(chapterId, signal())) {
+      events.push(event);
+    }
+
+    expect(calls).toHaveLength(SCENE_IDS.length + 1);
+    expect((await store.getSceneDraft(chapterId, 'scene-1'))?.content).toBe(
+      deltasForCallForRetry(2).join(''),
+    );
+    expect((await store.getChapter(chapterId))?.content).toContain('场景2正文');
+    expect(events.filter((event) => event.type === 'scene')).toHaveLength(SCENE_IDS.length);
+  });
+
+  it('resumes from the first missing scene after a provider failure', async () => {
+    const first = makeFakeProxy({ failOnCall: 3, deltasBeforeFail: 1 });
+    const firstWriter = new ChapterWriter(
+      store,
+      new ModelConfigService(store),
+      new SceneWriter(store, new ModelConfigService(store), first.proxy),
+      new ChapterMerger(store),
+    );
+    await expect((async () => {
+      for await (const _event of firstWriter.streamChapter(chapterId, signal())) {
+        // consume until the failing scene
+      }
+    })()).rejects.toBeInstanceOf(ProxyError);
+
+    expect(await store.getSceneDraft(chapterId, 'scene-1')).toBeDefined();
+    expect(await store.getSceneDraft(chapterId, 'scene-2')).toBeDefined();
+    expect(await store.getSceneDraft(chapterId, 'scene-3')).toBeUndefined();
+
+    const resumed = makeFakeProxy();
+    const resumedWriter = new ChapterWriter(
+      store,
+      new ModelConfigService(store),
+      new SceneWriter(store, new ModelConfigService(store), resumed.proxy),
+      new ChapterMerger(store),
+    );
+    for await (const _event of resumedWriter.streamChapter(chapterId, signal())) {
+      // Existing scene-1/scene-2 checkpoints are skipped.
+    }
+    expect(resumed.calls).toHaveLength(SCENE_IDS.length - 2);
+    expect((await store.getChapter(chapterId))?.content).toContain('场景3正文');
+  });
+
+  it('does not merge whitespace-only scene drafts', async () => {
+    for (const sceneId of SCENE_IDS) {
+      await store.saveSceneDraft({
+        chapterId,
+        sceneId,
+        content: '  \n\n',
+        updatedAt: new Date().toISOString(),
+      });
+    }
+    const merger = new ChapterMerger(store);
+    await expect(merger.merge(chapterId)).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    expect((await store.getChapter(chapterId))?.content).toBe('');
+  });
+
   it('stops on a mid-chapter scene failure, keeping earlier scenes and leaving the chapter unmerged (Req 7.4)', async () => {
     const failOnScene = 3; // 1-based: fail while writing scene-3.
     const { proxy, deltasForCall } = makeFakeProxy({
@@ -347,3 +424,7 @@ describe('SceneWriter / ChapterWriter integration', () => {
     expect(chapter?.content).toBe('');
   });
 });
+
+function deltasForCallForRetry(call: number): string[] {
+  return [`场景${call}正文A`, `场景${call}正文B`, `场景${call}正文C`];
+}

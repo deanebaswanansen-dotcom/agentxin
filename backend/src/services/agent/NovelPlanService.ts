@@ -28,6 +28,9 @@ import { ServiceError } from '../ServiceError.js';
 import type { ModelConfigService } from '../modelConfig/ModelConfigService.js';
 import { stripReasoningArtifacts } from '../text/reasoningSanitizer.js';
 
+// A planning turn is a checkpoint, not a survey page. Keep each checkpoint
+// small enough that the user can make a real decision, then resume the same
+// session with the remaining requirement queue.
 const MAX_QUESTIONS_PER_TURN = 5;
 const TOTAL_QUESTION_BUDGET = 10;
 const MAX_OPTIONS_PER_QUESTION = 4;
@@ -105,10 +108,26 @@ function parsePositiveInt(raw: unknown): number | undefined {
 }
 
 export function inferExplicitGenre(text: string): string | undefined {
+  // Keep mixed genres intact so a request such as “校园推理” does not lose
+  // its setting when the detector encounters the mystery keyword first.
+  if (/(?:校园)/.test(text) && /(?:悬疑|推理)/.test(text)) return '校园悬疑';
+  if (/(?:校园)/.test(text) && /(?:言情|爱情|恋爱)/.test(text)) return '校园言情';
   for (const [pattern, genre] of GENRE_PATTERNS) {
     if (pattern.test(text)) return genre;
   }
   return undefined;
+}
+
+function isCampusGenre(genre: string | undefined): boolean {
+  return genre === '校园' || genre === '校园悬疑' || genre === '校园言情';
+}
+
+function isMysteryGenre(genre: string | undefined): boolean {
+  return genre === '悬疑' || genre === '校园悬疑';
+}
+
+function isRomanceGenre(genre: string | undefined): boolean {
+  return genre === '言情' || genre === '校园言情';
 }
 
 export function extractScaleFromText(text: string): Scale {
@@ -676,6 +695,100 @@ function isHighValueQuestion(question: NovelPlanQuestion): boolean {
   return (question.impactScore ?? 8) >= 7;
 }
 
+/**
+ * Providers occasionally omit the auditable checklist even though it is part
+ * of the planner contract.  Keep the checklist useful in that case by
+ * deriving only facts that are visible in the request and the requirement
+ * queue; this is not a replacement for model reasoning.
+ */
+function fallbackChecklist(
+  seed: string,
+  missingRequirements: PlanRequirement[],
+  questions: NovelPlanQuestion[],
+  modelChecklist?: NovelPlanChecklist,
+): NovelPlanChecklist {
+  const explicitGenre = inferExplicitGenre(seed);
+  const confirmedFacts = [...(modelChecklist?.confirmedFacts ?? [])];
+  if (explicitGenre && !confirmedFacts.some((item) => item.includes(explicitGenre))) {
+    confirmedFacts.unshift(`题材：${explicitGenre}`);
+  }
+  const unresolved = [...(modelChecklist?.unresolvedDecisions ?? [])];
+  const labels: Partial<Record<PlanRequirement, string>> = {
+    genre: '题材类型',
+    main_direction: '主线冲突与目标',
+    protagonist_type: '主角身份与故事起点',
+    core_story: '一句话故事钩子',
+    target_total_words: '全书目标总字数',
+    target_total_chapters: '全书章节数',
+    target_words_per_chapter: '单章目标字数',
+    target_volume_count: '分卷数量',
+    ending_direction: '结局方向',
+    writing_requirements: '节奏与写作限制',
+  };
+  for (const requirement of missingRequirements) {
+    const label = labels[requirement];
+    if (label && !unresolved.some((item) => item.includes(label))) unresolved.push(`待确认：${label}`);
+  }
+  for (const question of questions) {
+    if (!unresolved.some((item) => item.includes(question.question))) unresolved.push(question.question);
+  }
+  return {
+    confirmedFacts: confirmedFacts.slice(0, 8),
+    unresolvedDecisions: unresolved.slice(0, 8),
+    safeDefaults: (modelChecklist?.safeDefaults?.length
+      ? modelChecklist.safeDefaults
+      : ['国家、城市、配角姓名及普通世界细节由 Agent 补全']).slice(0, 8),
+    hardConstraints: (modelChecklist?.hardConstraints?.length
+      ? modelChecklist.hardConstraints
+      : explicitGenre
+        ? [`题材固定为${explicitGenre}，不得替换成其他题材或时代背景`]
+        : []).slice(0, 8),
+  };
+}
+
+function topicCompatibleQuestion(question: NovelPlanQuestion, topicText: string): boolean {
+  const genre = inferExplicitGenre(topicText);
+  if (!genre) return true;
+  const text = `${question.question} ${question.options.map((option) => option.label).join(' ')}`;
+  const forbidden =
+    isCampusGenre(genre)
+      ? /魔法|修仙|仙侠|斗气|骑士|王国|法师|宗门|灵气|魔兽/i
+      : genre === '科幻' || genre === '硬科幻'
+        ? /修仙|仙侠|宗门|灵气|魔兽|魔法等级|斗气|学院试炼/i
+        : isMysteryGenre(genre)
+          ? /修仙|宗门|灵气|魔法等级|斗气/i
+          : genre === '西方玄幻'
+          ? /校园竞赛|班主任|社团活动|火星殖民|太空舱|修仙|仙侠|宗门|灵气/i
+            : genre === '仙侠' || genre === '东方玄幻'
+              ? /校园竞赛|班主任|社团活动|火星殖民|太空舱/i
+              : undefined;
+  if (forbidden?.test(text)) return false;
+
+  // For the three core slots, generic labels are not enough once the user
+  // has named a genre. A hard-sci-fi prompt must receive sci-fi choices, not
+  // the default fantasy/adventure card returned by a drifting provider.
+  if (question.id === 'core_main_direction' || question.id === 'core_protagonist_type' || question.id === 'core_story') {
+    const required =
+      isCampusGenre(genre)
+          ? /学校|校园|学业|社团|竞赛|学生|友情|恋爱|秘密/i
+        : genre === '科幻' || genre === '硬科幻'
+          ? /科幻|科技|殖民|太空|资源|灾难|文明|探索|科研|工程|生存/i
+          : isMysteryGenre(genre)
+            ? /案件|失踪|调查|证据|谜团|身份|线索|真相/i
+                : genre === '西方玄幻'
+                  ? /魔法|王国|教会|骑士|遗迹|冒险|王冠|诅咒|血脉/i
+              : genre === '仙侠' || genre === '东方玄幻'
+                ? /修仙|宗门|灵气|仙|秘境|法宝|渡劫/i
+                : isRomanceGenre(genre)
+                  ? /感情|恋爱|关系|重逢|误会|家庭|婚恋|对手/i
+                  : genre === '恐怖'
+                    ? /恐怖|怪谈|异常|幸存|封闭|仪式|诅咒|灵异/i
+                : undefined;
+    if (required && !required.test(text)) return false;
+  }
+  return true;
+}
+
 function askedQuestionIds(
   history: NovelPlanHistoryTurn[],
   answers: NovelPlanAnswer[] | undefined,
@@ -737,7 +850,7 @@ function missingPlanRequirements(text: string, config: NovelPlanConfig | undefin
 
 function planRequirementsQuestions(missing: PlanRequirement[], topicText = ''): NovelPlanQuestion[] {
   const genre = inferExplicitGenre(topicText);
-  const topicMainDirection: NovelPlanQuestion = genre === '校园'
+  const topicMainDirection: NovelPlanQuestion = isCampusGenre(genre)
     ? {
         id: 'core_main_direction',
         question: '在校园环境中，主线冲突优先围绕哪种核心体验展开？',
@@ -749,7 +862,7 @@ function planRequirementsQuestions(missing: PlanRequirement[], topicText = ''): 
           { id: 'campus_secret', label: '校园秘密、调查与真相' },
         ],
       }
-    : genre === '科幻'
+    : genre === '科幻' || genre === '硬科幻'
       ? {
           id: 'core_main_direction',
           question: '在科幻世界中，主线冲突优先围绕哪种核心问题展开？',
@@ -761,7 +874,7 @@ function planRequirementsQuestions(missing: PlanRequirement[], topicText = ''): 
             { id: 'science_civilization', label: '文明存亡与第一接触' },
           ],
         }
-      : genre === '悬疑'
+      : isMysteryGenre(genre)
         ? {
             id: 'core_main_direction',
             question: '在悬疑故事中，主线调查优先围绕哪种谜团展开？',
@@ -773,7 +886,31 @@ function planRequirementsQuestions(missing: PlanRequirement[], topicText = ''): 
               { id: 'mystery_conspiracy', label: '拆穿组织阴谋或连环事件' },
             ],
           }
-        : genre === '都市'
+      : genre === '西方玄幻' || genre === '奇幻' || genre === '玄幻'
+        ? {
+            id: 'core_main_direction',
+            question: '在奇幻世界中，主线冲突优先围绕哪种核心目标展开？',
+            impactScore: 10,
+            options: [
+              { id: 'fantasy_quest', label: '遗迹探索、冒险成长与失落传承' },
+              { id: 'fantasy_war', label: '王国战争、阵营选择与权力争夺' },
+              { id: 'fantasy_revenge', label: '血仇、诅咒与被掩盖的真相' },
+              { id: 'fantasy_survival', label: '边境求生与对抗古老威胁' },
+            ],
+          }
+        : genre === '仙侠' || genre === '东方玄幻'
+          ? {
+              id: 'core_main_direction',
+              question: '在修行世界中，主线冲突优先围绕哪种核心目标展开？',
+              impactScore: 10,
+              options: [
+                { id: 'xianxia_ascension', label: '求道突破与成仙之路' },
+                { id: 'xianxia_sect', label: '宗门竞争、师徒传承与势力争夺' },
+                { id: 'xianxia_revenge', label: '灭门真相、复仇与因果清算' },
+                { id: 'xianxia_three_realms', label: '三界危机与苍生存亡' },
+              ],
+            }
+          : genre === '都市'
           ? {
               id: 'core_main_direction',
               question: '在现实 / 都市环境中，主线冲突优先围绕哪种目标展开？',
@@ -796,7 +933,7 @@ function planRequirementsQuestions(missing: PlanRequirement[], topicText = ''): 
                 { id: 'survival_escape', label: '求生与逃亡' },
               ],
             };
-  const topicProtagonist: NovelPlanQuestion | undefined = genre === '校园'
+  const topicProtagonist: NovelPlanQuestion | undefined = isCampusGenre(genre)
     ? {
         id: 'core_protagonist_type',
         question: '主角以哪一种校园身份或人生起点进入故事？',
@@ -808,7 +945,7 @@ function planRequirementsQuestions(missing: PlanRequirement[], topicText = ''): 
           { id: 'campus_club_member', label: '普通学生 / 社团成员' },
         ],
       }
-    : genre === '科幻'
+    : genre === '科幻' || genre === '硬科幻'
       ? {
           id: 'core_protagonist_type',
           question: '主角以哪一种科幻身份或处境进入故事？',
@@ -820,8 +957,68 @@ function planRequirementsQuestions(missing: PlanRequirement[], topicText = ''): 
             { id: 'science_ai', label: '人工智能或改造人' },
           ],
         }
-      : undefined;
-  const topicStory: NovelPlanQuestion | undefined = genre === '校园'
+      : isMysteryGenre(genre)
+        ? {
+            id: 'core_protagonist_type',
+            question: '主角以哪一种调查身份或处境进入这起案件？',
+            impactScore: 9,
+            options: [
+              { id: 'mystery_detective', label: '职业侦探 / 警探' },
+              { id: 'mystery_reporter', label: '记者 / 调查者' },
+              { id: 'mystery_witness', label: '案件目击者或关系人' },
+              { id: 'mystery_suspect', label: '被卷入案件的嫌疑人' },
+            ],
+          }
+        : genre === '西方玄幻' || genre === '奇幻' || genre === '玄幻'
+          ? {
+              id: 'core_protagonist_type',
+              question: '主角以哪一种奇幻身份或人生处境进入故事？',
+              impactScore: 9,
+              options: [
+                { id: 'fantasy_exile', label: '流亡者 / 被夺权的继承人' },
+                { id: 'fantasy_adventurer', label: '冒险者 / 遗迹猎人' },
+                { id: 'fantasy_apprentice', label: '魔法学徒 / 初出茅庐者' },
+                { id: 'fantasy_guardian', label: '边境守卫 / 普通平民' },
+              ],
+            }
+          : genre === '仙侠' || genre === '东方玄幻'
+            ? {
+                id: 'core_protagonist_type',
+                question: '主角以哪一种修行起点进入故事？',
+                impactScore: 9,
+                options: [
+                  { id: 'xianxia_mortal', label: '凡人 / 杂役弟子' },
+                  { id: 'xianxia_disciple', label: '宗门新弟子 / 外门弟子' },
+                  { id: 'xianxia_reincarnator', label: '重生者 / 转世者' },
+                  { id: 'xianxia_exile', label: '被逐修士 / 散修' },
+                ],
+              }
+            : isRomanceGenre(genre)
+              ? {
+                  id: 'core_protagonist_type',
+                  question: '主角以哪一种关系处境进入感情故事？',
+                  impactScore: 9,
+                  options: [
+                    { id: 'romance_reunion', label: '旧识重逢 / 久别再遇' },
+                    { id: 'romance_strangers', label: '陌生人从相遇开始' },
+                    { id: 'romance_rivals', label: '竞争对手 / 立场相反' },
+                    { id: 'romance_contract', label: '契约关系 / 形式婚恋' },
+                  ],
+                }
+              : genre === '恐怖'
+                ? {
+                    id: 'core_protagonist_type',
+                    question: '主角以哪一种处境面对恐怖事件？',
+                    impactScore: 9,
+                    options: [
+                      { id: 'horror_survivor', label: '唯一幸存者 / 受害者' },
+                      { id: 'horror_investigator', label: '调查异常事件的人' },
+                      { id: 'horror_resident', label: '无法离开封闭场所的居民' },
+                      { id: 'horror_believer', label: '相信怪谈却无人相信的人' },
+                    ],
+                  }
+                : undefined;
+  const topicStory: NovelPlanQuestion | undefined = isCampusGenre(genre)
     ? {
         id: 'core_story',
         question: '这所校园里最值得展开的一句话故事钩子是什么？',
@@ -833,7 +1030,7 @@ function planRequirementsQuestions(missing: PlanRequirement[], topicText = ''): 
           { id: 'campus_past', label: '校园旧案或秘密重新浮出水面' },
         ],
       }
-    : genre === '悬疑'
+      : isMysteryGenre(genre)
       ? {
           id: 'core_story',
           question: '这起案件最核心的一句话故事钩子是什么？',
@@ -845,7 +1042,55 @@ function planRequirementsQuestions(missing: PlanRequirement[], topicText = ''): 
             { id: 'mystery_personal', label: '案件与主角过去有直接关系' },
           ],
         }
-      : undefined;
+      : genre === '西方玄幻' || genre === '奇幻' || genre === '玄幻'
+        ? {
+            id: 'core_story',
+            question: '这个奇幻世界最值得展开的一句话故事钩子是什么？',
+            impactScore: 10,
+            options: [
+              { id: 'fantasy_cursed_relic', label: '被诅咒的遗物重新出现，牵动旧王国的秘密' },
+              { id: 'fantasy_exile_return', label: '流亡者必须回到故国阻止一场战争' },
+              { id: 'fantasy_ancient_threat', label: '沉睡的古老威胁正在苏醒' },
+              { id: 'fantasy_faction_choice', label: '主角必须在两个阵营之间作出不可逆选择' },
+            ],
+          }
+        : genre === '仙侠' || genre === '东方玄幻'
+          ? {
+              id: 'core_story',
+              question: '这段修行旅程最核心的一句话故事钩子是什么？',
+              impactScore: 10,
+              options: [
+                { id: 'xianxia_legacy', label: '残缺传承将主角卷入三界争端' },
+                { id: 'xianxia_sect_secret', label: '宗门盛世背后隐藏着必须偿还的旧债' },
+                { id: 'xianxia_revenge', label: '灭门真相迫使主角踏上复仇与求道之路' },
+                { id: 'xianxia_ascension', label: '成仙之路要求主角牺牲最重要的人或信念' },
+              ],
+            }
+          : isRomanceGenre(genre)
+            ? {
+                id: 'core_story',
+                question: '这段感情关系最核心的一句话故事钩子是什么？',
+                impactScore: 10,
+                options: [
+                  { id: 'romance_misunderstanding', label: '误会与秘密让两人必须重新选择彼此' },
+                  { id: 'romance_obstacle', label: '现实身份或家庭阻力迫使两人对抗环境' },
+                  { id: 'romance_growth', label: '两人相互推动，在关系中完成自我成长' },
+                  { id: 'romance_reunion_truth', label: '重逢揭开一段被隐瞒多年的真相' },
+                ],
+              }
+            : genre === '恐怖'
+              ? {
+                  id: 'core_story',
+                  question: '这场恐怖故事最核心的一句话钩子是什么？',
+                  impactScore: 10,
+                  options: [
+                    { id: 'horror_closed_place', label: '封闭场所出现无法解释的重复事件' },
+                    { id: 'horror_ritual', label: '一个古老仪式正在要求新的牺牲者' },
+                    { id: 'horror_unreliable', label: '主角无法确定自己看到的是否真实' },
+                    { id: 'horror_personal', label: '恐怖源头与主角被掩埋的过去有关' },
+                  ],
+                }
+              : undefined;
   const questions: Record<PlanRequirement, NovelPlanQuestion> = {
     genre: {
       id: 'core_genre',
@@ -958,18 +1203,38 @@ function selectPlanningQuestions(
   questionBudget: number,
   topicText = '',
 ): NovelPlanQuestion[] {
+  const available = Math.min(questionBudget, MAX_QUESTIONS_PER_TURN);
+  if (available <= 0) return [];
+
+  // The requirement queue is the deterministic safety rail. It is ordered as
+  // core direction, then scale, then ending/style, so one provider response
+  // cannot collapse the entire consultation into a single survey card. A
+  // valid, topic-specific Agent question still gets priority over a fallback.
+  const fallback = planRequirementsQuestions(missingRequirements, topicText)
+    .filter((question) => !alreadyAsked(question, history));
   const selected = modelQuestions
     .filter(isHighValueQuestion)
+    .filter((question) => topicCompatibleQuestion(question, topicText))
     .filter((question) => !alreadyAsked(question, history));
-  const selectedIds = new Set(selected.map((question) => question.id));
-  // A valid Agent question is authoritative. Do not append a generic survey
-  // just to fill the visual card; this is what previously turned campus ideas
-  // into fantasy-style prompts.
-  if (selected.length > 0) return selected.slice(0, Math.min(questionBudget, MAX_QUESTIONS_PER_TURN));
-  const fallback = planRequirementsQuestions(missingRequirements, topicText)
-    .filter((question) => !selectedIds.has(question.id))
-    .filter((question) => !alreadyAsked(question, history));
-  return [...selected, ...fallback].slice(0, Math.min(questionBudget, MAX_QUESTIONS_PER_TURN));
+  // Preserve useful model questions, but never let a provider's single
+  // generic question hide the required scale fields.  Missing requirements
+  // are appended in priority order until this checkpoint is full; the next
+  // turn resumes from the remaining queue.  This is the guard that prevents
+  // "one question then start writing" when the provider prematurely returns
+  // ready or asks only a low-context follow-up.
+  const merged: NovelPlanQuestion[] = [];
+  for (const question of selected) {
+    if (!merged.some((item) => item.id === question.id)) merged.push(question);
+  }
+  // A valid model-designed set is authoritative. The server must not add
+  // generic fallback cards merely to fill the UI; fallback is only needed when
+  // the provider returned one (or zero) usable blocking decision.
+  if (merged.length >= 2) return merged.slice(0, available);
+  for (const question of fallback) {
+    if (!merged.some((item) => item.id === question.id)) merged.push(question);
+    if (merged.length >= available) break;
+  }
+  return merged.slice(0, available);
 }
 
 function alreadyAsked(question: NovelPlanQuestion, history: NovelPlanHistoryTurn[]): boolean {
@@ -1244,7 +1509,7 @@ export class NovelPlanService {
           round,
           message: decision.message,
           questions,
-          planningChecklist: decision.planningChecklist,
+          planningChecklist: fallbackChecklist(seed, missingRequirements, questions, decision.planningChecklist),
         };
       }
     }
@@ -1254,7 +1519,14 @@ export class NovelPlanService {
     const filteredQuestionCount = decision.status === 'asking'
       ? selectPlanningQuestions(decision.questions, [], history, questionBudget, knownText).length
       : 0;
-    if (!mustFinish && (missingRequirements.length > 0 || hasUnresolvedChecklist || (decision.status === 'asking' && filteredQuestionCount === 0))) {
+    if (
+      !mustFinish &&
+      (
+        (decision.status !== 'asking' && missingRequirements.length > 0) ||
+        hasUnresolvedChecklist ||
+        (decision.status === 'asking' && decision.questions.length > 0 && filteredQuestionCount === 0)
+      )
+    ) {
       decision = await this.generateDecision(
         config,
         seed,
@@ -1282,7 +1554,7 @@ export class NovelPlanService {
             round,
             message: decision.message,
             questions,
-            planningChecklist: decision.planningChecklist,
+            planningChecklist: fallbackChecklist(seed, missingRequirements, questions, decision.planningChecklist),
           };
         }
       }
@@ -1300,7 +1572,12 @@ export class NovelPlanService {
           0,
           Math.min(questionBudget, MAX_QUESTIONS_PER_TURN),
         ),
-        planningChecklist: decision.planningChecklist,
+        planningChecklist: fallbackChecklist(
+          seed,
+          missingRequirements,
+          planRequirementsQuestions(missingRequirements, knownText),
+          decision.planningChecklist,
+        ),
       };
     }
 
@@ -1368,7 +1645,7 @@ export class NovelPlanService {
       questions: [],
       brief: decision.brief,
       planSummary: decision.planSummary,
-      planningChecklist: decision.planningChecklist,
+      planningChecklist: fallbackChecklist(seed, [], [], decision.planningChecklist),
     };
   }
 
@@ -1399,11 +1676,11 @@ export class NovelPlanService {
       '用户明确说过的题材、时代、地域、文化、人物、禁忌和规模都是不可覆盖的硬约束。',
       '禁止重复询问已明确的信息；禁止把西方玄幻改成校园、都市、修仙等其他核心类型。',
       '问题与选项必须从 planningChecklist.unresolvedDecisions 和当前题材推导；禁止复用固定题库。已识别校园时，问题必须围绕学校类型、学业/社团/竞赛、校园关系、校园秘密等现实校园要素；禁止出现魔法、修仙、骑士、王国等不属于用户题材的选项。其他题材同理，问题必须使用该题材自己的冲突、角色身份和场景词汇。',
-      '可安全推断的细节由你做专业决定，不向用户转嫁；只有答案会导致两种根本不同故事时才提问。',
+      '可安全推断的细节由你做专业决定，不向用户转嫁；只有答案会导致两种根本不同故事时才提问。规模字段是例外：全文总字数、总章节数、单章字数、卷数会决定执行成本，任一缺失都必须列入本轮或后续问题，不能直接用默认值开写。',
       `主动提问总预算剩余 ${questionBudget} 题；asking 时不得超过该预算，每轮可提出 2-${MAX_QUESTIONS_PER_TURN} 个具体问题，每题 2-${MAX_OPTIONS_PER_QUESTION} 个选项，必须含 impactScore（0-10）与稳定英文 snake_case id。`,
       '只有 impactScore >= 7 且同时满足“无法合理推断、显著改变主线、后期修改成本高”的问题才允许询问。',
       '国家/城市/人物姓名、货币、等级名称、普通配角、普通反派、支线和世界细节由你直接创造，禁止询问。',
-      'ready 时 questions 必须为空，并返回完整 brief 与 planSummary；asking 时 questions 必须来自 unresolvedDecisions，优先提出 2-5 个互不重复且同一题材内的高影响问题。',
+      'ready 时 questions 必须为空，并返回完整 brief 与 planSummary；asking 时 questions 必须来自 unresolvedDecisions，优先提出 2-5 个互不重复且同一题材内的高影响问题；规模字段缺失时不得返回 ready；本轮只处理当前优先级，剩余缺口放入下一轮。',
       'planSummary JSON 字段：title, genre, protagonist, hook, tone, constraints, totalWords, wordsPerChapter, chapterCount, volumeCount, chapterOutlines。',
       '本模块只做是否追问与方向收束，不生成 storyPlan；完整 Story Plan 由后续专用 Agent 一次生成。',
       'chapterOutlines 每项字段：number, title, goal, estimatedWords；goal 必须含行动、冲突/变化、章末推进。',

@@ -21,6 +21,7 @@ import { pythonBridge, type PythonBridgeResult } from '../../proxy/PythonBridge.
 import type { BlueprintService } from '../blueprint/BlueprintService.js';
 import type { ChapterWriter } from '../blueprint/ChapterWriter.js';
 import { ServiceError } from '../ServiceError.js';
+import { isProxyError } from '../../proxy/ProxyError.js';
 import type { ModelConfigService } from '../modelConfig/ModelConfigService.js';
 import type { MemoryService } from '../memory/MemoryService.js';
 import { scaledMemoryOptions } from '../memory/MemoryService.js';
@@ -35,6 +36,12 @@ import {
 } from './subagents/index.js';
 
 const MAX_EMPTY_CHAPTER_ATTEMPTS = 3;
+const RETRYABLE_CHAPTER_PROVIDER_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+
+function isRetryableChapterError(error: unknown): boolean {
+  if (!isProxyError(error)) return false;
+  return error.status === undefined || RETRYABLE_CHAPTER_PROVIDER_STATUSES.has(error.status);
+}
 
 const TASK_MODES: Record<AgentTask, AgentRunMode | 'either'> = {
   novel: 'either',
@@ -1122,31 +1129,23 @@ export class AgentOrchestrator {
         current: i + 1,
         total: chapterCount,
       });
-      const chapter = await this.store.createChapter(pid, title);
-      let content = '';
-      for (let attempt = 1; attempt <= MAX_EMPTY_CHAPTER_ATTEMPTS; attempt += 1) {
-        content = await this.generateChapterWithMemory(
-          config,
-          pid,
-          pack,
-          num,
-          plannedFinalChapter,
-          attempt === 1
-            ? directorBrief
-            : `${directorBrief}\n\n# 重试要求\n上一次模型返回了空正文。本次必须直接输出完整章节正文，不得只输出思考、解释或空白。`,
-          perChapter,
-          signal,
-        );
-        if (content.trim().length > 0) break;
-        if (attempt < MAX_EMPTY_CHAPTER_ATTEMPTS) {
-          emit({
-            phase: 'chapter',
-            message: `【ChapterAgent】「${title}」返回空正文，正在重试（${attempt + 1}/${MAX_EMPTY_CHAPTER_ATTEMPTS}）…`,
-            current: i + 1,
-            total: chapterCount,
-          });
-        }
-      }
+      const chapter = await this.getOrCreateLongNovelChapter(pid, title);
+      let content = await this.writeLongNovelChapter(
+        config,
+        pid,
+        chapter.id,
+        pack,
+        num,
+        plannedFinalChapter,
+        title,
+        planChapter?.goal,
+        directorBrief,
+        perChapter,
+        signal,
+        emit,
+        { current: i + 1, total: chapterCount },
+        steps,
+      );
 
       // Empty prose is a writer failure, not a continuity conflict. Never send
       // it to ContinuityAgent/ReviewAgent, and remove the empty placeholder so
@@ -1462,21 +1461,31 @@ export class AgentOrchestrator {
         ? `第${num}章 ${planChapter.title.trim()}`
         : `第${num}章`;
       emit({ phase: 'chapter', message: `正在写「${title}」正文…`, current: i + 1, total: chapterCount });
-      const chapter = await this.store.createChapter(pid, title);
+      const chapter = await this.getOrCreateLongNovelChapter(pid, title);
       artifacts.push({ kind: 'chapter', id: chapter.id, title });
       lastChapterId = chapter.id;
 
-      const content = await this.generateChapterWithMemory(
+      const content = await this.writeLongNovelChapter(
         config,
         pid,
+        chapter.id,
         pack,
         num,
         plannedFinalChapter,
+        title,
+        planChapter?.goal,
         packPrompt,
         wordsPerChapter,
         signal,
+        emit,
+        { current: i + 1, total: chapterCount },
+        steps,
       );
-      await this.store.updateChapterContent(chapter.id, content);
+      if (content.trim().length === 0) {
+        await this.store.deleteChapter(chapter.id);
+        steps.push(`【ChapterAgent】「${title}」未生成正文，已保留项目状态供重试。`);
+        break;
+      }
       // 审校 → 可选修订 → 再检 → 仅对终稿应用结论与反思
       const processed = await this.processChapterDraft(
         config,
@@ -1543,6 +1552,152 @@ export class AgentOrchestrator {
         completedChapters,
       },
     };
+  }
+
+  /**
+   * Long-form chapter writer with a resumable scene pipeline.
+   *
+   * The blueprint module is the durable path: each scene is committed before
+   * the next one starts, so a provider timeout resumes from the first missing
+   * scene.  Existing projects or providers that cannot return valid blueprint
+   * JSON still get a bounded direct-writer fallback; this keeps the feature
+   * compatible with older models while making the normal path scene-sized.
+   */
+  private async writeLongNovelChapter(
+    config: ModelConfig,
+    projectId: Id,
+    chapterId: Id,
+    pack: GeneratedPack,
+    chapterNumber: number,
+    totalChapters: number,
+    chapterTitle: string,
+    chapterGoal: string | undefined,
+    seedPrompt: string,
+    targetWords: number,
+    signal: AbortSignal,
+    emit: (event: AgentProgressEvent) => void,
+    progress: { current: number; total: number },
+    steps: string[],
+  ): Promise<string> {
+    const memoryContext = this.memory.buildContext(projectId, scaledMemoryOptions(chapterNumber));
+    const requirement = [
+      `章节编号：${chapterNumber}`,
+      `章节标题：${chapterTitle}`,
+      `目标字数：${targetWords}`,
+      `本章目标：${chapterGoal?.trim() || '承接前情，推进主线冲突，完成一次明确状态变化并留下章末钩子。'}`,
+      `整本题材与用户要求：${seedPrompt}`,
+      memoryContext.length > 0 ? `当前故事记忆（只提取事实，不要照抄摘要）：\n${memoryContext}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+
+    try {
+      emit({
+        phase: 'setup',
+        message: `【ChapterPlanner】为「${chapterTitle}」拆分场景蓝图…`,
+        current: progress.current,
+        total: progress.total,
+      });
+      const existingBlueprint = await this.store.getChapterBlueprintByChapter(chapterId);
+      if (existingBlueprint) {
+        const existingDrafts = await this.store.listSceneDrafts(chapterId);
+        steps.push(
+          `【ChapterPlanner】复用「${chapterTitle}」已有场景蓝图（已完成 ${existingDrafts.filter((draft) => draft.content.trim().length > 0).length}/${existingBlueprint.scenes.length} 个场景）。`,
+        );
+        emit({
+          phase: 'setup',
+          message: `【ChapterPlanner】检测到「${chapterTitle}」检查点，继续未完成场景…`,
+          current: progress.current,
+          total: progress.total,
+        });
+      } else {
+        await this.blueprintService.generate(
+          chapterId,
+          { targetWords, requirement },
+          signal,
+        );
+        steps.push(`【ChapterPlanner】已保存「${chapterTitle}」场景蓝图。`);
+      }
+
+      let sceneCount = 0;
+      for await (const event of this.chapterWriter.streamChapter(chapterId, signal)) {
+        if (event.type === 'scene') {
+          sceneCount += 1;
+          emit({
+            phase: 'chapter',
+            message: `【SceneWriter】正在写「${chapterTitle}」场景 ${event.sceneId}…`,
+            current: progress.current,
+            total: progress.total,
+          });
+        }
+      }
+      const saved = await this.store.getChapter(chapterId);
+      const content = saved?.content?.trim() ?? '';
+      if (content.length > 0) {
+        steps.push(`【SceneWriter】已完成「${chapterTitle}」（${sceneCount} 个场景，${content.length} 字）。`);
+        return content;
+      }
+      throw ServiceError.validation(`「${chapterTitle}」场景已结束但合并正文为空。`);
+    } catch (error) {
+      if (signal.aborted) throw error;
+      const detail = error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160);
+      steps.push(`【ChapterPlanner】「${chapterTitle}」蓝图链路未完成，已降级为正文续写（${detail}）。`);
+      emit({
+        phase: 'info',
+        message: `【主 Agent】「${chapterTitle}」场景链路暂不可用，保留已完成分场景并改用兼容写作链路。`,
+        current: progress.current,
+        total: progress.total,
+      });
+    }
+
+    let content = '';
+    let lastProviderError: unknown;
+    for (let attempt = 1; attempt <= MAX_EMPTY_CHAPTER_ATTEMPTS; attempt += 1) {
+      try {
+        content = await this.generateChapterWithMemory(
+          config,
+          projectId,
+          pack,
+          chapterNumber,
+          totalChapters,
+          attempt === 1
+            ? seedPrompt
+            : `${seedPrompt}\n\n# 重试要求\n上一次模型返回了空正文或临时网关失败。本次必须直接输出完整章节正文，不得只输出思考、解释或空白。`,
+          targetWords,
+          signal,
+        );
+        lastProviderError = undefined;
+      } catch (error) {
+        if (signal.aborted || !isRetryableChapterError(error)) throw error;
+        lastProviderError = error;
+        if (attempt < MAX_EMPTY_CHAPTER_ATTEMPTS) {
+          emit({
+            phase: 'chapter',
+            message: `【ChapterAgent】「${chapterTitle}」模型暂时失败，正在重试（${attempt + 1}/${MAX_EMPTY_CHAPTER_ATTEMPTS}）…`,
+            current: progress.current,
+            total: progress.total,
+          });
+          continue;
+        }
+        break;
+      }
+      if (content.trim().length > 0) break;
+      if (attempt < MAX_EMPTY_CHAPTER_ATTEMPTS) {
+        emit({
+          phase: 'chapter',
+          message: `【ChapterAgent】「${chapterTitle}」返回空正文，正在重试（${attempt + 1}/${MAX_EMPTY_CHAPTER_ATTEMPTS}）…`,
+          current: progress.current,
+          total: progress.total,
+        });
+      }
+    }
+    if (content.trim().length === 0 && lastProviderError !== undefined) {
+      throw lastProviderError;
+    }
+    if (content.trim().length > 0) {
+      await this.store.updateChapterContent(chapterId, content);
+    }
+    return content;
   }
 
   /** 用「设定包 + 长期记忆」生成单章正文（用于一键整本的长程循环）。 */
@@ -2084,14 +2239,39 @@ export class AgentOrchestrator {
     });
 
     // 先只做审校，不反思：避免修订前草稿污染记忆/伏笔
-    const inspection = await this.inspectChapterDraft(
-      config,
-      projectId,
-      chapterNumber,
-      chapterTitle,
-      content,
-      signal,
-    );
+    let inspection: InspectorReport;
+    try {
+      inspection = await this.inspectChapterDraft(
+        config,
+        projectId,
+        chapterNumber,
+        chapterTitle,
+        content,
+        signal,
+      );
+    } catch (error) {
+      if (signal.aborted) throw error;
+      // Review is an auxiliary worker.  A provider 502/timeout must not erase
+      // a valid chapter or abort the whole novel; the next run can inspect it.
+      emit({
+        phase: 'info',
+        message: `【ContinuityAgent】审校请求失败，已保留「${chapterTitle}」正文并继续。`,
+        current: progress?.current,
+        total: progress?.total,
+      });
+      inspection = {
+        score0to100: 70,
+        verdict: 'inspection_unavailable',
+        plotCoherence: '审校服务暂不可用，正文已保存。',
+        fatalIssues: [],
+        earlyCharacterStatus: [],
+        recommendRevision: false,
+        revisionHints: [],
+        structuralChecks: [],
+        injectedMemoryChars: 0,
+        injectedMemoryOptions: scaledMemoryOptions(chapterNumber),
+      };
+    }
 
     let gates: GateResult | undefined;
     if (options.qualityGates) {
@@ -2104,6 +2284,7 @@ export class AgentOrchestrator {
         inspectorScore: inspection.score0to100,
         recommendRevision: inspection.recommendRevision,
         revisionHints: inspection.revisionHints,
+        fatalIssues: inspection.fatalIssues,
       });
     }
 
@@ -2197,6 +2378,7 @@ export class AgentOrchestrator {
             inspectorScore: finalInspection.score0to100,
             recommendRevision: finalInspection.recommendRevision,
             revisionHints: finalInspection.revisionHints,
+            fatalIssues: finalInspection.fatalIssues,
           });
         }
       } else if (revisedContent !== undefined) {
@@ -2337,11 +2519,39 @@ export class AgentOrchestrator {
     }
   }
 
-  /** Drop chapter shells left by interrupted runs so resume continues at the right number. */
+  /**
+   * Reuse an incomplete chapter that already has a blueprint/checkpoint.  A
+   * long run must not create a second "第 N 章" after a provider timeout: the
+   * first chapter owns the scene drafts that make the run resumable.
+   */
+  private async getOrCreateLongNovelChapter(projectId: Id, title: string) {
+    const chapters = await this.store.listChapters(projectId);
+    for (const chapter of chapters) {
+      if (chapter.title !== title || chapter.content.trim().length > 0) continue;
+      const [blueprint, drafts] = await Promise.all([
+        this.store.getChapterBlueprintByChapter(chapter.id),
+        this.store.listSceneDrafts(chapter.id),
+      ]);
+      if (blueprint || drafts.some((draft) => draft.content.trim().length > 0)) {
+        return chapter;
+      }
+    }
+    return this.store.createChapter(projectId, title);
+  }
+
+  /**
+   * Remove only truly empty shells.  A shell with a blueprint or a non-empty
+   * scene draft is a durable checkpoint and must survive the next run.
+   */
   private async purgeEmptyChapterShells(projectId: Id): Promise<void> {
     const chapters = await this.store.listChapters(projectId);
     for (const chapter of chapters) {
-      if (chapter.content.trim().length === 0) {
+      if (chapter.content.trim().length > 0) continue;
+      const [blueprint, drafts] = await Promise.all([
+        this.store.getChapterBlueprintByChapter(chapter.id),
+        this.store.listSceneDrafts(chapter.id),
+      ]);
+      if (!blueprint && !drafts.some((draft) => draft.content.trim().length > 0)) {
         await this.store.deleteChapter(chapter.id);
       }
     }

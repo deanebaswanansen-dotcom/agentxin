@@ -77,6 +77,12 @@ const env = (import.meta as unknown as { env?: Record<string, string | undefined
 const DEFAULT_BASE_URL = (env?.VITE_API_BASE_URL ?? '/api').replace(/\/$/, '');
 const USE_BACKGROUND_AGENT_JOBS = env?.VITE_AGENT_BACKGROUND_JOBS === 'true';
 
+// A request that has gone completely silent is indistinguishable from a dead
+// proxy to a browser.  The backend emits SSE heartbeats while long jobs run,
+// so this is an inactivity limit rather than a total job limit.
+const REQUEST_TIMEOUT_MS = 45_000;
+const STREAM_IDLE_TIMEOUT_MS = 45_000;
+
 /** Browser-local persistence so API Key survives refresh (local-dev tool UX). */
 const MODEL_CONFIG_STORAGE_KEY = 'nwa.modelConfig.v1';
 const CLIENT_ID_STORAGE_KEY = 'nwa.clientId.v1';
@@ -207,6 +213,43 @@ function modelConfigHeader(): Record<string, string> {
   return headers;
 }
 
+interface LinkedTimeoutSignal {
+  signal: AbortSignal;
+  didTimeout: () => boolean;
+  touch: () => void;
+  dispose: () => void;
+}
+
+/** Combine the caller's cancellation with a bounded inactivity timeout. */
+function linkedTimeoutSignal(parent: AbortSignal | undefined, timeoutMs: number): LinkedTimeoutSignal {
+  const controller = new AbortController();
+  let timedOut = false;
+  let timer: ReturnType<typeof globalThis.setTimeout>;
+  const arm = (): void => {
+    timer = globalThis.setTimeout(() => {
+      timedOut = true;
+      controller.abort(new DOMException('Request timed out.', 'TimeoutError'));
+    }, timeoutMs);
+  };
+  arm();
+  const onAbort = (): void => controller.abort(parent?.reason);
+  parent?.addEventListener('abort', onAbort, { once: true });
+  return {
+    signal: controller.signal,
+    didTimeout: () => timedOut,
+    touch: () => {
+      if (!timedOut && !controller.signal.aborted) {
+        globalThis.clearTimeout(timer);
+        arm();
+      }
+    },
+    dispose: () => {
+      globalThis.clearTimeout(timer);
+      parent?.removeEventListener('abort', onAbort);
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -252,7 +295,15 @@ function statusToCode(status: number): ErrorCode {
       return 'NOT_FOUND';
     case 409:
       return 'MODEL_NOT_CONFIGURED';
+    case 401:
+    case 402:
+    case 403:
+    case 408:
     case 502:
+    case 503:
+    case 504:
+      return 'PROVIDER_ERROR';
+    case 429:
       return 'PROVIDER_ERROR';
     default:
       return 'STORE_ERROR';
@@ -316,7 +367,8 @@ async function request<T>(
   body?: unknown,
   options?: RequestOptions,
 ): Promise<T> {
-  const init: RequestInit = { method, signal: options?.signal };
+  const timeout = linkedTimeoutSignal(options?.signal, REQUEST_TIMEOUT_MS);
+  const init: RequestInit = { method, signal: timeout.signal };
   const requestHeaders = options?.includeModelConfig === true
     ? modelConfigHeader()
     : clientIdentityHeader();
@@ -330,24 +382,35 @@ async function request<T>(
     init.headers = requestHeaders;
   }
 
-  const res = await fetch(`${baseUrl}${path}`, init);
-  if (!res.ok) {
-    const errBody = await readBody(res);
-    throw toApiClientError(errBody, res.status, res.statusText);
-  }
-  const parsedBody = await readBody(res);
-  if (typeof parsedBody === 'string') {
-    throw new ApiClientError(
-      {
-        error: {
-          code: 'STORE_ERROR',
-          message: '接口返回了非 JSON 响应，可能是后端 API 未部署或路径被静态站回退。',
+  try {
+    const res = await fetch(`${baseUrl}${path}`, init);
+    if (!res.ok) {
+      const errBody = await readBody(res);
+      throw toApiClientError(errBody, res.status, res.statusText);
+    }
+    const parsedBody = await readBody(res);
+    if (typeof parsedBody === 'string') {
+      throw new ApiClientError(
+        {
+          error: {
+            code: 'STORE_ERROR',
+            message: '接口返回了非 JSON 响应，可能是后端 API 未部署或路径被静态站回退。',
+          },
         },
-      },
-      res.status,
-    );
+        res.status,
+      );
+    }
+    return parsedBody as T;
+  } catch (error) {
+    if (timeout.didTimeout()) {
+      throw new ApiClientError(
+        { error: { code: 'PROVIDER_ERROR', message: '请求超过 45 秒没有响应，请检查后端或模型服务。' } },
+      );
+    }
+    throw error;
+  } finally {
+    timeout.dispose();
   }
-  return parsedBody as T;
 }
 
 /** Encode a path segment (typically an id) for safe URL interpolation. */
@@ -484,23 +547,37 @@ async function streamSse(
   options?: WriteOptions,
   onSseEvent?: (event: SseEvent) => boolean | void,
 ): Promise<string> {
+  const timeout = linkedTimeoutSignal(options?.signal, STREAM_IDLE_TIMEOUT_MS);
   const init: RequestInit = {
     method: 'POST',
     headers: { Accept: 'text/event-stream', ...modelConfigHeader() },
-    signal: options?.signal,
+    signal: timeout.signal,
   };
   if (body !== undefined) {
     init.headers = { 'Content-Type': 'application/json', Accept: 'text/event-stream', ...modelConfigHeader() };
     init.body = JSON.stringify(body);
   }
 
-  const res = await fetch(url, init);
+  let res: Response;
+  try {
+    res = await fetch(url, init);
+  } catch (error) {
+    timeout.dispose();
+    if (timeout.didTimeout()) {
+      throw new ApiClientError({
+        error: { code: 'PROVIDER_ERROR', message: '流式响应超过 45 秒没有数据，连接已中止。' },
+      });
+    }
+    throw error;
+  }
 
   if (!res.ok) {
     const errBody = await readBody(res);
+    timeout.dispose();
     throw toApiClientError(errBody, res.status, res.statusText);
   }
   if (res.body === null) {
+    timeout.dispose();
     throw new ApiClientError(
       { error: { code: 'PROVIDER_ERROR', message: '写作响应缺少数据流。' } },
       res.status,
@@ -512,6 +589,7 @@ async function streamSse(
   const reasoningFilter = new ReasoningArtifactFilter();
   let buffer = '';
   let full = '';
+  let sawDone = false;
 
   const consumeEvents = (events: SseEvent[]): 'done' | 'continue' => {
     for (const ev of events) {
@@ -519,6 +597,7 @@ async function streamSse(
         throw sseErrorToApiClientError(ev.data);
       }
       if (ev.event === 'done') {
+        sawDone = true;
         const tail = reasoningFilter.flush();
         if (tail.length > 0) {
           full += tail;
@@ -551,6 +630,7 @@ async function streamSse(
   try {
     for (;;) {
       const { value, done } = await reader.read();
+      timeout.touch();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const parsed = parseSseEvents(buffer);
@@ -568,7 +648,15 @@ async function streamSse(
     if (consumeEvents(trailing.events) === 'done') {
       return full;
     }
+  } catch (error) {
+    if (timeout.didTimeout()) {
+      throw new ApiClientError({
+        error: { code: 'PROVIDER_ERROR', message: '流式响应超过 45 秒没有数据，连接已中止。' },
+      });
+    }
+    throw error;
   } finally {
+    timeout.dispose();
     try {
       reader.releaseLock();
     } catch {
@@ -580,6 +668,11 @@ async function streamSse(
   if (tail.length > 0) {
     full += tail;
     options?.onDelta?.(tail);
+  }
+  if (!sawDone) {
+    throw new ApiClientError({
+      error: { code: 'PROVIDER_ERROR', message: '模型响应流提前结束，未收到完成信号。' },
+    });
   }
   return full;
 }

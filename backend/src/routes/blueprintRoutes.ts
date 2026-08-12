@@ -59,6 +59,7 @@
 import type { FastifyInstance } from 'fastify';
 
 import { corsResponseHeaders } from '../cors.js';
+import { startSseHeartbeat } from './sseHeartbeat.js';
 import type { BlueprintService } from '../services/blueprint/BlueprintService.js';
 import type { ChapterMerger } from '../services/blueprint/ChapterMerger.js';
 import type { ChapterWriter } from '../services/blueprint/ChapterWriter.js';
@@ -200,8 +201,10 @@ async function runSceneStream(
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
     ...corsResponseHeaders(),
   });
+  const stopHeartbeat = startSseHeartbeat(raw);
 
   // 客户端断开时取消编排（及出站提供商请求）。监听 RESPONSE 套接字的 'close'，
   // 以 writableEnded 区分正常结束与真实断开（与 writingRoutes 一致）。
@@ -252,6 +255,7 @@ async function runSceneStream(
       raw.write(sseFrame('error', JSON.stringify(apiError)));
     }
   } finally {
+    stopHeartbeat();
     raw.removeListener('close', onClose);
     if (!raw.writableEnded) {
       raw.end();
@@ -486,8 +490,10 @@ export function registerBlueprintRoutes(
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
         ...corsResponseHeaders(),
       });
+      const stopHeartbeat = startSseHeartbeat(raw);
 
       // 客户端断开时取消整章生成。监听 RESPONSE 套接字（reply.raw）的 'close'，
       // 并以 writableEnded 区分正常结束与真实断开（与 writingRoutes 一致）。
@@ -523,6 +529,7 @@ export function registerBlueprintRoutes(
           raw.write(sseFrame('error', JSON.stringify(apiError)));
         }
       } finally {
+        stopHeartbeat();
         raw.removeListener('close', onClose);
         if (!raw.writableEnded) {
           raw.end();

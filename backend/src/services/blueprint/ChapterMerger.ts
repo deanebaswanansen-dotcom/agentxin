@@ -55,8 +55,7 @@ export class ChapterMerger {
     // 2) 读取该章节全部已持久化的场景正文（需求 8.1）。
     const drafts = await this.store.listSceneDrafts(chapterId);
 
-    // 判定口径：以 sceneId 的 draft 是否存在为「已写作」标准（存在即已写作），
-    // 与 content 是否为空无关。
+    // 判定口径：必须存在可见正文；空白或仅思维痕迹的残留草稿仍视为未写作。
     const draftsBySceneId = new Map<string, string>(
       drafts.map((draft) => [draft.sceneId, stripReasoningArtifacts(draft.content)]),
     );
@@ -65,7 +64,12 @@ export class ChapterMerger {
     //    且不写入章节正文（需求 8.4）。
     const missing = blueprint.scenes
       .map((scene) => scene.scene_id)
-      .filter((sceneId) => !draftsBySceneId.has(sceneId));
+      .filter((sceneId) => {
+        const draft = draftsBySceneId.get(sceneId);
+        // A persisted whitespace/reasoning-only draft is indistinguishable
+        // from an unwritten scene to readers, so it must not unblock merge.
+        return draft === undefined || draft.trim().length === 0;
+      });
     if (missing.length > 0) {
       throw ServiceError.validation(
         `存在未写作场景，无法合并：${missing.join('、')}`,
