@@ -177,6 +177,21 @@ function PlanTurnCard({
         {message.round > 0 ? ` · 第 ${message.round} 次决策` : ''}
       </span>
       <div className="nwa-chat__content nwa-plan-chat__message">{message.message}</div>
+      {message.planningChecklist ? (
+        <details className="nwa-plan-chat__brief-details nwa-plan-chat__checklist">
+          <summary>Agent 自检清单</summary>
+          <dl className="nwa-plan-chat__summary">
+            <dt>已确认</dt>
+            <dd>{message.planningChecklist.confirmedFacts.join('；') || '暂无'}</dd>
+            <dt>待决策</dt>
+            <dd>{message.planningChecklist.unresolvedDecisions.join('；') || '暂无'}</dd>
+            <dt>可自行决定</dt>
+            <dd>{message.planningChecklist.safeDefaults.join('；') || '暂无'}</dd>
+            <dt>硬约束</dt>
+            <dd>{message.planningChecklist.hardConstraints.join('；') || '暂无'}</dd>
+          </dl>
+        </details>
+      ) : null}
 
       {message.status === 'asking' && questions.length > 0 ? (
         <div className="nwa-plan-chat__questions">

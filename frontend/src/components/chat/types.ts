@@ -14,6 +14,7 @@ import type {
   AgentRunMetrics,
   AgentProgressEvent,
   Chapter,
+  NovelPlanChecklist,
   NovelPlanChapterOutline,
   NovelPlanQuestion,
   NovelPlanSummary,
@@ -86,6 +87,7 @@ export interface PlanTurnMessage {
   questions?: NovelPlanQuestion[];
   brief?: string;
   planSummary?: NovelPlanSummary;
+  planningChecklist?: NovelPlanChecklist;
   /** 本轮是否已提交（禁用继续点选）。 */
   resolved?: boolean;
   /** 是否已用 brief 触发下游生成。 */

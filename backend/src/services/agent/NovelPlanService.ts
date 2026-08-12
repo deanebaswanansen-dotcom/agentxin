@@ -12,6 +12,7 @@ import type {
   ChatMessage,
   ModelConfig,
   NovelPlanAnswer,
+  NovelPlanChecklist,
   NovelPlanConfig,
   NovelPlanChapterOutline,
   NovelPlanDepth,
@@ -85,6 +86,7 @@ interface AgentDecision {
   status: 'asking' | 'ready';
   message: string;
   questions: NovelPlanQuestion[];
+  planningChecklist?: NovelPlanChecklist;
   brief?: string;
   planSummary?: NovelPlanSummary;
 }
@@ -611,6 +613,29 @@ function normalizeSummary(raw: unknown): NovelPlanSummary | undefined {
   return Object.values(summary).some((value) => value !== undefined) ? summary : undefined;
 }
 
+function normalizeChecklist(raw: unknown): NovelPlanChecklist | undefined {
+  if (!isRecord(raw)) return undefined;
+  const read = (...keys: string[]): string[] => {
+    for (const key of keys) {
+      const value = raw[key];
+      if (Array.isArray(value)) {
+        return value
+          .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+          .map((item) => item.trim())
+          .slice(0, 8);
+      }
+    }
+    return [];
+  };
+  const checklist: NovelPlanChecklist = {
+    confirmedFacts: read('confirmedFacts', 'confirmed_facts', 'confirmed'),
+    unresolvedDecisions: read('unresolvedDecisions', 'unresolved_decisions', 'unresolved'),
+    safeDefaults: read('safeDefaults', 'safe_defaults', 'defaults'),
+    hardConstraints: read('hardConstraints', 'hard_constraints', 'constraints'),
+  };
+  return Object.values(checklist).some((items) => items.length > 0) ? checklist : undefined;
+}
+
 function normalizeDecision(raw: unknown): AgentDecision {
   if (!isRecord(raw)) throw new ProxyError('策划 Agent 未返回有效 JSON。');
   const summary = normalizeSummary(raw.planSummary);
@@ -632,6 +657,7 @@ function normalizeDecision(raw: unknown): AgentDecision {
     questions,
     brief: typeof raw.brief === 'string' && raw.brief.trim() ? raw.brief.trim() : undefined,
     planSummary: summary,
+    planningChecklist: normalizeChecklist(raw.planningChecklist ?? raw.planning_checklist),
   };
 }
 
@@ -683,10 +709,10 @@ type PlanRequirement =
 function missingCoreRequirements(text: string): CoreRequirement[] {
   const missing: CoreRequirement[] = [];
   if (!inferExplicitGenre(text)) missing.push('genre');
-  if (!/(?:冒险|成长|争霸|战争|领地|经营|学院|复仇|求生|探案|权谋|救世|成神|主线|目标)/.test(text)) {
+  if (!/(?:冒险|成长|争霸|战争|领地|经营|学院|复仇|求生|探案|权谋|救世|成神|主线|目标|学业|竞赛|社团|恋爱|友情|秘密|调查|生存|阴谋|文明|探索|案件|失踪|职业|事业|家庭|关系|科技|灾难)/.test(text)) {
     missing.push('main_direction');
   }
-  if (!/(?:主角|冒险者|贵族|骑士|魔法师|法师|平民|穿越者|佣兵|猎人|王子|公主|领主|刺客|祭司)/.test(text)) {
+  if (!/(?:主角|冒险者|贵族|骑士|魔法师|法师|平民|穿越者|佣兵|猎人|王子|公主|领主|刺客|祭司|学生|转学生|新生|社团成员|竞赛选手|老师|教师|校长|班主任|研究员|工程师|探险者|幸存者)/.test(text)) {
     missing.push('protagonist_type');
   }
   return missing;
@@ -709,7 +735,117 @@ function missingPlanRequirements(text: string, config: NovelPlanConfig | undefin
   return missing;
 }
 
-function planRequirementsQuestions(missing: PlanRequirement[]): NovelPlanQuestion[] {
+function planRequirementsQuestions(missing: PlanRequirement[], topicText = ''): NovelPlanQuestion[] {
+  const genre = inferExplicitGenre(topicText);
+  const topicMainDirection: NovelPlanQuestion = genre === '校园'
+    ? {
+        id: 'core_main_direction',
+        question: '在校园环境中，主线冲突优先围绕哪种核心体验展开？',
+        impactScore: 10,
+        options: [
+          { id: 'campus_growth', label: '学业 / 能力成长与自我突破' },
+          { id: 'campus_competition', label: '社团、竞赛或校园荣誉争夺' },
+          { id: 'campus_relationships', label: '友情、恋爱与关系选择' },
+          { id: 'campus_secret', label: '校园秘密、调查与真相' },
+        ],
+      }
+    : genre === '科幻'
+      ? {
+          id: 'core_main_direction',
+          question: '在科幻世界中，主线冲突优先围绕哪种核心问题展开？',
+          impactScore: 10,
+          options: [
+            { id: 'science_exploration', label: '探索未知与科学突破' },
+            { id: 'science_survival', label: '灾难环境中的生存与迁徙' },
+            { id: 'science_conspiracy', label: '科技垄断、阴谋与反抗' },
+            { id: 'science_civilization', label: '文明存亡与第一接触' },
+          ],
+        }
+      : genre === '悬疑'
+        ? {
+            id: 'core_main_direction',
+            question: '在悬疑故事中，主线调查优先围绕哪种谜团展开？',
+            impactScore: 10,
+            options: [
+              { id: 'mystery_case', label: '追查一桩具体案件' },
+              { id: 'mystery_missing', label: '寻找失踪者或失落之物' },
+              { id: 'mystery_identity', label: '揭开人物身份与过去' },
+              { id: 'mystery_conspiracy', label: '拆穿组织阴谋或连环事件' },
+            ],
+          }
+        : genre === '都市'
+          ? {
+              id: 'core_main_direction',
+              question: '在现实 / 都市环境中，主线冲突优先围绕哪种目标展开？',
+              impactScore: 10,
+              options: [
+                { id: 'urban_career', label: '职业选择与事业突破' },
+                { id: 'urban_relationships', label: '家庭、友情或亲密关系' },
+                { id: 'urban_revenge', label: '现实困境中的反击与翻身' },
+                { id: 'urban_secret', label: '调查身边秘密并改变生活' },
+              ],
+            }
+          : {
+              id: 'core_main_direction',
+              question: '主线冲突优先围绕哪一种目标展开？',
+              impactScore: 10,
+              options: [
+                { id: 'adventure_growth', label: '冒险成长' },
+                { id: 'war_and_kingdom', label: '战争与争霸' },
+                { id: 'revenge_and_truth', label: '复仇与真相' },
+                { id: 'survival_escape', label: '求生与逃亡' },
+              ],
+            };
+  const topicProtagonist: NovelPlanQuestion | undefined = genre === '校园'
+    ? {
+        id: 'core_protagonist_type',
+        question: '主角以哪一种校园身份或人生起点进入故事？',
+        impactScore: 9,
+        options: [
+          { id: 'campus_transfer', label: '转学生 / 刚入学的新生' },
+          { id: 'campus_achiever', label: '资优生 / 竞赛选手' },
+          { id: 'campus_troublemaker', label: '问题学生 / 留级生' },
+          { id: 'campus_club_member', label: '普通学生 / 社团成员' },
+        ],
+      }
+    : genre === '科幻'
+      ? {
+          id: 'core_protagonist_type',
+          question: '主角以哪一种科幻身份或处境进入故事？',
+          impactScore: 9,
+          options: [
+            { id: 'science_engineer', label: '工程师 / 科研人员' },
+            { id: 'science_explorer', label: '探险者 / 舰船成员' },
+            { id: 'science_survivor', label: '灾难幸存者 / 普通人' },
+            { id: 'science_ai', label: '人工智能或改造人' },
+          ],
+        }
+      : undefined;
+  const topicStory: NovelPlanQuestion | undefined = genre === '校园'
+    ? {
+        id: 'core_story',
+        question: '这所校园里最值得展开的一句话故事钩子是什么？',
+        impactScore: 10,
+        options: [
+          { id: 'campus_hidden_rule', label: '学校有一条不能触碰的隐藏规则' },
+          { id: 'campus_competition', label: '一场比赛或选拔改变了主角的人生' },
+          { id: 'campus_relationship', label: '一段关系迫使主角作出选择' },
+          { id: 'campus_past', label: '校园旧案或秘密重新浮出水面' },
+        ],
+      }
+    : genre === '悬疑'
+      ? {
+          id: 'core_story',
+          question: '这起案件最核心的一句话故事钩子是什么？',
+          impactScore: 10,
+          options: [
+            { id: 'mystery_impossible', label: '一桩看似不可能发生的案件' },
+            { id: 'mystery_missing_truth', label: '失踪者留下改变全局的线索' },
+            { id: 'mystery_unreliable', label: '所有证词都可能不可信' },
+            { id: 'mystery_personal', label: '案件与主角过去有直接关系' },
+          ],
+        }
+      : undefined;
   const questions: Record<PlanRequirement, NovelPlanQuestion> = {
     genre: {
       id: 'core_genre',
@@ -722,18 +858,8 @@ function planRequirementsQuestions(missing: PlanRequirement[]): NovelPlanQuestio
         { id: 'mystery', label: '悬疑 / 推理' },
       ],
     },
-    main_direction: {
-      id: 'core_main_direction',
-      question: '主线冲突优先围绕哪一种目标展开？',
-      impactScore: 10,
-      options: [
-        { id: 'adventure_growth', label: '冒险成长' },
-        { id: 'war_and_kingdom', label: '战争与争霸' },
-        { id: 'revenge_and_truth', label: '复仇与真相' },
-        { id: 'survival_escape', label: '求生与逃亡' },
-      ],
-    },
-    protagonist_type: {
+    main_direction: topicMainDirection,
+    protagonist_type: topicProtagonist ?? {
       id: 'core_protagonist_type',
       question: '主角以哪一种身份或起点进入故事？',
       impactScore: 9,
@@ -744,7 +870,7 @@ function planRequirementsQuestions(missing: PlanRequirement[]): NovelPlanQuestio
         { id: 'noble_heir', label: '贵族 / 继承人' },
       ],
     },
-    core_story: {
+    core_story: topicStory ?? {
       id: 'core_story',
       question: '这本小说最核心的一句话设定或故事钩子是什么？',
       impactScore: 10,
@@ -830,12 +956,17 @@ function selectPlanningQuestions(
   missingRequirements: PlanRequirement[],
   history: NovelPlanHistoryTurn[],
   questionBudget: number,
+  topicText = '',
 ): NovelPlanQuestion[] {
   const selected = modelQuestions
     .filter(isHighValueQuestion)
     .filter((question) => !alreadyAsked(question, history));
   const selectedIds = new Set(selected.map((question) => question.id));
-  const fallback = planRequirementsQuestions(missingRequirements)
+  // A valid Agent question is authoritative. Do not append a generic survey
+  // just to fill the visual card; this is what previously turned campus ideas
+  // into fantasy-style prompts.
+  if (selected.length > 0) return selected.slice(0, Math.min(questionBudget, MAX_QUESTIONS_PER_TURN));
+  const fallback = planRequirementsQuestions(missingRequirements, topicText)
     .filter((question) => !selectedIds.has(question.id))
     .filter((question) => !alreadyAsked(question, history));
   return [...selected, ...fallback].slice(0, Math.min(questionBudget, MAX_QUESTIONS_PER_TURN));
@@ -1098,12 +1229,14 @@ export class NovelPlanService {
           .filter(isHighValueQuestion)
           .filter((question) => !alreadyAsked(question, history)).length
       : 0;
+    const hasUnresolvedChecklist = (decision.planningChecklist?.unresolvedDecisions.length ?? 0) > 0;
     if (!mustFinish && decision.status === 'asking' && (acceptedModelQuestionCount > 0 || missingRequirements.length === 0)) {
       const questions = selectPlanningQuestions(
         decision.questions,
         missingRequirements,
         history,
         questionBudget,
+        knownText,
       );
       if (questions.length > 0) {
         return {
@@ -1111,6 +1244,7 @@ export class NovelPlanService {
           round,
           message: decision.message,
           questions,
+          planningChecklist: decision.planningChecklist,
         };
       }
     }
@@ -1118,9 +1252,9 @@ export class NovelPlanService {
     // A provider can ignore the Requirement State, or return an invalid/low-value
     // question. Give the planning Agent one strict correction turn first.
     const filteredQuestionCount = decision.status === 'asking'
-      ? selectPlanningQuestions(decision.questions, [], history, questionBudget).length
+      ? selectPlanningQuestions(decision.questions, [], history, questionBudget, knownText).length
       : 0;
-    if (!mustFinish && (missingRequirements.length > 0 || (decision.status === 'asking' && filteredQuestionCount === 0))) {
+    if (!mustFinish && (missingRequirements.length > 0 || hasUnresolvedChecklist || (decision.status === 'asking' && filteredQuestionCount === 0))) {
       decision = await this.generateDecision(
         config,
         seed,
@@ -1140,6 +1274,7 @@ export class NovelPlanService {
           missingRequirements,
           history,
           questionBudget,
+          knownText,
         );
         if (questions.length > 0) {
           return {
@@ -1147,6 +1282,7 @@ export class NovelPlanService {
             round,
             message: decision.message,
             questions,
+            planningChecklist: decision.planningChecklist,
           };
         }
       }
@@ -1160,11 +1296,16 @@ export class NovelPlanService {
         status: 'asking',
         round,
         message: '开始生成完整计划前，需要确认故事方向和规模等高影响参数。',
-        questions: planRequirementsQuestions(missingRequirements).slice(
+        questions: planRequirementsQuestions(missingRequirements, knownText).slice(
           0,
           Math.min(questionBudget, MAX_QUESTIONS_PER_TURN),
         ),
+        planningChecklist: decision.planningChecklist,
       };
+    }
+
+    if (!mustFinish && (decision.planningChecklist?.unresolvedDecisions.length ?? 0) > 0) {
+      throw new ProxyError('策划 Agent 的自检清单仍有未决策项，请重试本轮。');
     }
 
     if (decision.status !== 'ready' || !decision.planSummary) {
@@ -1227,6 +1368,7 @@ export class NovelPlanService {
       questions: [],
       brief: decision.brief,
       planSummary: decision.planSummary,
+      planningChecklist: decision.planningChecklist,
     };
   }
 
@@ -1253,14 +1395,15 @@ export class NovelPlanService {
     const system = [
       '你是拥有决策权的小说总策划 Agent，不是固定问卷或工作流。只输出 JSON。',
       '循环：理解目标与已确认事实 → 判断是否存在真正阻塞创作的缺口 → 选择追问或直接形成方案。',
+      '每轮先输出一份 planningChecklist（这是可审计的工作清单，不是隐藏思维链）：confirmedFacts 只列用户明确说过或已回答的事实；unresolvedDecisions 只列会改变主线、人物弧光、结局或篇幅结构的未决项；safeDefaults 列出你可以自行决定的低风险细节；hardConstraints 列出绝不能违背的题材、时代、人物和禁忌。每项写短句，最多各 8 条。',
       '用户明确说过的题材、时代、地域、文化、人物、禁忌和规模都是不可覆盖的硬约束。',
       '禁止重复询问已明确的信息；禁止把西方玄幻改成校园、都市、修仙等其他核心类型。',
-      '问题与选项必须从当前用户需求推导；禁止复用固定的“冒险成长/战争与王国/复仇与真相/求生与逃亡”题目或任何通用题库。',
+      '问题与选项必须从 planningChecklist.unresolvedDecisions 和当前题材推导；禁止复用固定题库。已识别校园时，问题必须围绕学校类型、学业/社团/竞赛、校园关系、校园秘密等现实校园要素；禁止出现魔法、修仙、骑士、王国等不属于用户题材的选项。其他题材同理，问题必须使用该题材自己的冲突、角色身份和场景词汇。',
       '可安全推断的细节由你做专业决定，不向用户转嫁；只有答案会导致两种根本不同故事时才提问。',
       `主动提问总预算剩余 ${questionBudget} 题；asking 时不得超过该预算，每轮可提出 2-${MAX_QUESTIONS_PER_TURN} 个具体问题，每题 2-${MAX_OPTIONS_PER_QUESTION} 个选项，必须含 impactScore（0-10）与稳定英文 snake_case id。`,
       '只有 impactScore >= 7 且同时满足“无法合理推断、显著改变主线、后期修改成本高”的问题才允许询问。',
       '国家/城市/人物姓名、货币、等级名称、普通配角、普通反派、支线和世界细节由你直接创造，禁止询问。',
-      'ready 时 questions 必须为空，并返回完整 brief 与 planSummary。',
+      'ready 时 questions 必须为空，并返回完整 brief 与 planSummary；asking 时 questions 必须来自 unresolvedDecisions，优先提出 2-5 个互不重复且同一题材内的高影响问题。',
       'planSummary JSON 字段：title, genre, protagonist, hook, tone, constraints, totalWords, wordsPerChapter, chapterCount, volumeCount, chapterOutlines。',
       '本模块只做是否追问与方向收束，不生成 storyPlan；完整 Story Plan 由后续专用 Agent 一次生成。',
       'chapterOutlines 每项字段：number, title, goal, estimatedWords；goal 必须含行动、冲突/变化、章末推进。',
@@ -1273,7 +1416,7 @@ export class NovelPlanService {
           ? `本轮必须 asking：提出 2-${MAX_QUESTIONS_PER_TURN} 个尚未问过的高影响问题，不得返回 ready；优先覆盖 Requirement State 中尚未确认的规模、主线和结局参数。`
         : '信息足以形成方向时可以 0 问并立即 ready；不要为了凑轮数而提问。',
       missingRequirements.length > 0
-        ? `Requirement State 尚缺高影响参数：${missingRequirements.join('、')}。优先询问其中会改变篇幅、章节结构、主线或结局的问题；不要只问一个题材后直接 ready。`
+        ? `服务端观察到尚未确认的高影响字段：${missingRequirements.join('、')}。把它们作为检查提示，先由你自行判断哪些真的阻塞当前创作；不要把这些字段机械地变成固定问卷。`
         : 'Requirement State 的高影响参数已足够；除非存在新的不可逆重大分叉，否则直接 ready。',
       explicitGenre ? `已识别硬约束题材：${explicitGenre}。planSummary.genre 必须完全保持。` : '',
     ]
@@ -1283,7 +1426,7 @@ export class NovelPlanService {
       sessionText(seed, history, answers),
       planConfigText(planConfig),
       `已识别规模：总字数=${knownScale.totalWords ?? '未指定'}；每章=${knownScale.wordsPerChapter ?? '未指定'}；章数=${knownScale.chapterCount ?? '未指定'}。`,
-      '输出示例结构：{"status":"asking|ready","message":"...","questions":[],"brief":"...","planSummary":{}}',
+      '输出示例结构：{"status":"asking|ready","message":"...","planningChecklist":{"confirmedFacts":[],"unresolvedDecisions":[],"safeDefaults":[],"hardConstraints":[]},"questions":[],"brief":"...","planSummary":{}}',
     ].join('\n\n');
     const data = await this.collectJson(
       config,

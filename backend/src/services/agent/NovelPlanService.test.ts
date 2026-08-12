@@ -112,7 +112,7 @@ describe('NovelPlanService goal-driven agent', () => {
     ).rejects.toMatchObject({ code: 'MODEL_NOT_CONFIGURED' });
   });
 
-  it('calls the agent immediately and asks at most three high-impact questions', async () => {
+  it('calls the agent immediately and preserves the Agent-selected high-impact questions', async () => {
     const proxy = new QueueProxy([
       JSON.stringify({
         status: 'asking',
@@ -152,7 +152,7 @@ describe('NovelPlanService goal-driven agent', () => {
     );
 
     expect(result.status).toBe('asking');
-    expect(result.questions).toHaveLength(5);
+    expect(result.questions).toHaveLength(3);
     const prompt = proxy.calls[0].map((message) => message.content).join('\n');
     expect(prompt).toContain('不是固定问卷或工作流');
     expect(prompt).toContain('已识别硬约束题材：西方玄幻');
@@ -186,13 +186,7 @@ describe('NovelPlanService goal-driven agent', () => {
     );
 
     expect(result.status).toBe('asking');
-    expect(result.questions?.map((question) => question.id)).toEqual([
-      'moral_boundary',
-      'core_main_direction',
-      'core_protagonist_type',
-      'target_total_words',
-      'target_total_chapters',
-    ]);
+    expect(result.questions?.map((question) => question.id)).toEqual(['moral_boundary']);
     expect(result.planSummary).toBeUndefined();
     expect(proxy.calls).toHaveLength(1);
   });
@@ -229,13 +223,7 @@ describe('NovelPlanService goal-driven agent', () => {
     );
 
     expect(result.status).toBe('asking');
-    expect(result.questions?.map((question) => question.id)).toEqual([
-      'protagonist_identity',
-      'core_protagonist_type',
-      'target_total_words',
-      'target_total_chapters',
-      'target_words_per_chapter',
-    ]);
+    expect(result.questions?.map((question) => question.id)).toEqual(['protagonist_identity']);
     expect(proxy.calls).toHaveLength(2);
   });
 
@@ -306,6 +294,107 @@ describe('NovelPlanService goal-driven agent', () => {
     ]);
     expect(result.questions?.[0]?.question).toContain('题材类型');
     expect(result.questions?.[1]?.options.map((option) => option.id)).toContain('adventure_growth');
+    expect(proxy.calls).toHaveLength(2);
+  });
+
+  it('keeps model questions inside the explicit campus topic', async () => {
+    const proxy = new QueueProxy([
+      JSON.stringify({
+        status: 'asking',
+        message: '先确认校园故事的核心矛盾和主角起点。',
+        planningChecklist: {
+          confirmedFacts: ['题材是校园故事'],
+          unresolvedDecisions: ['校园冲突类型', '主角在学校的身份'],
+          safeDefaults: ['学校名称和城市'],
+          hardConstraints: ['不得改成玄幻或修仙'],
+        },
+        questions: [
+          {
+            id: 'campus_conflict',
+            question: '这所学校的核心矛盾更接近哪一种？',
+            impactScore: 10,
+            options: [
+              { id: 'exam', label: '升学与竞赛压力' },
+              { id: 'club', label: '社团荣誉与团队竞争' },
+            ],
+          },
+          {
+            id: 'campus_role',
+            question: '主角以哪一种校园身份开始故事？',
+            impactScore: 9,
+            options: [
+              { id: 'transfer', label: '转学生' },
+              { id: 'club_member', label: '社团成员' },
+            ],
+          },
+        ],
+      }),
+    ]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      { seedPrompt: '写一个校园故事' },
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe('asking');
+    expect(result.questions?.map((question) => question.id)).toEqual(['campus_conflict', 'campus_role']);
+    expect(result.questions?.flatMap((question) => question.options.map((option) => option.label)).join(''))
+      .not.toMatch(/魔法|修仙|骑士|王国/);
+    expect(result.planningChecklist?.unresolvedDecisions).toContain('校园冲突类型');
+  });
+
+  it('uses a topic-aware fallback when the model ignores a campus clarification', async () => {
+    const service = new NovelPlanService(
+      mockConfigService(),
+      new QueueProxy([readyDecision(), readyDecision()]),
+    );
+    const result = await service.turn(
+      { seedPrompt: '写一个校园故事' },
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe('asking');
+    const text = result.questions?.map((question) => `${question.question} ${question.options.map((option) => option.label).join(' ')}`).join('\n') ?? '';
+    expect(text).toContain('校园');
+    expect(text).not.toMatch(/魔法|修仙|骑士|王国/);
+  });
+
+  it('does not start while the Agent checklist still has unresolved decisions', async () => {
+    const proxy = new QueueProxy([
+      JSON.stringify({
+        ...JSON.parse(readyDecision()),
+        planningChecklist: {
+          confirmedFacts: ['题材已确定'],
+          unresolvedDecisions: ['结局是否开放式'],
+          safeDefaults: [],
+          hardConstraints: [],
+        },
+      }),
+      JSON.stringify({
+        status: 'asking',
+        message: '先确认结局形态。',
+        planningChecklist: {
+          confirmedFacts: ['题材已确定'],
+          unresolvedDecisions: ['结局是否开放式'],
+          safeDefaults: [],
+          hardConstraints: [],
+        },
+        questions: [{
+          id: 'ending_shape',
+          question: '结局采用哪种形态？',
+          impactScore: 9,
+          options: [{ id: 'closed', label: '完整收束' }, { id: 'open', label: '开放式' }],
+        }],
+      }),
+    ]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      { seedPrompt: '写西方玄幻，主角是流浪骑士，主线是复仇与真相，总字数10万字，总章节数40，每章2500字' },
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe('asking');
+    expect(result.questions?.map((question) => question.id)).toEqual(['ending_shape']);
     expect(proxy.calls).toHaveLength(2);
   });
 

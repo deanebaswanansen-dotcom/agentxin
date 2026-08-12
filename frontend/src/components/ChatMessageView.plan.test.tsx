@@ -96,4 +96,28 @@ describe('ChatMessageView plan card', () => {
     expect(screen.getByText('旧帝国覆灭后的阿斯塔大陆。')).toBeInTheDocument();
     expect(screen.getByText('施法消耗记忆')).toBeInTheDocument();
   });
+
+  it('shows the Agent self-checklist before its questions or final plan', () => {
+    const message: PlanTurnMessage = {
+      id: 'plan-checklist',
+      role: 'assistant',
+      kind: 'plan-turn',
+      status: 'asking',
+      round: 1,
+      message: '先确认校园故事真正的分叉点。',
+      planningChecklist: {
+        confirmedFacts: ['题材是校园故事'],
+        unresolvedDecisions: ['校园冲突类型'],
+        safeDefaults: ['学校名称'],
+        hardConstraints: ['不改成玄幻'],
+      },
+      questions: [],
+    };
+
+    render(<ChatMessageView message={message} streaming={false} />);
+
+    expect(screen.getByText('Agent 自检清单')).toBeInTheDocument();
+    expect(screen.getByText('校园冲突类型')).toBeInTheDocument();
+    expect(screen.getByText('不改成玄幻')).toBeInTheDocument();
+  });
 });
