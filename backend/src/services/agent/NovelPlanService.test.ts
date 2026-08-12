@@ -271,6 +271,38 @@ describe('NovelPlanService goal-driven agent', () => {
     expect(proxy.calls.length).toBeGreaterThanOrEqual(1);
   });
 
+  it('stops arbitrary core defaults when the provider ignores a required clarification', async () => {
+    const proxy = new QueueProxy([readyDecision(), readyDecision()]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      { seedPrompt: '写本小说' },
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe('asking');
+    expect(result.questions?.[0]?.id).toContain('core_requirements');
+    expect(result.questions?.[0]?.options.map((option) => option.id)).toEqual([
+      'user_specify',
+      'agent_fill_defaults',
+    ]);
+    expect(proxy.calls).toHaveLength(2);
+  });
+
+  it('accepts defaults only after the user explicitly authorizes them', async () => {
+    const proxy = new QueueProxy([readyDecision()]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      {
+        seedPrompt: '写本小说',
+        answers: [{ questionId: 'core_requirements_genre_main_direction_protagonist_type', selectedOptionIds: ['agent_fill_defaults'] }],
+      },
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe('ready');
+    expect(proxy.calls).toHaveLength(1);
+  });
+
   it('rejects low-value world-detail questions and asks a high-impact confirmation instead', async () => {
     const lowValue = JSON.stringify({
       status: 'asking',
@@ -385,7 +417,7 @@ describe('NovelPlanService goal-driven agent', () => {
     const service = new NovelPlanService(mockConfigService(), proxy);
     const result = await service.turn(
       {
-        seedPrompt: '写西方玄幻，两章，每章1200字',
+        seedPrompt: '写西方玄幻，两章，每章1200字，主角是流浪骑士，冒险成长',
         history: [
           { role: 'assistant', content: 'magic_cost: 魔法代价采用哪一种？' },
           { role: 'user', content: 'magic_cost：消耗记忆' },
