@@ -309,6 +309,86 @@ describe('NovelPlanService goal-driven agent', () => {
     expect(result.brief).toContain('第2章 灰烬之路 2');
   });
 
+  it('normalizes 50 chapter provider aliases instead of reporting 0/50', async () => {
+    const aliasedOutlines = Array.from({ length: 50 }, (_, index) => ({
+      chapter: index + 1,
+      chapter_title: `远征 ${index + 1}`,
+      summary: `骑士推进第 ${index + 1} 个目标，与教会发生冲突，并在章末得到下一条线索。`,
+      estimated_words: 2000,
+    }));
+    const proxy = new QueueProxy([
+      readyDecision({
+        totalWords: 100000,
+        wordsPerChapter: 2000,
+        chapterCount: 50,
+        chapterOutlines: [],
+      }),
+      JSON.stringify({ chapters: aliasedOutlines }),
+    ]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      { seedPrompt: '西方玄幻，50章，每章2000字，流浪骑士冒险成长，直接开始' },
+      new AbortController().signal,
+    );
+
+    expect(result.planSummary?.chapterOutlines).toHaveLength(50);
+    expect(result.planSummary?.chapterOutlines?.[49]).toMatchObject({
+      number: 50,
+      title: '远征 50',
+      estimatedWords: 2000,
+    });
+  });
+
+  it('requests only the missing range when a provider truncates a long outline', async () => {
+    const firstBatch = outlines(40);
+    const lastBatch = outlines(10).map((item, index) => ({
+      ...item,
+      number: 41 + index,
+      title: `灰烬之路 ${41 + index}`,
+    }));
+    const proxy = new QueueProxy([
+      readyDecision({
+        totalWords: 100000,
+        wordsPerChapter: 2000,
+        chapterCount: 50,
+        chapterOutlines: [],
+      }),
+      JSON.stringify({ chapterOutlines: firstBatch }),
+      JSON.stringify({ chapter_outlines: lastBatch }),
+    ]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      { seedPrompt: '西方玄幻，50章，每章2000字，流浪骑士冒险成长，直接开始' },
+      new AbortController().signal,
+    );
+
+    expect(result.planSummary?.chapterOutlines).toHaveLength(50);
+    expect(proxy.calls[2][0].content).toContain('只生成第 41-50 章');
+    expect(result.planSummary?.chapterOutlines?.[49].number).toBe(50);
+  });
+
+  it('recovers once when the first long-outline response parses as 0/50', async () => {
+    const proxy = new QueueProxy([
+      readyDecision({
+        totalWords: 100000,
+        wordsPerChapter: 2000,
+        chapterCount: 50,
+        chapterOutlines: [],
+      }),
+      JSON.stringify({ chapterPlan: { note: 'provider-specific shape' } }),
+      JSON.stringify({ chapterOutlines: outlines(50) }),
+    ]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      { seedPrompt: '西方玄幻，50章，每章2000字，流浪骑士冒险成长，直接开始' },
+      new AbortController().signal,
+    );
+
+    expect(result.planSummary?.chapterOutlines).toHaveLength(50);
+    expect(proxy.calls[2][0].content).toContain('只生成第 1-50 章');
+    expect(proxy.calls[2][1].content).toContain('首次返回无法解析');
+  });
+
   it('builds a complete Story Plan with a dedicated agent call when the draft is shallow', async () => {
     const storyPlan = JSON.parse(readyDecision()).planSummary.storyPlan;
     const proxy = new QueueProxy([
