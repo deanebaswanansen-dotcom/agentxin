@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 
 import type { ReferenceAnalysisService } from '../services/reference/ReferenceAnalysisService.js';
+import { corsResponseHeaders } from '../cors.js';
 import type {
   Id,
   ReferenceAnalyzeRequest,
@@ -9,6 +10,7 @@ import type {
   SimilarityCheckRequest,
 } from '../types/index.js';
 import { toErrorResponse } from './errorMapping.js';
+import { startSseHeartbeat } from './sseHeartbeat.js';
 
 interface IdParams {
   id: Id;
@@ -16,6 +18,11 @@ interface IdParams {
 
 interface ProjectParams {
   projectId: Id;
+}
+
+function sseFrame(event: string, data?: string): string {
+  const head = `event: ${event}\n`;
+  return data === undefined ? `${head}\n` : `${head}data: ${data}\n\n`;
 }
 
 export function registerReferenceRoutes(
@@ -73,6 +80,60 @@ export function registerReferenceRoutes(
       } catch (error) {
         const { status, body } = toErrorResponse(error);
         return reply.code(status).send(body);
+      }
+    },
+  );
+
+  // Reference analysis may perform multiple model passes (summary, extraction,
+  // and chapter outfit continuity). Keep the connection active while those
+  // passes run so the browser and reverse proxies do not turn a healthy job
+  // into a 45-second timeout.
+  app.post<{ Params: IdParams; Body: ReferenceAnalyzeRequest }>(
+    '/api/references/:id/analyze-stream',
+    async (request, reply) => {
+      reply.hijack();
+      const raw = reply.raw;
+      raw.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+        ...corsResponseHeaders(),
+      });
+      const stopHeartbeat = startSseHeartbeat(raw);
+      const controller = new AbortController();
+      const onClose = (): void => {
+        if (!raw.writableEnded) controller.abort();
+      };
+      raw.on('close', onClose);
+
+      try {
+        if (!raw.writableEnded) {
+          raw.write(
+            sseFrame(
+              'progress',
+              JSON.stringify({ message: '参考小说拆解已开始，正在提取剧情、人物与大纲…' }),
+            ),
+          );
+        }
+        const result = await service.analyze(
+          request.params.id,
+          controller.signal,
+          request.body ?? {},
+        );
+        if (!controller.signal.aborted && !raw.writableEnded) {
+          raw.write(sseFrame('result', JSON.stringify(result)));
+          raw.write(sseFrame('done'));
+        }
+      } catch (error) {
+        if (!controller.signal.aborted && !raw.writableEnded) {
+          const { body } = toErrorResponse(error);
+          raw.write(sseFrame('error', JSON.stringify(body)));
+        }
+      } finally {
+        stopHeartbeat();
+        raw.removeListener('close', onClose);
+        if (!raw.writableEnded) raw.end();
       }
     },
   );

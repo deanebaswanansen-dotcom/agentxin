@@ -710,6 +710,40 @@ async function streamPlanTurn(
   return result;
 }
 
+async function streamReferenceAnalyze(
+  baseUrl: string,
+  referenceId: Id,
+  body: ReferenceAnalyzeRequest,
+  signal?: AbortSignal,
+): Promise<ReferenceAnalyzeResult> {
+  let result: ReferenceAnalyzeResult | undefined;
+  await streamSse(
+    `${baseUrl}/references/${seg(referenceId)}/analyze-stream`,
+    body,
+    { signal },
+    (event) => {
+      if (event.event === 'progress') return true;
+      if (event.event === 'result') {
+        try {
+          result = JSON.parse(event.data) as ReferenceAnalyzeResult;
+        } catch {
+          throw new ApiClientError({
+            error: { code: 'PROVIDER_ERROR', message: '参考拆解 Agent 返回了无效结果。' },
+          });
+        }
+        return true;
+      }
+      return false;
+    },
+  );
+  if (result === undefined) {
+    throw new ApiClientError({
+      error: { code: 'PROVIDER_ERROR', message: '参考拆解数据流结束，但没有返回分析结果。' },
+    });
+  }
+  return result;
+}
+
 /**
  * Consume the writing SSE stream for a chapter. Thin wrapper over
  * {@link streamSse} preserving the original `write()` behavior and signature.
@@ -1406,10 +1440,7 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
       get: (id, signal) => request(b, 'GET', `/references/${seg(id)}`, undefined, { signal }),
       import: (body, signal) => request(b, 'POST', '/references/import', body, { signal }),
       analyze: (id, body, signal) =>
-        request(b, 'POST', `/references/${seg(id)}/analyze`, body ?? {}, {
-          signal,
-          includeModelConfig: true,
-        }),
+        streamReferenceAnalyze(b, id, body ?? {}, signal),
       transfer: (projectId, body, signal) =>
         request(b, 'POST', `/projects/${seg(projectId)}/reference-transfer`, body, {
           signal,

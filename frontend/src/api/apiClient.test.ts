@@ -146,6 +146,34 @@ describe('apiClient request building', () => {
     expect((init?.headers as Record<string, string>).Accept).toBe('text/event-stream');
   });
 
+  it('consumes reference analysis over SSE so multi-pass extraction stays active', async () => {
+    const result = {
+      reference: { id: 'ref-1', title: '样例', depth: 'standard', status: 'ready' },
+      profile: {},
+      analysisProjectId: 'project-1',
+      analysisProjectName: '小说拆解 · 样例',
+      artifacts: [],
+      chaptersAnalyzed: 2,
+      chaptersSelected: 2,
+      message: '完成',
+    };
+    const mock = installFetch(() =>
+      sseResponse([
+        ': heartbeat\n\n',
+        'event: progress\ndata: {"message":"拆解中"}\n\n',
+        `event: result\ndata: ${JSON.stringify(result)}\n\n`,
+        'event: done\n\n',
+      ]),
+    );
+
+    await expect(
+      client().references.analyze('ref-1', { chapterIds: ['chapter-1', 'chapter-2'] }),
+    ).resolves.toEqual(result);
+    const [url, init] = mock.mock.calls[0];
+    expect(url).toBe('/api/references/ref-1/analyze-stream');
+    expect((init?.headers as Record<string, string>).Accept).toBe('text/event-stream');
+  });
+
   it('migrates retired DeepSeek model aliases without touching custom gateways', () => {
     expect(
       migrateStoredModelConfig({
