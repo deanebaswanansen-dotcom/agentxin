@@ -249,23 +249,67 @@ function normalizeOutlines(
   raw: unknown,
   chapterCount: number,
   wordsPerChapter: number,
+  startNumber = 1,
 ): NovelPlanChapterOutline[] {
-  if (!Array.isArray(raw)) return [];
+  const rows = Array.isArray(raw)
+    ? raw
+    : isRecord(raw)
+      ? Object.values(raw).filter(isRecord)
+      : [];
   const result: NovelPlanChapterOutline[] = [];
-  for (const item of raw) {
+  for (const item of rows) {
     if (!isRecord(item)) continue;
-    const title = typeof item.title === 'string' ? item.title.trim() : '';
-    const goal = typeof item.goal === 'string' ? item.goal.trim() : '';
+    const title = recordTextAny(item, 'title', 'name', 'chapterTitle', 'chapter_title', '章节标题');
+    const goal = recordTextAny(
+      item,
+      'goal',
+      'summary',
+      'outline',
+      'plot',
+      'objective',
+      'content',
+      'chapterGoal',
+      'chapter_goal',
+      '本章任务',
+      '章节概要',
+    );
     if (!title || !goal) continue;
     result.push({
-      number: result.length + 1,
+      number: startNumber + result.length,
       title,
       goal,
-      estimatedWords: parsePositiveInt(item.estimatedWords) ?? wordsPerChapter,
+      estimatedWords:
+        parsePositiveInt(
+          item.estimatedWords ??
+            item.estimated_words ??
+            item.wordCount ??
+            item.word_count ??
+            item.targetWords ??
+            item.target_words ??
+            item.目标字数,
+        ) ?? wordsPerChapter,
     });
     if (result.length >= chapterCount) break;
   }
   return result;
+}
+
+function outlinePayload(data: Record<string, unknown>): unknown {
+  const summary = isRecord(data.planSummary)
+    ? data.planSummary
+    : isRecord(data.plan_summary)
+      ? data.plan_summary
+      : undefined;
+  return (
+    data.chapterOutlines ??
+    data.chapter_outlines ??
+    data.chapters ??
+    data.outlines ??
+    data.分章大纲 ??
+    summary?.chapterOutlines ??
+    summary?.chapter_outlines ??
+    summary?.chapters
+  );
 }
 
 function stringArray(raw: unknown): string[] {
@@ -1054,7 +1098,8 @@ export class NovelPlanService {
         {
           role: 'system',
           content: [
-            '你是分章策划 Agent。只输出 JSON：{"chapterOutlines":[...]}。',
+            '你是分章策划 Agent。只输出 JSON，不要 Markdown。根对象只能有 chapterOutlines 字段。',
+            '严格结构：{"chapterOutlines":[{"number":1,"title":"章节标题","goal":"角色行动；具体冲突或状态变化；章末推进","estimatedWords":2000}]}。',
             `必须连续生成 ${scale.chapterCount} 章，每章约 ${scale.wordsPerChapter} 字，不得缺章、跳号或写正文。`,
             '每章 goal 必须写明：角色行动、具体冲突/状态变化、章末推进；相邻章节必须有因果关系。',
             '用户硬约束优先级最高，不得换题材、换时代、换文化背景。',
@@ -1073,15 +1118,63 @@ export class NovelPlanService {
         },
       ],
       signal,
+      16384,
     );
     if (!isRecord(data)) throw new ProxyError('分章策划 Agent 未返回有效 JSON。');
-    const outlines = normalizeOutlines(
-      data.chapterOutlines,
+    let outlines = normalizeOutlines(
+      outlinePayload(data),
       scale.chapterCount,
       scale.wordsPerChapter,
     );
+    if (outlines.length < scale.chapterCount) {
+      const missing = scale.chapterCount - outlines.length;
+      const start = outlines.length + 1;
+      const continuation = await this.collectJson(
+        config,
+        [
+          {
+            role: 'system',
+            content: [
+              '你是分章策划补全 Agent。只输出 JSON，不要 Markdown。根对象只能有 chapterOutlines 字段。',
+              `只生成第 ${start}-${scale.chapterCount} 章，共 ${missing} 章；不得重复已有章节。`,
+              `每章约 ${scale.wordsPerChapter} 字；字段固定为 number、title、goal、estimatedWords。`,
+              'goal 必须包含角色行动、具体冲突或状态变化、章末推进，并承接已有最后章节。',
+              explicitGenre ? `题材必须是：${explicitGenre}。` : '',
+            ]
+              .filter(Boolean)
+              .join('\n'),
+          },
+          {
+            role: 'user',
+            content: [
+              sessionText(seed, history, answers),
+              '当前策划摘要：',
+              JSON.stringify({ ...summary, chapterOutlines: undefined }, null, 2),
+              outlines.length > 0 ? '已有最后三章：' : '首次返回无法解析，请按严格结构重新生成全部章节：',
+              outlines.length > 0 ? JSON.stringify(outlines.slice(-3), null, 2) : '无',
+            ].join('\n\n'),
+          },
+        ],
+        signal,
+        Math.min(16384, Math.max(4096, missing * 320)),
+      );
+      if (isRecord(continuation)) {
+        outlines = [
+          ...outlines,
+          ...normalizeOutlines(
+            outlinePayload(continuation),
+            missing,
+            scale.wordsPerChapter,
+            start,
+          ),
+        ];
+      }
+    }
     if (outlines.length !== scale.chapterCount) {
-      throw new ProxyError(`分章策划 Agent 只返回 ${outlines.length}/${scale.chapterCount} 章，请重试。`);
+      const keys = Object.keys(data).slice(0, 8).join('、') || '无';
+      throw new ProxyError(
+        `分章策划 Agent 只返回 ${outlines.length}/${scale.chapterCount} 章（返回字段：${keys}），请重试。`,
+      );
     }
     const planSummary = ensureStructuredStoryPlan({
       ...summary,
