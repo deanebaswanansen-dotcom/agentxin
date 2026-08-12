@@ -472,6 +472,8 @@ export interface NovelPlanSummary {
   wordsPerChapter?: number;
   /** 计划章节数。 */
   chapterCount?: number;
+  /** 全书目标卷数。 */
+  volumeCount?: number;
   /** 当前已展开的章节规划窗口末章；长篇计划按窗口滚动展开。 */
   plannedThroughChapter?: number;
   planConfig?: NovelPlanConfig;

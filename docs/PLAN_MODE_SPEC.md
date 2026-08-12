@@ -9,7 +9,7 @@
 - 已知信息禁止重复询问；低风险设定禁止询问。
 - 只有答案会改变主线、结局或不可逆结构时才追问；不得把计划模式变成固定问卷。
 - 目标参数与用户硬约束优先；缺失参数由 Agent 做可修改的专业默认决策。
-- 题材、主线或主角起点等核心方向缺失时，必须先 asking 并展示可选项与“其他/补充”入口；用户选择/补充后才能 ready。用户点击“够了，出方案”时，视为明确允许 Agent 为仍缺失的细节采用可修改的专业默认值。
+- 题材、主线、主角起点、全文目标字数、总章节数、单章字数和卷数等高影响参数缺失时，必须先 asking 并展示可选项与“其他/补充”入口；同一轮展示的问题必须全部回答后才能继续。用户点击“跳过未答项，直接出方案”时，视为明确允许 Agent 为仍缺失的细节采用可修改的专业默认值。
 - 最终结果包含执行 brief、全文/分卷/阶段层级和当前滚动章节窗口；正文由 Writer Agent 读取当前章节计划后生成。
 
 请求中的 `planConfig` 同时接受 SPEC 的 snake_case 字段与前端使用的 camelCase 字段：
@@ -53,21 +53,23 @@
 ## Code Style
 
 ```ts
-const questions = decision.questions
-  .filter(isHighValueQuestion)
-  .filter((question) => !alreadyAsked(question, history))
-  .slice(0, questionBudget);
+const questions = selectPlanningQuestions(
+  decision.questions,
+  missingRequirements,
+  history,
+  questionBudget,
+);
 ```
 
 函数使用动词命名，边界输入先归一化；计划规则集中在服务层，界面只负责呈现和提交结构化答案。
 
 ## Testing Strategy
 
-- 单元测试验证配置优先级、0 问/追问、低价值问题拒绝、重复问题拒绝、滚动章节窗口与强制收束。
+- 单元测试验证配置优先级、规模参数追问、0 问/追问、低价值问题拒绝、重复问题拒绝、滚动章节窗口与强制收束。
 - 单元测试必须证明问题来自模型决策，不得由服务端固定题库在模型调用前短路。
-- 回答一题后仍有核心方向缺口且提问预算未耗尽时，必须再次执行 Agent 决策，不得因界面轮次提前收束。
+- 当前一轮问题回答后仍有高影响缺口且提问预算未耗尽时，必须再次执行 Agent 决策，不得因界面轮次提前收束。
 - 集成测试验证 Story Plan 能穿过 Agent 路由并写入项目资料与长期记忆。
-- 前端测试验证题目 ID/文本进入历史、选项标签提交、Story Plan 可见。
+- 前端测试验证题目 ID/文本进入历史、所有当前问题完成后才可提交、选项标签提交、Story Plan 可见。
 - 部署前执行前后端全量测试、构建和阿里云 `/api/agent/plan/turn-stream` SSE 回归。
 
 ## Boundaries
@@ -79,7 +81,7 @@ const questions = decision.questions
 ## Success Criteria
 
 - 结构化字段会在请求中传入 Planner；填写完整时可直接生成计划，缺失字段由 Agent 自主补全或提出高影响问题。
-- 同一问题 ID 在一次计划会话中只出现 1 次；问题数量由 Agent 决策，不使用固定题库。
+- 同一问题 ID 在一次计划会话中只出现 1 次；问题由 Agent 决策，服务端只对未确认的高影响字段提供兜底。
 - 计划层级至少包含全文规模、分卷范围、卷内阶段目标与当前章节窗口；400 章等长篇目标不一次性展开全部细节。
 - 生成任务收到完整 Story Plan，项目资料中保存 `Story Plan（计划锁定）`。
 - 阿里云正式站计划 SSE 必须先返回进度帧，最终进入 `asking` 或 `ready`，无 502/空结果。

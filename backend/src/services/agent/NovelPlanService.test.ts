@@ -152,12 +152,12 @@ describe('NovelPlanService goal-driven agent', () => {
     );
 
     expect(result.status).toBe('asking');
-    expect(result.questions).toHaveLength(3);
+    expect(result.questions).toHaveLength(5);
     const prompt = proxy.calls[0].map((message) => message.content).join('\n');
     expect(prompt).toContain('不是固定问卷或工作流');
     expect(prompt).toContain('已识别硬约束题材：西方玄幻');
     expect(prompt).toContain('信息足以形成方向时可以 0 问并立即 ready');
-    expect(prompt).toContain('主动提问总预算剩余 3 题');
+    expect(prompt).toContain('主动提问总预算剩余 10 题');
     expect(proxy.options[0]).toMatchObject({ jsonMode: true, disableThinking: true });
   });
 
@@ -186,7 +186,13 @@ describe('NovelPlanService goal-driven agent', () => {
     );
 
     expect(result.status).toBe('asking');
-    expect(result.questions?.map((question) => question.id)).toEqual(['moral_boundary']);
+    expect(result.questions?.map((question) => question.id)).toEqual([
+      'moral_boundary',
+      'core_main_direction',
+      'core_protagonist_type',
+      'target_total_words',
+      'target_total_chapters',
+    ]);
     expect(result.planSummary).toBeUndefined();
     expect(proxy.calls).toHaveLength(1);
   });
@@ -223,7 +229,13 @@ describe('NovelPlanService goal-driven agent', () => {
     );
 
     expect(result.status).toBe('asking');
-    expect(result.questions?.map((question) => question.id)).toEqual(['protagonist_identity']);
+    expect(result.questions?.map((question) => question.id)).toEqual([
+      'protagonist_identity',
+      'core_protagonist_type',
+      'target_total_words',
+      'target_total_chapters',
+      'target_words_per_chapter',
+    ]);
     expect(proxy.calls).toHaveLength(2);
   });
 
@@ -249,7 +261,9 @@ describe('NovelPlanService goal-driven agent', () => {
       ]),
     );
     const result = await service.turn(
-      { seedPrompt: '写西方玄幻，主角是流浪骑士，走冒险成长主线，正统史诗风格' },
+      {
+        seedPrompt: '写西方玄幻，主角是流浪骑士，走冒险成长主线，正统史诗风格',
+      },
       new AbortController().signal,
     );
 
@@ -262,7 +276,10 @@ describe('NovelPlanService goal-driven agent', () => {
     ]);
     const service = new NovelPlanService(mockConfigService(), proxy);
     const result = await service.turn(
-      { seedPrompt: '写西方玄幻，主角是流浪骑士，走冒险成长主线，正统史诗风格' },
+      {
+        seedPrompt:
+          '写西方玄幻，主角是流浪骑士，走冒险成长主线，正统史诗风格；总字数30万字，总章节数100，每章3000字，5卷，苦尽甘来，慢热群像不后宫',
+      },
       new AbortController().signal,
     );
 
@@ -284,6 +301,8 @@ describe('NovelPlanService goal-driven agent', () => {
       'core_genre',
       'core_main_direction',
       'core_protagonist_type',
+      'target_total_words',
+      'target_total_chapters',
     ]);
     expect(result.questions?.[0]?.question).toContain('题材类型');
     expect(result.questions?.[1]?.options.map((option) => option.id)).toContain('adventure_growth');
@@ -404,7 +423,7 @@ describe('NovelPlanService goal-driven agent', () => {
     const service = new NovelPlanService(mockConfigService(), proxy);
     const result = await service.turn(
       {
-        seedPrompt: '写西方玄幻，两章，每章1200字，主角是流浪骑士，冒险成长',
+        seedPrompt: '写西方玄幻，总字数2400字，总章节数2，每章1200字，主角是流浪骑士，冒险成长，5卷，苦尽甘来，慢热群像不后宫',
         history: [
           { role: 'assistant', content: 'magic_cost: 魔法代价采用哪一种？' },
           { role: 'user', content: 'magic_cost：消耗记忆' },
@@ -661,6 +680,12 @@ describe('planning facts', () => {
         { questionId: 'chapter_count', selectedOptionIds: ['ch_50'] },
       ]).chapterCount,
     ).toBe(MAX_OUTLINE_CHAPTERS);
+    expect(
+      collectScaleFromSession([], [
+        { questionId: 'target_volume_count', selectedOptionIds: ['volumes_5'] },
+      ]).volumeCount,
+    ).toBe(5);
+    expect(extractScaleFromText('全书30万字，分成5卷').volumeCount).toBe(5);
     expect(extractScaleFromText('前3章要精彩，第1章内解决冲突').chapterCount).toBeUndefined();
   });
 

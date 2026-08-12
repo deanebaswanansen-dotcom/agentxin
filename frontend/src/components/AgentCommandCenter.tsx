@@ -591,7 +591,7 @@ export function AgentCommandCenter({
 
   const canSubmitPlan = useMemo(() => {
     if (planBusy || running || planPhase !== 'asking') return false;
-    return planQuestions.some((q) => {
+    return planQuestions.length > 0 && planQuestions.every((q) => {
       const a = planAnswers[q.id];
       return Boolean(a && (a.selectedOptionIds.length > 0 || a.customText.trim().length > 0));
     });
@@ -910,7 +910,7 @@ export function AgentCommandCenter({
                     disabled={!canSubmitPlan}
                     onClick={() => void submitPlanAnswers(false)}
                   >
-                    {planBusy ? '提交中…' : '提交回答，继续追问'}
+                    {planBusy ? '提交中…' : '回答全部问题，继续追问'}
                   </button>
                   <button
                     type="button"
@@ -918,7 +918,7 @@ export function AgentCommandCenter({
                     disabled={planBusy || running}
                     onClick={() => void submitPlanAnswers(true)}
                   >
-                    够了，直接出方案
+                    跳过未答项，直接出方案
                   </button>
                 </>
               ) : null}

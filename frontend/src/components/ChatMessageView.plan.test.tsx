@@ -1,10 +1,54 @@
-import { render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { fireEvent, render, screen } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { PlanTurnMessage } from './chat/types.js';
 import { ChatMessageView } from './ChatMessageView.js';
 
 describe('ChatMessageView plan card', () => {
+  it('requires every displayed planning question before normal submission', () => {
+    const onPlanSubmit = vi.fn();
+    const message: PlanTurnMessage = {
+      id: 'plan-asking',
+      role: 'assistant',
+      kind: 'plan-turn',
+      status: 'asking',
+      round: 1,
+      message: '请确认高影响参数。',
+      questions: [
+        {
+          id: 'target_total_words',
+          question: '全书目标总字数？',
+          impactScore: 8,
+          options: [{ id: 'total_100k', label: '约 10 万字' }],
+        },
+        {
+          id: 'target_words_per_chapter',
+          question: '每章目标字数？',
+          impactScore: 8,
+          options: [{ id: 'wpc_2500', label: '约 2500 字' }],
+        },
+      ],
+    };
+
+    render(<ChatMessageView message={message} streaming={false} onPlanSubmit={onPlanSubmit} />);
+
+    const submit = screen.getByRole('button', { name: '回答全部问题，继续策划' });
+    expect(submit).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: '约 10 万字' }));
+    expect(submit).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: '约 2500 字' }));
+    expect(submit).toBeEnabled();
+    fireEvent.click(submit);
+    expect(onPlanSubmit).toHaveBeenCalledWith(
+      'plan-asking',
+      expect.arrayContaining([
+        expect.objectContaining({ questionId: 'target_total_words' }),
+        expect.objectContaining({ questionId: 'target_words_per_chapter' }),
+      ]),
+      false,
+    );
+  });
+
   it('renders the reusable structured Story Plan', () => {
     const message: PlanTurnMessage = {
       id: 'plan-1',
