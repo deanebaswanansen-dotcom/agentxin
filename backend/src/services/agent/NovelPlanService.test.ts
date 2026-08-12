@@ -156,7 +156,7 @@ describe('NovelPlanService goal-driven agent', () => {
     const prompt = proxy.calls[0].map((message) => message.content).join('\n');
     expect(prompt).toContain('不是固定问卷或工作流');
     expect(prompt).toContain('已识别硬约束题材：西方玄幻');
-    expect(prompt).toContain('信息足以形成方向时可以 0 问并立即 ready');
+    expect(prompt).toContain('本轮必须 asking');
     expect(prompt).toContain('主动提问总预算剩余 3 题');
     expect(proxy.options[0]).toMatchObject({ jsonMode: true, disableThinking: true });
   });
@@ -227,7 +227,7 @@ describe('NovelPlanService goal-driven agent', () => {
     expect(proxy.calls).toHaveLength(2);
   });
 
-  it('rejects an invalid asking shape and tells the agent to finish', async () => {
+  it('rejects an invalid asking shape and asks the agent for a valid confirmation', async () => {
     const service = new NovelPlanService(
       mockConfigService(),
       new QueueProxy([
@@ -236,7 +236,16 @@ describe('NovelPlanService goal-driven agent', () => {
           message: '需要确认方向。',
           questions: [{ id: 'direction', question: '想写什么方向？', options: [] }],
         }),
-        readyDecision(),
+        JSON.stringify({
+          status: 'asking',
+          message: '开写前确认主线。',
+          questions: [{
+            id: 'main_direction',
+            question: '主线最偏向哪一种核心体验？',
+            impactScore: 9,
+            options: [{ id: 'quest', label: '冒险远征' }, { id: 'war', label: '王国战争' }],
+          }],
+        }),
       ]),
     );
     const result = await service.turn(
@@ -244,23 +253,40 @@ describe('NovelPlanService goal-driven agent', () => {
       new AbortController().signal,
     );
 
-    expect(result.status).toBe('ready');
+    expect(result.status).toBe('asking');
   });
 
-  it('asks zero questions when the user already supplied the core direction', async () => {
-    const proxy = new QueueProxy([readyDecision()]);
+  it('requires a confirmation question on the first turn unless the user explicitly bypasses planning', async () => {
+    const proxy = new QueueProxy([
+      readyDecision(),
+      JSON.stringify({
+        status: 'asking',
+        message: '开写前确认一个会改变成书效果的选择。',
+        questions: [
+          {
+            id: 'story_emphasis',
+            question: '这本书最希望读者记住哪一种核心体验？',
+            impactScore: 9,
+            options: [
+              { id: 'epic_quest', label: '史诗冒险' },
+              { id: 'tragic_growth', label: '悲剧成长' },
+            ],
+          },
+        ],
+      }),
+    ]);
     const service = new NovelPlanService(mockConfigService(), proxy);
     const result = await service.turn(
       { seedPrompt: '写西方玄幻，主角是流浪骑士，走冒险成长主线，正统史诗风格' },
       new AbortController().signal,
     );
 
-    expect(result.status).toBe('ready');
-    expect(result.planSummary?.storyPlan?.metadata.genre).toBe('西方玄幻');
-    expect(proxy.calls).toHaveLength(1);
+    expect(result.status).toBe('asking');
+    expect(result.questions?.map((question) => question.id)).toEqual(['story_emphasis']);
+    expect(proxy.calls).toHaveLength(2);
   });
 
-  it('rejects low-value world-detail questions and tells the agent to finish', async () => {
+  it('rejects low-value world-detail questions and asks a high-impact confirmation instead', async () => {
     const lowValue = JSON.stringify({
       status: 'asking',
       message: '确认细节。',
@@ -276,14 +302,23 @@ describe('NovelPlanService goal-driven agent', () => {
         },
       ],
     });
-    const proxy = new QueueProxy([lowValue, readyDecision()]);
+    const proxy = new QueueProxy([lowValue, JSON.stringify({
+      status: 'asking',
+      message: '改问会改变故事结构的选择。',
+      questions: [{
+        id: 'main_direction',
+        question: '主线最偏向哪一种核心体验？',
+        impactScore: 9,
+        options: [{ id: 'quest', label: '冒险远征' }, { id: 'war', label: '王国战争' }],
+      }],
+    })]);
     const service = new NovelPlanService(mockConfigService(), proxy);
     const result = await service.turn(
       { seedPrompt: '写西方玄幻，主角是流浪骑士，走冒险成长主线，正统史诗风格' },
       new AbortController().signal,
     );
 
-    expect(result.status).toBe('ready');
+    expect(result.status).toBe('asking');
     expect(proxy.calls).toHaveLength(2);
   });
 

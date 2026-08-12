@@ -796,6 +796,8 @@ export class NovelPlanService {
     const history = Array.isArray(request.history) ? request.history : [];
     const target = request.targetTask ?? 'long_novel';
     const bypass = hasExplicitPlanningBypass(seed);
+    const requiresFirstTurnConfirmation =
+      !bypass && history.length === 0 && (request.answers?.length ?? 0) === 0;
     const askedIds = askedQuestionIds(history, request.answers);
     const questionBudget = Math.max(0, TOTAL_QUESTION_BUDGET - askedIds.size);
     const knownText = sessionText(seed, history, request.answers);
@@ -818,6 +820,7 @@ export class NovelPlanService {
       questionBudget,
       missingCore,
       signal,
+      requiresFirstTurnConfirmation,
     );
 
     if (!mustFinish && decision.status === 'asking') {
@@ -839,7 +842,7 @@ export class NovelPlanService {
     // one answer. Give the planning Agent one strict correction turn so the
     // remaining high-impact decisions are considered. This is model-driven;
     // no local fixed questionnaire is substituted.
-    if (!mustFinish && missingCore.length > 0) {
+    if (!mustFinish && (requiresFirstTurnConfirmation || missingCore.length > 0)) {
       decision = await this.generateDecision(
         config,
         seed,
@@ -866,6 +869,10 @@ export class NovelPlanService {
           };
         }
       }
+    }
+
+    if (requiresFirstTurnConfirmation) {
+      throw new ProxyError('计划模式首次决策必须先向用户确认至少一个关键选择，请重试本轮。');
     }
 
     if (decision.status !== 'ready' || !decision.planSummary) {
@@ -949,7 +956,7 @@ export class NovelPlanService {
       forceReady
         ? '本轮必须 ready。信息不足时采用清晰、可修改的专业默认值，不得继续提问。'
         : requireQuestion
-          ? '本轮必须 asking：从 Requirement State 缺口中提出 1-3 个尚未问过的高影响问题，不得返回 ready。'
+          ? '本轮必须 asking：提出 1-3 个尚未问过的高影响问题，不得返回 ready；即使核心方向已足够，也要让用户确认一个会改变成书效果的关键选择。'
         : '信息足以形成方向时可以 0 问并立即 ready；不要为了凑轮数而提问。',
       missingCore.length > 0
         ? `Requirement State 尚缺核心方向：${missingCore.join('、')}。只从这些缺口中选择真正高影响的问题。`
