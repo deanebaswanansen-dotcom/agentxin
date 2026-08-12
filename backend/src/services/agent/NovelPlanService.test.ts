@@ -156,7 +156,7 @@ describe('NovelPlanService goal-driven agent', () => {
     const prompt = proxy.calls[0].map((message) => message.content).join('\n');
     expect(prompt).toContain('不是固定问卷或工作流');
     expect(prompt).toContain('已识别硬约束题材：西方玄幻');
-    expect(prompt).toContain('本轮必须 asking');
+    expect(prompt).toContain('信息足以形成方向时可以 0 问并立即 ready');
     expect(prompt).toContain('主动提问总预算剩余 3 题');
     expect(proxy.options[0]).toMatchObject({ jsonMode: true, disableThinking: true });
   });
@@ -256,24 +256,9 @@ describe('NovelPlanService goal-driven agent', () => {
     expect(result.status).toBe('asking');
   });
 
-  it('requires a confirmation question on the first turn unless the user explicitly bypasses planning', async () => {
+  it('lets the Agent finish immediately when the request already contains enough direction', async () => {
     const proxy = new QueueProxy([
       readyDecision(),
-      JSON.stringify({
-        status: 'asking',
-        message: '开写前确认一个会改变成书效果的选择。',
-        questions: [
-          {
-            id: 'story_emphasis',
-            question: '这本书最希望读者记住哪一种核心体验？',
-            impactScore: 9,
-            options: [
-              { id: 'epic_quest', label: '史诗冒险' },
-              { id: 'tragic_growth', label: '悲剧成长' },
-            ],
-          },
-        ],
-      }),
     ]);
     const service = new NovelPlanService(mockConfigService(), proxy);
     const result = await service.turn(
@@ -281,23 +266,9 @@ describe('NovelPlanService goal-driven agent', () => {
       new AbortController().signal,
     );
 
-    expect(result.status).toBe('asking');
-    expect(result.questions?.map((question) => question.id)).toEqual(['story_emphasis']);
-    expect(proxy.calls).toHaveLength(2);
-  });
-
-  it('falls back to one targeted confirmation when the model ignores the first-turn asking requirement', async () => {
-    const proxy = new QueueProxy([readyDecision(), readyDecision()]);
-    const service = new NovelPlanService(mockConfigService(), proxy);
-    const result = await service.turn(
-      { seedPrompt: '写一本骑士小说' },
-      new AbortController().signal,
-    );
-
-    expect(result.status).toBe('asking');
-    expect(result.questions).toHaveLength(1);
-    expect(result.questions?.[0]?.id).toBe('genre_direction');
-    expect(result.questions?.[0]?.options).toHaveLength(4);
+    expect(result.status).toBe('ready');
+    expect(result.questions).toEqual([]);
+    expect(proxy.calls.length).toBeGreaterThanOrEqual(1);
   });
 
   it('rejects low-value world-detail questions and asks a high-impact confirmation instead', async () => {
@@ -356,6 +327,43 @@ describe('NovelPlanService goal-driven agent', () => {
       '题材固定为西方玄幻，不得替换成其他题材或时代背景',
     );
     expect(result.brief).toContain('原始需求：西方玄幻');
+  });
+
+  it('honors structured SPEC fields and rolls a long plan out in a chapter window', async () => {
+    const proxy = new QueueProxy([
+      readyDecision({
+        totalWords: 1_000_000,
+        wordsPerChapter: 2500,
+        chapterCount: 400,
+        chapterOutlines: [],
+      }),
+      JSON.stringify({ chapterOutlines: outlines(50) }),
+    ]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      {
+        seedPrompt: '请开始计划',
+        planConfig: {
+          targetTotalWords: 1_000_000,
+          targetTotalChapters: 400,
+          targetWordsPerChapter: { min: 2500, max: 3000 },
+          targetVolumeCount: 10,
+          genres: ['东方玄幻', '学院', '冒险'],
+          coreStory: '主角进入学院后发现世界隐藏的秘密，最终卷入战争。',
+          endingDirection: '苦尽甘来',
+          writingRequirements: '慢热、群像、不后宫',
+        },
+      },
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe('ready');
+    expect(result.planSummary?.chapterCount).toBe(400);
+    expect(result.planSummary?.planConfig?.targetVolumeCount).toBe(10);
+    expect(result.planSummary?.endingDirection).toBe('苦尽甘来');
+    expect(result.planSummary?.plannedThroughChapter).toBe(50);
+    expect(result.planSummary?.chapterOutlines).toHaveLength(50);
+    expect(proxy.calls[1][0].content).toContain('当前滚动窗口');
   });
 
   it('filters repeated questions and asks the Agent to reconsider unresolved core decisions', async () => {

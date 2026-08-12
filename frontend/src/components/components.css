@@ -3955,6 +3955,45 @@
 }
 
 /* —— 对话内计划模式卡片 —— */
+.nwa-plan-config {
+  display: grid;
+  gap: 0.6rem;
+  flex: 1 1 100%;
+  padding: 0.65rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: var(--bg-editor, var(--bg-surface));
+}
+
+.nwa-plan-config__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: 0.5rem;
+}
+
+.nwa-plan-config label {
+  display: grid;
+  gap: 0.25rem;
+  color: var(--text-secondary);
+  font-size: var(--fs-xs);
+}
+
+.nwa-plan-config input,
+.nwa-plan-config textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.42rem 0.5rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  background: var(--bg-panel-solid, var(--bg-surface));
+  color: var(--text-primary);
+  font: inherit;
+}
+
+.nwa-plan-config__wide {
+  width: 100%;
+}
+
 .nwa-chat__msg--plan {
   max-width: 100%;
   gap: 0.65rem;

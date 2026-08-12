@@ -68,4 +68,46 @@ describe('planRoutes turn-stream', () => {
     expect(response.body).toContain('event: error');
     expect(response.body).toContain('VALIDATION_ERROR');
   });
+
+  it('accepts the SPEC snake_case plan configuration without a seed prompt', async () => {
+    const turn = vi.fn().mockResolvedValue({
+      status: 'ready',
+      round: 1,
+      message: '已形成计划。',
+      questions: [],
+    }) as unknown as NovelPlanService['turn'];
+    await buildApp(turn);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/agent/plan/turn-stream',
+      payload: {
+        planConfig: {
+          target_total_words: '100万字',
+          target_total_chapters: '400章',
+          target_words_per_chapter: '2500~3000',
+          target_volume_count: 10,
+          genre: '东方玄幻 + 学院 + 冒险',
+          core_story: '主角进入学院后发现世界隐藏的秘密。',
+          ending_direction: '苦尽甘来',
+          writing_requirements: '慢热、群像',
+        },
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain('event: result');
+    expect(turn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        seedPrompt: '请根据结构化计划配置自动生成小说计划',
+        planConfig: expect.objectContaining({
+          targetTotalWords: 1_000_000,
+          targetTotalChapters: 400,
+          targetWordsPerChapter: { min: 2500, max: 3000 },
+          genres: ['东方玄幻', '学院', '冒险'],
+        }),
+      }),
+      expect.any(AbortSignal),
+    );
+  });
 });
