@@ -593,6 +593,60 @@ function missingCoreRequirements(text: string): CoreRequirement[] {
   return missing;
 }
 
+function mandatoryConfirmationQuestion(missing: CoreRequirement[]): NovelPlanQuestion {
+  const first = missing[0];
+  if (first === 'genre') {
+    return {
+      id: 'genre_direction',
+      question: '这本小说的题材方向先定在哪一类？',
+      impactScore: 10,
+      options: [
+        { id: 'western_fantasy', label: '西方玄幻', description: '骑士、魔法、王国与史诗冒险' },
+        { id: 'eastern_fantasy', label: '东方玄幻', description: '宗门、血脉、秘境与修行体系' },
+        { id: 'science_fiction', label: '科幻', description: '科技、太空或未来社会冲突' },
+        { id: 'mystery', label: '悬疑推理', description: '线索、谜案与真相反转' },
+      ],
+    };
+  }
+  if (first === 'main_direction') {
+    return {
+      id: 'main_direction',
+      question: '主线冲突优先围绕哪一种目标展开？',
+      impactScore: 9,
+      options: [
+        { id: 'adventure_growth', label: '冒险成长' },
+        { id: 'war_and_kingdom', label: '战争与王国' },
+        { id: 'revenge_and_truth', label: '复仇与真相' },
+        { id: 'survival_escape', label: '求生与逃亡' },
+      ],
+    };
+  }
+  if (first === 'protagonist_type') {
+    return {
+      id: 'protagonist_identity',
+      question: '主角以哪一种身份进入故事最合适？',
+      impactScore: 8,
+      options: [
+        { id: 'knight', label: '骑士或护卫' },
+        { id: 'mage', label: '法师或学者' },
+        { id: 'heir', label: '王族或贵族继承人' },
+        { id: 'outsider', label: '平民或流亡者' },
+      ],
+    };
+  }
+  return {
+    id: 'tone_direction',
+    question: '你希望读者首先感受到哪一种整体基调？',
+    impactScore: 8,
+    options: [
+      { id: 'epic', label: '正统史诗' },
+      { id: 'dark', label: '黑暗压迫' },
+      { id: 'light', label: '轻松爽快' },
+      { id: 'warm', label: '温暖治愈' },
+    ],
+  };
+}
+
 function alreadyAsked(question: NovelPlanQuestion, history: NovelPlanHistoryTurn[]): boolean {
   const idPattern = new RegExp(`(?:^|\\b)${question.id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\b|:)`, 'i');
   const signature = questionSignature(question.question);
@@ -797,7 +851,10 @@ export class NovelPlanService {
     const target = request.targetTask ?? 'long_novel';
     const bypass = hasExplicitPlanningBypass(seed);
     const requiresFirstTurnConfirmation =
-      !bypass && history.length === 0 && (request.answers?.length ?? 0) === 0;
+      !bypass &&
+      request.forceReady !== true &&
+      history.length === 0 &&
+      (request.answers?.length ?? 0) === 0;
     const askedIds = askedQuestionIds(history, request.answers);
     const questionBudget = Math.max(0, TOTAL_QUESTION_BUDGET - askedIds.size);
     const knownText = sessionText(seed, history, request.answers);
@@ -872,7 +929,12 @@ export class NovelPlanService {
     }
 
     if (requiresFirstTurnConfirmation) {
-      throw new ProxyError('计划模式首次决策必须先向用户确认至少一个关键选择，请重试本轮。');
+      return {
+        status: 'asking',
+        round,
+        message: '开始策划前，先确认一个会改变故事结构的关键选择。',
+        questions: [mandatoryConfirmationQuestion(missingCore)],
+      };
     }
 
     if (decision.status !== 'ready' || !decision.planSummary) {

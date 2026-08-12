@@ -286,6 +286,20 @@ describe('NovelPlanService goal-driven agent', () => {
     expect(proxy.calls).toHaveLength(2);
   });
 
+  it('falls back to one targeted confirmation when the model ignores the first-turn asking requirement', async () => {
+    const proxy = new QueueProxy([readyDecision(), readyDecision()]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      { seedPrompt: '写一本骑士小说' },
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe('asking');
+    expect(result.questions).toHaveLength(1);
+    expect(result.questions?.[0]?.id).toBe('genre_direction');
+    expect(result.questions?.[0]?.options).toHaveLength(4);
+  });
+
   it('rejects low-value world-detail questions and asks a high-impact confirmation instead', async () => {
     const lowValue = JSON.stringify({
       status: 'asking',
