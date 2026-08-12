@@ -819,11 +819,13 @@ export function ChatWorkspace({
       return;
     }
 
-    // 允许直接发送「/计划 核心剧情」，不要求用户先点菜单再重复输入一次。
+    // 允许直接发送「/计划 核心剧情」，但仍先打开计划配置，让用户确认核心方向。
     const directPlanMatch = text.match(/^\/计划(?:\s+([\s\S]*))?$/);
     if (directPlanMatch) {
-      setInput('');
-      await startPlanMode(directPlanMatch[1]?.trim() ?? '');
+      const planTask = AGENT_TASKS.find((task) => task.key === 'plan');
+      if (planTask) setPendingTask(planTask);
+      setInput(directPlanMatch[1]?.trim() ?? '');
+      inputRef.current?.focus();
       return;
     }
 

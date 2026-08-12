@@ -280,27 +280,14 @@ describe('NovelPlanService goal-driven agent', () => {
     );
 
     expect(result.status).toBe('asking');
-    expect(result.questions?.[0]?.id).toContain('core_requirements');
-    expect(result.questions?.[0]?.options.map((option) => option.id)).toEqual([
-      'user_specify',
-      'agent_fill_defaults',
+    expect(result.questions?.map((question) => question.id)).toEqual([
+      'core_genre',
+      'core_main_direction',
+      'core_protagonist_type',
     ]);
+    expect(result.questions?.[0]?.question).toContain('题材类型');
+    expect(result.questions?.[1]?.options.map((option) => option.id)).toContain('adventure_growth');
     expect(proxy.calls).toHaveLength(2);
-  });
-
-  it('accepts defaults only after the user explicitly authorizes them', async () => {
-    const proxy = new QueueProxy([readyDecision()]);
-    const service = new NovelPlanService(mockConfigService(), proxy);
-    const result = await service.turn(
-      {
-        seedPrompt: '写本小说',
-        answers: [{ questionId: 'core_requirements_genre_main_direction_protagonist_type', selectedOptionIds: ['agent_fill_defaults'] }],
-      },
-      new AbortController().signal,
-    );
-
-    expect(result.status).toBe('ready');
-    expect(proxy.calls).toHaveLength(1);
   });
 
   it('rejects low-value world-detail questions and asks a high-impact confirmation instead', async () => {

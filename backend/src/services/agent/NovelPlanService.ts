@@ -674,34 +674,43 @@ function missingCoreRequirements(text: string): CoreRequirement[] {
   return missing;
 }
 
-function coreRequirementsQuestion(missing: CoreRequirement[]): NovelPlanQuestion {
-  const labels: Record<CoreRequirement, string> = {
-    genre: '题材类型',
-    main_direction: '核心剧情/主线目标',
-    protagonist_type: '主角身份或起点',
+function coreRequirementsQuestions(missing: CoreRequirement[]): NovelPlanQuestion[] {
+  const questions: Record<CoreRequirement, NovelPlanQuestion> = {
+    genre: {
+      id: 'core_genre',
+      question: '这本小说的题材类型是什么？',
+      impactScore: 10,
+      options: [
+        { id: 'eastern_fantasy', label: '东方玄幻 / 仙侠' },
+        { id: 'western_fantasy', label: '西方玄幻' },
+        { id: 'science_fiction', label: '科幻' },
+        { id: 'mystery', label: '悬疑 / 推理' },
+      ],
+    },
+    main_direction: {
+      id: 'core_main_direction',
+      question: '主线冲突优先围绕哪一种目标展开？',
+      impactScore: 10,
+      options: [
+        { id: 'adventure_growth', label: '冒险成长' },
+        { id: 'war_and_kingdom', label: '战争与争霸' },
+        { id: 'revenge_and_truth', label: '复仇与真相' },
+        { id: 'survival_escape', label: '求生与逃亡' },
+      ],
+    },
+    protagonist_type: {
+      id: 'core_protagonist_type',
+      question: '主角以哪一种身份或起点进入故事？',
+      impactScore: 9,
+      options: [
+        { id: 'ordinary_person', label: '普通人 / 平民' },
+        { id: 'knight_warrior', label: '骑士 / 战士' },
+        { id: 'mage_scholar', label: '法师 / 学者' },
+        { id: 'noble_heir', label: '贵族 / 继承人' },
+      ],
+    },
   };
-  const pending = missing.map((item) => labels[item]).join('、');
-  return {
-    id: `core_requirements_${missing.join('_')}`,
-    question: `当前还没有确认${pending}。请直接在“其他 / 补充”中用自然语言填写；也可以授权 Agent 仅对未填写项使用默认值。`,
-    impactScore: 10,
-    options: [
-      {
-        id: 'user_specify',
-        label: '我来补充核心方向',
-        description: '在下方补充框直接写题材、主线或主角要求。',
-      },
-      {
-        id: 'agent_fill_defaults',
-        label: '授权 Agent 补全',
-        description: '只对未填写的核心参数使用可修改的专业默认值。',
-      },
-    ],
-  };
-}
-
-function hasAgentDefaultAuthorization(answers: NovelPlanAnswer[] | undefined): boolean {
-  return (answers ?? []).some((answer) => answer.selectedOptionIds.includes('agent_fill_defaults'));
+  return missing.map((item) => questions[item]);
 }
 
 function alreadyAsked(question: NovelPlanQuestion, history: NovelPlanHistoryTurn[]): boolean {
@@ -920,7 +929,7 @@ export class NovelPlanService {
     }
     const history = Array.isArray(request.history) ? request.history : [];
     const target = request.targetTask ?? 'long_novel';
-    const bypass = hasExplicitPlanningBypass(seed) || hasAgentDefaultAuthorization(request.answers);
+    const bypass = hasExplicitPlanningBypass(seed);
     const askedIds = askedQuestionIds(history, request.answers);
     const questionBudget = Math.max(0, TOTAL_QUESTION_BUDGET - askedIds.size);
     const knownText = [sessionText(seed, history, request.answers), planConfigText(request.planConfig)]
@@ -1001,15 +1010,15 @@ export class NovelPlanService {
       }
     }
 
-    // Core direction must not be silently invented. This is a consent/clarification
-    // gate, not a fixed genre questionnaire; the user may type any answer in the
-    // free-text supplement or explicitly authorize defaults.
+    // Core direction must not be silently invented. If the model ignored the
+    // clarification request, expose the actual missing choices with free-text
+    // supplements instead of a meta-level authorization question.
     if (!mustFinish && missingCore.length > 0) {
       return {
         status: 'asking',
         round,
         message: '开始生成完整计划前，需要确认会改变整本小说方向的核心参数。',
-        questions: [coreRequirementsQuestion(missingCore)].slice(0, questionBudget),
+        questions: coreRequirementsQuestions(missingCore).slice(0, questionBudget),
       };
     }
 

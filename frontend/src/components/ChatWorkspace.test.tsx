@@ -121,6 +121,18 @@ describe('ChatWorkspace', () => {
     expect(await screen.findByText(/Agent 先理解目标与硬约束/)).toBeInTheDocument();
   });
 
+  it('opens plan configuration before sending a direct /计划 command', async () => {
+    render(<ChatWorkspace projectId={null} onError={vi.fn()} />);
+
+    const input = screen.getByRole('textbox', { name: '对话输入' });
+    fireEvent.change(input, { target: { value: '/计划 写本小说' } });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+
+    expect(await screen.findByLabelText('小说计划配置')).toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: '对话输入' })).toHaveValue('写本小说');
+    expect(apiClient.agent.runStream).not.toHaveBeenCalled();
+  });
+
   it('shows the selected slash task title without leaking the icon key', async () => {
     render(<ChatWorkspace projectId="p-1" projectName="测试项目" />);
 
