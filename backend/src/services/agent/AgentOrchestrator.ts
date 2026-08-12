@@ -1185,7 +1185,7 @@ export class AgentOrchestrator {
           current: i + 1,
           total: chapterCount,
         });
-        content = await this.generateChapterWithMemory(
+        const rewrittenContent = await this.generateChapterWithMemory(
           config,
           pid,
           pack,
@@ -1195,6 +1195,16 @@ export class AgentOrchestrator {
           perChapter,
           signal,
         );
+        if (rewrittenContent.trim().length > 0) {
+          content = rewrittenContent;
+        } else {
+          emit({
+            phase: 'info',
+            message: `【ChapterAgent】格式重写「${title}」返回空正文，已保留原稿继续审校。`,
+            current: i + 1,
+            total: chapterCount,
+          });
+        }
       }
 
       await this.store.updateChapterContent(chapter.id, content);
@@ -2154,7 +2164,7 @@ export class AgentOrchestrator {
           total: progress?.total,
         });
       }
-      if (revisedContent !== undefined) {
+      if (revisedContent !== undefined && revisedContent.trim().length > 0) {
         finalContent = revisedContent;
         await this.store.updateChapterContent(chapterId, finalContent);
         revised = true;
@@ -2189,6 +2199,13 @@ export class AgentOrchestrator {
             revisionHints: finalInspection.revisionHints,
           });
         }
+      } else if (revisedContent !== undefined) {
+        emit({
+          phase: 'info',
+          message: `【ReviewAgent】修订「${chapterTitle}」返回空正文，已保留原稿。`,
+          current: progress?.current,
+          total: progress?.total,
+        });
       }
     }
 
