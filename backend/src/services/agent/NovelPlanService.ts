@@ -12,6 +12,7 @@ import type {
   ChatMessage,
   ModelConfig,
   NovelPlanAnswer,
+  NovelPlanConfig,
   NovelPlanChapterOutline,
   NovelPlanDepth,
   NovelPlanHistoryTurn,
@@ -30,6 +31,9 @@ const MAX_QUESTIONS_PER_TURN = 3;
 const TOTAL_QUESTION_BUDGET = 3;
 const MAX_OPTIONS_PER_QUESTION = 4;
 const MAX_AGENT_ROUNDS = 3;
+/** Maximum total chapters kept in a plan. Detailed chapter anchors are rolled out in batches. */
+const MAX_PLAN_CHAPTERS = 1000;
+/** Maximum chapter anchors requested in one model call, preventing 400-chapter prompt timeouts. */
 export const MAX_OUTLINE_CHAPTERS = 50;
 const DEFAULT_WORDS_PER_CHAPTER = 2000;
 const DEFAULT_CHAPTER_COUNT = 10;
@@ -74,6 +78,7 @@ interface Scale {
   totalWords?: number;
   wordsPerChapter?: number;
   chapterCount?: number;
+  volumeCount?: number;
 }
 
 interface AgentDecision {
@@ -135,6 +140,7 @@ function mergeScale(...parts: Scale[]): Scale {
     if (part.totalWords) result.totalWords = part.totalWords;
     if (part.wordsPerChapter) result.wordsPerChapter = part.wordsPerChapter;
     if (part.chapterCount) result.chapterCount = part.chapterCount;
+    if (part.volumeCount) result.volumeCount = part.volumeCount;
   }
   if (result.totalWords && result.wordsPerChapter && !result.chapterCount) {
     result.chapterCount = Math.round(result.totalWords / result.wordsPerChapter);
@@ -146,9 +152,48 @@ function mergeScale(...parts: Scale[]): Scale {
     result.totalWords = result.wordsPerChapter * result.chapterCount;
   }
   if (result.chapterCount) {
-    result.chapterCount = Math.min(MAX_OUTLINE_CHAPTERS, Math.max(1, result.chapterCount));
+    result.chapterCount = Math.min(MAX_PLAN_CHAPTERS, Math.max(1, result.chapterCount));
   }
   return result;
+}
+
+function planConfigText(config: NovelPlanConfig | undefined): string {
+  if (!config) return '';
+  return [
+    '结构化计划配置（用户明确填写的字段优先级最高）：',
+    config.targetTotalWords ? `- 全文目标字数：${config.targetTotalWords}` : '',
+    config.targetTotalChapters ? `- 总章节数：${config.targetTotalChapters}` : '',
+    config.targetWordsPerChapter
+      ? `- 单章目标字数：${config.targetWordsPerChapter.min}-${config.targetWordsPerChapter.max}`
+      : '',
+    config.targetVolumeCount ? `- 目标卷数：${config.targetVolumeCount}` : '',
+    config.genres?.length ? `- 小说类型：${config.genres.join(' + ')}` : '',
+    config.coreStory ? `- 核心剧情：${config.coreStory}` : '',
+    config.endingDirection ? `- 结局方向：${config.endingDirection}` : '',
+    config.writingRequirements ? `- 额外要求：${config.writingRequirements}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+function scaleFromPlanConfig(config: NovelPlanConfig | undefined): Scale {
+  return {
+    totalWords: config?.targetTotalWords,
+    chapterCount: config?.targetTotalChapters,
+    wordsPerChapter: config?.targetWordsPerChapter?.max,
+    volumeCount: config?.targetVolumeCount,
+  };
+}
+
+function planConfigConflict(config: NovelPlanConfig | undefined): string | undefined {
+  if (!config?.targetTotalWords || !config.targetTotalChapters || !config.targetWordsPerChapter) {
+    return undefined;
+  }
+  const { min, max } = config.targetWordsPerChapter;
+  const lower = config.targetTotalChapters * min;
+  const upper = config.targetTotalChapters * max;
+  if (config.targetTotalWords >= lower && config.targetTotalWords <= upper) return undefined;
+  return `字数约束存在数学冲突：${config.targetTotalChapters}章×${min}-${max}字的可行范围为${lower}-${upper}字；请以全文目标或单章范围为准并在后续计划中调整。`;
 }
 
 function answerText(answer: NovelPlanAnswer): string {
@@ -197,6 +242,7 @@ export function collectScaleFromSession(
       wordsPerChapter: summary.wordsPerChapter,
       chapterCount: summary.chapterCount,
     });
+    parts.push(scaleFromPlanConfig(summary.planConfig));
   }
   return mergeScale(...parts);
 }
@@ -402,6 +448,23 @@ export function normalizeStoryPlan(raw: unknown): NovelStoryPlan | undefined {
           goal: recordText(volume, 'goal'),
           chapterStart: parsePositiveInt(volume.chapterStart ?? volume.chapter_start) ?? 1,
           chapterEnd: parsePositiveInt(volume.chapterEnd ?? volume.chapter_end) ?? 1,
+          targetWords: parsePositiveInt(volume.targetWords ?? volume.target_words),
+          mainConflict: recordTextAny(volume, 'mainConflict', 'main_conflict') || undefined,
+          climax: recordText(volume, 'climax') || undefined,
+          endingHook: recordTextAny(volume, 'endingHook', 'ending_hook') || undefined,
+          stages: Array.isArray(volume.stages)
+            ? volume.stages
+                .filter(isRecord)
+                .map((stage) => ({
+                  title: recordText(stage, 'title'),
+                  chapterStart: parsePositiveInt(stage.chapterStart ?? stage.chapter_start) ?? 1,
+                  chapterEnd: parsePositiveInt(stage.chapterEnd ?? stage.chapter_end) ?? 1,
+                  goal: recordText(stage, 'goal'),
+                  climax: recordText(stage, 'climax') || undefined,
+                  endingState: recordTextAny(stage, 'endingState', 'ending_state') || undefined,
+                }))
+                .filter((stage) => stage.title && stage.goal)
+            : undefined,
         }))
         .filter((volume) => volume.title && volume.goal)
     : [];
@@ -411,6 +474,18 @@ export function normalizeStoryPlan(raw: unknown): NovelStoryPlan | undefined {
       genre: recordText(metadata, 'genre') || undefined,
       targetLength: parsePositiveInt(metadata?.targetLength ?? metadata?.target_length),
       tone: recordText(metadata, 'tone') || undefined,
+      targetTotalChapters: parsePositiveInt(
+        metadata?.targetTotalChapters ?? metadata?.target_total_chapters,
+      ),
+      targetWordsPerChapterMin: parsePositiveInt(
+        metadata?.targetWordsPerChapterMin ?? metadata?.target_words_per_chapter_min,
+      ),
+      targetWordsPerChapterMax: parsePositiveInt(
+        metadata?.targetWordsPerChapterMax ?? metadata?.target_words_per_chapter_max,
+      ),
+      targetVolumeCount: parsePositiveInt(
+        metadata?.targetVolumeCount ?? metadata?.target_volume_count,
+      ),
     },
     premise: {
       oneSentence: recordTextAny(premise, 'oneSentence', 'one_sentence') || premiseText,
@@ -492,6 +567,11 @@ function normalizeSummary(raw: unknown): NovelPlanSummary | undefined {
         .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
         .map((item) => item.trim())
     : undefined;
+  const genres = Array.isArray(raw.genres)
+    ? raw.genres
+        .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+        .map((item) => item.trim())
+    : undefined;
   const scale = mergeScale({
     totalWords: parsePositiveInt(raw.totalWords),
     wordsPerChapter: parsePositiveInt(raw.wordsPerChapter),
@@ -502,6 +582,7 @@ function normalizeSummary(raw: unknown): NovelPlanSummary | undefined {
   const summary: NovelPlanSummary = {
     title: text('title'),
     genre: text('genre'),
+    genres,
     protagonist: text('protagonist'),
     hook: text('hook'),
     tone: text('tone'),
@@ -509,6 +590,9 @@ function normalizeSummary(raw: unknown): NovelPlanSummary | undefined {
     totalWords: scale.totalWords,
     wordsPerChapter: scale.wordsPerChapter,
     chapterCount: scale.chapterCount,
+    plannedThroughChapter: parsePositiveInt(
+      raw.plannedThroughChapter ?? raw.planned_through_chapter,
+    ),
     chapterOutlines:
       chapterCount > 0
         ? normalizeOutlines(raw.chapterOutlines, chapterCount, wordsPerChapter)
@@ -576,7 +660,7 @@ function askedQuestionIds(
   return ids;
 }
 
-type CoreRequirement = 'genre' | 'main_direction' | 'protagonist_type' | 'tone';
+type CoreRequirement = 'genre' | 'main_direction' | 'protagonist_type';
 
 function missingCoreRequirements(text: string): CoreRequirement[] {
   const missing: CoreRequirement[] = [];
@@ -587,64 +671,7 @@ function missingCoreRequirements(text: string): CoreRequirement[] {
   if (!/(?:主角|冒险者|贵族|骑士|魔法师|法师|平民|穿越者|佣兵|猎人|王子|公主|领主|刺客|祭司)/.test(text)) {
     missing.push('protagonist_type');
   }
-  if (!/(?:轻松|爽文|史诗|正统|黑暗|轻小说|群像|治愈|压抑|幽默|热血|基调|风格)/.test(text)) {
-    missing.push('tone');
-  }
   return missing;
-}
-
-function mandatoryConfirmationQuestion(missing: CoreRequirement[]): NovelPlanQuestion {
-  const first = missing[0];
-  if (first === 'genre') {
-    return {
-      id: 'genre_direction',
-      question: '这本小说的题材方向先定在哪一类？',
-      impactScore: 10,
-      options: [
-        { id: 'western_fantasy', label: '西方玄幻', description: '骑士、魔法、王国与史诗冒险' },
-        { id: 'eastern_fantasy', label: '东方玄幻', description: '宗门、血脉、秘境与修行体系' },
-        { id: 'science_fiction', label: '科幻', description: '科技、太空或未来社会冲突' },
-        { id: 'mystery', label: '悬疑推理', description: '线索、谜案与真相反转' },
-      ],
-    };
-  }
-  if (first === 'main_direction') {
-    return {
-      id: 'main_direction',
-      question: '主线冲突优先围绕哪一种目标展开？',
-      impactScore: 9,
-      options: [
-        { id: 'adventure_growth', label: '冒险成长' },
-        { id: 'war_and_kingdom', label: '战争与王国' },
-        { id: 'revenge_and_truth', label: '复仇与真相' },
-        { id: 'survival_escape', label: '求生与逃亡' },
-      ],
-    };
-  }
-  if (first === 'protagonist_type') {
-    return {
-      id: 'protagonist_identity',
-      question: '主角以哪一种身份进入故事最合适？',
-      impactScore: 8,
-      options: [
-        { id: 'knight', label: '骑士或护卫' },
-        { id: 'mage', label: '法师或学者' },
-        { id: 'heir', label: '王族或贵族继承人' },
-        { id: 'outsider', label: '平民或流亡者' },
-      ],
-    };
-  }
-  return {
-    id: 'tone_direction',
-    question: '你希望读者首先感受到哪一种整体基调？',
-    impactScore: 8,
-    options: [
-      { id: 'epic', label: '正统史诗' },
-      { id: 'dark', label: '黑暗压迫' },
-      { id: 'light', label: '轻松爽快' },
-      { id: 'warm', label: '温暖治愈' },
-    ],
-  };
 }
 
 function alreadyAsked(question: NovelPlanQuestion, history: NovelPlanHistoryTurn[]): boolean {
@@ -660,12 +687,16 @@ function alreadyAsked(question: NovelPlanQuestion, history: NovelPlanHistoryTurn
 function completeScale(scale: Scale, target: NovelPlanTargetTask): Required<Scale> {
   const defaultChapters = target === 'novel' || target === 'title' ? 1 : DEFAULT_CHAPTER_COUNT;
   const chapterCount = Math.min(
-    MAX_OUTLINE_CHAPTERS,
+    MAX_PLAN_CHAPTERS,
     Math.max(1, scale.chapterCount ?? defaultChapters),
   );
   const wordsPerChapter = Math.max(500, scale.wordsPerChapter ?? DEFAULT_WORDS_PER_CHAPTER);
   const totalWords = Math.max(wordsPerChapter * chapterCount, scale.totalWords ?? 0);
-  return { totalWords, wordsPerChapter, chapterCount };
+  const volumeCount = Math.min(
+    50,
+    Math.max(1, scale.volumeCount ?? Math.ceil(chapterCount / 40)),
+  );
+  return { totalWords, wordsPerChapter, chapterCount, volumeCount };
 }
 
 function formatOutlines(outlines: NovelPlanChapterOutline[]): string {
@@ -698,6 +729,8 @@ function enforceUserIntent(
     const rule = `题材固定为${explicitGenre}，不得替换成其他题材或时代背景`;
     if (!constraints.includes(rule)) constraints.unshift(rule);
   }
+  const conflict = planConfigConflict(decision.planSummary.planConfig);
+  if (conflict && !constraints.includes(conflict)) constraints.push(conflict);
   const planSummary: NovelPlanSummary = {
     ...decision.planSummary,
     genre: explicitGenre ?? decision.planSummary.genre,
@@ -745,6 +778,14 @@ function ensureStructuredStoryPlan(summary: NovelPlanSummary): NovelPlanSummary 
       genre: summary.genre ?? current?.metadata.genre,
       targetLength: summary.totalWords ?? current?.metadata.targetLength,
       tone: summary.tone ?? current?.metadata.tone,
+      targetTotalChapters:
+        summary.planConfig?.targetTotalChapters ?? current?.metadata.targetTotalChapters,
+      targetWordsPerChapterMin:
+        summary.planConfig?.targetWordsPerChapter?.min ?? current?.metadata.targetWordsPerChapterMin,
+      targetWordsPerChapterMax:
+        summary.planConfig?.targetWordsPerChapter?.max ?? current?.metadata.targetWordsPerChapterMax,
+      targetVolumeCount:
+        summary.planConfig?.targetVolumeCount ?? current?.metadata.targetVolumeCount,
     },
     premise: {
       oneSentence: current?.premise.oneSentence || summary.hook || summary.title || '待正文展开',
@@ -850,14 +891,11 @@ export class NovelPlanService {
     const history = Array.isArray(request.history) ? request.history : [];
     const target = request.targetTask ?? 'long_novel';
     const bypass = hasExplicitPlanningBypass(seed);
-    const requiresFirstTurnConfirmation =
-      !bypass &&
-      request.forceReady !== true &&
-      history.length === 0 &&
-      (request.answers?.length ?? 0) === 0;
     const askedIds = askedQuestionIds(history, request.answers);
     const questionBudget = Math.max(0, TOTAL_QUESTION_BUDGET - askedIds.size);
-    const knownText = sessionText(seed, history, request.answers);
+    const knownText = [sessionText(seed, history, request.answers), planConfigText(request.planConfig)]
+      .filter(Boolean)
+      .join('\n');
     const missingCore = missingCoreRequirements(knownText);
     const round = Math.min(
       MAX_AGENT_ROUNDS,
@@ -877,7 +915,8 @@ export class NovelPlanService {
       questionBudget,
       missingCore,
       signal,
-      requiresFirstTurnConfirmation,
+      false,
+      request.planConfig,
     );
 
     if (!mustFinish && decision.status === 'asking') {
@@ -895,11 +934,15 @@ export class NovelPlanService {
       }
     }
 
-    // A provider can ignore the Requirement State and return ready after only
-    // one answer. Give the planning Agent one strict correction turn so the
-    // remaining high-impact decisions are considered. This is model-driven;
-    // no local fixed questionnaire is substituted.
-    if (!mustFinish && (requiresFirstTurnConfirmation || missingCore.length > 0)) {
+    // A provider can ignore the Requirement State, or return an invalid/low-value
+    // question. Give the planning Agent one strict correction turn. This remains
+    // model-driven; no local fixed questionnaire is substituted.
+    const filteredQuestionCount = decision.status === 'asking'
+      ? decision.questions
+          .filter(isHighValueQuestion)
+          .filter((question) => !alreadyAsked(question, history)).length
+      : 0;
+    if (!mustFinish && (missingCore.length > 0 || (decision.status === 'asking' && filteredQuestionCount === 0))) {
       decision = await this.generateDecision(
         config,
         seed,
@@ -911,6 +954,7 @@ export class NovelPlanService {
         missingCore,
         signal,
         true,
+        request.planConfig,
       );
       if (decision.status === 'asking') {
         const questions = decision.questions
@@ -928,15 +972,6 @@ export class NovelPlanService {
       }
     }
 
-    if (requiresFirstTurnConfirmation) {
-      return {
-        status: 'asking',
-        round,
-        message: '开始策划前，先确认一个会改变故事结构的关键选择。',
-        questions: [mandatoryConfirmationQuestion(missingCore)],
-      };
-    }
-
     if (decision.status !== 'ready' || !decision.planSummary) {
       decision = await this.generateDecision(
         config,
@@ -948,12 +983,26 @@ export class NovelPlanService {
         0,
         [],
         signal,
+        false,
+        request.planConfig,
       );
     }
 
     if (decision.status !== 'ready' || !decision.planSummary) {
       throw new ProxyError('策划 Agent 没有形成可执行方案，请重试本轮。');
     }
+    decision = {
+      ...decision,
+      planSummary: {
+        ...decision.planSummary,
+        planConfig: request.planConfig ?? decision.planSummary.planConfig,
+        genres: request.planConfig?.genres ?? decision.planSummary.genres,
+        endingDirection:
+          request.planConfig?.endingDirection ?? decision.planSummary.endingDirection,
+        writingRequirements:
+          request.planConfig?.writingRequirements ?? decision.planSummary.writingRequirements,
+      },
+    };
     decision = enforceUserIntent(decision, seed, history, request.answers, target);
     const [storyDecision, outlineDecision] = await Promise.all([
       this.ensureStoryPlan(config, decision, seed, history, request.answers, signal),
@@ -980,6 +1029,7 @@ export class NovelPlanService {
       status: 'ready',
       round,
       message: decision.message,
+      questions: [],
       brief: decision.brief,
       planSummary: decision.planSummary,
     };
@@ -996,16 +1046,21 @@ export class NovelPlanService {
     missingCore: CoreRequirement[],
     signal: AbortSignal,
     requireQuestion = false,
+    planConfig?: NovelPlanConfig,
   ): Promise<AgentDecision> {
     const explicitGenre = inferExplicitGenre(
-      [seed, ...history.filter((turn) => turn.role === 'user').map((turn) => turn.content)].join('\n'),
+      [seed, ...history.filter((turn) => turn.role === 'user').map((turn) => turn.content), planConfigText(planConfig)].join('\n'),
     );
-    const knownScale = collectScaleFromSession(history, answers, undefined, seed);
+    const knownScale = mergeScale(
+      scaleFromPlanConfig(planConfig),
+      collectScaleFromSession(history, answers, undefined, seed),
+    );
     const system = [
       '你是拥有决策权的小说总策划 Agent，不是固定问卷或工作流。只输出 JSON。',
       '循环：理解目标与已确认事实 → 判断是否存在真正阻塞创作的缺口 → 选择追问或直接形成方案。',
       '用户明确说过的题材、时代、地域、文化、人物、禁忌和规模都是不可覆盖的硬约束。',
       '禁止重复询问已明确的信息；禁止把西方玄幻改成校园、都市、修仙等其他核心类型。',
+      '问题与选项必须从当前用户需求推导；禁止复用固定的“冒险成长/战争与王国/复仇与真相/求生与逃亡”题目或任何通用题库。',
       '可安全推断的细节由你做专业决定，不向用户转嫁；只有答案会导致两种根本不同故事时才提问。',
       `主动提问总预算剩余 ${questionBudget} 题；asking 时不得超过该预算，每题 2-${MAX_OPTIONS_PER_QUESTION} 个具体选项，必须含 impactScore（0-10）与稳定英文 snake_case id。`,
       '只有 impactScore >= 7 且同时满足“无法合理推断、显著改变主线、后期修改成本高”的问题才允许询问。',
@@ -1014,6 +1069,8 @@ export class NovelPlanService {
       'planSummary JSON 字段：title, genre, protagonist, hook, tone, constraints, totalWords, wordsPerChapter, chapterCount, chapterOutlines。',
       '本模块只做是否追问与方向收束，不生成 storyPlan；完整 Story Plan 由后续专用 Agent 一次生成。',
       'chapterOutlines 每项字段：number, title, goal, estimatedWords；goal 必须含行动、冲突/变化、章末推进。',
+      '计划配置中的全文、卷数、单章字数、类型、核心剧情、结局方向和额外要求必须进入最终方案；未填写的细节由你自动补全，不得用固定问卷替代策划。',
+      planConfigText(planConfig),
       `下游目标：${TARGET_LABELS[target]}。`,
       forceReady
         ? '本轮必须 ready。信息不足时采用清晰、可修改的专业默认值，不得继续提问。'
@@ -1029,6 +1086,7 @@ export class NovelPlanService {
       .join('\n');
     const user = [
       sessionText(seed, history, answers),
+      planConfigText(planConfig),
       `已识别规模：总字数=${knownScale.totalWords ?? '未指定'}；每章=${knownScale.wordsPerChapter ?? '未指定'}；章数=${knownScale.chapterCount ?? '未指定'}。`,
       '输出示例结构：{"status":"asking|ready","message":"...","questions":[],"brief":"...","planSummary":{}}',
     ].join('\n\n');
@@ -1059,10 +1117,12 @@ export class NovelPlanService {
         {
           role: 'system',
           content: [
-            '你是 Story Plan 架构 Agent。只输出 JSON：{"storyPlan":{...}}，不要输出分章大纲或正文。',
+            '你是 Story Plan 架构 Agent。只输出 JSON：{"storyPlan":{...}}，不要输出正文。',
             '用户已决定“想看什么”，你负责完整决定“怎么写”；禁止向用户追加问题。',
             '自动创造国家、城市、历史、种族、宗教、派系、力量体系、配角、反派、支线、伏笔和谜团。',
             'storyPlan 使用 camelCase，必须完整包含 metadata、premise、protagonist、world、powerSystem、characters、factions、mainPlot、subplots、characterArcs、volumes、foreshadowing、mysteries、constraints。',
+            'metadata 必须回写 targetTotalChapters、targetWordsPerChapterMin、targetWordsPerChapterMax、targetVolumeCount；volumes 必须按全文目标分配章节范围，每卷包含 stages，形成“全文→分卷→阶段”的层级。',
+            '每个 volume 至少包含 number、title、goal、chapterStart、chapterEnd、targetWords、mainConflict、climax、endingHook、stages；每个 stage 至少包含 title、chapterStart、chapterEnd、goal、endingState。',
             '质量下限：world.overview 至少 80 字；powerSystem.rules 至少 3 条；characters 至少 4 人；mainPlot 四段完整；foreshadowing 至少 3 条。',
             '控制篇幅：整个 JSON 不超过 3500 个汉字；世界概述 80-160 字；人物 4-6 人；每个数组 3-6 项；每项只保留可执行信息。',
             '所有内容必须服从用户明确题材、人物方向、风格、禁忌与规模，不得套用其他题材模板。',
@@ -1118,15 +1178,18 @@ export class NovelPlanService {
       collectScaleFromSession(history, answers, summary, seed),
       target,
     );
-    if ((summary.chapterOutlines?.length ?? 0) >= scale.chapterCount) {
+    // 长篇只展开当前滚动窗口；全文目标仍保存在 chapterCount/Story Plan 中。
+    const outlineTargetCount = Math.min(scale.chapterCount, MAX_OUTLINE_CHAPTERS);
+    if ((summary.chapterOutlines?.length ?? 0) >= outlineTargetCount) {
       const outlines = normalizeOutlines(
         summary.chapterOutlines,
-        scale.chapterCount,
+        outlineTargetCount,
         scale.wordsPerChapter,
       );
       const planSummary = ensureStructuredStoryPlan({
         ...summary,
         ...scale,
+        plannedThroughChapter: Math.min(scale.chapterCount, outlines.at(-1)?.number ?? 0),
         chapterOutlines: outlines,
       });
       return {
@@ -1147,7 +1210,9 @@ export class NovelPlanService {
           content: [
             '你是分章策划 Agent。只输出 JSON，不要 Markdown。根对象只能有 chapterOutlines 字段。',
             '严格结构：{"chapterOutlines":[{"number":1,"title":"章节标题","goal":"角色行动；具体冲突或状态变化；章末推进","estimatedWords":2000}]}。',
-            `必须连续生成 ${scale.chapterCount} 章，每章约 ${scale.wordsPerChapter} 字，不得缺章、跳号或写正文。`,
+            scale.chapterCount > outlineTargetCount
+              ? `本轮只生成第 1-${outlineTargetCount} 章（当前滚动窗口），每章约 ${scale.wordsPerChapter} 字；全文目标共 ${scale.chapterCount} 章，后续由 Plan Mode 按阶段继续展开。不得缺章、跳号或写正文。`
+              : `必须连续生成 ${outlineTargetCount} 章，每章约 ${scale.wordsPerChapter} 字，不得缺章、跳号或写正文。`,
             '每章 goal 必须写明：角色行动、具体冲突/状态变化、章末推进；相邻章节必须有因果关系。',
             '用户硬约束优先级最高，不得换题材、换时代、换文化背景。',
             explicitGenre ? `题材必须是：${explicitGenre}。` : '',
@@ -1170,11 +1235,11 @@ export class NovelPlanService {
     if (!isRecord(data)) throw new ProxyError('分章策划 Agent 未返回有效 JSON。');
     let outlines = normalizeOutlines(
       outlinePayload(data),
-      scale.chapterCount,
+      outlineTargetCount,
       scale.wordsPerChapter,
     );
-    if (outlines.length < scale.chapterCount) {
-      const missing = scale.chapterCount - outlines.length;
+    if (outlines.length < outlineTargetCount) {
+      const missing = outlineTargetCount - outlines.length;
       const start = outlines.length + 1;
       const continuation = await this.collectJson(
         config,
@@ -1183,7 +1248,7 @@ export class NovelPlanService {
             role: 'system',
             content: [
               '你是分章策划补全 Agent。只输出 JSON，不要 Markdown。根对象只能有 chapterOutlines 字段。',
-              `只生成第 ${start}-${scale.chapterCount} 章，共 ${missing} 章；不得重复已有章节。`,
+              `只生成第 ${start}-${outlineTargetCount} 章，共 ${missing} 章；不得重复已有章节。全文目标共 ${scale.chapterCount} 章，本轮只补齐当前窗口。`,
               `每章约 ${scale.wordsPerChapter} 字；字段固定为 number、title、goal、estimatedWords。`,
               'goal 必须包含角色行动、具体冲突或状态变化、章末推进，并承接已有最后章节。',
               explicitGenre ? `题材必须是：${explicitGenre}。` : '',
@@ -1217,15 +1282,16 @@ export class NovelPlanService {
         ];
       }
     }
-    if (outlines.length !== scale.chapterCount) {
+    if (outlines.length !== outlineTargetCount) {
       const keys = Object.keys(data).slice(0, 8).join('、') || '无';
       throw new ProxyError(
-        `分章策划 Agent 只返回 ${outlines.length}/${scale.chapterCount} 章（返回字段：${keys}），请重试。`,
+        `分章策划 Agent 只返回 ${outlines.length}/${outlineTargetCount} 章（全文目标 ${scale.chapterCount} 章；返回字段：${keys}），请重试。`,
       );
     }
     const planSummary = ensureStructuredStoryPlan({
       ...summary,
       ...scale,
+      plannedThroughChapter: Math.min(scale.chapterCount, outlines.at(-1)?.number ?? 0),
       chapterOutlines: outlines,
     });
     return {
@@ -1255,6 +1321,9 @@ export class NovelPlanService {
       JSON.stringify(summary.storyPlan, null, 2),
       '【执行规模】',
       `${summary.chapterCount} 章；每章约 ${summary.wordsPerChapter} 字；全书约 ${summary.totalWords} 字。`,
+      summary.plannedThroughChapter && summary.chapterCount && summary.plannedThroughChapter < summary.chapterCount
+        ? `当前已展开第 1-${summary.plannedThroughChapter} 章；后续章节按卷内阶段滚动规划。`
+        : '',
       '【分章大纲】',
       formatOutlines(summary.chapterOutlines ?? []),
     ]

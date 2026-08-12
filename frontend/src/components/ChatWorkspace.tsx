@@ -36,6 +36,7 @@ import type {
   AgentTask,
   Id,
   NovelPlanAnswer,
+  NovelPlanConfig,
   NovelPlanHistoryTurn,
   NovelPlanQuestion,
   NovelPlanSummary,
@@ -77,6 +78,43 @@ function hasSlashCommandMatch(input: string): boolean {
       task.slash.toLowerCase().includes(query) ||
       task.desc.toLowerCase().includes(query),
   );
+}
+
+function positivePlanNumber(value: string, max: number): number | undefined {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) return undefined;
+  return Math.min(max, parsed);
+}
+
+function buildPlanConfig(
+  totalWords: string,
+  totalChapters: string,
+  wordsMin: string,
+  wordsMax: string,
+  volumeCount: string,
+  genres: string,
+  endingDirection: string,
+  writingRequirements: string,
+  coreStory: string,
+): NovelPlanConfig | undefined {
+  const min = positivePlanNumber(wordsMin, 20000);
+  const max = positivePlanNumber(wordsMax, 20000);
+  const chapterRange = min || max
+    ? { min: min ?? max!, max: max ?? min! }
+    : undefined;
+  const config: NovelPlanConfig = {
+    targetTotalWords: positivePlanNumber(totalWords, 20_000_000),
+    targetTotalChapters: positivePlanNumber(totalChapters, 1000),
+    targetWordsPerChapter: chapterRange
+      ? { min: chapterRange.min, max: Math.max(chapterRange.min, chapterRange.max) }
+      : undefined,
+    targetVolumeCount: positivePlanNumber(volumeCount, 50),
+    genres: genres.split(/[+,，、]/).map((item) => item.trim()).filter(Boolean),
+    coreStory: coreStory.trim() || undefined,
+    endingDirection: endingDirection.trim() || undefined,
+    writingRequirements: writingRequirements.trim() || undefined,
+  };
+  return Object.values(config).some((value) => value !== undefined) ? config : undefined;
 }
 
 function resolveAdoptionTarget(editorContent: string, selection?: EditorSelection): AdoptionTarget {
@@ -188,6 +226,15 @@ export function ChatWorkspace({
   const [planSeed, setPlanSeed] = useState('');
   const [planHistory, setPlanHistory] = useState<NovelPlanHistoryTurn[]>([]);
   const [activePlanQuestions, setActivePlanQuestions] = useState<NovelPlanQuestion[]>([]);
+  const [activePlanConfig, setActivePlanConfig] = useState<NovelPlanConfig | undefined>();
+  const [planTotalWords, setPlanTotalWords] = useState('');
+  const [planTotalChapters, setPlanTotalChapters] = useState('');
+  const [planWordsMin, setPlanWordsMin] = useState('');
+  const [planWordsMax, setPlanWordsMax] = useState('');
+  const [planVolumeCount, setPlanVolumeCount] = useState('');
+  const [planGenres, setPlanGenres] = useState('');
+  const [planEndingDirection, setPlanEndingDirection] = useState('');
+  const [planWritingRequirements, setPlanWritingRequirements] = useState('');
   const planAbortRef = useRef<AbortController | null>(null);
 
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -266,11 +313,12 @@ export function ChatWorkspace({
   );
 
   const startPlanMode = useCallback(
-    async (seed: string) => {
-      const seedPrompt = seed.trim();
+    async (seed: string, planConfig?: NovelPlanConfig) => {
+      const seedPrompt = seed.trim() || planConfig?.coreStory?.trim() || '请根据计划配置自动生成小说计划';
       if (!seedPrompt || planBusy || planAbortRef.current !== null || agent.running || chat.streaming) return;
       setPlanBusy(true);
       setPlanSeed(seedPrompt);
+      setActivePlanConfig(planConfig);
       setPlanHistory([]);
       setActivePlanQuestions([]);
       chat.appendMessage({
@@ -286,6 +334,7 @@ export function ChatWorkspace({
         const response = await apiClient.agent.planTurn(
           {
             seedPrompt,
+            planConfig,
             targetTask: 'long_novel',
             history: [],
           },
@@ -332,6 +381,7 @@ export function ChatWorkspace({
         const response = await apiClient.agent.planTurn(
           {
             seedPrompt: seed,
+            planConfig: activePlanConfig,
             targetTask: 'long_novel',
             history: historyForApi,
             answers,
@@ -373,6 +423,7 @@ export function ChatWorkspace({
       planBusy,
       planHistory,
       planSeed,
+      activePlanConfig,
     ],
   );
 
@@ -711,10 +762,21 @@ export function ChatWorkspace({
     if (pendingTask) {
       // /计划 → 头脑风暴，不直接猛写
       if (pendingTask.key === 'plan') {
-        if (text.length === 0) return;
+        const config = buildPlanConfig(
+          planTotalWords,
+          planTotalChapters,
+          planWordsMin,
+          planWordsMax,
+          planVolumeCount,
+          planGenres,
+          planEndingDirection,
+          planWritingRequirements,
+          text,
+        );
+        if (text.length === 0 && !config) return;
         setPendingTask(null);
         setInput('');
-        await startPlanMode(text);
+        await startPlanMode(text, config);
         return;
       }
       // /参考 → 导入整本，再勾选章节分析
@@ -757,6 +819,14 @@ export function ChatWorkspace({
       return;
     }
 
+    // 允许直接发送「/计划 核心剧情」，不要求用户先点菜单再重复输入一次。
+    const directPlanMatch = text.match(/^\/计划(?:\s+([\s\S]*))?$/);
+    if (directPlanMatch) {
+      setInput('');
+      await startPlanMode(directPlanMatch[1]?.trim() ?? '');
+      return;
+    }
+
     // 普通对话
     if (text.length === 0) return;
     setInput('');
@@ -773,6 +843,14 @@ export function ChatWorkspace({
     planBusy,
     startPlanMode,
     runReferenceImport,
+    planTotalWords,
+    planTotalChapters,
+    planWordsMin,
+    planWordsMax,
+    planVolumeCount,
+    planGenres,
+    planEndingDirection,
+    planWritingRequirements,
   ]);
 
   const busy = chat.streaming || agent.running || planBusy;
@@ -823,7 +901,18 @@ export function ChatWorkspace({
       ? pendingTask.key === 'auto_next' ||
         pendingTask.key === 'workspace_review' ||
         pendingTask.key === 'chapter_diagnosis' ||
-        input.trim().length > 0
+        input.trim().length > 0 ||
+        (pendingTask.key === 'plan' &&
+          [
+            planTotalWords,
+            planTotalChapters,
+            planWordsMin,
+            planWordsMax,
+            planVolumeCount,
+            planGenres,
+            planEndingDirection,
+            planWritingRequirements,
+          ].some((value) => value.trim().length > 0))
       : input.trim().length > 0);
 
   // 写作模式：选区提示
@@ -1066,6 +1155,21 @@ export function ChatWorkspace({
               <Icon name="x" />
             </button>
           </span>
+          {pendingTask.key === 'plan' ? (
+            <div className="nwa-plan-config" aria-label="小说计划配置">
+              <div className="nwa-plan-config__grid">
+                <label>全文目标字数<input type="number" min={1} placeholder="例如 1000000" value={planTotalWords} disabled={busy} onChange={(e) => setPlanTotalWords(e.target.value)} /></label>
+                <label>总章节数<input type="number" min={1} placeholder="例如 400" value={planTotalChapters} disabled={busy} onChange={(e) => setPlanTotalChapters(e.target.value)} /></label>
+                <label>单章最少字数<input type="number" min={300} placeholder="例如 2400" value={planWordsMin} disabled={busy} onChange={(e) => setPlanWordsMin(e.target.value)} /></label>
+                <label>单章最多字数<input type="number" min={300} placeholder="例如 2800" value={planWordsMax} disabled={busy} onChange={(e) => setPlanWordsMax(e.target.value)} /></label>
+                <label>目标卷数<input type="number" min={1} placeholder="可留空由 Agent 推荐" value={planVolumeCount} disabled={busy} onChange={(e) => setPlanVolumeCount(e.target.value)} /></label>
+                <label>小说类型<input type="text" placeholder="玄幻 + 学院 + 冒险" value={planGenres} disabled={busy} onChange={(e) => setPlanGenres(e.target.value)} /></label>
+                <label>结局方向<input type="text" placeholder="自动规划 / 大团圆 / 悲剧…" value={planEndingDirection} disabled={busy} onChange={(e) => setPlanEndingDirection(e.target.value)} /></label>
+              </div>
+              <label className="nwa-plan-config__wide">额外要求<textarea rows={2} placeholder="慢热、群像、不后宫、不要系统流…" value={planWritingRequirements} disabled={busy} onChange={(e) => setPlanWritingRequirements(e.target.value)} /></label>
+              <span className="nwa-muted">核心剧情请填写下方对话框；上方字段是计划约束，留空的细节由 Agent 自动补全。</span>
+            </div>
+          ) : null}
           {pendingTask.key === 'full_novel' || pendingTask.key === 'long_novel' ? (
             <span className="nwa-chat-pending__params">
               <label className="nwa-chat-pending__param">

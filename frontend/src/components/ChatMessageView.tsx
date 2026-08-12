@@ -292,6 +292,22 @@ function PlanTurnCard({
                   <dd>{message.planSummary.constraints.join('；')}</dd>
                 </>
               ) : null}
+              {message.planSummary.genres?.length ? (
+                <>
+                  <dt>类型组合</dt>
+                  <dd>{message.planSummary.genres.join(' + ')}</dd>
+                </>
+              ) : null}
+              {message.planSummary.endingDirection || message.planSummary.writingRequirements ? (
+                <>
+                  {message.planSummary.endingDirection ? (
+                    <><dt>结局方向</dt><dd>{message.planSummary.endingDirection}</dd></>
+                  ) : null}
+                  {message.planSummary.writingRequirements ? (
+                    <><dt>额外要求</dt><dd>{message.planSummary.writingRequirements}</dd></>
+                  ) : null}
+                </>
+              ) : null}
             </dl>
           ) : null}
           {message.planSummary?.storyPlan ? (
@@ -329,12 +345,37 @@ function PlanTurnCard({
                     <dd>{message.planSummary.storyPlan.foreshadowing.join('；')}</dd>
                   </>
                 ) : null}
+                {message.planSummary.storyPlan.volumes.length > 0 ? (
+                  <>
+                    <dt>分卷与阶段</dt>
+                    <dd>
+                      {message.planSummary.storyPlan.volumes.map((volume) => (
+                        <div key={volume.number}>
+                          第{volume.number}卷《{volume.title}》：第{volume.chapterStart}-{volume.chapterEnd}章；{volume.goal}
+                          {volume.stages?.length ? (
+                            <ul>
+                              {volume.stages.map((stage) => (
+                                <li key={`${volume.number}-${stage.title}`}>{stage.title}（{stage.chapterStart}-{stage.chapterEnd}章）：{stage.goal}</li>
+                              ))}
+                            </ul>
+                          ) : null}
+                        </div>
+                      ))}
+                    </dd>
+                  </>
+                ) : null}
               </dl>
             </details>
           ) : null}
           {message.planSummary?.chapterOutlines && message.planSummary.chapterOutlines.length > 0 ? (
             <div className="nwa-plan-chat__chapters" aria-label="分章大纲">
               <strong className="nwa-plan-chat__chapters-title">分章大纲（Agent 生成）</strong>
+              {message.planSummary.chapterCount && message.planSummary.plannedThroughChapter &&
+              message.planSummary.plannedThroughChapter < message.planSummary.chapterCount ? (
+                <p className="nwa-muted">
+                  当前展开第 1-{message.planSummary.plannedThroughChapter} 章 / 全文 {message.planSummary.chapterCount} 章，后续按阶段滚动规划。
+                </p>
+              ) : null}
               <ol className="nwa-plan-chat__chapter-list">
                 {message.planSummary.chapterOutlines.map((ch) => (
                   <li key={ch.number}>

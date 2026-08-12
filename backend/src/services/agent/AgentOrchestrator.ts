@@ -2941,12 +2941,18 @@ function appendPlanContextToPrompt(prompt: string, plan: NovelPlanSummary | unde
   const lines: string[] = ['# 已确认创作计划（必须严格遵守）'];
   if (plan.title?.trim()) lines.push(`- 书名向：${plan.title.trim()}`);
   if (plan.genre?.trim()) lines.push(`- 赛道：${plan.genre.trim()}`);
+  if (plan.genres && plan.genres.length > 0) lines.push(`- 类型组合：${plan.genres.join(' + ')}`);
   if (plan.protagonist?.trim()) lines.push(`- 主角：${plan.protagonist.trim()}`);
   if (plan.hook?.trim()) lines.push(`- 钩子：${plan.hook.trim()}`);
   if (plan.tone?.trim()) lines.push(`- 基调：${plan.tone.trim()}`);
   if (plan.chapterCount) lines.push(`- 计划章数：${plan.chapterCount}`);
   if (plan.wordsPerChapter) lines.push(`- 每章字数：约 ${plan.wordsPerChapter}`);
   if (plan.totalWords) lines.push(`- 全书约：${plan.totalWords} 字`);
+  if (plan.endingDirection?.trim()) lines.push(`- 结局方向：${plan.endingDirection.trim()}`);
+  if (plan.writingRequirements?.trim()) lines.push(`- 额外要求：${plan.writingRequirements.trim()}`);
+  if (plan.plannedThroughChapter && plan.chapterCount && plan.plannedThroughChapter < plan.chapterCount) {
+    lines.push(`- 当前章节窗口：第 1-${plan.plannedThroughChapter} 章（全文 ${plan.chapterCount} 章，后续按阶段滚动展开）`);
+  }
   if (plan.constraints && plan.constraints.length > 0) {
     lines.push(`- 约束：${plan.constraints.join('；')}`);
   }
@@ -2972,9 +2978,12 @@ function formatPlanCreationRules(plan: NovelPlanSummary): string | undefined {
   const lines: string[] = ['# 创作规则（计划采纳）', ''];
   if (plan.title?.trim()) lines.push(`- 书名向：${plan.title.trim()}`);
   if (plan.genre?.trim()) lines.push(`- 题材赛道：${plan.genre.trim()}`);
+  if (plan.genres && plan.genres.length > 0) lines.push(`- 类型组合：${plan.genres.join(' + ')}`);
   if (plan.protagonist?.trim()) lines.push(`- 主角：${plan.protagonist.trim()}`);
   if (plan.hook?.trim()) lines.push(`- 核心钩子：${plan.hook.trim()}`);
   if (plan.tone?.trim()) lines.push(`- 叙事基调：${plan.tone.trim()}`);
+  if (plan.endingDirection?.trim()) lines.push(`- 结局方向：${plan.endingDirection.trim()}`);
+  if (plan.writingRequirements?.trim()) lines.push(`- 额外要求：${plan.writingRequirements.trim()}`);
   if (plan.chapterCount || plan.wordsPerChapter || plan.totalWords) {
     const parts = [
       plan.chapterCount ? `${plan.chapterCount} 章` : null,

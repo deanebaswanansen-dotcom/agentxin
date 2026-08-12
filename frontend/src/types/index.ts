@@ -331,6 +331,18 @@ export interface NovelPlanAnswer {
   customText?: string;
 }
 
+/** Plan Mode v1.0 的结构化目标配置。 */
+export interface NovelPlanConfig {
+  targetTotalWords?: number;
+  targetTotalChapters?: number;
+  targetWordsPerChapter?: { min: number; max: number };
+  targetVolumeCount?: number;
+  genres?: string[];
+  coreStory?: string;
+  endingDirection?: string;
+  writingRequirements?: string;
+}
+
 export interface ModelConnectionResult {
   ok: true;
   modelName: string;
@@ -339,6 +351,7 @@ export interface ModelConnectionResult {
 
 export interface NovelPlanTurnRequest {
   seedPrompt: string;
+  planConfig?: NovelPlanConfig;
   targetTask?: NovelPlanTargetTask;
   /** Optional decision budget retained for older clients; no fixed survey is used. */
   depth?: NovelPlanDepth;
@@ -364,6 +377,10 @@ export interface NovelStoryPlan {
     genre?: string;
     targetLength?: number;
     tone?: string;
+    targetTotalChapters?: number;
+    targetWordsPerChapterMin?: number;
+    targetWordsPerChapterMax?: number;
+    targetVolumeCount?: number;
   };
   premise: {
     oneSentence: string;
@@ -420,6 +437,18 @@ export interface NovelStoryPlan {
     goal: string;
     chapterStart: number;
     chapterEnd: number;
+    targetWords?: number;
+    mainConflict?: string;
+    climax?: string;
+    endingHook?: string;
+    stages?: Array<{
+      title: string;
+      chapterStart: number;
+      chapterEnd: number;
+      goal: string;
+      climax?: string;
+      endingState?: string;
+    }>;
   }>;
   foreshadowing: string[];
   mysteries: string[];
@@ -432,6 +461,7 @@ export interface NovelStoryPlan {
 export interface NovelPlanSummary {
   title?: string;
   genre?: string;
+  genres?: string[];
   protagonist?: string;
   hook?: string;
   tone?: string;
@@ -442,6 +472,11 @@ export interface NovelPlanSummary {
   wordsPerChapter?: number;
   /** 计划章节数。 */
   chapterCount?: number;
+  /** 当前已展开的章节规划窗口末章；长篇计划按窗口滚动展开。 */
+  plannedThroughChapter?: number;
+  planConfig?: NovelPlanConfig;
+  endingDirection?: string;
+  writingRequirements?: string;
   /** Agent 生成的分章大纲（写正文前的章纲）。 */
   chapterOutlines?: NovelPlanChapterOutline[];
   /** 完整结构化 Story Plan，供所有下游 Agent 复用。 */
