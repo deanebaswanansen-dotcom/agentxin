@@ -8,6 +8,7 @@
  *   TEST_API_BASE_URL  API root when frontend/backend use different local ports
  *   TEST_MODEL     Provider model (default: deepseek-v4-flash)
  *   TEST_SCENARIO  campus | western (default: campus)
+ *   TEST_TOTAL_CHAPTERS  Planned novel size (default: 3); one run must still cap at 5.
  */
 import { createRequire } from 'node:module';
 
@@ -19,6 +20,8 @@ const API = (process.env.TEST_API_BASE_URL ?? `${SITE}/api`).replace(/\/$/, '');
 const API_KEY = process.env.TEST_API_KEY?.trim();
 const MODEL = process.env.TEST_MODEL?.trim() || 'deepseek-v4-flash';
 const SCENARIO = process.env.TEST_SCENARIO === 'western' ? 'western' : 'campus';
+const TOTAL_CHAPTERS = Math.min(500, Math.max(1, Number.parseInt(process.env.TEST_TOTAL_CHAPTERS ?? '3', 10) || 3));
+const EXPECTED_BATCH = Math.min(5, TOTAL_CHAPTERS);
 const CLIENT_ID = process.env.TEST_CLIENT_ID ?? `e2e${Date.now().toString(16)}`.padEnd(64, '7').slice(0, 64);
 const API_HEADERS = { 'X-Agentxin-Client-Id': CLIENT_ID };
 
@@ -61,6 +64,8 @@ async function main() {
     scenario: SCENARIO,
     clientId: CLIENT_ID,
     projectName,
+    plannedChapters: TOTAL_CHAPTERS,
+    expectedBatch: EXPECTED_BATCH,
     planRounds: [],
     duplicateQuestions: [],
     offTopicQuestions: [],
@@ -111,8 +116,8 @@ async function main() {
     await page.getByRole('button', { name: '发送' }).click();
     const config = page.getByLabel('小说计划配置');
     await config.waitFor({ timeout: 10_000 });
-    await config.getByLabel('全文目标字数').fill('2400');
-    await config.getByLabel('总章节数').fill('3');
+    await config.getByLabel('全文目标字数').fill(String(TOTAL_CHAPTERS * 800));
+    await config.getByLabel('总章节数').fill(String(TOTAL_CHAPTERS));
     await config.getByLabel('单章最少字数').fill('700');
     await config.getByLabel('单章最多字数').fill('900');
     await config.getByLabel('小说类型').fill(scenario.genre);
@@ -201,7 +206,7 @@ async function main() {
       if (job.status === 'failed' || job.status === 'cancelled') throw new Error(`后台任务${job.status}：${safe(job.error?.message ?? '')}`);
       await new Promise((resolve) => setTimeout(resolve, 2_000));
     }
-    if (report.job?.status !== 'completed') throw new Error('20 分钟内未完成 3 章小说。');
+    if (report.job?.status !== 'completed') throw new Error(`20 分钟内未完成 ${EXPECTED_BATCH} 章小说。`);
     report.summary = safe(finalJob?.result?.summary ?? '');
     report.modelCalls = finalJob?.result?.metrics?.modelCalls ?? 0;
     report.fallbackSteps = (finalJob?.result?.steps ?? [])
@@ -216,7 +221,7 @@ async function main() {
           actualWords: Array.from((chapter.content ?? '').replace(/\s/gu, '')).length,
         }))
       : [];
-    if (report.chapters.length < 3 || report.chapters.some((chapter) => chapter.chars < 300)) {
+    if (report.chapters.length !== EXPECTED_BATCH || report.chapters.some((chapter) => chapter.chars < 300)) {
       throw new Error(`章节落盘异常：${JSON.stringify(report.chapters)}`);
     }
     if (report.chapters.some((chapter) => chapter.actualWords < 700 || chapter.actualWords > 900)) {
