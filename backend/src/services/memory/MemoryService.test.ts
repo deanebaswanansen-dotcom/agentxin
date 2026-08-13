@@ -27,11 +27,10 @@ describe('MemoryService', () => {
     return MemoryStore.create(file).then((store) => ({ store, svc: new MemoryService(store), file }));
   }
 
-  it('scaledMemoryOptions grows with chapter count for long novels', () => {
-    expect(scaledMemoryOptions(1).maxSummaries).toBe(8);
-    expect(scaledMemoryOptions(30).maxSummaries).toBeGreaterThanOrEqual(8);
-    expect(scaledMemoryOptions(250).maxSummaries).toBe(32);
-    expect(scaledMemoryOptions(250).maxFacts).toBe(63);
+  it('keeps long-novel memory injection bounded as chapter count grows', () => {
+    expect(scaledMemoryOptions(1)).toMatchObject({ maxSummaries: 2, maxChars: 16_000 });
+    expect(scaledMemoryOptions(30)).toMatchObject({ maxSummaries: 2, maxChars: 16_000 });
+    expect(scaledMemoryOptions(250)).toMatchObject({ maxSummaries: 2, maxChars: 16_000 });
   });
 
   it('returns empty context when there is no memory', async () => {
@@ -93,6 +92,28 @@ describe('MemoryService', () => {
     expect(ctx).toContain('第1章：林辰觉醒');
     expect(ctx).toContain('写作风格沉淀');
     expect(ctx).toContain('多用短句');
+  });
+
+  it('buildContext never exceeds the explicit prompt budget', async () => {
+    const { svc } = await service();
+    await svc.recordFacts(
+      'p1',
+      Array.from({ length: 30 }, (_, index) => ({
+        kind: 'plot' as const,
+        text: `关键剧情${index}：${'不可重复的长设定'.repeat(30)}`,
+      })),
+    );
+    for (let index = 1; index <= 8; index += 1) {
+      await svc.appendChapterSummary('p1', {
+        chapterId: `c${index}`,
+        title: `第${index}章`,
+        summary: `摘要${index}：${'本章状态变化'.repeat(30)}`,
+      });
+    }
+
+    const ctx = svc.buildContext('p1', { ...scaledMemoryOptions(250), maxChars: 800 });
+    expect(ctx.length).toBeLessThanOrEqual(800);
+    expect(ctx).toContain('第8章');
   });
 
   it('persists to disk and reloads across store instances', async () => {

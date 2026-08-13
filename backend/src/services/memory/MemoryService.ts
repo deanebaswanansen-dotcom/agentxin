@@ -38,6 +38,8 @@ export interface BuildContextOptions {
   maxWorkflow?: number;
   /** 最多回灌的未回收伏笔条数（默认 12）。 */
   maxForeshadows?: number;
+  /** 最终注入文本的字符上限；长篇默认由 scaledMemoryOptions 固定为 16,000。 */
+  maxChars?: number;
   /**
    * 当前写作进度 0–1（章号/总章数）。
    * 接近收尾时会提高未回收伏笔的提示强度。
@@ -64,17 +66,16 @@ export interface TouchForeshadowInput {
 }
 
 /**
- * Scale memory injection with novel length.
- * Long runs (几十万字) cannot rely on a fixed 6-summary window.
+ * 长篇写作使用固定窗口和固定字符预算，章数增长只增加持久化记忆，不增加单章 prompt。
  */
-export function scaledMemoryOptions(chapterCount: number): BuildContextOptions {
-  const chapters = Math.max(1, Math.floor(chapterCount));
+export function scaledMemoryOptions(_chapterCount: number): BuildContextOptions {
   return {
-    maxSummaries: Math.min(40, Math.max(8, Math.ceil(chapters / 8))),
-    maxFacts: Math.min(80, Math.max(24, Math.ceil(chapters / 4))),
-    maxLearnings: Math.min(16, Math.max(8, Math.ceil(chapters / 20))),
-    maxWorkflow: Math.min(12, Math.max(6, Math.ceil(chapters / 25))),
-    maxForeshadows: Math.min(20, Math.max(8, Math.ceil(chapters / 15))),
+    maxSummaries: 2,
+    maxFacts: 24,
+    maxLearnings: 6,
+    maxWorkflow: 3,
+    maxForeshadows: 10,
+    maxChars: 16_000,
   };
 }
 
@@ -419,7 +420,8 @@ export class MemoryService {
         : undefined;
 
     const memory = this.store.read(projectId);
-    const sections: string[] = [];
+    type ContextSectionKind = 'facts' | 'foreshadows' | 'summaries' | 'learnings' | 'workflow';
+    const sections: Array<{ kind: ContextSectionKind; content: string }> = [];
 
     const facts = memory.facts.slice(-maxFacts);
     if (facts.length > 0) {
@@ -437,7 +439,10 @@ export class MemoryService {
           grouped[kind].forEach((t) => lines.push(`- ${t}`));
         }
       });
-      sections.push(`# 故事设定记忆（须保持一致，禁止与下列设定冲突）\n${lines.join('\n')}`);
+      sections.push({
+        kind: 'facts',
+        content: `# 故事设定记忆（须保持一致，禁止与下列设定冲突）\n${lines.join('\n')}`,
+      });
     }
 
     const openForeshadows = sortOpenForeshadows(
@@ -460,28 +465,76 @@ export class MemoryService {
       if (lateGame) {
         lines.push('- 写作要求：本章至少推进或回收 1 条高/中紧急度伏笔，并在结局前清掉核心悬念。');
       }
-      sections.push(`${header}\n${lines.join('\n')}`);
+      sections.push({ kind: 'foreshadows', content: `${header}\n${lines.join('\n')}` });
     }
 
     const summaries = memory.summaries.slice(-maxSummaries);
     if (summaries.length > 0) {
       const lines = summaries.map((s) => `- ${s.title}：${s.summary}`);
-      sections.push(`# 前情提要（按章节顺序，须自然顺接）\n${lines.join('\n')}`);
+      sections.push({
+        kind: 'summaries',
+        content: `# 前情提要（按章节顺序，须自然顺接）\n${lines.join('\n')}`,
+      });
     }
 
     const learnings = memory.learnings.slice(-maxLearnings);
     if (learnings.length > 0) {
       const lines = learnings.map((l) => `- ${l.text}`);
-      sections.push(`# 写作风格沉淀（请遵循，持续保持文风一致）\n${lines.join('\n')}`);
+      sections.push({
+        kind: 'learnings',
+        content: `# 写作风格沉淀（请遵循，持续保持文风一致）\n${lines.join('\n')}`,
+      });
     }
 
     const workflow = memory.workflow.slice(-maxWorkflow);
     if (workflow.length > 0) {
       const lines = workflow.map((event) => `- ${event.task}：${event.summary}`);
-      sections.push(`# 最近工作流轨迹（用于判断当前创作阶段）\n${lines.join('\n')}`);
+      sections.push({
+        kind: 'workflow',
+        content: `# 最近工作流轨迹（用于判断当前创作阶段）\n${lines.join('\n')}`,
+      });
     }
 
-    return sections.join('\n\n');
+    const maxChars = options.maxChars;
+    if (maxChars === undefined || !Number.isFinite(maxChars) || maxChars <= 0) {
+      return sections.map((section) => section.content).join('\n\n');
+    }
+
+    const ratios: Record<ContextSectionKind, number> = {
+      facts: 0.35,
+      foreshadows: 0.15,
+      summaries: 0.25,
+      learnings: 0.15,
+      workflow: 0.1,
+    };
+    const keepTail = new Set<ContextSectionKind>(['summaries', 'learnings', 'workflow']);
+    const bounded = sections.map((section) => {
+      const budget = Math.max(40, Math.floor(maxChars * ratios[section.kind]));
+      if (section.content.length <= budget) return section.content;
+      if (section.kind === 'summaries') {
+        const [heading = '', ...entries] = section.content.split('\n');
+        const entryBudget = Math.max(
+          12,
+          Math.floor((budget - heading.length - entries.length) / Math.max(1, entries.length)),
+        );
+        return [
+          heading,
+          ...entries.map((entry) =>
+            entry.length <= entryBudget ? entry : `${entry.slice(0, Math.max(0, entryBudget - 1))}…`,
+          ),
+        ]
+          .join('\n')
+          .slice(0, budget);
+      }
+      if (keepTail.has(section.kind)) {
+        const headingEnd = section.content.indexOf('\n');
+        const heading = headingEnd >= 0 ? section.content.slice(0, headingEnd) : '';
+        const suffixBudget = Math.max(0, budget - heading.length - 4);
+        return `${heading}\n…\n${section.content.slice(-suffixBudget)}`.slice(0, budget);
+      }
+      return `${section.content.slice(0, Math.max(0, budget - 8))}\n…（截断）`;
+    });
+    return bounded.join('\n\n').slice(0, maxChars);
   }
 }
 

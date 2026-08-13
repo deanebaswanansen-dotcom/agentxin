@@ -30,7 +30,12 @@ import type { ReferenceAnalysisService } from '../reference/ReferenceAnalysisSer
 import { MaterialResearchService } from '../research/MaterialResearchService.js';
 import { stripReasoningArtifacts } from '../text/reasoningSanitizer.js';
 import type { LongNovelConfigStorePort } from './longNovel/LongNovelConfigStore.js';
-import { defaultLongNovelConfig, runChapterQualityGates, type GateResult } from './longNovel/qualityGates.js';
+import {
+  defaultLongNovelConfig,
+  runChapterQualityGates,
+  type GateFinding,
+  type GateResult,
+} from './longNovel/qualityGates.js';
 import {
   ContinuityInspectorSubAgent,
   type InspectorReport,
@@ -135,6 +140,29 @@ export function remainingLongNovelBatch(
   plannedTotalChapters: number,
 ): number {
   return Math.min(requestedBatch, Math.max(0, plannedTotalChapters - completedChapters));
+}
+
+export function longNovelBatchLimit(level: LongNovelAutomationLevel): number {
+  return level === 'assistant' ? 1 : 5;
+}
+
+export function shouldAutoReviseChapter(input: {
+  enabled: boolean;
+  inspectorScore: number;
+  recommendRevision: boolean;
+  revisionHints: string[];
+  fatalIssues: string[];
+  findings: GateFinding[];
+}): boolean {
+  if (!input.enabled) return false;
+  const fixableFormatFailure = input.findings.some(
+    (finding) => finding.gate === 'format' && finding.autoFixable,
+  );
+  const materialContinuityFailure = input.fatalIssues.length > 0 || input.inspectorScore < 70;
+  return (
+    fixableFormatFailure ||
+    (materialContinuityFailure && input.recommendRevision && input.revisionHints.length > 0)
+  );
 }
 
 function truncatePromptSection(value: string, maxChars: number): string {
@@ -1015,7 +1043,7 @@ export class AgentOrchestrator {
       targetWordsPerChapter: perChapter,
       minWordsPerChapter: options?.minWordsPerChapter,
       maxWordsPerChapter: options?.maxWordsPerChapter,
-      maxChaptersPerRun: requestedBatch,
+      maxChaptersPerRun: longNovelBatchLimit(automationLevel),
     });
     // assistant 强制单章；unattended 允许更大批次但受 options.chapters 限制
     let chapterCount = Math.min(requestedBatch, modeConfig.maxChaptersPerRun);
@@ -1227,22 +1255,38 @@ export class AgentOrchestrator {
         total: chapterCount,
       });
       const chapter = await this.getOrCreateLongNovelChapter(pid, title);
-      let content = await this.writeLongNovelChapter(
-        config,
-        pid,
-        chapter.id,
-        pack,
-        num,
-        plannedFinalChapter,
-        title,
-        planChapter?.goal,
-        directorBrief,
-        perChapter,
-        signal,
-        emit,
-        { current: i + 1, total: chapterCount },
-        steps,
-      );
+      let content: string;
+      try {
+        content = await this.writeLongNovelChapter(
+          config,
+          pid,
+          chapter.id,
+          pack,
+          num,
+          plannedFinalChapter,
+          title,
+          planChapter?.goal,
+          directorBrief,
+          perChapter,
+          signal,
+          emit,
+          { current: i + 1, total: chapterCount },
+          steps,
+        );
+      } catch (error) {
+        if (signal.aborted) throw error;
+        await this.discardEmptyChapterUnlessCheckpoint(chapter.id);
+        const detail = error instanceof Error ? error.message.slice(0, 120) : '未知模型错误';
+        stoppedReason = `第${num}章生成失败，检查点已保留，可从本章继续（${detail}）`;
+        steps.push(`【ChapterAgent】「${title}」生成失败；前序章节与当前场景检查点均已保留。`);
+        emit({
+          phase: 'info',
+          message: `【主 Agent】${stoppedReason}`,
+          current: i + 1,
+          total: chapterCount,
+        });
+        break;
+      }
 
       // Empty prose is a writer failure, not a continuity conflict. Never send
       // it to ContinuityAgent/ReviewAgent, and remove the empty placeholder so
@@ -2393,10 +2437,14 @@ export class AgentOrchestrator {
     let shouldRevise = false;
     let hints: string[] = [];
     if (options.qualityGates) {
-      shouldRevise =
-        options.autoRevisionEnabled &&
-        (inspection.recommendRevision ||
-          Boolean(gates?.findings.some((f) => f.autoFixable && f.severity !== 'pass')));
+      shouldRevise = shouldAutoReviseChapter({
+        enabled: options.autoRevisionEnabled,
+        inspectorScore: inspection.score0to100,
+        recommendRevision: inspection.recommendRevision,
+        revisionHints: inspection.revisionHints,
+        fatalIssues: inspection.fatalIssues,
+        findings: gates?.findings ?? [],
+      });
       if (shouldRevise) {
         hints = [
           ...inspection.revisionHints,

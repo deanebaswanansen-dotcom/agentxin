@@ -169,7 +169,7 @@ export function defaultLongNovelConfig(partial?: Partial<{
   const perChapter = partial?.targetWordsPerChapter ?? 2000;
   const maxRun =
     partial?.maxChaptersPerRun ??
-    (level === 'assistant' ? 1 : level === 'semi_auto' ? 5 : level === 'auto' ? 20 : 50);
+    (level === 'assistant' ? 1 : 5);
   return {
     enabled: true,
     automationLevel: level,

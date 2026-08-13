@@ -11,10 +11,12 @@ import {
   extractChapterOutline,
   normalizeFullNovelOptions,
   normalizeLongNovelTotalWords,
+  longNovelBatchLimit,
   remainingLongNovelBatch,
   parseCharacterProfiles,
   parseReflection,
   revisionDoesNotWorsenWordRange,
+  shouldAutoReviseChapter,
   AgentOrchestrator,
 } from './AgentOrchestrator.js';
 import type { ModelProxy, StreamCompletionOptions } from '../../proxy/ModelProxy.js';
@@ -168,6 +170,43 @@ describe('normalizeFullNovelOptions', () => {
     expect(remainingLongNovelBatch(3, 2, 3)).toBe(1);
     expect(remainingLongNovelBatch(3, 3, 3)).toBe(0);
     expect(remainingLongNovelBatch(3, 1, 10)).toBe(3);
+  });
+
+  it('caps every autonomous long-novel batch at five chapters', () => {
+    expect(longNovelBatchLimit('assistant')).toBe(1);
+    expect(longNovelBatchLimit('semi_auto')).toBe(5);
+    expect(longNovelBatchLimit('auto')).toBe(5);
+    expect(longNovelBatchLimit('unattended')).toBe(5);
+  });
+
+  it('does not spend a full revision call on advisory style findings', () => {
+    expect(
+      shouldAutoReviseChapter({
+        enabled: true,
+        inspectorScore: 88,
+        recommendRevision: true,
+        revisionHints: ['可以增强对白节奏'],
+        fatalIssues: [],
+        findings: [
+          {
+            gate: 'style',
+            severity: 'soft',
+            message: '本章对白较少。',
+            autoFixable: true,
+          },
+        ],
+      }),
+    ).toBe(false);
+    expect(
+      shouldAutoReviseChapter({
+        enabled: true,
+        inspectorScore: 65,
+        recommendRevision: true,
+        revisionHints: ['修正人物身份冲突'],
+        fatalIssues: ['人物身份冲突'],
+        findings: [],
+      }),
+    ).toBe(true);
   });
 
   it('rejects a ReviewAgent revision that moves farther outside the confirmed word range', () => {
@@ -537,6 +576,95 @@ describe('normalizeFullNovelOptions', () => {
     expect((result.metrics?.completedChapters ?? 0) >= 1).toBe(true);
     const artifactKeys = result.artifacts.map((artifact) => `${artifact.kind}:${artifact.id}`);
     expect(new Set(artifactKeys).size).toBe(artifactKeys.length);
+  });
+
+  it('enforces the five-chapter batch cap in the real long-novel loop', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-five-chapter-batch-'));
+    const store = await FileDataStore.create(join(tempDir, 'store.json'));
+    await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock-model' });
+    const memory = new MemoryService(await MemoryStore.create(join(tempDir, 'memory.json')));
+    const orchestrator = new AgentOrchestrator(
+      store,
+      new ModelConfigService(store),
+      new CaptureProxy(),
+      undefined as never,
+      undefined as never,
+      memory,
+    );
+
+    const result = await orchestrator.run(
+      {
+        task: 'long_novel',
+        mode: 'draft',
+        prompt: '代码御剑长篇',
+        options: {
+          chapters: 12,
+          totalChapters: 12,
+          targetWords: 500,
+          automationLevel: 'unattended',
+        },
+      },
+      new AbortController().signal,
+    );
+
+    expect(result.metrics?.completedChapters).toBe(5);
+    expect(result.summary).toContain('完成 5/5 章');
+    expect(await store.listChapters(result.projectId)).toHaveLength(5);
+  });
+
+  it('pauses on a failed chapter and resumes from that chapter without duplication', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-chapter-resume-'));
+    const store = await FileDataStore.create(join(tempDir, 'store.json'));
+    await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock-model' });
+    const memory = new MemoryService(await MemoryStore.create(join(tempDir, 'memory.json')));
+    const proxy = new CaptureProxy();
+    const original = proxy.streamCompletion.bind(proxy);
+    let failSecondChapter = true;
+    proxy.streamCompletion = (config, messages, signal, options) => {
+      const system = messages[0]?.content ?? '';
+      if (system.includes('正文写作子 Agent') && system.includes('第 2 / 3 章') && failSecondChapter) {
+        return (async function* () {
+          throw new ProxyError('模型提供商暂时不可用', { status: 503 });
+        })();
+      }
+      return original(config, messages, signal, options);
+    };
+    const orchestrator = new AgentOrchestrator(
+      store,
+      new ModelConfigService(store),
+      proxy,
+      undefined as never,
+      undefined as never,
+      memory,
+    );
+
+    const first = await orchestrator.run(
+      {
+        task: 'long_novel',
+        mode: 'draft',
+        prompt: '代码御剑长篇',
+        options: { chapters: 3, totalChapters: 3, targetWords: 500, automationLevel: 'semi_auto' },
+      },
+      new AbortController().signal,
+    );
+    expect(first.summary).toContain('已暂停');
+    expect(first.metrics?.completedChapters).toBe(1);
+
+    failSecondChapter = false;
+    const resumed = await orchestrator.run(
+      {
+        task: 'long_novel',
+        mode: 'draft',
+        prompt: '代码御剑长篇',
+        projectId: first.projectId,
+        options: { chapters: 5, totalChapters: 3, targetWords: 500, automationLevel: 'semi_auto' },
+      },
+      new AbortController().signal,
+    );
+    const chapters = await store.listChapters(first.projectId);
+    expect(resumed.summary).toContain('完成 2/2 章');
+    expect(chapters.map((chapter) => chapter.title)).toEqual(['第1章', '第2章', '第3章']);
+    expect(chapters.every((chapter) => chapter.content.trim().length > 0)).toBe(true);
   });
 
   it('retries an empty ChapterAgent response before continuity review', async () => {
