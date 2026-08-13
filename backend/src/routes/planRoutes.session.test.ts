@@ -12,6 +12,25 @@ describe('planRoutes persistent project session', () => {
     await Promise.all(apps.splice(0).map((app) => app.close()));
   });
 
+  it('returns a successful null response when a project has no plan session', async () => {
+    const app = Fastify({ logger: false });
+    apps.push(app);
+    registerPlanRoutes(
+      app,
+      { turn: vi.fn() } as unknown as NovelPlanService,
+      PlanSessionStore.ephemeral(),
+    );
+    await app.ready();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/projects/new-project/plan-session',
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toBeNull();
+  });
+
   it('uses the server-side history on the next answer turn and exposes recovery', async () => {
     const turn = vi
       .fn()

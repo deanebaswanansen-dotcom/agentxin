@@ -4,10 +4,13 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
+  BLUEPRINT_REQUIREMENT_MAX_CHARS,
+  buildChapterBlueprintRequirement,
   buildControlOutlineFromPlan,
   extractChapterOutfitPlan,
   extractChapterOutline,
   normalizeFullNovelOptions,
+  normalizeLongNovelTotalWords,
   parseCharacterProfiles,
   parseReflection,
   AgentOrchestrator,
@@ -152,6 +155,28 @@ describe('normalizeFullNovelOptions', () => {
       wordsPerChapter: 300,
       plannedWords: 300,
     });
+  });
+
+  it('honors an explicitly configured short total instead of silently raising it to 10,000 words', () => {
+    expect(normalizeLongNovelTotalWords(2400)).toBe(2400);
+    expect(normalizeLongNovelTotalWords(undefined)).toBe(200_000);
+  });
+
+  it('keeps blueprint requirements within the API limit without dropping story memory', () => {
+    const requirement = buildChapterBlueprintRequirement({
+      chapterNumber: 7,
+      chapterTitle: '破碎盟约',
+      targetWords: 3000,
+      chapterGoal: '推进联盟冲突。'.repeat(400),
+      seedPrompt: '西方玄幻世界设定。'.repeat(1000),
+      memoryContext: '塞琳娜的发尾灰黑。'.repeat(1000),
+    });
+
+    expect(requirement.length).toBeLessThanOrEqual(BLUEPRINT_REQUIREMENT_MAX_CHARS);
+    expect(requirement).toContain('章节编号：7');
+    expect(requirement).toContain('整本题材与用户要求');
+    expect(requirement).toContain('当前故事记忆');
+    expect(requirement).toContain('塞琳娜');
   });
 
   it('extracts the requested chapter anchor from a markdown outline', () => {
@@ -487,6 +512,8 @@ describe('normalizeFullNovelOptions', () => {
     const outlines = await store.listOutlines(result.projectId);
     expect(outlines.some((o) => o.title.includes('长篇小说模式配置'))).toBe(true);
     expect((result.metrics?.completedChapters ?? 0) >= 1).toBe(true);
+    const artifactKeys = result.artifacts.map((artifact) => `${artifact.kind}:${artifact.id}`);
+    expect(new Set(artifactKeys).size).toBe(artifactKeys.length);
   });
 
   it('retries an empty ChapterAgent response before continuity review', async () => {

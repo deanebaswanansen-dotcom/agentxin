@@ -146,7 +146,11 @@ export class ContinuityInspectorSubAgent {
     ];
 
     const chunks: string[] = [];
-    for await (const delta of this.modelProxy.streamCompletion(config, messages, signal, { jsonMode: true })) {
+    for await (const delta of this.modelProxy.streamCompletion(config, messages, signal, {
+      jsonMode: true,
+      disableThinking: true,
+      maxTokens: 2048,
+    })) {
       if (delta.kind === 'content') chunks.push(delta.text);
     }
     const raw = stripReasoningArtifacts(chunks.join(''));

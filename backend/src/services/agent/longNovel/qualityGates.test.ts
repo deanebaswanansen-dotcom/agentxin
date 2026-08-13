@@ -46,9 +46,9 @@ describe('long novel quality gates', () => {
       chapterTitle: '第2章',
       inspectorScore: 40,
       recommendRevision: true,
-      revisionHints: ['角色已死亡却再次出场，属于明确设定冲突'],
+      revisionHints: ['将发色改为与设定一致，并加强章末钩子'],
     });
-    expect(conflict.hardFail).toBe(true);
+    expect(conflict.hardFail).toBe(false);
 
     const fatalFinding = runChapterQualityGates({
       content: body,
@@ -58,9 +58,22 @@ describe('long novel quality gates', () => {
       chapterTitle: '第2章',
       inspectorScore: 40,
       recommendRevision: false,
-      fatalIssues: ['人物身份与 Canon 冲突'],
+      fatalIssues: ['角色已死亡却再次出场，人物身份与 Canon 冲突'],
     });
     expect(fatalFinding.hardFail).toBe(true);
+
+    const appearanceDrift = runChapterQualityGates({
+      content: body,
+      minWords: 100,
+      maxWords: 8000,
+      targetWords: 1500,
+      chapterTitle: '第2章',
+      inspectorScore: 45,
+      recommendRevision: true,
+      fatalIssues: ['卡奥斯的旧疤从小臂变成右手无名指，与人物设定不一致'],
+      revisionHints: ['将旧疤位置改回小臂'],
+    });
+    expect(appearanceDrift.hardFail).toBe(false);
   });
 
   it('default config maps automation levels to max chapters per run', () => {

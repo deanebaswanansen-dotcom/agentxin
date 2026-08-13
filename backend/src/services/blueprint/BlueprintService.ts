@@ -171,14 +171,39 @@ export class BlueprintService {
     const fullText = await this.collectStream(
       this.modelProxy.streamCompletion(config, messages, signal, {
         jsonMode: true,
+        disableThinking: true,
+        maxTokens: 4096,
       }),
     );
 
-    // 7) 解析模型输出为蓝图核心结构（失败抛 VALIDATION_ERROR，需求 3.1 / 3.4 / 3.5）。
-    const core = parseBlueprintFromText(fullText);
-
-    // 8) 结构校验（失败抛 VALIDATION_ERROR，需求 4.x）。
-    validateBlueprint(core);
+    // 7–8) 解析并校验。结构化模型偶尔返回被截断的 JSON；只对这种领域校验
+    // 错误补发一次更精简的 JSON 请求，提供商/网络错误仍直接向上传递。
+    let core;
+    try {
+      core = parseBlueprintFromText(fullText);
+      validateBlueprint(core);
+    } catch (error) {
+      if (!(error instanceof ServiceError) || error.code !== 'VALIDATION_ERROR') throw error;
+      const retryMessages = [
+        ...messages,
+        {
+          role: 'user' as const,
+          content: [
+            '上一次蓝图 JSON 不完整或未通过结构校验。请重新输出一份更精简的完整 JSON。',
+            '只保留 schema 要求字段；场景控制在 3–5 个；不要解释、Markdown 或思考过程。',
+          ].join('\n'),
+        },
+      ];
+      const retryText = await this.collectStream(
+        this.modelProxy.streamCompletion(config, retryMessages, signal, {
+          jsonMode: true,
+          disableThinking: true,
+          maxTokens: 4096,
+        }),
+      );
+      core = parseBlueprintFromText(retryText);
+      validateBlueprint(core);
+    }
 
     // 9) 绑定目标章节标识符，确保蓝图与目标章节一致。
     const blueprint: ChapterBlueprint = { ...core, chapter_id: chapterId };

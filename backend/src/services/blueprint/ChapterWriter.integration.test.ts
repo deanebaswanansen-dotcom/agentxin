@@ -27,7 +27,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import type { ModelProxy } from '../../proxy/ModelProxy.js';
+import type { ModelProxy, StreamCompletionOptions } from '../../proxy/ModelProxy.js';
 import type { StreamDelta } from '../../proxy/sseParser.js';
 import { ProxyError, isProxyError } from '../../proxy/ProxyError.js';
 import type {
@@ -79,14 +79,14 @@ function makeFakeProxy(options: FakeProxyOptions = {}) {
   } = options;
 
   let callCount = 0;
-  const calls: { config: ModelConfig; messages: ChatMessage[]; index: number }[] =
+  const calls: { config: ModelConfig; messages: ChatMessage[]; index: number; options?: StreamCompletionOptions }[] =
     [];
 
   const proxy: ModelProxy = {
-    streamCompletion(config, messages) {
+    streamCompletion(config, messages, _signal, streamOptions) {
       callCount += 1;
       const index = callCount;
-      calls.push({ config, messages, index });
+      calls.push({ config, messages, index, options: streamOptions });
       const deltas = deltasForCall(index);
       const fail = failOnCall === index;
       return (async function* () {
@@ -184,6 +184,7 @@ describe('SceneWriter / ChapterWriter integration', () => {
     expect(fullText).toBe(deltasForCall(1).join(''));
     expect(calls).toHaveLength(1);
     expect(calls[0].config).toEqual(VALID_CONFIG);
+    expect(calls[0].options).toEqual({ disableThinking: true, maxTokens: 728 });
 
     // The caller persists only after the stream completes normally (Req 6.5).
     await sceneWriter.finalizeDraft(chapterId, 'scene-1', fullText);

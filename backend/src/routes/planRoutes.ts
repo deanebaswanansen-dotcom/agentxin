@@ -316,11 +316,7 @@ export function registerPlanRoutes(
 ): void {
   app.get<{ Params: { projectId: string } }>('/api/projects/:projectId/plan-session', async (request, reply) => {
     const session = sessions.get(request.params.projectId);
-    if (!session) {
-      const { status, body } = toErrorResponse(ServiceError.notFound('该项目还没有计划会话。'));
-      return reply.code(status).send(body);
-    }
-    return reply.code(200).send(session);
+    return reply.code(200).send(session ?? null);
   });
 
   app.delete<{ Params: { projectId: string } }>('/api/projects/:projectId/plan-session', async (request, reply) => {

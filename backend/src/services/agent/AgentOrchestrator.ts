@@ -37,6 +37,7 @@ import {
 
 const MAX_EMPTY_CHAPTER_ATTEMPTS = 3;
 const RETRYABLE_CHAPTER_PROVIDER_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+export const BLUEPRINT_REQUIREMENT_MAX_CHARS = 5000;
 
 function isRetryableChapterError(error: unknown): boolean {
   if (!isProxyError(error)) return false;
@@ -98,6 +99,53 @@ export function normalizeFullNovelOptions(chapters: number, targetWords: number)
     wordsPerChapter,
     plannedWords: chapterCount * wordsPerChapter,
   };
+}
+
+export function normalizeLongNovelTotalWords(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return 200_000;
+  return clampInteger(
+    value,
+    FULL_NOVEL_LIMITS.minTargetWords,
+    FULL_NOVEL_LIMITS.maxChapters * FULL_NOVEL_LIMITS.maxTargetWords,
+  );
+}
+
+function truncatePromptSection(value: string, maxChars: number): string {
+  const normalized = value.trim();
+  if (normalized.length <= maxChars) return normalized;
+  const suffix = '\n…（内容已截断）';
+  return `${normalized.slice(0, Math.max(0, maxChars - suffix.length))}${suffix}`;
+}
+
+export function buildChapterBlueprintRequirement(input: {
+  chapterNumber: number;
+  chapterTitle: string;
+  targetWords: number;
+  chapterGoal?: string;
+  seedPrompt: string;
+  memoryContext: string;
+}): string {
+  const header = [
+    `章节编号：${input.chapterNumber}`,
+    `章节标题：${truncatePromptSection(input.chapterTitle, 200)}`,
+    `目标字数：${input.targetWords}`,
+    `本章目标：${truncatePromptSection(
+      input.chapterGoal?.trim() || '承接前情，推进主线冲突，完成一次明确状态变化并留下章末钩子。',
+      1200,
+    )}`,
+  ].join('\n\n');
+  const seed = `整本题材与用户要求：${truncatePromptSection(input.seedPrompt, 1800)}`;
+  const memoryLabel = '当前故事记忆（只提取事实，不要照抄摘要）：\n';
+  const base = `${header}\n\n${seed}`;
+  const memoryBudget = BLUEPRINT_REQUIREMENT_MAX_CHARS - base.length - 2 - memoryLabel.length;
+  const memory = input.memoryContext.trim();
+  if (memory.length === 0 || memoryBudget <= 0) {
+    return base.slice(0, BLUEPRINT_REQUIREMENT_MAX_CHARS);
+  }
+  return `${base}\n\n${memoryLabel}${truncatePromptSection(memory, memoryBudget)}`.slice(
+    0,
+    BLUEPRINT_REQUIREMENT_MAX_CHARS,
+  );
 }
 
 export function extractChapterOutline(outline: string, chapterNumber: number): string | undefined {
@@ -926,7 +974,7 @@ export class AgentOrchestrator {
       FULL_NOVEL_LIMITS.minChapters,
       FULL_NOVEL_LIMITS.maxChapters,
     );
-    const totalWords = Math.max(10_000, options?.totalWords ?? 200_000);
+    const totalWords = normalizeLongNovelTotalWords(options?.totalWords);
     const plannedTotalChapters = clampInteger(
       options?.totalChapters ?? options?.planSummary?.chapterCount ?? Math.ceil(totalWords / perChapter),
       FULL_NOVEL_LIMITS.minChapters,
@@ -1174,9 +1222,10 @@ export class AgentOrchestrator {
         targetWords: perChapter,
         chapterTitle: title,
       });
-      const formatNeedsRewrite =
-        gates.hardFail ||
-        gates.findings.some((f) => f.gate === 'format' && f.autoFixable && f.severity !== 'pass');
+      // Slight word-count drift is advisory and must not discard a complete
+      // scene pipeline draft. Re-run the expensive whole-chapter writer only
+      // for hard format failures such as empty/meta output.
+      const formatNeedsRewrite = gates.hardFail;
       if (modeConfig.autoRevisionEnabled && formatNeedsRewrite) {
         emit({
           phase: 'chapter',
@@ -1580,16 +1629,14 @@ export class AgentOrchestrator {
     steps: string[],
   ): Promise<string> {
     const memoryContext = this.memory.buildContext(projectId, scaledMemoryOptions(chapterNumber));
-    const requirement = [
-      `章节编号：${chapterNumber}`,
-      `章节标题：${chapterTitle}`,
-      `目标字数：${targetWords}`,
-      `本章目标：${chapterGoal?.trim() || '承接前情，推进主线冲突，完成一次明确状态变化并留下章末钩子。'}`,
-      `整本题材与用户要求：${seedPrompt}`,
-      memoryContext.length > 0 ? `当前故事记忆（只提取事实，不要照抄摘要）：\n${memoryContext}` : '',
-    ]
-      .filter(Boolean)
-      .join('\n\n');
+    const requirement = buildChapterBlueprintRequirement({
+      chapterNumber,
+      chapterTitle,
+      targetWords,
+      chapterGoal,
+      seedPrompt,
+      memoryContext,
+    });
 
     try {
       emit({
@@ -2107,7 +2154,9 @@ export class AgentOrchestrator {
       }
     }
     const saved = await this.upsertOutlineByTitle(projectId, '分章人物服装表', outfitPlan);
-    artifacts.push({ kind: 'outline', id: saved.id, title: saved.title });
+    if (!artifacts.some((artifact) => artifact.kind === 'outline' && artifact.id === saved.id)) {
+      artifacts.push({ kind: 'outline', id: saved.id, title: saved.title });
+    }
     return pack.characters.includes(outfitPlan)
       ? pack
       : { ...pack, characters: `${pack.characters.trim()}\n\n${outfitPlan}` };
@@ -2627,7 +2676,7 @@ export class AgentOrchestrator {
     chapterNumber: number,
     _totalChapters: number,
     seedPrompt: string,
-    _targetWords: number,
+    targetWords: number,
     original: string,
     hints: string[],
     signal: AbortSignal,
@@ -2657,6 +2706,10 @@ export class AgentOrchestrator {
         },
       ],
       signal,
+      {
+        disableThinking: true,
+        maxTokens: Math.min(8192, Math.max(2048, targetWords * 2 + 1024)),
+      },
     );
   }
 
@@ -2715,7 +2768,7 @@ export class AgentOrchestrator {
           { role: 'user', content: `章节标题：${chapterTitle}\n\n正文：\n${text.slice(0, 6000)}` },
         ],
         signal,
-        { jsonMode: true },
+        { jsonMode: true, disableThinking: true, maxTokens: 2048 },
       );
       const parsed = parseReflection(raw);
       if (parsed.summary.length > 0) summary = parsed.summary;
@@ -2936,7 +2989,7 @@ export class AgentOrchestrator {
     config: ModelConfig,
     messages: ChatMessage[],
     signal: AbortSignal,
-    options?: { jsonMode?: boolean },
+    options?: { jsonMode?: boolean; disableThinking?: boolean; maxTokens?: number },
   ): Promise<string> {
     const chunks: string[] = [];
     for await (const delta of this.modelProxy.streamCompletion(config, messages, signal, options)) {

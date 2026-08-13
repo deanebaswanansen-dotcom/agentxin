@@ -31,6 +31,17 @@ export interface GateResult {
   findings: GateFinding[];
 }
 
+function isCatastrophicContinuityIssue(issue: string): boolean {
+  const normalized = issue.replace(/\s+/g, '');
+  return (
+    /(?:死亡|已死).{0,24}(?:复活|再次出场|仍然活着|存活)/.test(normalized) ||
+    /(?:身份|性别).{0,24}(?:冲突|矛盾|错误|错置|不一致)/.test(normalized) ||
+    /(?:时间线|年代|时间顺序).{0,32}(?:冲突|矛盾|不可能|倒置)/.test(normalized) ||
+    /(?:世界规则|力量体系|核心能力).{0,32}(?:冲突|矛盾|违反|不一致)/.test(normalized) ||
+    /硬冲突/.test(normalized)
+  );
+}
+
 const META_LEAK =
   /^(?:好的|当然|作为|以下是|我来|下面给出|根据你的要求|JSON|system prompt)/im;
 
@@ -93,9 +104,10 @@ export function runChapterQualityGates(input: GateInput): GateResult {
   }
 
   // Gate 3 一致性（来自检测子 Agent）
-  const hasExplicitConflict = [...(input.revisionHints ?? []), ...(input.fatalIssues ?? [])].some((hint) =>
-    /死亡|复活|性别|身份|能力|设定|时间线|世界规则|硬冲突|矛盾/.test(hint),
-  );
+  // Reviewer labels are advisory. Only catastrophic, story-breaking facts may
+  // halt an unattended run; appearance, outfit and ordinary scar drift remain
+  // auto-fixable soft findings.
+  const hasExplicitConflict = (input.fatalIssues ?? []).some(isCatastrophicContinuityIssue);
   if (input.inspectorScore !== undefined && input.inspectorScore < 50) {
     // A numeric score is a reviewer signal, not a deterministic conflict.  A
     // malformed/overly conservative reviewer must not halt a whole novel;

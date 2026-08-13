@@ -716,18 +716,13 @@ async function getPlanSession(
   projectId: Id,
   signal?: AbortSignal,
 ): Promise<NovelPlanSession | null> {
-  try {
-    return await request<NovelPlanSession>(
-      baseUrl,
-      'GET',
-      `/projects/${seg(projectId)}/plan-session`,
-      undefined,
-      { signal },
-    );
-  } catch (error) {
-    if (error instanceof ApiClientError && error.code === 'NOT_FOUND') return null;
-    throw error;
-  }
+  return request<NovelPlanSession | null>(
+    baseUrl,
+    'GET',
+    `/projects/${seg(projectId)}/plan-session`,
+    undefined,
+    { signal },
+  );
 }
 
 async function streamReferenceAnalyze(

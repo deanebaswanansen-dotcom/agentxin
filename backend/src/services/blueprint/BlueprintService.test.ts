@@ -361,6 +361,28 @@ describe('BlueprintService.generate — request-body validation', () => {
 // ---------------------------------------------------------------------------
 
 describe('BlueprintService.generate — invalid model output', () => {
+  it('retries one truncated JSON response with a concise schema-only request', async () => {
+    const seeded = await seed();
+    const responses = ['{"chapter_id":"truncated"', blueprintAsModelOutput(makeValidBlueprintCore())];
+    const calls: ChatMessage[][] = [];
+    const proxy: ModelProxy = {
+      streamCompletion(_config, messages) {
+        calls.push(messages);
+        const response = responses.shift() ?? '';
+        return (async function* () {
+          yield { kind: 'content' as const, text: response };
+        })();
+      },
+    };
+    const service = new BlueprintService(seeded.store, seeded.modelConfigService, proxy);
+
+    const result = await service.generate(seeded.chapterId, VALID_BODY, signal());
+
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.at(-1)?.content).toContain('更精简的完整 JSON');
+    expect(result.scenes).toHaveLength(3);
+  });
+
   it('throws VALIDATION_ERROR when the model output has no parseable JSON (Req 3.4)', async () => {
     const seeded = await seed();
     const { proxy } = makeFakeProxy({

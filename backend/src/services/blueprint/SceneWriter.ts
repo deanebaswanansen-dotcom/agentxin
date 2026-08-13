@@ -114,7 +114,10 @@ export class SceneWriter {
     });
 
     // 6) 发起流式补全并透传增量（需求 6.4）。
-    const stream = this.modelProxy.streamCompletion(config, messages, signal);
+    const stream = this.modelProxy.streamCompletion(config, messages, signal, {
+      disableThinking: true,
+      maxTokens: Math.min(4096, Math.max(256, scene.target_words + 128)),
+    });
     return { blueprint, scene, stream };
   }
 
