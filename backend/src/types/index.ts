@@ -359,6 +359,10 @@ export interface ModelConnectionResult {
 
 export interface NovelPlanTurnRequest {
   seedPrompt: string;
+  /** 当前计划所属项目；提供后由服务端保存并恢复多轮状态。 */
+  projectId?: Id;
+  /** 明确开始新的计划会话，清除该项目的旧计划状态。 */
+  resetSession?: boolean;
   /** v1.0 结构化计划输入；seedPrompt 保留用于兼容旧客户端。 */
   planConfig?: NovelPlanConfig;
   targetTask?: NovelPlanTargetTask;
@@ -497,6 +501,8 @@ export interface NovelPlanSummary {
 
 export interface NovelPlanTurnResponse {
   status: 'asking' | 'ready';
+  /** 服务端持久化计划会话 id。 */
+  sessionId?: string;
   round: number;
   message: string;
   questions?: NovelPlanQuestion[];
@@ -509,6 +515,30 @@ export interface NovelPlanTurnResponse {
   depth?: NovelPlanDepth;
   /** 该深度的目标轮次区间，如 [8, 10]。 */
   depthRoundRange?: [number, number];
+}
+
+export interface NovelPlanDecision {
+  key: string;
+  status: 'unknown' | 'asked' | 'answered' | 'delegated' | 'locked';
+  value?: string | number | string[];
+  source: 'user' | 'agent' | 'config';
+  questionId?: string;
+  updatedAt: string;
+}
+
+export interface NovelPlanSession {
+  id: string;
+  projectId: Id;
+  seedPrompt: string;
+  targetTask: NovelPlanTargetTask;
+  depth?: NovelPlanDepth;
+  planConfig?: NovelPlanConfig;
+  history: NovelPlanHistoryTurn[];
+  activeQuestions: NovelPlanQuestion[];
+  decisions: Record<string, NovelPlanDecision>;
+  lastResponse: NovelPlanTurnResponse;
+  createdAt: string;
+  updatedAt: string;
 }
 
 // ---------------------------------------------------------------------------

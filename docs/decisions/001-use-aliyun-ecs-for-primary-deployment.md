@@ -16,7 +16,7 @@ AgentXin 包含多轮计划、长篇正文生成、连续性审校和自动修�
 
 ## 决策
 
-使用阿里云 ECS 常驻运行 Node.js/Fastify 后端，Nginx 提供静态前端并反向代理 `/api`。所有客户端数据统一存放在 ECS 云盘 `/var/lib/agentxin`，仍按 `x-agentxin-client-id` 分目录隔离；前端构建设置 `VITE_AGENT_BACKGROUND_JOBS=false`，直接使用后端 SSE 路由。
+使用阿里云 ECS 常驻运行 Node.js/Fastify 后端，Nginx 提供静态前端并反向代理 `/api`。所有客户端数据统一存放在 ECS 云盘 `/var/lib/agentxin`，仍按 `x-agentxin-client-id` 隔离；前端构建设置 `VITE_AGENT_BACKGROUND_JOBS=false`。计划/短任务使用 SSE，整本与长篇任务写入服务器 `AgentRunStore` 并由后台执行器运行，浏览器按任务 ID 读取进度和结果。
 
 Nginx 对 Agent 路由关闭代理缓冲，并将读写超时设为 3600 秒。公网仅开放 80/443，后端 3000 端口不对公网开放。
 
@@ -42,7 +42,7 @@ Nginx 对 Agent 路由关闭代理缓冲，并将读写超时设为 3600 秒。�
 
 ## 后果
 
-- 长任务由常驻进程处理，不再依赖 Netlify 函数时限。
+- 长任务由常驻进程处理并持久化状态；浏览器断开不取消任务，服务重启后可从章节/场景检查点恢复。
 - 数据集中保存在一台 ECS 云盘，无需数据库，但必须建立独立备份。
 - 团队需要维护 systemd、Nginx、安全组、系统更新和日志。
 - 当前客户端编号仍绑定浏览器，跨设备同步与账号恢复需要后续单独设计。

@@ -1151,7 +1151,7 @@ export class AgentOrchestrator {
       // it to ContinuityAgent/ReviewAgent, and remove the empty placeholder so
       // a later resume can generate the same chapter number cleanly.
       if (content.trim().length === 0) {
-        await this.store.deleteChapter(chapter.id);
+        await this.discardEmptyChapterUnlessCheckpoint(chapter.id);
         stoppedReason = `ChapterAgent 连续 ${MAX_EMPTY_CHAPTER_ATTEMPTS} 次返回空正文，已暂停（${title}）`;
         steps.push(`【ChapterAgent】「${title}」连续 ${MAX_EMPTY_CHAPTER_ATTEMPTS} 次未返回正文，未进入审校。`);
         emit({
@@ -1482,7 +1482,7 @@ export class AgentOrchestrator {
         steps,
       );
       if (content.trim().length === 0) {
-        await this.store.deleteChapter(chapter.id);
+        await this.discardEmptyChapterUnlessCheckpoint(chapter.id);
         steps.push(`【ChapterAgent】「${title}」未生成正文，已保留项目状态供重试。`);
         break;
       }
@@ -2537,6 +2537,17 @@ export class AgentOrchestrator {
       }
     }
     return this.store.createChapter(projectId, title);
+  }
+
+  /** Delete a blank shell only when it owns no resumable scene work. */
+  private async discardEmptyChapterUnlessCheckpoint(chapterId: Id): Promise<void> {
+    const [blueprint, drafts] = await Promise.all([
+      this.store.getChapterBlueprintByChapter(chapterId),
+      this.store.listSceneDrafts(chapterId),
+    ]);
+    if (!blueprint && !drafts.some((draft) => draft.content.trim().length > 0)) {
+      await this.store.deleteChapter(chapterId);
+    }
   }
 
   /**

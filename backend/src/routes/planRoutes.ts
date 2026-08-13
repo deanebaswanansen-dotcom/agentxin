@@ -9,6 +9,11 @@ import type { FastifyInstance } from 'fastify';
 
 import { corsResponseHeaders } from '../cors.js';
 import type { NovelPlanService } from '../services/agent/NovelPlanService.js';
+import {
+  PlanSessionStore,
+  reducePlanSession,
+  type PlanSessionStorePort,
+} from '../services/agent/plan/PlanSessionStore.js';
 import { ServiceError } from '../services/ServiceError.js';
 import type {
   NovelPlanAnswer,
@@ -203,8 +208,16 @@ function parsePlanBody(raw: unknown): NovelPlanTurnRequest {
   if (body.depth !== undefined && !isPlanDepth(body.depth)) {
     throw ServiceError.validation(`depth 必须是：${PLAN_DEPTHS.join('、')}。`);
   }
+  if (body.projectId !== undefined && (typeof body.projectId !== 'string' || body.projectId.trim().length === 0)) {
+    throw ServiceError.validation('projectId 必须是非空字符串。');
+  }
+  if (body.resetSession !== undefined && typeof body.resetSession !== 'boolean') {
+    throw ServiceError.validation('resetSession 必须为布尔值。');
+  }
   return {
     seedPrompt: seedPrompt || '请根据结构化计划配置自动生成小说计划',
+    projectId: typeof body.projectId === 'string' ? body.projectId.trim() : undefined,
+    resetSession: body.resetSession === true,
     planConfig,
     targetTask: isTargetTask(body.targetTask) ? body.targetTask : undefined,
     depth: isPlanDepth(body.depth) ? body.depth : undefined,
@@ -219,7 +232,102 @@ function sseFrame(event: string, data?: string): string {
   return data === undefined ? `${head}\n` : `${head}data: ${data}\n\n`;
 }
 
-export function registerPlanRoutes(app: FastifyInstance, planService: NovelPlanService): void {
+function formatAssistantHistory(result: Awaited<ReturnType<NovelPlanService['turn']>>): string {
+  const lines = [result.message.trim()].filter(Boolean);
+  if (result.planningChecklist) {
+    const checklist = result.planningChecklist;
+    lines.push(
+      `PLANNING_CHECKLIST confirmed=${checklist.confirmedFacts.join('、') || '无'} unresolved=${checklist.unresolvedDecisions.join('、') || '无'} defaults=${checklist.safeDefaults.join('、') || '无'} constraints=${checklist.hardConstraints.join('、') || '无'}`,
+    );
+  }
+  for (const question of result.questions ?? []) {
+    lines.push(`PLAN_QUESTION[${question.id}] score=${question.impactScore ?? '-'}: ${question.question}`);
+  }
+  return lines.join('\n');
+}
+
+function formatAnswerHistory(
+  answers: NovelPlanAnswer[],
+  questions: import('../types/index.js').NovelPlanQuestion[],
+): string {
+  return answers.map((answer) => {
+    const question = questions.find((item) => item.id === answer.questionId);
+    const labels = answer.selectedOptionLabels?.length
+      ? answer.selectedOptionLabels
+      : answer.selectedOptionIds.map(
+          (id) => question?.options.find((option) => option.id === id)?.label ?? id,
+        );
+    const custom = answer.customText?.trim();
+    const value = [...labels, ...(custom ? [`补充：${custom}`] : [])].join('；') || '（跳过）';
+    return `- ${answer.questionId}: ${answer.selectedOptionIds.join(',') || '-'} | ${question?.question ?? answer.questionId} → ${value}`;
+  }).join('\n');
+}
+
+async function executePlanTurn(
+  parsed: NovelPlanTurnRequest,
+  planService: NovelPlanService,
+  sessions: PlanSessionStorePort,
+  signal: AbortSignal,
+): Promise<Awaited<ReturnType<NovelPlanService['turn']>>> {
+  const projectId = parsed.projectId;
+  const existing = projectId && !parsed.resetSession ? sessions.get(projectId) : undefined;
+  const continuing = existing !== undefined && ((parsed.answers?.length ?? 0) > 0 || (parsed.history?.length ?? 0) > 0);
+  const requestForService: NovelPlanTurnRequest = continuing
+    ? {
+        ...parsed,
+        seedPrompt: existing.seedPrompt,
+        targetTask: parsed.targetTask ?? existing.targetTask,
+        depth: parsed.depth ?? existing.depth,
+        planConfig: parsed.planConfig ?? existing.planConfig,
+        history: existing.history,
+      }
+    : parsed;
+  const result = await planService.turn(requestForService, signal);
+  if (!projectId) return result;
+
+  const history: NovelPlanHistoryTurn[] = continuing
+    ? [...existing.history]
+    : [{ role: 'user', content: `灵感：${requestForService.seedPrompt}` }];
+  if ((parsed.answers?.length ?? 0) > 0) {
+    history.push({
+      role: 'user',
+      content: formatAnswerHistory(parsed.answers ?? [], existing?.activeQuestions ?? []),
+    });
+  }
+  history.push({ role: 'assistant', content: formatAssistantHistory(result) });
+  const session = reducePlanSession(continuing ? existing : undefined, {
+    projectId,
+    seedPrompt: requestForService.seedPrompt,
+    targetTask: requestForService.targetTask,
+    depth: requestForService.depth,
+    planConfig: requestForService.planConfig,
+    answers: parsed.answers,
+    response: result,
+    history,
+  });
+  await sessions.save(session);
+  return { ...result, sessionId: session.id };
+}
+
+export function registerPlanRoutes(
+  app: FastifyInstance,
+  planService: NovelPlanService,
+  sessions: PlanSessionStorePort = PlanSessionStore.ephemeral(),
+): void {
+  app.get<{ Params: { projectId: string } }>('/api/projects/:projectId/plan-session', async (request, reply) => {
+    const session = sessions.get(request.params.projectId);
+    if (!session) {
+      const { status, body } = toErrorResponse(ServiceError.notFound('该项目还没有计划会话。'));
+      return reply.code(status).send(body);
+    }
+    return reply.code(200).send(session);
+  });
+
+  app.delete<{ Params: { projectId: string } }>('/api/projects/:projectId/plan-session', async (request, reply) => {
+    await sessions.clear(request.params.projectId);
+    return reply.code(204).send();
+  });
+
   app.post('/api/agent/plan/turn', async (request, reply) => {
     try {
       const parsed = parsePlanBody(request.body ?? {});
@@ -232,7 +340,7 @@ export function registerPlanRoutes(app: FastifyInstance, planService: NovelPlanS
       };
       raw.on('close', onClose);
       try {
-        const result = await planService.turn(parsed, controller.signal);
+        const result = await executePlanTurn(parsed, planService, sessions, controller.signal);
         return reply.code(200).send(result);
       } finally {
         raw.removeListener('close', onClose);
@@ -288,7 +396,7 @@ export function registerPlanRoutes(app: FastifyInstance, planService: NovelPlanS
           JSON.stringify({ message: '策划 Agent 已接收信息，正在判断是否需要补问…' }),
         ),
       );
-      const result = await planService.turn(parsed, controller.signal);
+      const result = await executePlanTurn(parsed, planService, sessions, controller.signal);
       if (!raw.writableEnded) {
         writeFrame(sseFrame('result', JSON.stringify(result)));
         writeFrame(sseFrame('done'));

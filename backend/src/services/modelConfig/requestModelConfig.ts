@@ -37,6 +37,14 @@ export function hasRequestModelConfigScope(): boolean {
   return requestModelConfig.getStore() !== undefined;
 }
 
+/** Restore a captured BYOK model configuration inside a detached background task. */
+export function runWithRequestModelConfig<T>(
+  config: ModelConfig | undefined,
+  operation: () => T,
+): T {
+  return requestModelConfig.run({ config }, operation);
+}
+
 export function registerRequestModelConfig(app: FastifyInstance): void {
   app.addHook('onRequest', (request: FastifyRequest, _reply, done) => {
     requestModelConfig.run({ config: parseHeader(request.headers[HEADER_NAME]) }, done);

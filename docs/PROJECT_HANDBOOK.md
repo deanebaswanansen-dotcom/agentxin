@@ -1,6 +1,6 @@
 # AgentXin 项目说明书与交接手册
 
-最后更新：2026-08-12
+最后更新：2026-08-13
 
 本文供项目使用者、运维人员和接手开发的 Agent 使用。任何密钥都不得写入本文、源码、Git 提交、终端截图或日志。
 
@@ -14,7 +14,7 @@ AgentXin 是一个 AI 小说创作 Agent，不是固定步骤的工作流。用�
 - API Key 只保存在浏览器，并随模型请求发送；服务端不持久化 API Key。
 - 项目、章节、人物、世界观、大纲、记忆和参考资料保存在服务器云盘。
 - 计划模式必须尊重用户已给出的题材和约束，禁止重复询问；每轮先展示 Agent 自检清单，再只询问会改变主线、人物弧光、结局或篇幅结构的高影响问题，单轮最多 5 题、总预算 10 题。
-- 长篇写作使用流式请求，部署层不能缓冲响应，也不能用短时同步函数承载整项任务。
+- 长篇写作先创建服务器后台任务，再按任务 ID 轮询；切项目、刷新页面或临时断网不会终止服务器任务。
 
 计划模式的详细契约见 [`PLAN_MODE_SPEC.md`](PLAN_MODE_SPEC.md)。
 
@@ -81,7 +81,8 @@ API 配置保存在浏览器 Local Storage 的 `nwa.modelConfig.v1`。后端使�
 浏览器 React/Vite
   ├─ Local Storage：API 配置、客户端编号
   ├─ REST：项目、章节、设定、资料
-  └─ Fetch + SSE：计划模式、Agent 写作、自由对话
+  ├─ Fetch + SSE：计划模式、短任务、自由对话
+  └─ 后台任务轮询：整本/长篇写作
             │
             ▼
 Nginx :80
@@ -89,13 +90,17 @@ Nginx :80
   └─ /api/*       → Fastify 127.0.0.1:3000
                          │
                          ├─ NovelPlanService：计划决策与结构化 Story Plan
+                         ├─ PlanSessionStore：项目级计划决策与问题恢复
                          ├─ AgentOrchestrator：任务编排、写作与修订
+                         ├─ AgentRunStore：后台任务、进度、结果与重启恢复
                          ├─ ModelProxy：OpenAI-compatible 模型请求
                          └─ Client-scoped stores
                               ├─ projects/
                               ├─ memory/
                               ├─ references/
-                              └─ long-novel/
+                              ├─ long-novel/
+                              ├─ plan-sessions/
+                              └─ agent-runs.json
                                   位于 /var/lib/agentxin
 ```
 
@@ -114,7 +119,7 @@ Nginx :80
 
 ### 阿里云与 Netlify 的差异
 
-阿里云 ECS 使用常驻 Node.js 后端，前端必须保持 `VITE_AGENT_BACKGROUND_JOBS` 未设置或设为 `false`，任务直接调用 `/api/agent/plan/turn-stream` 和 `/api/agent/run-stream`。Netlify 部署会设置 `VITE_AGENT_BACKGROUND_JOBS=true`，改走 Background Functions 和轮询；该模式曾出现函数超时、502、发布额度和长任务状态问题，因此当前主部署选择 ECS，决策记录见 [`decisions/001-use-aliyun-ecs-for-primary-deployment.md`](decisions/001-use-aliyun-ecs-for-primary-deployment.md)。
+阿里云 ECS 使用常驻 Node.js 后端，前端必须保持 `VITE_AGENT_BACKGROUND_JOBS` 未设置或设为 `false`：计划与短任务使用 SSE，`full_novel`/`long_novel` 使用持久化 `/api/agent/jobs`。Netlify 设置 `VITE_AGENT_BACKGROUND_JOBS=true` 后改走 Netlify Background Functions；该模式仍受 15 分钟函数上限约束，因此当前主部署选择 ECS，决策记录见 [`decisions/001-use-aliyun-ecs-for-primary-deployment.md`](decisions/001-use-aliyun-ecs-for-primary-deployment.md)。
 
 ## 5. 本地开发与验证
 
@@ -325,14 +330,15 @@ systemctl status agentxin --no-pager
 | 公网 IP 打不开 | 阿里云安全组、`systemctl status nginx` | 开放 TCP 80；修复 Nginx 后重启 |
 | 首页能开但请求失败 | `systemctl status agentxin`、`journalctl -u agentxin -n 200` | 启动后端；确认 3000 未被其他进程占用 |
 | 关闭 SSH 后 API 失效 | `systemctl is-active agentxin` | 停止前台 `npm start`，安装并启用 systemd 服务 |
-| Agent 长时间后断开 | Nginx error log、后端日志 | 确认 `proxy_buffering off` 和两个 `3600s` 超时仍在 |
+| 长篇页面关闭或切项目 | 返回原项目查看后台任务 | 服务器继续运行；页面会恢复已持久化进度和结果 |
+| 服务器在长篇中重启 | 返回原项目并保持 API 配置有效 | 任务显示等待恢复；首次查询会从已保存章节/场景继续 |
 | 新电脑看不到旧项目 | 浏览器客户端编号不同 | 当前属于既定隔离行为；使用原浏览器，或另行实现账号与迁移功能 |
 | 清理浏览器后项目为空 | Local Storage 客户端编号已重建 | 服务器数据可能仍在；不要继续创建大量同名项目，先备份 `/var/lib/agentxin` |
 | API 测试失败 | 浏览器设置、模型服务地址、模型名、后端日志 | 在该电脑重新填写自己的 API 配置；不要把 Key 发给开发 Agent |
 | 返回 502 | `journalctl -u agentxin`、Nginx error log | 先确认后端存活，再检查上游模型返回和网络连接 |
 | 计划模式重复询问 | 计划会话历史、问题 ID、`NovelPlanService` 测试 | 按 `PLAN_MODE_SPEC.md` 修复，禁止用固定问卷替代 Agent 决策 |
 | 分章结果为 0/N 章 | 模型原始响应、解析与重试日志 | 验证结构化解析、分批策略和重试；不得伪造已生成章节 |
-| 长篇结果提示正文为空 | ChapterAgent 重试日志、模型原始响应 | 最多生成 3 次；拿到非空正文前禁止进入 ContinuityAgent/ReviewAgent，3 次均为空则删除空章节占位并暂停 |
+| 长篇结果提示正文为空 | ChapterAgent 重试日志、模型原始响应 | 最多生成 3 次；拿到非空正文前禁止进入审校；无蓝图的空壳删除，有场景检查点的章节保留并在下次恢复 |
 
 项目没有 `/api/health` 路由，访问该地址返回 404 不代表代理失败。可用首页 HTTP 200、systemd 状态和真实 API 请求共同判断服务状态。
 

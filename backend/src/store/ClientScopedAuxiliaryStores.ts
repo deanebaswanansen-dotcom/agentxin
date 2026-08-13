@@ -8,6 +8,10 @@ import {
 } from '../services/agent/longNovel/LongNovelConfigStore.js';
 import { MemoryStore, type MemoryStorePort } from '../services/memory/MemoryStore.js';
 import { ReferenceStore, type ReferenceStorePort } from '../services/reference/ReferenceStore.js';
+import {
+  PlanSessionStore,
+  type PlanSessionStorePort,
+} from '../services/agent/plan/PlanSessionStore.js';
 
 async function loadExisting<T>(
   rootDirectory: string,
@@ -86,5 +90,25 @@ export async function createClientScopedLongNovelConfigStore(
   return {
     get: (projectId) => current().get(projectId),
     save: (projectId, config) => current().save(projectId, config),
+  };
+}
+
+export async function createClientScopedPlanSessionStore(
+  rootDirectory: string,
+): Promise<PlanSessionStorePort> {
+  const { root, stores } = await loadExisting(rootDirectory, PlanSessionStore.create);
+  const current = (): PlanSessionStore => {
+    const clientId = getCurrentClientId();
+    let store = stores.get(clientId);
+    if (store === undefined) {
+      store = new PlanSessionStore(join(root, `${clientId}.json`));
+      stores.set(clientId, store);
+    }
+    return store;
+  };
+  return {
+    get: (projectId) => current().get(projectId),
+    save: (session) => current().save(session),
+    clear: (projectId) => current().clear(projectId),
   };
 }

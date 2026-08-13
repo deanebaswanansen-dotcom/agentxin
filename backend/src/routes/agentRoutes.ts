@@ -139,7 +139,7 @@ function parseAgentOptions(raw: unknown): AgentRunRequest['options'] | undefined
  * Validate and narrow a raw agent request body into an {@link AgentRunRequest}.
  * Throws `VALIDATION_ERROR` on malformed input (shared by REST and SSE routes).
  */
-function parseAgentBody(raw: RunAgentBody): AgentRunRequest {
+export function parseAgentBody(raw: RunAgentBody): AgentRunRequest {
   if (!isAgentTask(raw.task)) {
     throw ServiceError.validation(`Agent 任务无效，必须是：${AGENT_TASKS.join('、')}。`);
   }

@@ -241,6 +241,8 @@ export function ChatWorkspace({
   const [planEndingDirection, setPlanEndingDirection] = useState('');
   const [planWritingRequirements, setPlanWritingRequirements] = useState('');
   const planAbortRef = useRef<AbortController | null>(null);
+  const planRestoreAbortRef = useRef<AbortController | null>(null);
+  const chatMessagesRef = useRef(chat.messages);
 
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -253,8 +255,75 @@ export function ChatWorkspace({
   useEffect(() => {
     return () => {
       planAbortRef.current?.abort();
+      planRestoreAbortRef.current?.abort();
     };
   }, []);
+
+  useEffect(() => {
+    chatMessagesRef.current = chat.messages;
+  }, [chat.messages]);
+
+  useEffect(() => {
+    planAbortRef.current?.abort();
+    planRestoreAbortRef.current?.abort();
+    setPlanSeed('');
+    setPlanHistory([]);
+    setActivePlanQuestions([]);
+    setActivePlanConfig(undefined);
+    if (projectId === null) return;
+
+    const controller = new AbortController();
+    planRestoreAbortRef.current = controller;
+    void apiClient.agent.getPlanSession(projectId, controller.signal)
+      .then((session) => {
+        if (controller.signal.aborted || session === null) return;
+        setPlanSeed(session.seedPrompt);
+        setPlanHistory(session.history);
+        setActivePlanQuestions(session.activeQuestions);
+        setActivePlanConfig(session.planConfig);
+        setPlanTotalWords(session.planConfig?.targetTotalWords?.toString() ?? '');
+        setPlanTotalChapters(session.planConfig?.targetTotalChapters?.toString() ?? '');
+        setPlanWordsMin(session.planConfig?.targetWordsPerChapter?.min.toString() ?? '');
+        setPlanWordsMax(session.planConfig?.targetWordsPerChapter?.max.toString() ?? '');
+        setPlanVolumeCount(session.planConfig?.targetVolumeCount?.toString() ?? '');
+        setPlanGenres(session.planConfig?.genres?.join(' + ') ?? '');
+        setPlanEndingDirection(session.planConfig?.endingDirection ?? '');
+        setPlanWritingRequirements(session.planConfig?.writingRequirements ?? '');
+        const alreadyVisible = chatMessagesRef.current.some(
+          (message) =>
+            message.kind === 'plan-turn' &&
+            message.sessionId === session.id &&
+            message.round === session.lastResponse.round,
+        );
+        if (!alreadyVisible) {
+          const response = session.lastResponse;
+          chat.appendMessage({
+            id: `plan-session:${session.id}:round:${response.round}`,
+            role: 'assistant',
+            kind: 'plan-turn',
+            sessionId: session.id,
+            status: response.status,
+            round: response.round,
+            message: response.message,
+            questions: response.questions,
+            planningChecklist: response.planningChecklist,
+            brief: response.brief,
+            planSummary: response.planSummary,
+            resolved: false,
+            generated: false,
+            depth: response.depth,
+            depthRoundRange: response.depthRoundRange,
+          });
+        }
+      })
+      .catch((error) => {
+        if (!(error instanceof DOMException && error.name === 'AbortError')) onError?.(error);
+      })
+      .finally(() => {
+        if (planRestoreAbortRef.current === controller) planRestoreAbortRef.current = null;
+      });
+    return () => controller.abort();
+  }, [chat.appendMessage, onError, projectId]);
 
   // 自动滚到底
   useEffect(() => {
@@ -302,6 +371,7 @@ export function ChatWorkspace({
         id: makeId(),
         role: 'assistant',
         kind: 'plan-turn',
+        sessionId: response.sessionId,
         status: response.status,
         round: response.round,
         message: response.message,
@@ -323,6 +393,7 @@ export function ChatWorkspace({
       const seedPrompt = seed.trim() || planConfig?.coreStory?.trim() || '请根据计划配置自动生成小说计划';
       if (!seedPrompt || planBusy || planAbortRef.current !== null || agent.running || chat.streaming) return;
       setPlanBusy(true);
+      planRestoreAbortRef.current?.abort();
       setPlanSeed(seedPrompt);
       setActivePlanConfig(planConfig);
       setPlanHistory([]);
@@ -340,6 +411,8 @@ export function ChatWorkspace({
         const response = await apiClient.agent.planTurn(
           {
             seedPrompt,
+            projectId: projectId ?? undefined,
+            resetSession: true,
             planConfig,
             targetTask: 'long_novel',
             history: [],
@@ -363,7 +436,7 @@ export function ChatWorkspace({
         planAbortRef.current = null;
       }
     },
-    [agent.running, applyPlanResponse, chat, onError, planBusy],
+    [agent.running, applyPlanResponse, chat, onError, planBusy, projectId],
   );
 
   const submitPlanAnswers = useCallback(
@@ -387,6 +460,7 @@ export function ChatWorkspace({
         const response = await apiClient.agent.planTurn(
           {
             seedPrompt: seed,
+            projectId: projectId ?? undefined,
             planConfig: activePlanConfig,
             targetTask: 'long_novel',
             history: historyForApi,
@@ -430,6 +504,7 @@ export function ChatWorkspace({
       planHistory,
       planSeed,
       activePlanConfig,
+      projectId,
     ],
   );
 
@@ -883,8 +958,15 @@ export function ChatWorkspace({
 
   const doClear = useCallback(() => {
     chat.clear();
+    if (projectId !== null) {
+      void apiClient.agent.clearPlanSession(projectId).catch(onError);
+    }
+    setPlanSeed('');
+    setPlanHistory([]);
+    setActivePlanQuestions([]);
+    setActivePlanConfig(undefined);
     setConfirmClearOpen(false);
-  }, [chat]);
+  }, [chat, onError, projectId]);
 
   // —— 键盘 ——
   const handleKeyDown = useCallback(

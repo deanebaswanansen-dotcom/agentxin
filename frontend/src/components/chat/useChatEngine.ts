@@ -2,7 +2,7 @@
  * 对话引擎 Hook —— 从原 UnifiedChatPanel 提炼的流式对话逻辑。
  *
  * 负责：
- *  - 维护按 (projectId, chapterId) 隔离的对话消息流
+ *  - 维护按 projectId 隔离的对话消息流（切章节不丢 Agent 进度/结果）
  *  - 写作模式（续写/改写/润色 调 apiClient.write；提问 调 freeChat.stream）
  *  - 自由讨论模式（调 freeChat.stream，支持主题上下文）
  *  - 流式实时累积 + 思考过程 + AbortController 中止
@@ -88,7 +88,15 @@ function loadPersistedSessions(): Map<string, ChatMessage[]> {
     const raw = window.localStorage.getItem(CHAT_SESSIONS_STORAGE_KEY);
     if (raw === null) return new Map();
     const parsed = JSON.parse(raw) as Record<string, ChatMessage[]>;
-    return new Map(Object.entries(parsed));
+    const migrated = new Map<string, ChatMessage[]>();
+    for (const [legacyKey, messages] of Object.entries(parsed)) {
+      const projectKey = legacyKey.includes(':') ? legacyKey.split(':', 1)[0]! : legacyKey;
+      const previous = migrated.get(projectKey) ?? [];
+      const byId = new Map(previous.map((message) => [message.id, message]));
+      for (const message of Array.isArray(messages) ? messages : []) byId.set(message.id, message);
+      migrated.set(projectKey, [...byId.values()]);
+    }
+    return migrated;
   } catch {
     return new Map();
   }
@@ -118,10 +126,10 @@ export function useChatEngine(options: UseChatEngineOptions): ChatEngineState & 
   } = options;
 
   const isWritingMode = chapterId != null;
-  const sessionKey = `${projectId ?? 'none'}:${chapterId ?? 'free'}`;
+  const sessionKey = projectId ?? 'none';
 
   const abortRef = useRef<AbortController | null>(null);
-  // 在切换上下文时保留各自的会话历史，key = `${projectId}:${chapterId ?? 'free'}`
+  // 会话按项目隔离；章节只是当前写作上下文，不改变右侧 Agent 历史。
   const sessionsRef = useRef<Map<string, ChatMessage[]>>(loadPersistedSessions());
   const [operation, setOperation] = useState<WritingOperation>('continue');
   const [chatContext, setChatContext] = useState<FreeChatContext>(null);
@@ -195,7 +203,9 @@ export function useChatEngine(options: UseChatEngineOptions): ChatEngineState & 
   }, [streaming, commitMessages]);
 
   const appendMessage = useCallback((message: ChatMessage) => {
-    commitMessages((prev) => [...prev, message]);
+    commitMessages((prev) => prev.some((item) => item.id === message.id)
+      ? prev.map((item) => item.id === message.id ? message : item)
+      : [...prev, message]);
   }, [commitMessages]);
 
   const updateMessage = useCallback(
@@ -209,12 +219,12 @@ export function useChatEngine(options: UseChatEngineOptions): ChatEngineState & 
     commitMessages((prev) => prev.filter((m) => m.id !== id));
   }, [commitMessages]);
 
-  const carryNextSession = useCallback((targetProjectId?: Id, targetChapterId: Id | null = null) => {
+  const carryNextSession = useCallback((targetProjectId?: Id, _targetChapterId: Id | null = null) => {
     if (targetProjectId === undefined) {
       carryNextSessionRef.current = true;
       return;
     }
-    const targetKey = `${targetProjectId}:${targetChapterId ?? 'free'}`;
+    const targetKey = targetProjectId;
     if (!sessionsRef.current.has(targetKey)) {
       sessionsRef.current.set(targetKey, messagesRef.current);
       persistSessions(sessionsRef.current);

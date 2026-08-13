@@ -84,6 +84,7 @@ async function main() {
   const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
   const issues = [];
   let projectName = '';
+  let secondProjectName = '';
 
   try {
     await page.addInitScript((clientId) => {
@@ -146,6 +147,21 @@ async function main() {
     await page.getByText('任务完成').waitFor({ timeout: 120000 });
     await page.getByText(/项目：|世界观：|大纲：|章节：/).first().waitFor({ timeout: 15000 });
 
+    // Project chat isolation: a new project must not inherit the previous
+    // project's command/result pane, and returning must restore it.
+    const uniquePrompt = '短篇灵异：电梯里多一个人';
+    const chatPane = page.locator('.nwa-chat-workspace');
+    await chatPane.getByText(new RegExp(uniquePrompt)).first().waitFor({ timeout: 10000 });
+    secondProjectName = `UI隔离${Date.now().toString().slice(-5)}`;
+    await page.getByLabel('新项目名称').fill(secondProjectName);
+    await page.keyboard.press('Enter');
+    await page.locator('.nwa-project-tree__label', { hasText: secondProjectName }).waitFor({ timeout: 10000 });
+    if (await chatPane.getByText(new RegExp(uniquePrompt)).count() !== 0) {
+      issues.push('切到新项目后仍显示旧项目的 AI 对话。');
+    }
+    await page.locator('.nwa-project-tree__label', { hasText: projectName }).click();
+    await chatPane.getByText(new RegExp(uniquePrompt)).first().waitFor({ timeout: 10000 });
+
     await saveShot(page, 'current-desktop-smoke.png');
 
     await page.setViewportSize({ width: 390, height: 844 });
@@ -172,6 +188,7 @@ async function main() {
     process.exitCode = 1;
   } finally {
     await cleanupProjectByName(projectName);
+    await cleanupProjectByName(secondProjectName);
     await browser.close();
   }
 }

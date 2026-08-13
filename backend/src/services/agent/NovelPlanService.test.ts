@@ -887,6 +887,38 @@ describe('planning facts', () => {
   it('recognizes explicit genres without collapsing western fantasy into generic fantasy', () => {
     expect(inferExplicitGenre('写一本西方玄幻')).toBe('西方玄幻');
     expect(inferExplicitGenre('中式修仙门派')).toBe('仙侠');
+    expect(inferExplicitGenre('校园现实成长，不要玄幻元素')).toBe('校园');
+    expect(inferExplicitGenre('题材是校园，不得改成玄幻或修仙')).toBe('校园');
+  });
+
+  it('does not repeat a high-impact requirement after the user answers it', async () => {
+    const service = new NovelPlanService(
+      mockConfigService(),
+      new QueueProxy([readyDecision(), readyDecision()]),
+    );
+    const result = await service.turn(
+      {
+        seedPrompt: '校园现实成长：县城高中女生组建广播站，不要玄幻元素',
+        history: [
+          {
+            role: 'assistant',
+            content: 'PLAN_QUESTION[core_protagonist_type] score=9: 主角以哪一种校园身份进入故事？',
+          },
+        ],
+        answers: [
+          {
+            questionId: 'core_protagonist_type',
+            selectedOptionIds: ['campus_transfer'],
+            selectedOptionLabels: ['转学生 / 刚入学的新生'],
+          },
+        ],
+      },
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe('asking');
+    expect(result.questions?.map((question) => question.id)).not.toContain('core_protagonist_type');
+    expect(result.questions?.map((question) => question.question).join(' ')).not.toMatch(/奇幻|魔法|骑士|王国/);
   });
 
   it('collects explicit scale labels and ids without treating 前N章 as total chapters', () => {

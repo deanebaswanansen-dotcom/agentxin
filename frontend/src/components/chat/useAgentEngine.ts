@@ -91,6 +91,12 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
   const [running, setRunning] = useState(false);
   const [runningTask, setRunningTask] = useState<AgentTask | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const activeJobIdRef = useRef<string | null>(null);
+  const projectRef = useRef(projectId);
+  const onCompletedRef = useRef(onCompleted);
+  const onErrorRef = useRef(onError);
+  onCompletedRef.current = onCompleted;
+  onErrorRef.current = onError;
 
   useEffect(() => {
     return () => {
@@ -99,8 +105,83 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
   }, []);
 
   const stop = useCallback(() => {
+    const jobId = activeJobIdRef.current;
+    if (jobId && typeof apiClient.agent.cancelJob === 'function') {
+      void apiClient.agent.cancelJob(jobId).catch(() => undefined);
+    }
     abortRef.current?.abort();
   }, []);
+
+  useEffect(() => {
+    if (projectRef.current !== projectId) {
+      abortRef.current?.abort();
+      abortRef.current = null;
+      activeJobIdRef.current = null;
+      setRunning(false);
+      setRunningTask(null);
+      projectRef.current = projectId;
+    }
+    if (!projectId) return;
+    if (typeof apiClient.agent.listJobs !== 'function' || typeof apiClient.agent.watchJob !== 'function') return;
+    const controller = new AbortController();
+    let disposed = false;
+    void apiClient.agent.listJobs(projectId, controller.signal).then(async (jobs) => {
+      const completed = jobs.find((candidate) =>
+        candidate.status === 'completed' && candidate.result && candidate.request &&
+        isRunnableAgentTask(candidate.request.task));
+      if (completed?.result && completed.request && !disposed) {
+        const completedTask = completed.request.task;
+        appendMessage({
+          id: `agent-job:${completed.id}:result`, role: 'assistant', kind: 'agent-result',
+          task: completedTask, summary: completed.result.summary, steps: completed.result.steps,
+          artifacts: completed.result.artifacts, metrics: completed.result.metrics, chapterPreview: null,
+        });
+      }
+      const job = jobs.find((candidate) =>
+        candidate.status === 'queued' || candidate.status === 'running' ||
+        candidate.status === 'retrying' || candidate.status === 'waiting_user');
+      if (!job || disposed || !job.request || !isRunnableAgentTask(job.request.task)) return;
+      const task = job.request.task;
+      const taskTitle = AGENT_TASKS.find((item) => item.key === task)?.title ?? task;
+      const progressId = `agent-job:${job.id}:progress`;
+      abortRef.current = controller;
+      activeJobIdRef.current = job.id;
+      setRunning(true);
+      setRunningTask(task);
+      appendMessage({
+        id: progressId, role: 'assistant', kind: 'agent-progress', task, taskTitle, events: job.events,
+      });
+      try {
+        const result = await apiClient.agent.watchJob(job.id, {
+          signal: controller.signal,
+          onProgress: (event) => updateMessage(progressId, (previous) => previous.kind === 'agent-progress'
+            ? { ...previous, events: [...previous.events, event] }
+            : previous),
+        });
+        if (disposed) return;
+        removeMessage(progressId);
+        appendMessage({
+          id: `agent-job:${job.id}:result`, role: 'assistant', kind: 'agent-result', task,
+          summary: result.summary, steps: result.steps, artifacts: result.artifacts,
+          metrics: result.metrics, chapterPreview: null,
+        });
+        onCompletedRef.current?.(result);
+      } catch (error) {
+        if (!isAbort(error) && !disposed) onErrorRef.current?.(error);
+      } finally {
+        if (!disposed) {
+          setRunning(false);
+          setRunningTask(null);
+          activeJobIdRef.current = null;
+          abortRef.current = null;
+        }
+      }
+    }).catch(() => undefined);
+    return () => {
+      disposed = true;
+      controller.abort();
+    };
+  }, [projectId, appendMessage, updateMessage, removeMessage]);
 
   const run = useCallback(
     async (params: AgentRunParams) => {
@@ -179,6 +260,7 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
           apiClient.agent.runStream !== undefined
             ? await apiClient.agent.runStream(body, {
                 signal: controller.signal,
+                onJobCreated: (jobId) => { activeJobIdRef.current = jobId; },
                 onProgress: (event: AgentProgressEvent) => {
                   updateMessage(progressMsgId, (prev) => {
                     if (prev.kind !== 'agent-progress') return prev;
@@ -283,6 +365,7 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
         setRunning(false);
         setRunningTask(null);
         abortRef.current = null;
+        activeJobIdRef.current = null;
         onStreamingChange?.({ streaming: false, content: '', thinking: '' });
       }
     },

@@ -7,6 +7,7 @@ import {
   migrateStoredModelConfig,
   parseSseEvents,
   runAgentBackgroundJob,
+  runPersistentAgentJob,
   runPlanBackgroundJob,
   type SseEvent,
 } from './apiClient.js';
@@ -469,6 +470,33 @@ describe('Netlify background Agent jobs', () => {
     ]);
     expect(result.artifacts).toHaveLength(3);
     expect(result.summary).toContain('3/3');
+  });
+});
+
+describe('persistent backend Agent jobs', () => {
+  it('creates a server job and replays persisted progress while polling', async () => {
+    const progress = vi.fn();
+    let polls = 0;
+    const result: AgentRunResult = {
+      task: 'long_novel', mode: 'draft', projectId: 'p1', summary: '完成', steps: [], artifacts: [],
+    };
+    const mock = installFetch((url, init) => {
+      if (String(url).endsWith('/agent/jobs') && init?.method === 'POST') {
+        return jsonResponse({ id: 'job-1', status: 'queued', events: [] }, { status: 202 });
+      }
+      polls += 1;
+      return jsonResponse(polls === 1
+        ? { id: 'job-1', status: 'running', events: [{ phase: 'chapter', message: '第1章完成' }] }
+        : { id: 'job-1', status: 'completed', events: [{ phase: 'chapter', message: '第1章完成' }], result });
+    });
+
+    await expect(runPersistentAgentJob('/api', {
+      task: 'long_novel', mode: 'draft', prompt: '写一章', projectId: 'p1',
+    }, { onProgress: progress })).resolves.toEqual(result);
+    expect(progress).toHaveBeenCalledTimes(1);
+    expect(mock.mock.calls.map((call) => String(call[0]))).toEqual([
+      '/api/agent/jobs', '/api/agent/jobs/job-1', '/api/agent/jobs/job-1',
+    ]);
   });
 });
 

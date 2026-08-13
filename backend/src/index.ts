@@ -43,6 +43,7 @@ import { createClientScopedDataStore } from './store/ClientScopedDataStore.js';
 import {
   createClientScopedLongNovelConfigStore,
   createClientScopedMemoryStore,
+  createClientScopedPlanSessionStore,
   createClientScopedReferenceStore,
 } from './store/ClientScopedAuxiliaryStores.js';
 import { registerClientScope } from './services/client/clientScope.js';
@@ -80,13 +81,20 @@ import { registerModelConfigRoutes } from './routes/modelConfigRoutes.js';
 import { registerWritingRoutes } from './routes/writingRoutes.js';
 import { registerBlueprintRoutes } from './routes/blueprintRoutes.js';
 import { registerAgentRoutes } from './routes/agentRoutes.js';
+import { registerAgentJobRoutes } from './routes/agentJobRoutes.js';
 import { registerPlanRoutes } from './routes/planRoutes.js';
 import { registerFreeChatRoutes } from './routes/freeChatRoutes.js';
 import { registerImportRoutes } from './routes/importRoutes.js';
 import { registerReferenceRoutes } from './routes/referenceRoutes.js';
 import { FreeChatService } from './services/freeChat/FreeChatService.js';
 import { NovelPlanService } from './services/agent/NovelPlanService.js';
+import {
+  PlanSessionStore,
+  type PlanSessionStorePort,
+} from './services/agent/plan/PlanSessionStore.js';
 import { getCacheStatsSummary, resetCacheStats } from './proxy/cacheStats.js';
+import { AgentRunStore } from './services/agent/jobs/AgentRunStore.js';
+import { AgentJobRunner } from './services/agent/jobs/AgentJobRunner.js';
 
 /**
  * Build a fully wired Fastify application from an already-constructed
@@ -110,6 +118,8 @@ export function buildServer(
   memoryService?: MemoryService,
   referenceStore?: ReferenceStorePort,
   longNovelConfigStore?: LongNovelConfigStorePort,
+  planSessionStore?: PlanSessionStorePort,
+  agentRunStore?: AgentRunStore,
 ): FastifyInstance {
   const app = Fastify({ logger: false });
 
@@ -148,6 +158,7 @@ export function buildServer(
   const memory = memoryService ?? new MemoryService(MemoryStore.ephemeral());
   const refs = referenceStore ?? ReferenceStore.ephemeral();
   const longNovelConfigs = longNovelConfigStore ?? LongNovelConfigStore.ephemeral();
+  const planSessions = planSessionStore ?? PlanSessionStore.ephemeral();
   const projectService = new ProjectService(store);
   const chapterService = new ChapterService(store);
   const settingService = new SettingService(store);
@@ -210,7 +221,10 @@ export function buildServer(
   registerModelConfigRoutes(app, modelConfigService, proxy);
   registerWritingRoutes(app, writingService);
   registerAgentRoutes(app, agentService);
-  registerPlanRoutes(app, novelPlanService);
+  if (agentRunStore) {
+    registerAgentJobRoutes(app, agentRunStore, new AgentJobRunner(agentRunStore, agentService));
+  }
+  registerPlanRoutes(app, novelPlanService, planSessions);
   registerFreeChatRoutes(app, freeChatService);
   registerImportRoutes(app, importService);
   registerReferenceRoutes(app, referenceService);
@@ -256,7 +270,21 @@ export async function start(): Promise<FastifyInstance> {
   const longNovelConfigStore = clientRoot
     ? await createClientScopedLongNovelConfigStore(join(clientRoot, 'long-novel'))
     : await LongNovelConfigStore.create(process.env.LONG_NOVEL_CONFIG_FILE ?? undefined);
-  const app = buildServer(store, undefined, memory, referenceStore, longNovelConfigStore);
+  const planSessionStore = clientRoot
+    ? await createClientScopedPlanSessionStore(join(clientRoot, 'plan-sessions'))
+    : await PlanSessionStore.create(process.env.PLAN_SESSION_FILE ?? undefined);
+  const agentRunStore = await AgentRunStore.create(
+    process.env.AGENT_RUN_FILE ?? join(clientRoot ?? 'data', 'agent-runs.json'),
+  );
+  const app = buildServer(
+    store,
+    undefined,
+    memory,
+    referenceStore,
+    longNovelConfigStore,
+    planSessionStore,
+    agentRunStore,
+  );
 
   const port = Number(process.env.PORT ?? 3000);
   const address = await app.listen({ port, host: '0.0.0.0' });

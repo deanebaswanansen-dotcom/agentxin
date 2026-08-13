@@ -41,6 +41,7 @@ import type {
   ModelConfig,
   ModelConfigView,
   ModelConnectionResult,
+  NovelPlanSession,
   NovelPlanTurnRequest,
   NovelPlanTurnResponse,
   Outline,
@@ -710,6 +711,25 @@ async function streamPlanTurn(
   return result;
 }
 
+async function getPlanSession(
+  baseUrl: string,
+  projectId: Id,
+  signal?: AbortSignal,
+): Promise<NovelPlanSession | null> {
+  try {
+    return await request<NovelPlanSession>(
+      baseUrl,
+      'GET',
+      `/projects/${seg(projectId)}/plan-session`,
+      undefined,
+      { signal },
+    );
+  } catch (error) {
+    if (error instanceof ApiClientError && error.code === 'NOT_FOUND') return null;
+    throw error;
+  }
+}
+
 async function streamReferenceAnalyze(
   baseUrl: string,
   referenceId: Id,
@@ -770,6 +790,7 @@ async function streamWrite(
 export interface AgentRunStreamOptions {
   signal?: AbortSignal;
   onProgress?: (event: AgentProgressEvent) => void;
+  onJobCreated?: (jobId: string) => void;
 }
 
 interface AgentJobSnapshot {
@@ -777,6 +798,15 @@ interface AgentJobSnapshot {
   events?: AgentProgressEvent[];
   result?: AgentRunResult;
   error?: unknown;
+}
+
+export interface PersistentAgentJobSnapshot {
+  id: string;
+  status: 'queued' | 'running' | 'waiting_user' | 'retrying' | 'completed' | 'failed' | 'cancelled';
+  events: AgentProgressEvent[];
+  request?: AgentRunRequest;
+  result?: AgentRunResult;
+  error?: { code?: string; message: string };
 }
 
 interface PlanJobSnapshot {
@@ -1037,6 +1067,49 @@ export async function runAgentBackgroundJob(
   return mergeBackgroundResults(results);
 }
 
+/** Run long work on the persistent Node backend; aborting only detaches polling. */
+export async function runPersistentAgentJob(
+  baseUrl: string,
+  body: AgentRunRequest,
+  options?: AgentRunStreamOptions,
+): Promise<AgentRunResult> {
+  const created = await request<PersistentAgentJobSnapshot>(baseUrl, 'POST', '/agent/jobs', body, {
+    signal: options?.signal,
+    includeModelConfig: true,
+  });
+  options?.onJobCreated?.(created.id);
+  return watchPersistentAgentJob(baseUrl, created.id, options);
+}
+
+export async function watchPersistentAgentJob(
+  baseUrl: string,
+  jobId: string,
+  options?: AgentRunStreamOptions,
+): Promise<AgentRunResult> {
+  let deliveredEvents = 0;
+  for (;;) {
+    const snapshot = await request<PersistentAgentJobSnapshot>(
+      baseUrl,
+      'GET',
+      `/agent/jobs/${seg(jobId)}`,
+      undefined,
+      { signal: options?.signal, includeModelConfig: true },
+    );
+    for (const event of snapshot.events.slice(deliveredEvents)) options?.onProgress?.(event);
+    deliveredEvents = snapshot.events.length;
+    if (snapshot.status === 'completed' && snapshot.result) return snapshot.result;
+    if (snapshot.status === 'failed' || snapshot.status === 'cancelled') {
+      throw new ApiClientError({
+        error: {
+          code: snapshot.error?.code === 'PROVIDER_ERROR' ? 'PROVIDER_ERROR' : 'STORE_ERROR',
+          message: snapshot.error?.message ?? '后台 Agent 任务失败。',
+        },
+      });
+    }
+    await waitForPoll(750, options?.signal);
+  }
+}
+
 /**
  * Consume the agent SSE stream (`POST /api/agent/run-stream`). Forwards each
  * `event: progress` frame to `onProgress`, captures the final `event: result`
@@ -1051,6 +1124,9 @@ async function streamAgentRun(
 ): Promise<AgentRunResult> {
   if (USE_BACKGROUND_AGENT_JOBS) {
     return runAgentBackgroundJob(baseUrl, body, options);
+  }
+  if (BACKGROUND_CHAPTER_TASKS.has(body.task)) {
+    return runPersistentAgentJob(baseUrl, body, options);
   }
   let result: AgentRunResult | undefined;
   let settleAfterResult: ReturnType<typeof setTimeout> | undefined;
@@ -1181,6 +1257,11 @@ export interface ApiClient {
     runStream(body: AgentRunRequest, options?: AgentRunStreamOptions): Promise<AgentRunResult>;
     /** 开局计划模式：多轮追问 / 收束 brief。 */
     planTurn(body: NovelPlanTurnRequest, signal?: AbortSignal): Promise<NovelPlanTurnResponse>;
+    getPlanSession(projectId: Id, signal?: AbortSignal): Promise<NovelPlanSession | null>;
+    clearPlanSession(projectId: Id, signal?: AbortSignal): Promise<void>;
+    listJobs(projectId: Id, signal?: AbortSignal): Promise<PersistentAgentJobSnapshot[]>;
+    watchJob(jobId: string, options?: AgentRunStreamOptions): Promise<AgentRunResult>;
+    cancelJob(jobId: string, signal?: AbortSignal): Promise<PersistentAgentJobSnapshot>;
   };
   projects: {
     list(signal?: AbortSignal): Promise<Pick<Project, 'id' | 'name'>[]>;
@@ -1352,6 +1433,14 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
         USE_BACKGROUND_AGENT_JOBS
           ? runPlanBackgroundJob(b, body, signal)
           : streamPlanTurn(b, body, signal),
+      getPlanSession: (projectId, signal) => getPlanSession(b, projectId, signal),
+      clearPlanSession: (projectId, signal) =>
+        request(b, 'DELETE', `/projects/${seg(projectId)}/plan-session`, undefined, { signal }),
+      listJobs: (projectId, signal) =>
+        request(b, 'GET', `/projects/${seg(projectId)}/agent-jobs`, undefined, { signal }),
+      watchJob: (jobId, options) => watchPersistentAgentJob(b, jobId, options),
+      cancelJob: (jobId, signal) =>
+        request(b, 'POST', `/agent/jobs/${seg(jobId)}/cancel`, {}, { signal }),
     },
     projects: {
       list: (signal) => request(b, 'GET', '/projects', undefined, { signal }),

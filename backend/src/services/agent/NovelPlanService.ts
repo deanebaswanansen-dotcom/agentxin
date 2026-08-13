@@ -78,6 +78,13 @@ const GENRE_PATTERNS: Array<[RegExp, string]> = [
   [/(?:校园)/, '校园'],
 ];
 
+const GENRE_TERM_SOURCE =
+  '(?:西方玄幻|西幻|欧美奇幻|东方玄幻|中式玄幻|克苏鲁|洛夫克拉夫特|赛博朋克|赛博|太空歌剧|硬科幻|科幻|仙侠|修仙|武侠|玄幻|奇幻|末世|废土|悬疑|推理|恐怖|惊悚|历史|言情|爱情|恋爱|都市|校园)';
+const NEGATED_GENRE_PATTERN = new RegExp(
+  `(?:不要|不写|不含|不得|禁止|避免|拒绝|排除|并非|不是|没有)\\s*(?:写成|改成|变成|写|加入|包含|出现|使用|采用|任何)?\\s*${GENRE_TERM_SOURCE}(?:\\s*(?:或|、|/|和|与)\\s*${GENRE_TERM_SOURCE})*`,
+  'gi',
+);
+
 interface Scale {
   totalWords?: number;
   wordsPerChapter?: number;
@@ -108,12 +115,16 @@ function parsePositiveInt(raw: unknown): number | undefined {
 }
 
 export function inferExplicitGenre(text: string): string | undefined {
+  // Negative constraints are common in planning prompts and checklists (for
+  // example “校园现实，不要玄幻” or “不得改成玄幻或修仙”). They constrain the
+  // topic but must never become the detected topic themselves.
+  const positiveText = text.replace(NEGATED_GENRE_PATTERN, '');
   // Keep mixed genres intact so a request such as “校园推理” does not lose
   // its setting when the detector encounters the mystery keyword first.
-  if (/(?:校园)/.test(text) && /(?:悬疑|推理)/.test(text)) return '校园悬疑';
-  if (/(?:校园)/.test(text) && /(?:言情|爱情|恋爱)/.test(text)) return '校园言情';
+  if (/(?:校园)/.test(positiveText) && /(?:悬疑|推理)/.test(positiveText)) return '校园悬疑';
+  if (/(?:校园)/.test(positiveText) && /(?:言情|爱情|恋爱)/.test(positiveText)) return '校园言情';
   for (const [pattern, genre] of GENRE_PATTERNS) {
-    if (pattern.test(text)) return genre;
+    if (pattern.test(positiveText)) return genre;
   }
   return undefined;
 }
@@ -808,6 +819,24 @@ function askedQuestionIds(
   return ids;
 }
 
+function answeredQuestionIds(
+  history: NovelPlanHistoryTurn[],
+  answers: NovelPlanAnswer[] | undefined,
+): Set<string> {
+  const ids = new Set<string>();
+  for (const answer of answers ?? []) {
+    if (answer.selectedOptionIds.length > 0 || answer.customText?.trim()) ids.add(answer.questionId);
+  }
+  for (const turn of history) {
+    if (turn.role !== 'user') continue;
+    for (const line of turn.content.split('\n')) {
+      const match = line.match(/^\s*-\s*([a-z0-9_:-]+)\s*:\s*([^|]+)\|/i);
+      if (match && match[2]!.trim() !== '-') ids.add(match[1]!);
+    }
+  }
+  return ids;
+}
+
 type CoreRequirement = 'genre' | 'main_direction' | 'protagonist_type';
 type PlanRequirement =
   | CoreRequirement
@@ -818,6 +847,22 @@ type PlanRequirement =
   | 'target_volume_count'
   | 'ending_direction'
   | 'writing_requirements';
+
+function requirementAnsweredByQuestionId(requirement: PlanRequirement, answeredIds: Set<string>): boolean {
+  const aliases: Record<PlanRequirement, RegExp> = {
+    genre: /^(?:core_)?genre$|topic_type/i,
+    main_direction: /main_direction|campus_conflict|plot_direction|core_conflict/i,
+    protagonist_type: /protagonist|campus_role|character_role|hero_identity/i,
+    core_story: /core_story|premise|story_hook/i,
+    target_total_words: /target_total_words|total_words/i,
+    target_total_chapters: /target_total_chapters|chapter_count/i,
+    target_words_per_chapter: /target_words_per_chapter|words_per_chapter/i,
+    target_volume_count: /target_volume_count|volume_count/i,
+    ending_direction: /ending_direction|ending_shape/i,
+    writing_requirements: /writing_requirements|writing_style|pacing/i,
+  };
+  return Array.from(answeredIds).some((id) => aliases[requirement].test(id));
+}
 
 function missingCoreRequirements(text: string): CoreRequirement[] {
   const missing: CoreRequirement[] = [];
@@ -1466,7 +1511,9 @@ export class NovelPlanService {
       scaleFromPlanConfig(request.planConfig),
       collectScaleFromSession(history, request.answers, undefined, seed),
     );
-    const missingRequirements = missingPlanRequirements(knownText, request.planConfig, knownScale);
+    const answeredIds = answeredQuestionIds(history, request.answers);
+    const missingRequirements = missingPlanRequirements(knownText, request.planConfig, knownScale)
+      .filter((requirement) => !requirementAnsweredByQuestionId(requirement, answeredIds));
     const round = Math.min(
       MAX_AGENT_ROUNDS,
       1 + history.filter((turn) => turn.role === 'user').length,

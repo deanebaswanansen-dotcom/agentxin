@@ -7,7 +7,16 @@ vi.mock('../api/apiClient.js', () => ({
     write: vi.fn(),
     freeChat: { stream: vi.fn() },
     modelConfig: { save: vi.fn() },
-    agent: { runStream: vi.fn(), run: vi.fn() },
+    agent: {
+      runStream: vi.fn(),
+      run: vi.fn(),
+      planTurn: vi.fn(),
+      getPlanSession: vi.fn(),
+      clearPlanSession: vi.fn(),
+      listJobs: vi.fn(),
+      watchJob: vi.fn(),
+      cancelJob: vi.fn(),
+    },
     chapters: { list: vi.fn() },
   },
 }));
@@ -27,6 +36,9 @@ describe('ChatWorkspace', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     window.localStorage.clear();
+    vi.mocked(apiClient.agent.getPlanSession).mockResolvedValue(null);
+    vi.mocked(apiClient.agent.clearPlanSession).mockResolvedValue(undefined);
+    vi.mocked(apiClient.agent.listJobs).mockResolvedValue([]);
   });
 
   it('serializes plan question and option ids into history', () => {
@@ -220,6 +232,117 @@ describe('ChatWorkspace', () => {
 
     expect(screen.getByText('记录这轮对话')).toBeInTheDocument();
     expect(screen.getByText('历史回执')).toBeInTheDocument();
+  });
+
+  it('keeps project Agent history visible when selecting a chapter in the same project', async () => {
+    window.localStorage.setItem('nwa.chatSessions.v1', JSON.stringify({
+      'p-shared:free': [{ id: 'shared-message', role: 'assistant', kind: 'text', content: '项目级回复' }],
+    }));
+    const view = render(<ChatWorkspace projectId="p-shared" projectName="同一项目" chapterId={null} />);
+    expect(screen.getByText('项目级回复')).toBeInTheDocument();
+
+    view.rerender(<ChatWorkspace projectId="p-shared" projectName="同一项目" chapterId="chapter-1" />);
+    expect(await screen.findByText('项目级回复')).toBeInTheDocument();
+  });
+
+  it('restores a completed background task when returning to its project', async () => {
+    vi.mocked(apiClient.agent.listJobs).mockResolvedValue([{
+      id: 'completed-job',
+      status: 'completed',
+      events: [],
+      request: {
+        task: 'long_novel',
+        mode: 'draft',
+        prompt: '写完整本',
+        projectId: 'p-restored',
+      },
+      result: {
+        task: 'long_novel',
+        mode: 'draft',
+        projectId: 'p-restored',
+        summary: '离开项目期间已完成 20 章',
+        steps: ['已保存全部章节'],
+        artifacts: [],
+      },
+    }]);
+
+    render(<ChatWorkspace projectId="p-restored" projectName="恢复项目" />);
+
+    expect(await screen.findByText('离开项目期间已完成 20 章')).toBeInTheDocument();
+    expect(apiClient.agent.watchJob).not.toHaveBeenCalled();
+  });
+
+  it('starts a fresh project-scoped plan session', async () => {
+    vi.mocked(apiClient.agent.planTurn).mockResolvedValue({
+      status: 'asking',
+      sessionId: 'session-1',
+      round: 1,
+      message: '先确认校园主线。',
+      questions: [
+        {
+          id: 'core_main_direction',
+          question: '校园主线围绕什么展开？',
+          options: [{ id: 'growth', label: '学业与成长' }],
+        },
+      ],
+    });
+    render(<ChatWorkspace projectId="p-1" projectName="校园故事" />);
+
+    fireEvent.change(screen.getByRole('textbox', { name: '对话输入' }), {
+      target: { value: '/计划 写校园现实小说' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await screen.findByLabelText('小说计划配置');
+    fireEvent.click(screen.getByRole('button', { name: '执行' }));
+
+    await waitFor(() => {
+      expect(apiClient.agent.planTurn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          projectId: 'p-1',
+          resetSession: true,
+          seedPrompt: '写校园现实小说',
+        }),
+        expect.any(AbortSignal),
+      );
+    });
+  });
+
+  it('restores the latest plan question when returning to a project', async () => {
+    vi.mocked(apiClient.agent.getPlanSession).mockResolvedValue({
+      id: 'session-1',
+      projectId: 'p-1',
+      seedPrompt: '写校园现实小说',
+      targetTask: 'long_novel',
+      history: [],
+      activeQuestions: [
+        {
+          id: 'core_protagonist_type',
+          question: '主角在学校中的身份是什么？',
+          options: [{ id: 'student', label: '普通学生' }],
+        },
+      ],
+      decisions: {},
+      lastResponse: {
+        status: 'asking',
+        sessionId: 'session-1',
+        round: 2,
+        message: '继续确认主角。',
+        questions: [
+          {
+            id: 'core_protagonist_type',
+            question: '主角在学校中的身份是什么？',
+            options: [{ id: 'student', label: '普通学生' }],
+          },
+        ],
+      },
+      createdAt: '2026-08-13T00:00:00.000Z',
+      updatedAt: '2026-08-13T00:00:01.000Z',
+    });
+
+    render(<ChatWorkspace projectId="p-1" projectName="校园故事" />);
+
+    expect(await screen.findByText('继续确认主角。')).toBeInTheDocument();
+    expect(screen.getByText('主角在学校中的身份是什么？')).toBeInTheDocument();
   });
 
   it('does not carry a completed same-project task into a newly selected project', async () => {

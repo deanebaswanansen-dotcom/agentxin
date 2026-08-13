@@ -81,6 +81,7 @@ export interface PlanTurnMessage {
   id: string;
   role: 'assistant';
   kind: 'plan-turn';
+  sessionId?: string;
   status: 'asking' | 'ready';
   round: number;
   message: string;

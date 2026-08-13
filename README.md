@@ -55,7 +55,7 @@ npm test
 
 ## 主要线上部署（阿里云 ECS）
 
-当前生产架构为 Nginx 托管前端、Fastify 常驻后端、`/var/lib/agentxin` 持久化数据；完整部署、更新、备份和排错命令见 [`docs/PROJECT_HANDBOOK.md`](docs/PROJECT_HANDBOOK.md)。前端生产构建必须设置 `VITE_AGENT_BACKGROUND_JOBS=false`，长时间 Agent 任务直接使用 `/api` SSE，不经过短时函数。
+当前生产架构为 Nginx 托管前端、Fastify 常驻后端、`/var/lib/agentxin` 持久化数据；完整部署、更新、备份和排错命令见 [`docs/PROJECT_HANDBOOK.md`](docs/PROJECT_HANDBOOK.md)。前端生产构建必须设置 `VITE_AGENT_BACKGROUND_JOBS=false`；长篇任务使用服务器持久化任务队列，切项目、刷新或临时断网后可恢复。
 
 ## 兼容部署（Netlify，非当前主环境）
 
