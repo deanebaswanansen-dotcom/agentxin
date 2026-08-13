@@ -8,7 +8,7 @@ import type { ModelProxy } from '../proxy/ModelProxy.js';
 import type { StreamDelta } from '../proxy/sseParser.js';
 import { FileDataStore } from '../store/FileDataStore.js';
 import type { ChatMessage, ModelConfig } from '../types/index.js';
-import { parsePlanSummary } from './agentRoutes.js';
+import { parseAgentBody, parsePlanSummary } from './agentRoutes.js';
 
 class FakeProxy implements ModelProxy {
   calls: ChatMessage[][] = [];
@@ -63,6 +63,25 @@ describe('agent routes', () => {
 
     expect(parsed?.storyPlan?.premise.coreConflict).toBe('记忆与权力冲突。');
     expect(parsed?.storyPlan?.powerSystem.rules).toEqual(['魔法消耗记忆']);
+  });
+
+  it('preserves the user-confirmed chapter word range', () => {
+    const parsed = parseAgentBody({
+      task: 'long_novel',
+      mode: 'draft',
+      prompt: '校园悬疑',
+      options: {
+        targetWords: 800,
+        minWordsPerChapter: 700,
+        maxWordsPerChapter: 900,
+      },
+    });
+
+    expect(parsed.options).toMatchObject({
+      targetWords: 800,
+      minWordsPerChapter: 700,
+      maxWordsPerChapter: 900,
+    });
   });
 
   it('runs draft automation from one sentence and persists project artifacts', async () => {

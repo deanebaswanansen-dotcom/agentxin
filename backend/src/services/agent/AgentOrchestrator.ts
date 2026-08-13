@@ -20,6 +20,7 @@ import { getCacheStatsSummary, type CacheStatsSummary } from '../../proxy/cacheS
 import { pythonBridge, type PythonBridgeResult } from '../../proxy/PythonBridge.js';
 import type { BlueprintService } from '../blueprint/BlueprintService.js';
 import type { ChapterWriter } from '../blueprint/ChapterWriter.js';
+import { countActualWords, tokenBudgetForCharacterTarget } from '../blueprint/wordCount.js';
 import { ServiceError } from '../ServiceError.js';
 import { isProxyError } from '../../proxy/ProxyError.js';
 import type { ModelConfigService } from '../modelConfig/ModelConfigService.js';
@@ -38,6 +39,24 @@ import {
 const MAX_EMPTY_CHAPTER_ATTEMPTS = 3;
 const RETRYABLE_CHAPTER_PROVIDER_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 export const BLUEPRINT_REQUIREMENT_MAX_CHARS = 5000;
+
+function wordRangeDistance(
+  content: string,
+  range: { minWords: number; maxWords: number },
+): number {
+  const words = countActualWords(content);
+  if (words < range.minWords) return range.minWords - words;
+  if (words > range.maxWords) return words - range.maxWords;
+  return 0;
+}
+
+export function revisionDoesNotWorsenWordRange(
+  original: string,
+  revision: string,
+  range: { minWords: number; maxWords: number },
+): boolean {
+  return wordRangeDistance(revision, range) <= wordRangeDistance(original, range);
+}
 
 function isRetryableChapterError(error: unknown): boolean {
   if (!isProxyError(error)) return false;
@@ -108,6 +127,14 @@ export function normalizeLongNovelTotalWords(value: number | undefined): number 
     FULL_NOVEL_LIMITS.minTargetWords,
     FULL_NOVEL_LIMITS.maxChapters * FULL_NOVEL_LIMITS.maxTargetWords,
   );
+}
+
+export function remainingLongNovelBatch(
+  requestedBatch: number,
+  completedChapters: number,
+  plannedTotalChapters: number,
+): number {
+  return Math.min(requestedBatch, Math.max(0, plannedTotalChapters - completedChapters));
 }
 
 function truncatePromptSection(value: string, maxChars: number): string {
@@ -987,10 +1014,11 @@ export class AgentOrchestrator {
       targetChapters: plannedTotalChapters,
       targetWordsPerChapter: perChapter,
       minWordsPerChapter: options?.minWordsPerChapter,
+      maxWordsPerChapter: options?.maxWordsPerChapter,
       maxChaptersPerRun: requestedBatch,
     });
     // assistant 强制单章；unattended 允许更大批次但受 options.chapters 限制
-    const chapterCount = Math.min(requestedBatch, modeConfig.maxChaptersPerRun);
+    let chapterCount = Math.min(requestedBatch, modeConfig.maxChaptersPerRun);
 
     const emit = (event: AgentProgressEvent): void => {
       this.emitProgress(onProgress, event);
@@ -1011,17 +1039,41 @@ export class AgentOrchestrator {
       projectId,
       projectSeed,
     );
+    await this.purgeEmptyChapterShells(pid);
+    const existing = await this.store.listChapters(pid);
+    const completedBefore = existing.filter((ch) => ch.content.trim().length > 0).length;
+    const requestedChapterCount = chapterCount;
+    chapterCount = remainingLongNovelBatch(
+      requestedChapterCount,
+      completedBefore,
+      plannedTotalChapters,
+    );
     steps.push(projectCreated ? '已创建长篇小说项目。' : '已复用当前项目。');
     steps.push(
       `长篇配置：自动化=${automationLevel}；本批 ${chapterCount} 章×${perChapter} 字；总计划 ${plannedTotalChapters} 章 / 约 ${totalWords.toLocaleString()} 字。`,
     );
+    if (chapterCount < requestedChapterCount) {
+      steps.push(`检测到已完成 ${completedBefore} 章，本批按剩余总计划裁剪为 ${chapterCount} 章。`);
+    }
+
+    const artifacts: AgentArtifact[] = [{ kind: 'project', id: pid, title: projectTitle }];
+    if (chapterCount === 0) {
+      return {
+        task: 'long_novel',
+        mode: 'draft',
+        projectId: pid,
+        summary: `全书计划已完成：现有 ${completedBefore}/${plannedTotalChapters} 章，无需继续生成。`,
+        steps,
+        artifacts,
+        metrics: emptyMetrics(totalWords, 0),
+      };
+    }
 
     if (this.longNovelConfigStore) {
       await this.longNovelConfigStore.save(pid, modeConfig);
       steps.push('已保存长篇小说模式配置。');
     }
 
-    const artifacts: AgentArtifact[] = [{ kind: 'project', id: pid, title: projectTitle }];
     const packPrompt = appendPlanContextToPrompt(prompt, options?.planSummary);
     const transferPrompt = this.referenceService?.buildActiveTransferPrompt(pid) ?? '';
     const directorBrief = [
@@ -1093,9 +1145,6 @@ export class AgentOrchestrator {
       steps,
     );
 
-    await this.purgeEmptyChapterShells(pid);
-    const existing = await this.store.listChapters(pid);
-    const completedBefore = existing.filter((ch) => ch.content.trim().length > 0).length;
     const plannedFinalChapter = Math.max(completedBefore + chapterCount, plannedTotalChapters);
     pack = await this.ensureFullNovelControlOutline(
       config,
@@ -2384,6 +2433,7 @@ export class AgentOrchestrator {
           finalContent,
           hints,
           signal,
+          options.qualityGates ?? undefined,
         );
       } catch (error) {
         if (signal.aborted) throw error;
@@ -2394,7 +2444,12 @@ export class AgentOrchestrator {
           total: progress?.total,
         });
       }
-      if (revisedContent !== undefined && revisedContent.trim().length > 0) {
+      if (
+        revisedContent !== undefined &&
+        revisedContent.trim().length > 0 &&
+        (!options.qualityGates ||
+          revisionDoesNotWorsenWordRange(finalContent, revisedContent, options.qualityGates))
+      ) {
         finalContent = revisedContent;
         await this.store.updateChapterContent(chapterId, finalContent);
         revised = true;
@@ -2430,6 +2485,13 @@ export class AgentOrchestrator {
             fatalIssues: finalInspection.fatalIssues,
           });
         }
+      } else if (revisedContent !== undefined && revisedContent.trim().length > 0) {
+        emit({
+          phase: 'info',
+          message: `【ReviewAgent】修订「${chapterTitle}」后字数偏差更大，已保留更接近计划的原稿。`,
+          current: progress?.current,
+          total: progress?.total,
+        });
       } else if (revisedContent !== undefined) {
         emit({
           phase: 'info',
@@ -2680,9 +2742,13 @@ export class AgentOrchestrator {
     original: string,
     hints: string[],
     signal: AbortSignal,
+    wordRange?: { minWords: number; maxWords: number },
   ): Promise<string> {
     const memoryContext = this.memory.buildContext(projectId, scaledMemoryOptions(chapterNumber));
     const memoryBlock = memoryContext.length > 0 ? `\n\n${memoryContext}` : '';
+    const rangeRequirement = wordRange
+      ? `修订后的正文必须控制在 ${wordRange.minWords}-${wordRange.maxWords} 字；字数按去除空格和换行后的字符数计算，达到范围后立即收束，不得扩写超限。`
+      : `修订后的正文保持约 ${targetWords} 字。`;
     return this.generateText(
       config,
       [
@@ -2691,6 +2757,7 @@ export class AgentOrchestrator {
           content: [
             `你是长篇小说「写作子 Agent」，正在修订《${pack.title}》第 ${chapterNumber} 章。`,
             '检测子 Agent 已发现连贯性问题，你必须按修订建议改稿，保持人设与世界观一致。',
+            rangeRequirement,
             '只输出修订后的本章正文，不要解释。',
             pack.world.slice(0, 1200),
             pack.characters.slice(0, 1200),
@@ -2702,13 +2769,15 @@ export class AgentOrchestrator {
         },
         {
           role: 'user',
-          content: `原稿：\n${original.slice(0, 6000)}\n\n请输出修订后的第 ${chapterNumber} 章全文。题材：${seedPrompt}`,
+          content: `原稿：\n${original.slice(0, 6000)}\n\n请在不新增支线的前提下输出修订后的第 ${chapterNumber} 章全文。${rangeRequirement}\n题材：${seedPrompt}`,
         },
       ],
       signal,
       {
         disableThinking: true,
-        maxTokens: Math.min(8192, Math.max(2048, targetWords * 2 + 1024)),
+        maxTokens: wordRange
+          ? tokenBudgetForCharacterTarget(wordRange.maxWords, original)
+          : Math.min(8192, Math.max(2048, targetWords * 2 + 1024)),
       },
     );
   }

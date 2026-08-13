@@ -246,6 +246,8 @@ export interface AgentRunRequest {
     totalWords?: number;
     /** long_novel：每章最低字数（格式 Gate）。 */
     minWordsPerChapter?: number;
+    /** long_novel：每章最高字数（格式 Gate）。 */
+    maxWordsPerChapter?: number;
   };
 }
 

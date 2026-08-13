@@ -43,6 +43,22 @@ export function countActualWords(text: string): number {
 }
 
 /**
+ * Convert this product's character-count target into a provider token ceiling.
+ * Chinese prose usually packs more than one visible character into a token,
+ * while Latin prose needs roughly 1.5 tokens per word.  Detect the surrounding
+ * language so a Chinese 900-character request cannot expand to 2,000+ chars.
+ */
+export function tokenBudgetForCharacterTarget(targetWords: number, context: string): number {
+  const normalized = context.replace(/\s/gu, '');
+  const hanCount = normalized.match(/\p{Script=Han}/gu)?.length ?? 0;
+  const isHanDominant = normalized.length > 0 && hanCount / Array.from(normalized).length >= 0.1;
+  const estimate = isHanDominant
+    ? Math.ceil(targetWords * 0.6) + 64
+    : Math.ceil(targetWords * 1.5) + 128;
+  return Math.min(8192, Math.max(128, estimate));
+}
+
+/**
  * 由蓝图核心结构与各场景正文映射构建字数检查报告（需求 9.1–9.3）。
  *
  * 计算规则：

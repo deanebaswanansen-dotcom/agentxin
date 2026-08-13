@@ -31,6 +31,7 @@ import type { StreamDelta } from '../../proxy/sseParser.js';
 import { pythonBridge } from '../../proxy/PythonBridge.js';
 import type { DataStore } from '../../store/DataStore.js';
 import type {
+  BlueprintCore,
   ChapterBlueprint,
   GenerateBlueprintBody,
   Id,
@@ -58,6 +59,44 @@ const MAX_REQUIREMENT_LENGTH = 5000;
 /** 是否为正整数（严格大于 0 且为整数；非有限值一律视为非法）。 */
 function isPositiveInteger(value: number): boolean {
   return Number.isInteger(value) && value > 0;
+}
+
+/**
+ * Models often round each short scene independently (for example 3×250 for a
+ * 900-character chapter). Preserve their relative pacing while making the
+ * allocation sum exactly to the user-confirmed chapter target.
+ */
+export function normalizeBlueprintWordTargets(
+  core: BlueprintCore,
+  targetWords: number,
+): BlueprintCore {
+  if (
+    core.scenes.length === 0 ||
+    !core.scenes.every((scene) => isPositiveInteger(scene.target_words))
+  ) {
+    return { ...core, target_words: targetWords };
+  }
+  const total = core.scenes.reduce((sum, scene) => sum + scene.target_words, 0);
+  if (total === targetWords && core.target_words === targetWords) return core;
+
+  const scaled = core.scenes.map((scene, index) => {
+    const exact = (scene.target_words * targetWords) / total;
+    return { index, words: Math.max(1, Math.floor(exact)), fraction: exact - Math.floor(exact) };
+  });
+  let remaining = targetWords - scaled.reduce((sum, item) => sum + item.words, 0);
+  const order = [...scaled].sort((a, b) => b.fraction - a.fraction || a.index - b.index);
+  for (let cursor = 0; remaining > 0; cursor += 1, remaining -= 1) {
+    order[cursor % order.length]!.words += 1;
+  }
+
+  return {
+    ...core,
+    target_words: targetWords,
+    scenes: core.scenes.map((scene, index) => ({
+      ...scene,
+      target_words: scaled[index]!.words,
+    })),
+  };
 }
 
 export class BlueprintService {
@@ -180,7 +219,7 @@ export class BlueprintService {
     // 错误补发一次更精简的 JSON 请求，提供商/网络错误仍直接向上传递。
     let core;
     try {
-      core = parseBlueprintFromText(fullText);
+      core = normalizeBlueprintWordTargets(parseBlueprintFromText(fullText), body.targetWords);
       validateBlueprint(core);
     } catch (error) {
       if (!(error instanceof ServiceError) || error.code !== 'VALIDATION_ERROR') throw error;
@@ -201,7 +240,7 @@ export class BlueprintService {
           maxTokens: 4096,
         }),
       );
-      core = parseBlueprintFromText(retryText);
+      core = normalizeBlueprintWordTargets(parseBlueprintFromText(retryText), body.targetWords);
       validateBlueprint(core);
     }
 

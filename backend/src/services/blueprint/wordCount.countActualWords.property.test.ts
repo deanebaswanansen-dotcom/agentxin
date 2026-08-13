@@ -24,7 +24,7 @@
 import { describe, it, expect } from 'vitest';
 import fc from 'fast-check';
 
-import { countActualWords } from './wordCount.js';
+import { countActualWords, tokenBudgetForCharacterTarget } from './wordCount.js';
 
 const NUM_RUNS = 300;
 
@@ -107,6 +107,11 @@ const textArb: fc.Arbitrary<string> = fc.oneof(
 );
 
 describe('wordCount countActualWords property test', () => {
+  it('uses a bounded Chinese-character budget and a larger Latin-word budget', () => {
+    expect(tokenBudgetForCharacterTarget(900, '校园悬疑小说')).toBe(604);
+    expect(tokenBudgetForCharacterTarget(900, 'campus mystery novel')).toBe(1478);
+  });
+
   it('Feature: chapter-blueprint, Property 9: 实际字数等于去空白字符数', () => {
     fc.assert(
       fc.property(textArb, (s) => {

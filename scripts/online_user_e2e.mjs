@@ -5,6 +5,7 @@
  *   TEST_API_KEY   Provider key used only in this browser process.
  * Optional:
  *   TEST_BASE_URL  Public frontend (default: http://101.133.150.84)
+ *   TEST_API_BASE_URL  API root when frontend/backend use different local ports
  *   TEST_MODEL     Provider model (default: deepseek-v4-flash)
  *   TEST_SCENARIO  campus | western (default: campus)
  */
@@ -14,7 +15,7 @@ const require = createRequire(new URL('../frontend/package.json', import.meta.ur
 const { chromium } = require('playwright');
 
 const SITE = (process.env.TEST_BASE_URL ?? 'http://101.133.150.84').replace(/\/$/, '');
-const API = `${SITE}/api`;
+const API = (process.env.TEST_API_BASE_URL ?? `${SITE}/api`).replace(/\/$/, '');
 const API_KEY = process.env.TEST_API_KEY?.trim();
 const MODEL = process.env.TEST_MODEL?.trim() || 'deepseek-v4-flash';
 const SCENARIO = process.env.TEST_SCENARIO === 'western' ? 'western' : 'campus';
@@ -209,10 +210,17 @@ async function main() {
 
     const chapters = await api(`/projects/${encodeURIComponent(project.id)}/chapters`);
     report.chapters = Array.isArray(chapters.body)
-      ? chapters.body.map((chapter) => ({ title: chapter.title, chars: chapter.content?.trim().length ?? 0 }))
+      ? chapters.body.map((chapter) => ({
+          title: chapter.title,
+          chars: chapter.content?.trim().length ?? 0,
+          actualWords: Array.from((chapter.content ?? '').replace(/\s/gu, '')).length,
+        }))
       : [];
     if (report.chapters.length < 3 || report.chapters.some((chapter) => chapter.chars < 300)) {
       throw new Error(`章节落盘异常：${JSON.stringify(report.chapters)}`);
+    }
+    if (report.chapters.some((chapter) => chapter.actualWords < 700 || chapter.actualWords > 900)) {
+      throw new Error(`章节字数未遵守 700-900 字计划：${JSON.stringify(report.chapters)}`);
     }
     if (/暂停|失败/.test(report.summary)) {
       throw new Error(`小说未完整结束：${report.summary}`);

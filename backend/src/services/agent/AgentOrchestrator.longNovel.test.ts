@@ -11,8 +11,10 @@ import {
   extractChapterOutline,
   normalizeFullNovelOptions,
   normalizeLongNovelTotalWords,
+  remainingLongNovelBatch,
   parseCharacterProfiles,
   parseReflection,
+  revisionDoesNotWorsenWordRange,
   AgentOrchestrator,
 } from './AgentOrchestrator.js';
 import type { ModelProxy, StreamCompletionOptions } from '../../proxy/ModelProxy.js';
@@ -160,6 +162,27 @@ describe('normalizeFullNovelOptions', () => {
   it('honors an explicitly configured short total instead of silently raising it to 10,000 words', () => {
     expect(normalizeLongNovelTotalWords(2400)).toBe(2400);
     expect(normalizeLongNovelTotalWords(undefined)).toBe(200_000);
+  });
+
+  it('clips a resumed batch to the chapters remaining in the full plan', () => {
+    expect(remainingLongNovelBatch(3, 2, 3)).toBe(1);
+    expect(remainingLongNovelBatch(3, 3, 3)).toBe(0);
+    expect(remainingLongNovelBatch(3, 1, 10)).toBe(3);
+  });
+
+  it('rejects a ReviewAgent revision that moves farther outside the confirmed word range', () => {
+    expect(
+      revisionDoesNotWorsenWordRange('甲'.repeat(1200), '乙'.repeat(2200), {
+        minWords: 700,
+        maxWords: 900,
+      }),
+    ).toBe(false);
+    expect(
+      revisionDoesNotWorsenWordRange('甲'.repeat(1200), '乙'.repeat(850), {
+        minWords: 700,
+        maxWords: 900,
+      }),
+    ).toBe(true);
   });
 
   it('keeps blueprint requirements within the API limit without dropping story memory', () => {

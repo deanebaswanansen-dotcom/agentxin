@@ -50,7 +50,12 @@ describe('buildAgentRunOptions', () => {
       planSummary: undefined,
     });
 
-    const planSummary = { chapterCount: 20, totalWords: 100_000, wordsPerChapter: 2500 };
+    const planSummary = {
+      chapterCount: 20,
+      totalWords: 100_000,
+      wordsPerChapter: 2500,
+      planConfig: { targetWordsPerChapter: { min: 2200, max: 2800 } },
+    };
     expect(
       buildAgentRunOptions({
         task: 'long_novel',
@@ -68,6 +73,7 @@ describe('buildAgentRunOptions', () => {
       automationLevel: 'auto',
       planSummary,
       minWordsPerChapter: 800,
+      maxWordsPerChapter: 2800,
     });
   });
 

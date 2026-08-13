@@ -123,6 +123,7 @@ function parseAgentOptions(raw: unknown): AgentRunRequest['options'] | undefined
   const totalChapters = asOptionalPositiveInt(obj.totalChapters);
   const totalWords = asOptionalPositiveInt(obj.totalWords);
   const minWordsPerChapter = asOptionalPositiveInt(obj.minWordsPerChapter);
+  const maxWordsPerChapter = asOptionalPositiveInt(obj.maxWordsPerChapter);
   const planSummary = parsePlanSummary(obj.planSummary);
   const automationLevel = parseAutomationLevel(obj.automationLevel);
   if (targetWords !== undefined) options.targetWords = targetWords;
@@ -130,6 +131,7 @@ function parseAgentOptions(raw: unknown): AgentRunRequest['options'] | undefined
   if (totalChapters !== undefined) options.totalChapters = totalChapters;
   if (totalWords !== undefined) options.totalWords = totalWords;
   if (minWordsPerChapter !== undefined) options.minWordsPerChapter = minWordsPerChapter;
+  if (maxWordsPerChapter !== undefined) options.maxWordsPerChapter = maxWordsPerChapter;
   if (planSummary !== undefined) options.planSummary = planSummary;
   if (automationLevel !== undefined) options.automationLevel = automationLevel;
   return Object.keys(options).length > 0 ? options : undefined;

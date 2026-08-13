@@ -252,6 +252,7 @@ function buildSceneSystemContent(): string {
     '- 严格围绕场景目的（purpose）与必含要点（must_include）展开。',
     '- 场景结尾需达到指定的结束状态（ending_state）。',
     '- 正文实际字数应尽量接近场景目标字数（target_words）。',
+    '- 字数按去除空格与换行后的可见字符计数，控制在 target_words 的 90%-110%；达到上限前自然收束并立即停止。',
     '- 保持与已给出的出场角色设定一致；如有上一场景正文，需与其自然衔接。',
     '- 只输出场景正文，不要输出额外说明。',
   ].join('\n');

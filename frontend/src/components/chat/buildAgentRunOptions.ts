@@ -20,6 +20,7 @@ export interface BuildAgentRunOptionsInput {
   /** auto_next 专用字数，默认 2000。 */
   autoNextTargetWords?: number;
   minWordsPerChapter?: number;
+  maxWordsPerChapter?: number;
 }
 
 const FULL_NOVEL_DEFAULT_CHAPTERS = 3;
@@ -74,9 +75,11 @@ export function buildAgentRunOptions(
       automationLevel: input.automationLevel ?? 'semi_auto',
       planSummary,
     };
-    if (input.minWordsPerChapter !== undefined) {
-      options.minWordsPerChapter = input.minWordsPerChapter;
-    }
+    const plannedRange = planSummary?.planConfig?.targetWordsPerChapter;
+    const minWordsPerChapter = input.minWordsPerChapter ?? plannedRange?.min;
+    const maxWordsPerChapter = input.maxWordsPerChapter ?? plannedRange?.max;
+    if (minWordsPerChapter !== undefined) options.minWordsPerChapter = minWordsPerChapter;
+    if (maxWordsPerChapter !== undefined) options.maxWordsPerChapter = maxWordsPerChapter;
     return options;
   }
 

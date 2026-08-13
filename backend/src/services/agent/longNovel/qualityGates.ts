@@ -36,9 +36,8 @@ function isCatastrophicContinuityIssue(issue: string): boolean {
   return (
     /(?:死亡|已死).{0,24}(?:复活|再次出场|仍然活着|存活)/.test(normalized) ||
     /(?:身份|性别).{0,24}(?:冲突|矛盾|错误|错置|不一致)/.test(normalized) ||
-    /(?:时间线|年代|时间顺序).{0,32}(?:冲突|矛盾|不可能|倒置)/.test(normalized) ||
-    /(?:世界规则|力量体系|核心能力).{0,32}(?:冲突|矛盾|违反|不一致)/.test(normalized) ||
-    /硬冲突/.test(normalized)
+    /(?:时间线|年代|时间顺序).{0,32}(?:不可能|倒置|无法成立)/.test(normalized) ||
+    /(?:世界规则|力量体系|核心能力).{0,32}(?:冲突|矛盾|违反|不一致)/.test(normalized)
   );
 }
 
@@ -163,6 +162,7 @@ export function defaultLongNovelConfig(partial?: Partial<{
   targetChapters: number;
   targetWordsPerChapter: number;
   minWordsPerChapter: number;
+  maxWordsPerChapter: number;
   maxChaptersPerRun: number;
 }>): import('../../../types/index.js').LongNovelModeConfig {
   const level = partial?.automationLevel ?? 'semi_auto';
@@ -177,7 +177,8 @@ export function defaultLongNovelConfig(partial?: Partial<{
     targetChapters: partial?.targetChapters,
     minWordsPerChapter: partial?.minWordsPerChapter ?? Math.max(300, Math.floor(perChapter * 0.45)),
     targetWordsPerChapter: perChapter,
-    maxWordsPerChapter: Math.min(8000, Math.floor(perChapter * 1.8)),
+    maxWordsPerChapter:
+      partial?.maxWordsPerChapter ?? Math.min(8000, Math.floor(perChapter * 1.8)),
     checkpointInterval: 5,
     maxChaptersPerRun: maxRun,
     maxConsecutiveFailures: 3,

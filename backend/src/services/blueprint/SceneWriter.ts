@@ -35,6 +35,7 @@ import {
 } from './buildBlueprintPrompts.js';
 import { compareSceneId } from './mergeScenes.js';
 import { stripReasoningArtifacts } from '../text/reasoningSanitizer.js';
+import { tokenBudgetForCharacterTarget } from './wordCount.js';
 
 export class SceneWriter {
   /**
@@ -116,7 +117,13 @@ export class SceneWriter {
     // 6) 发起流式补全并透传增量（需求 6.4）。
     const stream = this.modelProxy.streamCompletion(config, messages, signal, {
       disableThinking: true,
-      maxTokens: Math.min(4096, Math.max(256, scene.target_words + 128)),
+      maxTokens: Math.min(
+        4096,
+        tokenBudgetForCharacterTarget(
+          scene.target_words,
+          `${blueprint.title}\n${blueprint.main_goal}\n${scene.purpose}`,
+        ),
+      ),
     });
     return { blueprint, scene, stream };
   }

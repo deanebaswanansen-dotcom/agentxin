@@ -215,6 +215,30 @@ const signal = () => new AbortController().signal;
 // ---------------------------------------------------------------------------
 
 describe('BlueprintService.generate — success path', () => {
+  it('normalizes rounded scene targets to the confirmed short-chapter target without retrying', async () => {
+    const seeded = await seed();
+    const rounded = {
+      ...makeValidBlueprintCore(900),
+      scenes: [
+        makeScene('scene-1', 250),
+        makeScene('scene-2', 250),
+        makeScene('scene-3', 250),
+      ],
+    };
+    const { proxy, calls } = makeFakeProxy({ chunks: [blueprintAsModelOutput(rounded)] });
+    const service = new BlueprintService(seeded.store, seeded.modelConfigService, proxy);
+
+    const result = await service.generate(
+      seeded.chapterId,
+      { ...VALID_BODY, targetWords: 900 },
+      signal(),
+    );
+
+    expect(calls).toHaveLength(1);
+    expect(result.target_words).toBe(900);
+    expect(result.scenes.reduce((sum, scene) => sum + scene.target_words, 0)).toBe(900);
+  });
+
   it('parses, validates and persists a valid blueprint; returned chapter_id equals the requested chapterId', async () => {
     const seeded = await seed();
     const core = makeValidBlueprintCore();

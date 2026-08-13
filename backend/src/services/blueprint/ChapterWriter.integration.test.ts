@@ -184,7 +184,7 @@ describe('SceneWriter / ChapterWriter integration', () => {
     expect(fullText).toBe(deltasForCall(1).join(''));
     expect(calls).toHaveLength(1);
     expect(calls[0].config).toEqual(VALID_CONFIG);
-    expect(calls[0].options).toEqual({ disableThinking: true, maxTokens: 728 });
+    expect(calls[0].options).toEqual({ disableThinking: true, maxTokens: 424 });
 
     // The caller persists only after the stream completes normally (Req 6.5).
     await sceneWriter.finalizeDraft(chapterId, 'scene-1', fullText);

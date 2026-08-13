@@ -74,6 +74,19 @@ describe('long novel quality gates', () => {
       revisionHints: ['将旧疤位置改回小臂'],
     });
     expect(appearanceDrift.hardFail).toBe(false);
+
+    const fixableDateMismatch = runChapterQualityGates({
+      content: body,
+      minWords: 100,
+      maxWords: 8000,
+      targetWords: 1500,
+      chapterTitle: '第2章',
+      inspectorScore: 45,
+      recommendRevision: true,
+      fatalIssues: ['时间线硬冲突：第1章写十一月五日，第2章误写十一月六日'],
+      revisionHints: ['统一火灾日期为十一月五日'],
+    });
+    expect(fixableDateMismatch.hardFail).toBe(false);
   });
 
   it('default config maps automation levels to max chapters per run', () => {
