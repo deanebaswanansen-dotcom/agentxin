@@ -1058,7 +1058,7 @@ export class AgentOrchestrator {
       maxWordsPerChapter: options?.maxWordsPerChapter,
       maxChaptersPerRun: longNovelBatchLimit(automationLevel),
     });
-    // assistant 强制单章；unattended 允许更大批次但受 options.chapters 限制
+    // assistant 强制单章；其余模式统一按五章检查点运行，避免超长任务丢失整批结果。
     let chapterCount = Math.min(requestedBatch, modeConfig.maxChaptersPerRun);
 
     const emit = (event: AgentProgressEvent): void => {
@@ -1093,6 +1093,11 @@ export class AgentOrchestrator {
     steps.push(
       `长篇配置：自动化=${automationLevel}；本批 ${chapterCount} 章×${perChapter} 字；总计划 ${plannedTotalChapters} 章 / 约 ${totalWords.toLocaleString()} 字。`,
     );
+    if (requestedBatch > modeConfig.maxChaptersPerRun) {
+      steps.push(
+        `为保证可恢复性，原请求 ${requestedBatch} 章已按单批安全上限裁剪为 ${modeConfig.maxChaptersPerRun} 章；完成后可继续下一批。`,
+      );
+    }
     if (chapterCount < requestedChapterCount) {
       steps.push(`检测到已完成 ${completedBefore} 章，本批按剩余总计划裁剪为 ${chapterCount} 章。`);
     }

@@ -626,6 +626,7 @@ describe('normalizeFullNovelOptions', () => {
 
     expect(result.metrics?.completedChapters).toBe(5);
     expect(result.summary).toContain('完成 5/5 章');
+    expect(result.steps.some((step) => step.includes('单批安全上限裁剪为 5 章'))).toBe(true);
     expect(await store.listChapters(result.projectId)).toHaveLength(5);
   });
 
