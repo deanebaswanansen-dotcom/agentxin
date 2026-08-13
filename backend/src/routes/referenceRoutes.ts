@@ -20,6 +20,11 @@ interface ProjectParams {
   projectId: Id;
 }
 
+// Reference text is capped at 1.5 million characters by the service. UTF-8
+// Chinese text can require roughly three bytes per character, so the default
+// Fastify 1 MiB body limit rejects valid books before validation runs.
+const REFERENCE_IMPORT_BODY_LIMIT_BYTES = 8 * 1024 * 1024;
+
 function sseFrame(event: string, data?: string): string {
   const head = `event: ${event}\n`;
   return data === undefined ? `${head}\n` : `${head}data: ${data}\n\n`;
@@ -38,15 +43,19 @@ export function registerReferenceRoutes(
     }
   });
 
-  app.post<{ Body: ReferenceImportRequest }>('/api/references/import', async (request, reply) => {
-    try {
-      const result = await service.importText(request.body ?? { text: '' });
-      return reply.code(201).send(result);
-    } catch (error) {
-      const { status, body } = toErrorResponse(error);
-      return reply.code(status).send(body);
-    }
-  });
+  app.post<{ Body: ReferenceImportRequest }>(
+    '/api/references/import',
+    { bodyLimit: REFERENCE_IMPORT_BODY_LIMIT_BYTES },
+    async (request, reply) => {
+      try {
+        const result = await service.importText(request.body ?? { text: '' });
+        return reply.code(201).send(result);
+      } catch (error) {
+        const { status, body } = toErrorResponse(error);
+        return reply.code(status).send(body);
+      }
+    },
+  );
 
   app.get<{ Params: IdParams }>('/api/references/:id', async (request, reply) => {
     try {

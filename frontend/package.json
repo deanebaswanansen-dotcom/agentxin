@@ -14,8 +14,6 @@
   },
   "dependencies": {
     "@hello-pangea/dnd": "^18.0.1",
-    "@netlify/blobs": "^10.7.12",
-    "fastify": "^4.28.1",
     "jszip": "^3.10.1",
     "lottie-web": "^5.13.0",
     "react": "18.3.1",
@@ -31,7 +29,7 @@
     "jsdom": "25.0.1",
     "playwright": "^1.60.0",
     "typescript": "5.6.3",
-    "vite": "5.4.11",
-    "vitest": "2.1.8"
+    "vite": "6.4.3",
+    "vitest": "3.2.6"
   }
 }

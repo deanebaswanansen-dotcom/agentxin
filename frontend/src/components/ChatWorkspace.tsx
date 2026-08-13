@@ -147,8 +147,8 @@ export interface ChatWorkspaceProps {
   onStreamingChange?: (state: { streaming: boolean; content: string; thinking: string }) => void;
   /** 写作模式生成文本被"采用"时触发（写回抽屉内的编辑器）。 */
   onAdoptContent?: (content: string) => void;
-  /** Agent 任务完成（刷新项目树/加载章节）。 */
-  onAgentCompleted?: (result: AgentRunResult) => void;
+  /** Agent 任务完成（刷新项目树/加载章节）。第二个参数是任务启动时的项目。 */
+  onAgentCompleted?: (result: AgentRunResult, sourceProjectId?: Id | null) => void;
   /** 点击 artifact 跳转（切资源抽屉 tab / 加载章节）。 */
   onJumpToArtifact?: (artifact: AgentArtifact) => void;
   /** 点击"在编辑器中打开"（打开章节抽屉）。 */
@@ -202,8 +202,13 @@ export function ChatWorkspace({
     onError,
     onStreamingChange,
     onCompleted: (result) => {
-      chat.carryNextSession();
-      onAgentCompleted?.(result);
+      // 只有结果会切换到另一个项目/章节时，才把本轮任务消息写入目标
+      // 会话。同一上下文完成时不复制，避免后续手动新建项目看到旧消息。
+      const resultChapterId = result.chapterId ?? null;
+      if (result.projectId !== projectId || resultChapterId !== chapterId) {
+        chat.carryNextSession(result.projectId, resultChapterId);
+      }
+      onAgentCompleted?.(result, projectId);
     },
     appendMessage: chat.appendMessage,
     updateMessage: chat.updateMessage,
@@ -595,6 +600,9 @@ export function ChatWorkspace({
           message: analyzed.message,
           transferred: false,
         });
+        if (analyzed.analysisProjectId !== projectId) {
+          chat.carryNextSession(analyzed.analysisProjectId, null);
+        }
         onAgentCompleted?.({
           task: 'outline',
           mode: 'reference',
@@ -607,7 +615,7 @@ export function ChatWorkspace({
             '整理剧情大纲、冲突爽点、伏笔反转与主题',
           ],
           artifacts: analyzed.artifacts,
-        });
+        }, projectId);
       } catch (error) {
         chat.updateMessage(messageId, (prev) =>
           prev.kind === 'reference-import' ? { ...prev, resolved: false } : prev,
@@ -636,6 +644,10 @@ export function ChatWorkspace({
       try {
         const book = await parseReaderFile(file);
         const text = readerBookToReferenceText(book);
+        if (text.length > 1_500_000) {
+          onError?.(new Error('解析后的正文超过 1,500,000 字符，请拆分后再导入。'));
+          return;
+        }
         const meta =
           `名称：${book.title}\n深度：standard\n\n${text}`;
         await runReferenceImport(meta, `${book.title}（${book.format.toUpperCase()}）`);
@@ -695,7 +707,7 @@ export function ChatWorkspace({
           summary: result.summary,
           steps: [result.summary],
           artifacts: result.artifacts,
-        });
+        }, projectId);
       } catch (error) {
         onError?.(error);
       } finally {

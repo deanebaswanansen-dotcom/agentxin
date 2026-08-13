@@ -72,8 +72,8 @@ export interface ChatEngineActions {
   updateMessage: (id: string, updater: (prev: ChatMessage) => ChatMessage) => void;
   /** 移除某条消息。 */
   removeMessage: (id: string) => void;
-  /** 下一次上下文切换时把当前消息带到目标上下文，供 Agent 创建新项目/章节后继续展示结果。 */
-  carryNextSession: () => void;
+  /** 把当前消息带到目标上下文，供 Agent 创建新项目/章节后继续展示结果。 */
+  carryNextSession: (targetProjectId?: Id, targetChapterId?: Id | null) => void;
 }
 
 function isAbort(error: unknown): boolean {
@@ -209,8 +209,16 @@ export function useChatEngine(options: UseChatEngineOptions): ChatEngineState & 
     commitMessages((prev) => prev.filter((m) => m.id !== id));
   }, [commitMessages]);
 
-  const carryNextSession = useCallback(() => {
-    carryNextSessionRef.current = true;
+  const carryNextSession = useCallback((targetProjectId?: Id, targetChapterId: Id | null = null) => {
+    if (targetProjectId === undefined) {
+      carryNextSessionRef.current = true;
+      return;
+    }
+    const targetKey = `${targetProjectId}:${targetChapterId ?? 'free'}`;
+    if (!sessionsRef.current.has(targetKey)) {
+      sessionsRef.current.set(targetKey, messagesRef.current);
+      persistSessions(sessionsRef.current);
+    }
   }, []);
 
   const sendText = useCallback(

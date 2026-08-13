@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import apiClient from '../api/apiClient.js';
 import type { AgentRunResult, Chapter, Id } from '../types/index.js';
 import type { EditorSelection } from '../components/ChapterEditor.js';
@@ -21,15 +21,19 @@ export function useWorkspaceSelection({
   const [projectListVersion, setProjectListVersion] = useState(0);
   const [editorContent, setEditorContent] = useState('');
   const [selection, setSelection] = useState<EditorSelection | undefined>(undefined);
+  const projectNameRequestRef = useRef(0);
+  const chapterRequestRef = useRef(0);
 
   const bumpProjectList = useCallback(() => {
     setProjectListVersion((version) => version + 1);
   }, []);
 
   const selectProjectNameFromServer = useCallback((projectId: Id) => {
+    const requestId = ++projectNameRequestRef.current;
     void apiClient.projects
       .list()
       .then((list) => {
+        if (requestId !== projectNameRequestRef.current) return;
         const found = list.find((p) => p.id === projectId);
         setSelectedProjectName(found?.name);
       })
@@ -39,6 +43,7 @@ export function useWorkspaceSelection({
   }, []);
 
   const resetChapter = useCallback(() => {
+    chapterRequestRef.current += 1;
     setSelectedChapterId(null);
     setSelectedChapter(null);
     setEditorContent('');
@@ -47,10 +52,12 @@ export function useWorkspaceSelection({
 
   const loadChapter = useCallback(
     async (projectId: Id, chapterId: Id, opts?: { openTools?: boolean }) => {
+      const requestId = ++chapterRequestRef.current;
       setSelectedProjectId(projectId);
       setSelectedChapterId(chapterId);
       try {
         const chapters = await apiClient.chapters.list(projectId);
+        if (requestId !== chapterRequestRef.current) return;
         const found = chapters.find((chapter) => chapter.id === chapterId) ?? null;
         setSelectedChapter(found);
         setEditorContent(found?.content ?? '');
@@ -59,6 +66,7 @@ export function useWorkspaceSelection({
           onOpenChapterTools?.();
         }
       } catch (error) {
+        if (requestId !== chapterRequestRef.current) return;
         reportError(error);
       }
     },
@@ -75,9 +83,11 @@ export function useWorkspaceSelection({
   );
 
   const selectCreatedProject = useCallback((projectId: Id, projectName: string) => {
+    projectNameRequestRef.current += 1;
     setSelectedProjectId(projectId);
     setSelectedProjectName(projectName);
-  }, []);
+    resetChapter();
+  }, [resetChapter]);
 
   const clearSelectedChapter = useCallback(
     (chapterId?: Id) => {
@@ -91,6 +101,7 @@ export function useWorkspaceSelection({
   const clearSelectedProject = useCallback(
     (projectId?: Id) => {
       if (projectId !== undefined && selectedProjectId !== projectId) return;
+      projectNameRequestRef.current += 1;
       setSelectedProjectId(null);
       setSelectedProjectName(undefined);
       clearSelectedChapter();
@@ -100,8 +111,16 @@ export function useWorkspaceSelection({
   );
 
   const applyAgentResult = useCallback(
-    (result: AgentRunResult) => {
+    (result: AgentRunResult, sourceProjectId?: Id | null) => {
       bumpProjectList();
+      // 任务可能运行数十秒。期间用户切换/新建项目后，旧任务的结果仍会
+      // 返回，但不能把当前工作区切回旧项目或打开旧章节。
+      if (
+        sourceProjectId !== undefined &&
+        selectedProjectId !== sourceProjectId
+      ) {
+        return;
+      }
       setSelectedProjectId(result.projectId);
       selectProjectNameFromServer(result.projectId);
       if (result.chapterId !== undefined) {
@@ -109,7 +128,7 @@ export function useWorkspaceSelection({
         void loadChapter(result.projectId, result.chapterId);
       }
     },
-    [bumpProjectList, loadChapter, selectProjectNameFromServer],
+    [bumpProjectList, loadChapter, selectProjectNameFromServer, selectedProjectId],
   );
 
   const handleSaved = useCallback((chapterId: Id, content: string) => {

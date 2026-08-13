@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -219,5 +220,84 @@ describe('ChatWorkspace', () => {
 
     expect(screen.getByText('记录这轮对话')).toBeInTheDocument();
     expect(screen.getByText('历史回执')).toBeInTheDocument();
+  });
+
+  it('does not carry a completed same-project task into a newly selected project', async () => {
+    vi.mocked(apiClient.agent.runStream).mockResolvedValue({
+      task: 'workspace_review',
+      mode: 'reference',
+      projectId: 'p-1',
+      summary: '旧项目审阅结果',
+      steps: ['已读取旧项目'],
+      artifacts: [],
+    });
+
+    const view = render(<ChatWorkspace projectId="p-1" projectName="旧项目" />);
+    fireEvent.change(screen.getByRole('textbox', { name: '对话输入' }), {
+      target: { value: '/审阅' },
+    });
+    fireEvent.click(screen.getByRole('option', { name: /\/审阅 · 主动审阅/ }));
+    fireEvent.click(screen.getByRole('button', { name: '执行' }));
+
+    expect(await screen.findByText('旧项目审阅结果')).toBeInTheDocument();
+    view.rerender(<ChatWorkspace projectId="p-2" projectName="新项目" />);
+
+    await waitFor(() => {
+      expect(screen.queryByText('旧项目审阅结果')).not.toBeInTheDocument();
+    });
+    expect(screen.getByText('自由讨论 · 新项目')).toBeInTheDocument();
+  });
+
+  it('keeps a new-book result visible after the Agent switches to the created project', async () => {
+    vi.mocked(apiClient.agent.runStream).mockResolvedValue({
+      task: 'novel',
+      mode: 'draft',
+      projectId: 'p-created',
+      chapterId: 'ch-created',
+      summary: '新书和首章已创建',
+      steps: ['已创建项目', '已写首章'],
+      artifacts: [],
+    });
+    vi.mocked(apiClient.chapters.list).mockResolvedValue([
+      {
+        id: 'ch-created',
+        projectId: 'p-created',
+        title: '第一章',
+        content: '首章正文',
+        position: 0,
+      },
+    ]);
+
+    function ProjectSwitchHarness(): JSX.Element {
+      const [context, setContext] = useState<{ projectId: string | null; chapterId: string | null }>({
+        projectId: null,
+        chapterId: null,
+      });
+      return (
+        <ChatWorkspace
+          key={context.projectId ?? 'no-project'}
+          projectId={context.projectId}
+          chapterId={context.chapterId}
+          onAgentCompleted={(result) => {
+            setContext({
+              projectId: result.projectId,
+              chapterId: result.chapterId ?? null,
+            });
+          }}
+        />
+      );
+    }
+
+    render(<ProjectSwitchHarness />);
+    fireEvent.change(screen.getByRole('textbox', { name: '对话输入' }), {
+      target: { value: '/新书' },
+    });
+    fireEvent.click(screen.getByRole('option', { name: /\/新书 · 一键创建新书/ }));
+    fireEvent.change(screen.getByRole('textbox', { name: '对话输入' }), {
+      target: { value: '东方奇幻冒险' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '执行' }));
+
+    expect(await screen.findByText('新书和首章已创建')).toBeInTheDocument();
   });
 });

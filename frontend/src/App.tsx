@@ -603,6 +603,7 @@ function Workbench(): JSX.Element {
               </button>
             </div>
           <ChatWorkspace
+            key={selectedProjectId ?? 'no-project'}
             projectId={selectedProjectId}
             projectName={selectedProjectName}
             chapterId={selectedChapterId}

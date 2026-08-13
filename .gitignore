@@ -35,6 +35,7 @@ Thumbs.db
 # Playwright MCP test artifacts
 .playwright-mcp/
 reports/
+.tmp-browser-client-data/
 
 # Local Netlify folder
 .netlify

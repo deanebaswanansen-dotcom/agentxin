@@ -190,6 +190,7 @@ User=root
 WorkingDirectory=/root/agentxin/backend
 Environment=NODE_ENV=production
 Environment=PORT=3000
+Environment=REQUIRE_CLIENT_ID=1
 Environment=CLIENT_DATA_DIR=/var/lib/agentxin
 ExecStart=/usr/bin/node /root/agentxin/backend/dist/index.js
 Restart=always

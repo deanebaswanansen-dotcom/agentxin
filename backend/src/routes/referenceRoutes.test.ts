@@ -74,4 +74,43 @@ describe('referenceRoutes analyze-stream', () => {
     expect(response.body).toContain('VALIDATION_ERROR');
     expect(response.body).not.toContain('event: done');
   });
+
+  it('accepts valid reference imports larger than Fastify default 1 MiB', async () => {
+    const importText = vi.fn().mockResolvedValue({
+      reference: { id: 'ref-large', title: '长篇参考', status: 'imported' },
+      chaptersDetected: 1,
+      wordCount: 400_000,
+      message: '已导入',
+      chapters: [],
+    });
+    app = Fastify({ logger: false });
+    registerReferenceRoutes(
+      app,
+      {
+        analyze: vi.fn(),
+        list: vi.fn(),
+        get: vi.fn(),
+        importText,
+        purgeRawText: vi.fn(),
+        remove: vi.fn(),
+        transferToProject: vi.fn(),
+        buildActiveTransferPrompt: vi.fn(),
+        checkSimilarity: vi.fn(),
+      } as unknown as ReferenceAnalysisService,
+    );
+    await app.ready();
+    const text = `第1章 开始\n${'中'.repeat(400_000)}`;
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/references/import',
+      payload: { title: '长篇参考', text },
+    });
+
+    expect(Buffer.byteLength(JSON.stringify({ title: '长篇参考', text }))).toBeGreaterThan(
+      1024 * 1024,
+    );
+    expect(response.statusCode).toBe(201);
+    expect(importText).toHaveBeenCalledWith({ title: '长篇参考', text });
+  });
 });
