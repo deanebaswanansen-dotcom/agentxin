@@ -17,6 +17,7 @@ import {
   parseReflection,
   revisionDoesNotWorsenWordRange,
   shouldAutoReviseChapter,
+  shouldInspectLongNovelChapter,
   AgentOrchestrator,
 } from './AgentOrchestrator.js';
 import type { ModelProxy, StreamCompletionOptions } from '../../proxy/ModelProxy.js';
@@ -205,6 +206,22 @@ describe('normalizeFullNovelOptions', () => {
         revisionHints: ['修正人物身份冲突'],
         fatalIssues: ['人物身份冲突'],
         findings: [],
+      }),
+    ).toBe(true);
+  });
+
+  it('runs continuity inspection on the first chapter, checkpoint, or format failure only', () => {
+    const clean = { ok: true, hardFail: false, findings: [] };
+    expect(shouldInspectLongNovelChapter(1, 5, clean)).toBe(true);
+    expect(shouldInspectLongNovelChapter(2, 5, clean)).toBe(false);
+    expect(shouldInspectLongNovelChapter(5, 5, clean)).toBe(true);
+    expect(
+      shouldInspectLongNovelChapter(3, 5, {
+        ok: true,
+        hardFail: false,
+        findings: [
+          { gate: 'format', severity: 'soft', message: '字数不足', autoFixable: true },
+        ],
       }),
     ).toBe(true);
   });
@@ -610,6 +627,69 @@ describe('normalizeFullNovelOptions', () => {
     expect(result.metrics?.completedChapters).toBe(5);
     expect(result.summary).toContain('完成 5/5 章');
     expect(await store.listChapters(result.projectId)).toHaveLength(5);
+  });
+
+  it('inspects only batch checkpoints and skips advisory ReviewAgent rewrites', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-bounded-review-'));
+    const store = await FileDataStore.create(join(tempDir, 'store.json'));
+    await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock-model' });
+    const memory = new MemoryService(await MemoryStore.create(join(tempDir, 'memory.json')));
+    const proxy = new CaptureProxy();
+    const original = proxy.streamCompletion.bind(proxy);
+    let inspections = 0;
+    let revisions = 0;
+    proxy.streamCompletion = (config, messages, signal, options) => {
+      const system = messages[0]?.content ?? '';
+      if (system.includes('正文写作子 Agent')) {
+        return (async function* () {
+          yield {
+            kind: 'content' as const,
+            text: '林远推门走进雨夜，说：“跟我来。”他们沿着旧城前行，却发现地图暗藏秘密，真正的危险才刚刚开始。'.repeat(10),
+          };
+        })();
+      }
+      if (system.includes('检测子 Agent')) {
+        inspections += 1;
+        return (async function* () {
+          yield {
+            kind: 'content' as const,
+            text: JSON.stringify({
+              score0to100: 88,
+              verdict: 'pass_with_advice',
+              plotCoherence: '连续',
+              fatalIssues: [],
+              earlyCharacterStatus: [],
+              recommendRevision: true,
+              revisionHints: ['可以增强对白节奏'],
+            }),
+          };
+        })();
+      }
+      if (system.includes('正在修订')) revisions += 1;
+      return original(config, messages, signal, options);
+    };
+    const orchestrator = new AgentOrchestrator(
+      store,
+      new ModelConfigService(store),
+      proxy,
+      undefined as never,
+      undefined as never,
+      memory,
+    );
+
+    const result = await orchestrator.run(
+      {
+        task: 'long_novel',
+        mode: 'draft',
+        prompt: '旧城悬疑长篇',
+        options: { chapters: 5, totalChapters: 5, targetWords: 500, automationLevel: 'semi_auto' },
+      },
+      new AbortController().signal,
+    );
+
+    expect(result.metrics?.completedChapters).toBe(5);
+    expect(inspections).toBe(2);
+    expect(revisions).toBe(0);
   });
 
   it('pauses on a failed chapter and resumes from that chapter without duplication', async () => {

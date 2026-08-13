@@ -165,6 +165,19 @@ export function shouldAutoReviseChapter(input: {
   );
 }
 
+export function shouldInspectLongNovelChapter(
+  chapterNumber: number,
+  checkpointInterval: number,
+  localGates: GateResult,
+): boolean {
+  return (
+    chapterNumber === 1 ||
+    (checkpointInterval > 0 && chapterNumber % checkpointInterval === 0) ||
+    localGates.hardFail ||
+    localGates.findings.some((finding) => finding.gate === 'format')
+  );
+}
+
 function truncatePromptSection(value: string, maxChars: number): string {
   const normalized = value.trim();
   if (normalized.length <= maxChars) return normalized;
@@ -1366,6 +1379,11 @@ export class AgentOrchestrator {
         emit,
         {
           autoRevisionEnabled: modeConfig.autoRevisionEnabled,
+          inspectChapter: shouldInspectLongNovelChapter(
+            num,
+            modeConfig.checkpointInterval,
+            gates,
+          ),
           qualityGates: {
             minWords: modeConfig.minWordsPerChapter,
             maxWords: modeConfig.maxWordsPerChapter,
@@ -2355,6 +2373,8 @@ export class AgentOrchestrator {
     emit: (event: AgentProgressEvent) => void,
     options: {
       autoRevisionEnabled: boolean;
+      /** false 时仅使用本地 Gate；每批首章和检查点仍会执行模型一致性审校。 */
+      inspectChapter?: boolean;
       /** 提供时走 long_novel Gate；null/undefined 走 full_novel（仅 recommendRevision+hints 修订）。 */
       qualityGates?: { minWords: number; maxWords: number; targetWords: number } | null;
       labels?: {
@@ -2373,38 +2393,13 @@ export class AgentOrchestrator {
     const progress = options.progress;
     const labels = options.labels;
 
-    emit({
-      phase: 'inspect',
-      message: labels?.inspect?.(chapterTitle) ?? `审校「${chapterTitle}」…`,
-      current: progress?.current,
-      total: progress?.total,
-    });
-
     // 先只做审校，不反思：避免修订前草稿污染记忆/伏笔
     let inspection: InspectorReport;
-    try {
-      inspection = await this.inspectChapterDraft(
-        config,
-        projectId,
-        chapterNumber,
-        chapterTitle,
-        content,
-        signal,
-      );
-    } catch (error) {
-      if (signal.aborted) throw error;
-      // Review is an auxiliary worker.  A provider 502/timeout must not erase
-      // a valid chapter or abort the whole novel; the next run can inspect it.
-      emit({
-        phase: 'info',
-        message: `【ContinuityAgent】审校请求失败，已保留「${chapterTitle}」正文并继续。`,
-        current: progress?.current,
-        total: progress?.total,
-      });
+    if (options.inspectChapter === false) {
       inspection = {
-        score0to100: 70,
-        verdict: 'inspection_unavailable',
-        plotCoherence: '审校服务暂不可用，正文已保存。',
+        score0to100: 100,
+        verdict: 'local_gate_pass',
+        plotCoherence: '本章通过本地质量 Gate；模型一致性审校留待批次检查点执行。',
         fatalIssues: [],
         earlyCharacterStatus: [],
         recommendRevision: false,
@@ -2413,6 +2408,45 @@ export class AgentOrchestrator {
         injectedMemoryChars: 0,
         injectedMemoryOptions: scaledMemoryOptions(chapterNumber),
       };
+    } else {
+      emit({
+        phase: 'inspect',
+        message: labels?.inspect?.(chapterTitle) ?? `审校「${chapterTitle}」…`,
+        current: progress?.current,
+        total: progress?.total,
+      });
+      try {
+        inspection = await this.inspectChapterDraft(
+          config,
+          projectId,
+          chapterNumber,
+          chapterTitle,
+          content,
+          signal,
+        );
+      } catch (error) {
+        if (signal.aborted) throw error;
+        // Review is an auxiliary worker.  A provider 502/timeout must not erase
+        // a valid chapter or abort the whole novel; the next run can inspect it.
+        emit({
+          phase: 'info',
+          message: `【ContinuityAgent】审校请求失败，已保留「${chapterTitle}」正文并继续。`,
+          current: progress?.current,
+          total: progress?.total,
+        });
+        inspection = {
+          score0to100: 70,
+          verdict: 'inspection_unavailable',
+          plotCoherence: '审校服务暂不可用，正文已保存。',
+          fatalIssues: [],
+          earlyCharacterStatus: [],
+          recommendRevision: false,
+          revisionHints: [],
+          structuralChecks: [],
+          injectedMemoryChars: 0,
+          injectedMemoryOptions: scaledMemoryOptions(chapterNumber),
+        };
+      }
     }
 
     let gates: GateResult | undefined;
