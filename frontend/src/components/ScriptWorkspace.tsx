@@ -314,10 +314,15 @@ function mergeWorkspaceSnapshot(
   };
 }
 
-const ACTIVE_JOB_STATUSES = new Set<ScriptAgentJobSnapshot['status']>([
+const POLLING_JOB_STATUSES = new Set<ScriptAgentJobSnapshot['status']>([
   'queued',
   'running',
   'retrying',
+]);
+
+const BLOCKING_JOB_STATUSES = new Set<ScriptAgentJobSnapshot['status']>([
+  ...POLLING_JOB_STATUSES,
+  'waiting_user',
 ]);
 
 function jobResourceSignature(jobs: ScriptAgentJobSnapshot[]): string {
@@ -987,10 +992,10 @@ export function ScriptWorkspace({
     };
   }, [client, onError, projectId, projectName]);
 
-  const hasActiveJobs = data?.jobs.some((job) => ACTIVE_JOB_STATUSES.has(job.status)) ?? false;
+  const hasPollingJobs = data?.jobs.some((job) => POLLING_JOB_STATUSES.has(job.status)) ?? false;
 
   useEffect(() => {
-    if (!hasActiveJobs) return undefined;
+    if (!hasPollingJobs) return undefined;
     const controller = new AbortController();
     let inFlight = false;
     const poll = async (): Promise<void> => {
@@ -1075,7 +1080,7 @@ export function ScriptWorkspace({
       pollErrorId.current = undefined;
       pollErrorReported.current = false;
     };
-  }, [client, hasActiveJobs, onError, onErrorClear, projectId, projectName]);
+  }, [client, hasPollingJobs, onError, onErrorClear, projectId, projectName]);
 
   const markResourceDirty = useCallback((resource: EditableScriptResource) => {
     dirtyResources.current[resource] = true;
@@ -1366,7 +1371,7 @@ export function ScriptWorkspace({
     }
     const endEpisode = startEpisode + episodeCount - 1;
     const hasOverlappingBatch = data.jobs.some((job) => {
-      if (job.task !== 'script_episode_batch' || !ACTIVE_JOB_STATUSES.has(job.status)) return false;
+      if (job.task !== 'script_episode_batch' || !BLOCKING_JOB_STATUSES.has(job.status)) return false;
       const options = job.scriptBatchOptions;
       if (!options) return false;
       const jobEnd = options.startEpisode + options.episodeCount - 1;
@@ -1407,7 +1412,7 @@ export function ScriptWorkspace({
       setNotice(`请先保存${unsavedResources.map((resource) => SCRIPT_RESOURCE_LABEL[resource]).join('、')}，再启动 Agent`);
       return;
     }
-    if (data?.jobs.some((job) => job.task === task && ACTIVE_JOB_STATUSES.has(job.status))) {
+    if (data?.jobs.some((job) => job.task === task && BLOCKING_JOB_STATUSES.has(job.status))) {
       setNotice(task === 'script_bible'
         ? '人物与世界补全任务正在运行，请勿重复提交'
         : '大纲生成任务正在运行，请勿重复提交');

@@ -614,6 +614,58 @@ describe('ScriptWorkspace', () => {
     expect(client.script.jobs.create).not.toHaveBeenCalled();
   });
 
+  it('does not poll a waiting-user job and can resume it from its checkpoint', async () => {
+    const client = createClient();
+    const waitingJob = {
+      id: 'job-waiting-review', projectId: 'project-1', task: 'script_episode_batch' as const,
+      status: 'waiting_user' as const, continuable: true,
+      scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 2 },
+      checkpoint: { episodeNumber: 2, node: 'draft' as const, attempt: 1, artifactRevision: 0 },
+      error: { code: 'SCRIPT_STRUCTURED_NEEDS_REVIEW', message: '正文结构需要确认' },
+    };
+    vi.mocked(client.script.jobs.list).mockResolvedValue([waitingJob]);
+    vi.mocked(client.script.jobs.resume).mockResolvedValue({
+      ...waitingJob,
+      status: 'running',
+      continuable: false,
+    });
+    const intervalSpy = vi.spyOn(globalThis, 'setInterval');
+
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    expect(intervalSpy.mock.calls.some((call) => call[1] === 2000)).toBe(false);
+    fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
+    expect(screen.getByText('等待确认')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '继续第 2 集所在的 1–5 集任务' }));
+
+    await waitFor(() => expect(client.script.jobs.resume).toHaveBeenCalledWith('job-waiting-review'));
+    expect(client.script.jobs.create).not.toHaveBeenCalled();
+  });
+
+  it('treats waiting-user material and episode jobs as duplicate blockers', async () => {
+    const client = createClient();
+    vi.mocked(client.script.jobs.list).mockResolvedValue([{
+      id: 'job-bible-waiting', projectId: 'project-1', task: 'script_bible',
+      status: 'waiting_user', continuable: false,
+    }, {
+      id: 'job-batch-waiting', projectId: 'project-1', task: 'script_episode_batch',
+      status: 'waiting_user', continuable: false,
+      scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 2 },
+    }]);
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '角色设定' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Agent 补全人物与世界' }));
+    expect(screen.getByText('人物与世界补全任务正在运行，请勿重复提交')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
+    fireEvent.click(screen.getByRole('button', { name: '生成第 1–5 集' }));
+    expect(screen.getByText('第 1–5 集已有生成任务正在运行')).toBeInTheDocument();
+    expect(client.script.jobs.create).not.toHaveBeenCalled();
+  });
+
   it('starts the next five-episode batch and shows its durable checkpoint', async () => {
     const client = createClient();
     vi.mocked(client.script.jobs.create).mockResolvedValue({
