@@ -1,0 +1,3 @@
+```json
+{"name":"沈清","hairstyle":"高马尾","role":"lead","aliases":["清清"]}
+```

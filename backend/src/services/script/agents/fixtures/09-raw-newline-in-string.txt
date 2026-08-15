@@ -1,0 +1,2 @@
+{"name":"沈清","hairstyle":"高马尾
+利落","role":"lead","aliases":["清清"]}

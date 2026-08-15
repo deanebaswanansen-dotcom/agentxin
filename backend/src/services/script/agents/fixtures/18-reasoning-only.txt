@@ -1,0 +1,1 @@
+<thinking>需要先补齐人物字段，再输出 JSON，但本次响应意外结束。</thinking>
