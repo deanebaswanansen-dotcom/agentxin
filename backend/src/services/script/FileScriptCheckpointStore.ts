@@ -4,20 +4,31 @@ import { isAbsolute, join, relative, resolve } from 'node:path';
 
 import { StoreError } from '../../store/StoreError.js';
 import { getCurrentClientId } from '../client/clientScope.js';
-import type {
-  ScriptCheckpointStore,
-  ScriptPipelineCheckpoint,
-} from './agents/ScriptDirector.js';
+import {
+  decodeScriptCheckpointV2,
+  migrateScriptCheckpointV1,
+  normalizeScriptCheckpointWrite,
+  type ScriptCheckpointStore,
+  type ScriptPipelineCheckpoint,
+  type ScriptPipelineCheckpointWrite,
+} from './agents/ScriptCheckpoint.js';
 
 const SAFE_PROJECT_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const MAX_RUN_KEY_LENGTH = 256;
 const RENAME_DELAYS_MS = [5, 15, 35, 75, 150, 300] as const;
 
-interface CheckpointFile {
-  schemaVersion: 1;
+export interface ScriptCheckpointFileV2 {
+  schemaVersion: 2;
   projectId: string;
   runKey: string;
   checkpoints: ScriptPipelineCheckpoint[];
+}
+
+interface ScriptCheckpointFileV1 {
+  schemaVersion: 1;
+  projectId: string;
+  runKey: string;
+  checkpoints: unknown[];
 }
 
 function clone<T>(value: T): T {
@@ -58,20 +69,39 @@ function validateScope(projectId: string, runKey: string): void {
   }
 }
 
-function normalizeFile(value: unknown, projectId: string, runKey: string): CheckpointFile {
+export function normalizeScriptCheckpointFile(
+  value: unknown,
+  projectId: string,
+  runKey: string,
+): ScriptCheckpointFileV2 {
   if (typeof value !== 'object' || value === null) {
     throw new StoreError(`短剧检查点文件格式无效: ${projectId}/${runKey}`);
   }
-  const input = value as Partial<CheckpointFile>;
-  if (
-    input.schemaVersion !== 1 ||
-    input.projectId !== projectId ||
-    input.runKey !== runKey ||
-    !Array.isArray(input.checkpoints)
-  ) {
+  const input = value as Partial<ScriptCheckpointFileV1 | ScriptCheckpointFileV2>;
+  if (input.projectId !== projectId || input.runKey !== runKey || !Array.isArray(input.checkpoints)) {
     throw new StoreError(`短剧检查点文件与当前运行不匹配: ${projectId}/${runKey}`);
   }
-  return clone(input as CheckpointFile);
+  try {
+    let checkpoints: ScriptPipelineCheckpoint[];
+    if (input.schemaVersion === 1) {
+      checkpoints = input.checkpoints.map(migrateScriptCheckpointV1);
+    } else if (input.schemaVersion === 2) {
+      checkpoints = input.checkpoints.map(decodeScriptCheckpointV2);
+    } else {
+      throw new StoreError(
+        `不支持的短剧检查点版本 ${String(input.schemaVersion)}: ${projectId}/${runKey}`,
+      );
+    }
+    if (checkpoints.some((item) => item.projectId !== projectId || item.runKey !== runKey)) {
+      throw new StoreError(`短剧检查点记录与当前运行不匹配: ${projectId}/${runKey}`);
+    }
+    return { schemaVersion: 2, projectId, runKey, checkpoints };
+  } catch (error) {
+    if (error instanceof StoreError) throw error;
+    throw new StoreError(`短剧检查点记录格式无效: ${projectId}/${runKey}`, {
+      cause: error,
+    });
+  }
 }
 
 /** A FileScriptCheckpointStore instance represents one client's checkpoint library. */
@@ -94,20 +124,24 @@ export class FileScriptCheckpointStore implements ScriptCheckpointStore {
     return join(this.rootDirectory, projectId, `${encodedRunKey}.json`);
   }
 
-  private async read(projectId: string, runKey: string): Promise<CheckpointFile> {
+  private async read(projectId: string, runKey: string): Promise<ScriptCheckpointFileV2> {
     const filePath = this.filePath(projectId, runKey);
     try {
-      return normalizeFile(JSON.parse(await readFile(filePath, 'utf8')), projectId, runKey);
+      return normalizeScriptCheckpointFile(
+        JSON.parse(await readFile(filePath, 'utf8')),
+        projectId,
+        runKey,
+      );
     } catch (error) {
       if (isErrno(error) && error.code === 'ENOENT') {
-        return { schemaVersion: 1, projectId, runKey, checkpoints: [] };
+        return { schemaVersion: 2, projectId, runKey, checkpoints: [] };
       }
       if (error instanceof StoreError) throw error;
       throw new StoreError(`读取短剧检查点失败: ${projectId}/${runKey}`, { cause: error });
     }
   }
 
-  private async persist(value: CheckpointFile): Promise<void> {
+  private async persist(value: ScriptCheckpointFileV2): Promise<void> {
     const filePath = this.filePath(value.projectId, value.runKey);
     const directory = join(this.rootDirectory, value.projectId);
     const tempPath = `${filePath}.tmp-${randomUUID()}`;
@@ -130,7 +164,7 @@ export class FileScriptCheckpointStore implements ScriptCheckpointStore {
     return clone((await this.read(projectId, runKey)).checkpoints);
   }
 
-  async save(checkpoint: ScriptPipelineCheckpoint): Promise<void> {
+  async save(checkpoint: ScriptPipelineCheckpointWrite): Promise<void> {
     const scopeKey = `${checkpoint.projectId}\u0000${checkpoint.runKey}`;
     const previous = this.mutationQueues.get(scopeKey) ?? Promise.resolve();
     const operation = previous.then(
@@ -167,16 +201,17 @@ export class FileScriptCheckpointStore implements ScriptCheckpointStore {
     await rm(directory, { recursive: true, force: true });
   }
 
-  private async saveAfterPrevious(checkpoint: ScriptPipelineCheckpoint): Promise<void> {
-    const file = await this.read(checkpoint.projectId, checkpoint.runKey);
+  private async saveAfterPrevious(checkpoint: ScriptPipelineCheckpointWrite): Promise<void> {
+    const normalized = normalizeScriptCheckpointWrite(checkpoint);
+    const file = await this.read(normalized.projectId, normalized.runKey);
     const index = file.checkpoints.findIndex(
       (current) =>
-        current.node === checkpoint.node &&
-        current.episodeNumber === checkpoint.episodeNumber &&
-        current.chunkStart === checkpoint.chunkStart,
+        current.node === normalized.node &&
+        current.episodeNumber === normalized.episodeNumber &&
+        current.chunkStart === normalized.chunkStart,
     );
-    if (index >= 0) file.checkpoints[index] = clone(checkpoint);
-    else file.checkpoints.push(clone(checkpoint));
+    if (index >= 0) file.checkpoints[index] = clone(normalized);
+    else file.checkpoints.push(clone(normalized));
     await this.persist(file);
   }
 }
