@@ -287,8 +287,37 @@ export function buildScriptUpstreamArtifactRef(
   return {
     node: node.trim(),
     artifactRevision,
-    artifactHash: computeScriptCheckpointArtifactHash(artifact),
+    artifactHash: isVersionedScriptCheckpointArtifact(artifact)
+      ? computeScriptCheckpointArtifactHash({
+          schemaVersion: artifact.schemaVersion,
+          stage: artifact.stage,
+          projectId: artifact.projectId,
+          episodeNumber: artifact.episodeNumber,
+          baseEpisodeRevision: artifact.baseEpisodeRevision,
+          inputFingerprint: artifact.inputFingerprint,
+          candidateHash: artifact.candidateHash,
+        })
+      : computeScriptCheckpointArtifactHash(artifact),
   };
+}
+
+function isVersionedScriptCheckpointArtifact(
+  value: unknown,
+): value is ScriptScenePlanArtifact | ScriptEpisodeCandidateArtifact {
+  if (!isRecord(value) || value.schemaVersion !== 1) return false;
+  if (!['scene_plan', 'draft', 'patched'].includes(String(value.stage))) return false;
+  return (
+    isNonEmptyString(value.projectId) &&
+    Number.isInteger(value.episodeNumber) &&
+    (value.episodeNumber as number) >= 1 &&
+    Number.isInteger(value.baseEpisodeRevision) &&
+    (value.baseEpisodeRevision as number) >= 0 &&
+    typeof value.inputFingerprint === 'string' &&
+    SHA256_HEX.test(value.inputFingerprint) &&
+    typeof value.candidateHash === 'string' &&
+    SHA256_HEX.test(value.candidateHash) &&
+    (value.stage === 'scene_plan' ? Array.isArray(value.plannedScenes) : isRecord(value.episode))
+  );
 }
 
 export function decodeScriptScenePlanArtifact(

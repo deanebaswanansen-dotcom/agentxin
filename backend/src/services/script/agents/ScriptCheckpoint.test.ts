@@ -232,8 +232,48 @@ describe('script checkpoint v2 recovery', () => {
     expect(buildScriptUpstreamArtifactRef('scene_plan', 5, artifact)).toEqual({
       node: 'scene_plan',
       artifactRevision: 5,
-      artifactHash: computeScriptCheckpointArtifactHash(artifact),
+      artifactHash: computeScriptCheckpointArtifactHash({
+        schemaVersion: artifact.schemaVersion,
+        stage: artifact.stage,
+        projectId: artifact.projectId,
+        episodeNumber: artifact.episodeNumber,
+        baseEpisodeRevision: artifact.baseEpisodeRevision,
+        inputFingerprint: artifact.inputFingerprint,
+        candidateHash: artifact.candidateHash,
+      }),
     });
+  });
+
+  it('uses stable typed-artifact identity for upstream refs and preserves legacy hashing', () => {
+    const artifact = buildScriptScenePlanArtifact(
+      artifactContext({ baseEpisodeRevision: 4, promptVersion: 'scene-plan-v1' }),
+      plannedScenes(),
+    );
+    const original = buildScriptUpstreamArtifactRef('scene_plan', 5, artifact);
+
+    expect(buildScriptUpstreamArtifactRef('scene_plan', 5, {
+      ...artifact,
+      createdAt: '2099-12-31T23:59:59.999Z',
+    }).artifactHash).toBe(original.artifactHash);
+    expect(buildScriptUpstreamArtifactRef('scene_plan', 5, {
+      ...artifact,
+      validationErrors: ['non-identity diagnostic'],
+    }).artifactHash).toBe(original.artifactHash);
+    expect(buildScriptUpstreamArtifactRef('scene_plan', 5, {
+      ...artifact,
+      candidateHash: 'a'.repeat(64),
+    }).artifactHash).not.toBe(original.artifactHash);
+    expect(buildScriptUpstreamArtifactRef('scene_plan', 5, {
+      ...artifact,
+      inputFingerprint: 'b'.repeat(64),
+    }).artifactHash).not.toBe(original.artifactHash);
+
+    const legacyArtifact = { kind: 'legacy', createdAt: '2026-08-15T00:00:00.000Z' };
+    const changedLegacyArtifact = { ...legacyArtifact, createdAt: '2099-12-31T23:59:59.999Z' };
+    expect(buildScriptUpstreamArtifactRef('legacy', 1, legacyArtifact).artifactHash)
+      .toBe(computeScriptCheckpointArtifactHash(legacyArtifact));
+    expect(buildScriptUpstreamArtifactRef('legacy', 1, changedLegacyArtifact).artifactHash)
+      .not.toBe(buildScriptUpstreamArtifactRef('legacy', 1, legacyArtifact).artifactHash);
   });
 
   it('builds and strictly decodes draft and patched episode artifacts', () => {
