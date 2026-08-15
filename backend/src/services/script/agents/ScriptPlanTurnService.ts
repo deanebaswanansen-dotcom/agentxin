@@ -5,7 +5,7 @@ import { ServiceError } from '../../ServiceError.js';
 import type {
   ScriptCheckpointStore,
   ScriptDirector,
-  ScriptPipelineCheckpoint,
+  ScriptPipelineCheckpointWrite,
 } from './ScriptDirector.js';
 import type {
   ScriptPlanningField,
@@ -266,7 +266,7 @@ export class ScriptPlanTurnService {
 
   private save(
     session: StoredScriptPlanSession,
-    status: ScriptPipelineCheckpoint['status'],
+    status: ScriptPipelineCheckpointWrite['status'],
     artifactRevision: number,
   ): Promise<void> {
     return this.checkpoints.save({
