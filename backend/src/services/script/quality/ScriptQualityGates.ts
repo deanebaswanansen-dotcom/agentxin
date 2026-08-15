@@ -15,10 +15,18 @@ export type ScriptGateSeverity = 'hard' | 'soft';
 export interface ScriptGateIssue {
   code: string;
   severity: ScriptGateSeverity;
+  /** Omitted findings are deterministic for backwards compatibility. */
+  source?: ScriptReviewSource;
   message: string;
   sceneId?: string;
   blockId?: string;
   path?: string;
+}
+
+export interface ScriptEvaluatedGateIssue extends ScriptGateIssue {
+  source: ScriptReviewSource;
+  /** Whether this exact finding is allowed to block the completed transition. */
+  blocking: boolean;
 }
 
 export interface ScriptGateOptions {
@@ -36,9 +44,17 @@ export interface ScriptGateOptions {
 
 export interface ScriptGateReport {
   hardFailed: boolean;
-  issues: ScriptGateIssue[];
+  issues: ScriptEvaluatedGateIssue[];
+  blockingIssues: ScriptEvaluatedGateIssue[];
+  advisoryIssues: ScriptEvaluatedGateIssue[];
   visibleChars: number;
   dialogueDensityPercent: number;
+}
+
+export function isBlockingScriptReviewIssue(
+  issue: Pick<ScriptReviewIssue, 'severity' | 'source' | 'status'>,
+): boolean {
+  return issue.status === 'open' && issue.severity === 'hard' && issue.source !== 'ai';
 }
 
 function normalizeDialogue(value: string): string {
@@ -363,7 +379,12 @@ export function validateScriptEpisode(
     .filter(Boolean)
     .find((value) => !combinedText.includes(value));
   if (missingRequired) {
-    addHard('MISSING_REQUIRED_FACT', `正文未明确包含必须事实：${missingRequired}`, 'scenes');
+    issues.push({
+      code: 'MISSING_REQUIRED_FACT',
+      severity: 'soft',
+      message: `正文未找到必须事实的确定性证据，请人工确认：${missingRequired}`,
+      path: 'scenes',
+    });
   }
   const matchedForbiddenFact = outlineForbiddenFacts.find((value) => combinedText.includes(value));
   if (matchedForbiddenFact) {
@@ -448,9 +469,20 @@ export function validateScriptEpisode(
     });
   }
   if (_options.reviewIssues) issues.push(..._options.reviewIssues.map((issue) => ({ ...issue })));
+  const evaluatedIssues: ScriptEvaluatedGateIssue[] = issues.map((issue) => {
+    const source = issue.source ?? 'deterministic';
+    return {
+      ...issue,
+      source,
+      blocking: issue.severity === 'hard' && source !== 'ai',
+    };
+  });
+  const blockingIssues = evaluatedIssues.filter((issue) => issue.blocking);
   return {
-    hardFailed: issues.some((issue) => issue.severity === 'hard'),
-    issues,
+    hardFailed: blockingIssues.length > 0,
+    issues: evaluatedIssues,
+    blockingIssues,
+    advisoryIssues: evaluatedIssues.filter((issue) => !issue.blocking),
     visibleChars,
     dialogueDensityPercent,
   };

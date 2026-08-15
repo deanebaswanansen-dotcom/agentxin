@@ -186,6 +186,10 @@ describe('validateScriptEpisode', () => {
       sceneId: 'scene-2',
       blockId: 'duplicate-block',
     });
+    expect(report.issues.find((issue) => issue.code === 'MISSING_REQUIRED_FACT')).toMatchObject({
+      severity: 'soft',
+      blocking: false,
+    });
   });
 
   it('reports structured continuity ledger conflicts without hard-failing the episode', () => {
@@ -235,6 +239,44 @@ describe('validateScriptEpisode', () => {
       sceneId: 'scene-1',
       blockId: 'block-1',
     });
+  });
+
+  it('keeps AI hard findings advisory while user hard findings remain blocking', () => {
+    const aiReport = validateScriptEpisode(
+      episode({ scenes: [validScene()], summary: '摘要' }),
+      plan,
+      {
+        reviewIssues: [{
+          code: 'AI_WEAK_HOOK',
+          severity: 'hard',
+          source: 'ai',
+          message: '模型认为卡点不够强。',
+        }],
+      },
+    );
+
+    expect(aiReport.hardFailed).toBe(false);
+    expect(aiReport.advisoryIssues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'AI_WEAK_HOOK', source: 'ai', blocking: false }),
+    ]));
+
+    const userReport = validateScriptEpisode(
+      episode({ scenes: [validScene()], summary: '摘要' }),
+      plan,
+      {
+        reviewIssues: [{
+          code: 'USER_CANON_CONFLICT',
+          severity: 'hard',
+          source: 'user',
+          message: '用户确认这是设定冲突。',
+        }],
+      },
+    );
+
+    expect(userReport.hardFailed).toBe(true);
+    expect(userReport.blockingIssues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'USER_CANON_CONFLICT', source: 'user', blocking: true }),
+    ]));
   });
 
   it.each([

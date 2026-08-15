@@ -16,7 +16,9 @@ import type {
 import type { ScriptStore } from '../ScriptStore.js';
 import {
   createScriptReviewIssues,
+  isBlockingScriptReviewIssue,
   validateScriptEpisode,
+  type ScriptEvaluatedGateIssue,
   type ScriptGateIssue,
   type ScriptGateReport,
 } from '../quality/ScriptQualityGates.js';
@@ -882,7 +884,10 @@ export class ScriptDirector {
         ...(reviewIssues ? { reviewIssues } : {}),
       });
       let deterministicReport = validateDraft(draft);
-      let report = validateDraft(draft, review.issues);
+      let report = validateDraft(
+        draft,
+        review.issues.map((issue) => ({ ...issue, source: 'ai' })),
+      );
 
       if (report.hardFailed) {
         const raw = await this.callModel({
@@ -899,7 +904,7 @@ export class ScriptDirector {
             `当前所有 blocks.text 去除空白后的总字符数是 ${report.visibleChars}，目标是 ${plan.targetCharsPerEpisode}；请据此精确增加或删除约 ${Math.abs(plan.targetCharsPerEpisode - report.visibleChars)} 个字符。最终必须在 ${Math.ceil(plan.targetCharsPerEpisode * 0.85)}—${Math.floor(plan.targetCharsPerEpisode * 1.15)} 之间，并优先贴近 ${plan.targetCharsPerEpisode}，返回前逐块相加核对。`,
             `对白只能使用这些已登记人物；未知说话人必须改为其中一个人物：${JSON.stringify(state.characters.map((character) => ({ id: character.id, name: character.name })))}`,
             `本集大纲：${JSON.stringify(outline)}`,
-            `硬错误：${JSON.stringify(report.issues.filter((issue) => issue.severity === 'hard'))}`,
+            `阻断错误：${JSON.stringify(report.blockingIssues)}`,
             `正文：${JSON.stringify(draft)}`,
           ].join('\n'),
           signal: request.signal,
@@ -933,7 +938,10 @@ export class ScriptDirector {
           updatedAt: this.now(),
         };
         deterministicReport = validateDraft(draft);
-        report = validateDraft(draft, review.issues);
+        report = validateDraft(
+          draft,
+          review.issues.map((issue) => ({ ...issue, source: 'ai' })),
+        );
       }
       if (report.hardFailed) {
         const failed = await this.dependencies.store.saveEpisode(
@@ -958,9 +966,7 @@ export class ScriptDirector {
       );
       const retainedOpenHard = persistedReview.items.filter(
         (item) =>
-          item.episodeNumber === episodeNumber &&
-          item.severity === 'hard' &&
-          item.status === 'open',
+          item.episodeNumber === episodeNumber && isBlockingScriptReviewIssue(item),
       );
       if (retainedOpenHard.length > 0) {
         const known = new Set(report.issues.map((issue) =>
@@ -970,15 +976,22 @@ export class ScriptDirector {
           .filter((issue) => !known.has(
             [issue.code, issue.sceneId ?? '', issue.blockId ?? '', issue.path ?? ''].join('\u0000'),
           ))
-          .map((issue): ScriptGateIssue => ({
+          .map((issue): ScriptEvaluatedGateIssue => ({
             code: issue.code,
             severity: 'hard',
+            source: issue.source,
+            blocking: true,
             message: issue.message,
             ...(issue.sceneId ? { sceneId: issue.sceneId } : {}),
             ...(issue.blockId ? { blockId: issue.blockId } : {}),
             ...(issue.path ? { path: issue.path } : {}),
           }));
-        report = { ...report, hardFailed: true, issues: [...report.issues, ...additional] };
+        report = {
+          ...report,
+          hardFailed: true,
+          issues: [...report.issues, ...additional],
+          blockingIssues: [...report.blockingIssues, ...additional],
+        };
         const failed = await this.dependencies.store.saveEpisode(
           { ...draft, status: 'failed', updatedAt: this.now() },
           draft.revision,

@@ -689,7 +689,7 @@ describe('ScriptDirector', () => {
     expect(calls).toHaveLength(callCount);
   });
 
-  it('re-runs AI review after revision and never completes while an AI hard issue remains', async () => {
+  it('persists an AI hard finding as advisory without rewriting or blocking completion', async () => {
     const state = readySingleEpisodeState();
     let reviewCalls = 0;
     let revisionCalls = 0;
@@ -742,17 +742,18 @@ describe('ScriptDirector', () => {
       checkpoints: new InMemoryScriptCheckpointStore(),
     });
 
-    await expect(director.run({
+    const result = await director.run({
       task: 'script_episode_batch',
       projectId: 'project-1',
       startEpisode: 1,
       episodeCount: 1,
       expectedPlanRevision: 1,
-    })).rejects.toBeInstanceOf(ScriptBatchPausedError);
+    });
 
-    expect(reviewCalls).toBe(2);
-    expect(revisionCalls).toBe(1);
-    expect(store.state.episodes[0]?.status).toBe('failed');
+    expect(result.kind).toBe('episode_batch');
+    expect(reviewCalls).toBe(1);
+    expect(revisionCalls).toBe(0);
+    expect(store.state.episodes[0]?.status).toBe('completed');
     expect(store.state.reviewIssues).toEqual(expect.arrayContaining([
       expect.objectContaining({
         code: 'AI_CHARACTER_LOGIC',
@@ -763,7 +764,7 @@ describe('ScriptDirector', () => {
     ]));
   });
 
-  it('completes only after the post-revision AI review confirms the hard issue is gone', async () => {
+  it('revises a deterministic blocking issue and completes after the follow-up review', async () => {
     const state = readySingleEpisodeState();
     let reviewCalls = 0;
     const episodePayload = {
@@ -782,20 +783,21 @@ describe('ScriptDirector', () => {
       openedThreads: [],
       closedThreads: [],
     };
+    const shortEpisodePayload = {
+      ...episodePayload,
+      scenes: [{
+        ...episodePayload.scenes[0],
+        blocks: [{ type: 'action', text: '剧情'.repeat(100) }],
+      }],
+    };
     const model: ScriptModelAdapter = {
       async complete(request) {
-        if (request.node === 'draft' || request.node === 'revision') {
-          return JSON.stringify(episodePayload);
-        }
+        if (request.node === 'draft') return JSON.stringify(shortEpisodePayload);
+        if (request.node === 'revision') return JSON.stringify(episodePayload);
         if (request.node === 'review') {
           reviewCalls += 1;
           return JSON.stringify({
-            issues: reviewCalls === 1 ? [{
-              code: 'AI_CHARACTER_LOGIC',
-              severity: 'hard',
-              message: '人物动机与上一集冲突。',
-              path: 'summary',
-            }] : [],
+            issues: [],
             summary: '沈清继续调查。',
             newFacts: [],
             openedThreads: [],
@@ -824,9 +826,7 @@ describe('ScriptDirector', () => {
     expect(result.kind).toBe('episode_batch');
     expect(reviewCalls).toBe(2);
     expect(store.state.episodes[0]?.status).toBe('completed');
-    expect(store.state.reviewIssues).not.toEqual(expect.arrayContaining([
-      expect.objectContaining({ code: 'AI_CHARACTER_LOGIC', status: 'open' }),
-    ]));
+    expect(result.reports[0]?.report.hardFailed).toBe(false);
   });
 
   it('does not bypass a retained user-authored open hard issue when the director saves completed', async () => {

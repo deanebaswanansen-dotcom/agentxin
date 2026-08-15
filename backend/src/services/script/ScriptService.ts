@@ -36,6 +36,7 @@ import { serializeFountain } from './serializers/fountain.js';
 import { ScriptConflictError, type ScriptStore } from './ScriptStore.js';
 import {
   createScriptReviewIssues,
+  isBlockingScriptReviewIssue,
   type ScriptGateReport,
   validateScriptEpisode,
 } from './quality/ScriptQualityGates.js';
@@ -482,7 +483,7 @@ function batchSummaries(
         item.episodeNumber >= startEpisode &&
         item.episodeNumber <= endEpisode,
     );
-    const unresolvedHardIssues = unresolved.filter((item) => item.severity === 'hard').length;
+    const unresolvedHardIssues = unresolved.filter(isBlockingScriptReviewIssue).length;
     const unresolvedSoftIssues = unresolved.length - unresolvedHardIssues;
     const completedEpisodes = episodes.filter((item) => item.status === 'completed').length;
     const batchSize = endEpisode - startEpisode + 1;
@@ -849,10 +850,7 @@ export class ScriptService {
         throw ScriptServiceError.validation('完成正文前必须先保存并确认短剧策划');
       }
       const unresolvedHardIssues = (state?.reviewIssues ?? []).filter(
-        (item) =>
-          item.episodeNumber === episodeNumber &&
-          item.severity === 'hard' &&
-          item.status === 'open',
+        (item) => item.episodeNumber === episodeNumber && isBlockingScriptReviewIssue(item),
       );
       if (unresolvedHardIssues.length > 0) {
         throw ScriptServiceError.validation('本集仍有未解决的硬性校稿问题，不能标记为已完成', {

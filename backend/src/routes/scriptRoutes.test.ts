@@ -369,7 +369,7 @@ describe('scriptRoutes', () => {
     });
   });
 
-  it('rejects completed status while the episode has a persisted open hard review issue', async () => {
+  it('rejects completed status while the episode has a persisted user hard review issue', async () => {
     await app.inject({
       method: 'PUT',
       url: `/api/projects/${projectId}/script-plan`,
@@ -390,14 +390,14 @@ describe('scriptRoutes', () => {
       payload: {
         expectedRevision: 0,
         items: [{
-          id: 'ai-hard-1',
+          id: 'user-hard-1',
           episodeNumber: 1,
           code: 'AI_LOGIC_CONFLICT',
           severity: 'hard',
           category: 'logic',
           message: '人物动机与前集冲突。',
           status: 'open',
-          source: 'ai',
+          source: 'user',
         }],
       },
     });
@@ -437,14 +437,14 @@ describe('scriptRoutes', () => {
         code: 'VALIDATION_ERROR',
         message: expect.stringContaining('未解决的硬性校稿问题'),
         details: {
-          issues: [expect.objectContaining({ id: 'ai-hard-1', status: 'open' })],
+          issues: [expect.objectContaining({ id: 'user-hard-1', status: 'open' })],
         },
       },
     });
 
     const fixed = await app.inject({
       method: 'PATCH',
-      url: `/api/projects/${projectId}/script-review-issues/ai-hard-1`,
+      url: `/api/projects/${projectId}/script-review-issues/user-hard-1`,
       payload: { expectedRevision: 1, status: 'fixed' },
     });
     expect(fixed.statusCode).toBe(200);
