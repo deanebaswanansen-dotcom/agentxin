@@ -127,6 +127,18 @@ describe('agent routes', () => {
     });
   });
 
+  it('rejects a short-drama batch that does not start on a fixed five-episode boundary', () => {
+    expect(() => parseAgentBody({
+      task: 'script_episode_batch',
+      projectId: 'script-project',
+      scriptBatchOptions: {
+        startEpisode: 2,
+        episodeCount: 5,
+        expectedPlanRevision: 3,
+      },
+    })).toThrow('短剧正文批次必须从第 1、6、11……集开始。');
+  });
+
   it('routes short-drama tasks through ScriptDirector instead of the novel orchestrator', async () => {
     const store = await FileDataStore.create(join(dir, 'store.json'));
     const scriptStore = await FileScriptStore.create(join(dir, 'scripts'));
