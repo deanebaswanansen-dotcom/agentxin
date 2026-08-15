@@ -19,7 +19,9 @@ import type {
   ScriptWorldBible,
 } from '../domain.js';
 import { FileScriptStore } from '../FileScriptStore.js';
+import { buildScriptInputRevisionRefs } from '../ScriptContinuityCommit.js';
 import { ScriptConflictError, type ScriptStore } from '../ScriptStore.js';
+import { computeScriptCheckpointInputFingerprint } from './ScriptCheckpoint.js';
 import {
   InMemoryScriptCheckpointStore,
   ScriptBatchPausedError,
@@ -90,6 +92,18 @@ class MemoryScriptStore implements ScriptStore {
     }
     if (this.state.reviewRevision !== input.expectedReviewRevision) {
       throw new ScriptConflictError(input.expectedReviewRevision, this.state.reviewRevision);
+    }
+    const currentInputRevisionRefs = buildScriptInputRevisionRefs(
+      this.state,
+      input.episode.episodeNumber,
+    );
+    for (const reference of input.inputRevisionRefs) {
+      const actualRevision = currentInputRevisionRefs.find((candidate) =>
+        candidate.resource === reference.resource && candidate.id === reference.id,
+      )?.revision ?? 0;
+      if (actualRevision !== reference.revision) {
+        throw new ScriptConflictError(reference.revision, actualRevision);
+      }
     }
     const updatedAt = '2026-08-15T12:00:00.000Z';
     const episode = {
@@ -298,6 +312,59 @@ function readySingleEpisodeState(): ScriptProjectState {
     revision: 1,
   }];
   return state;
+}
+
+function reviewingEpisode(
+  state: ScriptProjectState,
+  text: string,
+  options: {
+    title?: string;
+    revision?: number;
+    blockTextPrefix?: string;
+  } = {},
+): ScriptEpisode {
+  return {
+    id: 'candidate-episode-1',
+    projectId: state.projectId,
+    episodeNumber: 1,
+    title: options.title ?? '第一集',
+    outlineId: 'outline-1',
+    status: 'reviewing',
+    targetChars: state.plan?.targetCharsPerEpisode ?? 300,
+    scenes: [{
+      id: 'candidate-scene-1',
+      ordinal: 1,
+      location: '校报社',
+      timeOfDay: 'day',
+      interiorExterior: 'interior',
+      characterIds: ['lead'],
+      blocks: [{
+        id: 'candidate-block-1',
+        type: 'action',
+        text: `${options.blockTextPrefix ?? ''}${text}`,
+      }],
+    }],
+    summary: '',
+    newFacts: [],
+    openedThreads: [],
+    closedThreads: [],
+    revision: options.revision ?? 0,
+    createdAt: state.updatedAt,
+    updatedAt: state.updatedAt,
+  };
+}
+
+function balancedDraftBlocks(totalChars = 300) {
+  const dialogueChars = Math.round(totalChars * 0.6);
+  return [
+    { type: 'action' as const, text: '动'.repeat(totalChars - dialogueChars) },
+    {
+      type: 'dialogue' as const,
+      characterId: 'lead',
+      speaker: '沈清',
+      text: '话'.repeat(dialogueChars),
+    },
+  ];
 }
 
 describe('ScriptDirector', () => {
@@ -969,7 +1036,7 @@ describe('ScriptDirector', () => {
                 scenes: [{
                   ordinal: 1, location: '校报社', timeOfDay: 'day',
                   interiorExterior: 'interior', characterIds: ['lead'],
-                  blocks: [{ type: 'action', text: '剧情'.repeat(150) }],
+                  blocks: balancedDraftBlocks(),
                 }],
                 summary: '', newFacts: [], openedThreads: [], closedThreads: [],
               });
@@ -1013,7 +1080,7 @@ describe('ScriptDirector', () => {
               timeOfDay: 'day',
               interiorExterior: 'interior',
               characterIds: ['lead'],
-              blocks: [{ type: 'action', text: '剧情'.repeat(150) }],
+              blocks: balancedDraftBlocks(),
             }],
             summary: '',
             newFacts: [],
@@ -1161,7 +1228,7 @@ describe('ScriptDirector', () => {
                 timeOfDay: 'day',
                 interiorExterior: 'interior',
                 characterIds: ['lead'],
-                blocks: [{ type: 'action', text: '剧情'.repeat(150) }],
+                blocks: balancedDraftBlocks(),
               },
             ],
             summary: '',
@@ -1212,10 +1279,8 @@ describe('ScriptDirector', () => {
     expect(store.atomicCommitCalls).toHaveLength(2);
     expect(store.saveEpisodeCalls).toHaveLength(0);
     expect(store.state.reviewRevision).toBe(2);
-    expect(store.state.reviewIssues).toEqual(expect.arrayContaining([
-      expect.objectContaining({ episodeNumber: 1, code: 'DIALOGUE_DENSITY', source: 'deterministic' }),
-      expect.objectContaining({ episodeNumber: 2, code: 'DIALOGUE_DENSITY', source: 'deterministic' }),
-    ]));
+    expect(store.state.reviewIssues.some((issue) => issue.code === 'DIALOGUE_DENSITY'))
+      .toBe(false);
     expect(progress).toContain('completed');
     expect(calls.filter((call) => call.node === 'draft')).toHaveLength(2);
     expect(calls.find(
@@ -1255,7 +1320,7 @@ describe('ScriptDirector', () => {
               scenes: [{
                 ordinal: 1, location: '校报社', timeOfDay: 'day',
                 interiorExterior: 'interior', characterIds: ['lead'],
-                blocks: [{ type: 'action', text: '剧情'.repeat(150) }],
+                blocks: balancedDraftBlocks(),
               }],
               summary: '', newFacts: [], openedThreads: [], closedThreads: [],
             });
@@ -1282,12 +1347,24 @@ describe('ScriptDirector', () => {
       .toEqual([1]);
   });
 
-  it('stales draft, review, and revision lineage after the scene plan changes', async () => {
+  it('stales draft and review lineage after the scene plan changes', async () => {
     const state = readySingleEpisodeState();
+    state.reviewRevision = 1;
+    state.reviewIssues = [{
+      id: 'temporary-user-blocker',
+      projectId: state.projectId,
+      episodeNumber: 1,
+      code: 'USER_TEMPORARY_BLOCKER',
+      severity: 'hard',
+      category: 'continuity',
+      message: '先暂停提交，以便验证场景计划变更后的检查点血缘。',
+      status: 'open',
+      source: 'user',
+      createdAt: state.updatedAt,
+      updatedAt: state.updatedAt,
+    }];
     const store = new MemoryScriptStore(state);
     const checkpoints = new InMemoryScriptCheckpointStore();
-    let firstRun = true;
-    let revisionCalls = 0;
     const director = new ScriptDirector({
       store,
       checkpoints,
@@ -1299,35 +1376,16 @@ describe('ScriptDirector', () => {
               scenes: [{
                 ordinal: 1, location: '校报社', timeOfDay: 'day',
                 interiorExterior: 'interior', characterIds: ['lead'],
-                blocks: [{ type: 'action', text: '候选'.repeat(100) }],
+                blocks: balancedDraftBlocks(),
               }],
               summary: '', newFacts: [], openedThreads: [], closedThreads: [],
             });
           }
           if (request.node === 'review') {
-            if (firstRun && request.prompt.includes('这是修订后复检')) {
-              throw new Error('模拟修订候选落盘后的中断');
-            }
             return JSON.stringify({
               issues: [], summary: '沈清继续推进调查。', newFacts: [],
               openedThreads: [], closedThreads: [], wardrobe: [],
             });
-          }
-          if (request.node === 'revision') {
-            revisionCalls += 1;
-            const taskPrompt = request.prompt.split('\n结构契约：')[0] ?? request.prompt;
-            const current = JSON.parse(taskPrompt.split('当前候选：').at(-1) ?? '{}') as {
-              scenes: Array<{ id: string; blocks: Array<{ id: string }> }>;
-            };
-            return JSON.stringify({ operations: [{
-              op: 'insertBlockAfter',
-              sceneId: current.scenes[0]!.id,
-              afterBlockId: current.scenes[0]!.blocks.at(-1)!.id,
-              block: {
-                type: 'action',
-                text: '补'.repeat(70),
-              },
-            }] });
           }
           throw new Error(`unexpected node: ${request.node}`);
         },
@@ -1341,12 +1399,11 @@ describe('ScriptDirector', () => {
       expectedPlanRevision: 1,
     };
 
-    await expect(director.run(request)).rejects.toBeInstanceOf(ScriptStructuredNeedsReviewError);
+    await expect(director.run(request)).rejects.toBeInstanceOf(ScriptBatchPausedError);
     const firstHistory = await checkpoints.list('project-1', 'script_episode_batch:1:1');
     expect(firstHistory).toEqual(expect.arrayContaining([
       expect.objectContaining({ node: 'draft', status: 'succeeded' }),
       expect.objectContaining({ node: 'review', chunkStart: 1, status: 'succeeded' }),
-      expect.objectContaining({ node: 'revision', chunkStart: 1, status: 'succeeded' }),
     ]));
 
     const currentOutline = store.state.episodeOutlines[0]!;
@@ -1359,7 +1416,8 @@ describe('ScriptDirector', () => {
         purpose: '改为直播公开证据',
       }],
     };
-    firstRun = false;
+    store.state.reviewIssues = [];
+    store.state.reviewRevision += 1;
     await expect(director.run({
       ...request,
       expectedPlanRevision: store.state.plan!.revision,
@@ -1370,7 +1428,6 @@ describe('ScriptDirector', () => {
       { node: 'scene_plan' },
       { node: 'draft' },
       { node: 'review', chunkStart: 1 },
-      { node: 'revision', chunkStart: 1 },
     ] as const) {
       const lineage = history.filter((checkpoint) =>
         checkpoint.node === selector.node &&
@@ -1380,6 +1437,105 @@ describe('ScriptDirector', () => {
       expect(new Set(lineage.map((checkpoint) => checkpoint.artifactRevision)).size)
         .toBe(lineage.length);
     }
+  });
+
+  it('stales an episode-draft-v2 checkpoint after the v3 prompt upgrade', async () => {
+    const state = readySingleEpisodeState();
+    let draftCalls = 0;
+    const store = new MemoryScriptStore(state);
+    const model: ScriptModelAdapter = {
+      async complete(request) {
+        if (request.node === 'draft') {
+          draftCalls += 1;
+          return JSON.stringify({
+            episodeNumber: 1,
+            title: '第一集',
+            scenes: [{
+              ordinal: 1,
+              location: '校报社',
+              timeOfDay: 'day',
+              interiorExterior: 'interior',
+              characterIds: ['lead'],
+              blocks: balancedDraftBlocks(),
+            }],
+            summary: '', newFacts: [], openedThreads: [], closedThreads: [],
+          });
+        }
+        if (request.node === 'review') {
+          return JSON.stringify({
+            issues: [], summary: '沈清取得证据并继续调查。', newFacts: [],
+            openedThreads: [], closedThreads: [], wardrobe: [],
+          });
+        }
+        throw new Error(`unexpected node: ${request.node}`);
+      },
+    };
+    const sourceCheckpoints = new InMemoryScriptCheckpointStore();
+    const sourceDirector = new ScriptDirector({ store, checkpoints: sourceCheckpoints, model });
+    const request = {
+      task: 'script_episode_batch' as const,
+      projectId: state.projectId,
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: state.plan!.revision,
+    };
+
+    await expect(sourceDirector.run(request)).resolves.toMatchObject({ kind: 'episode_batch' });
+    const sourceHistory = await sourceCheckpoints.list(
+      state.projectId,
+      'script_episode_batch:1:1',
+    );
+    const sourceScenePlan = sourceHistory.find((checkpoint) =>
+      checkpoint.node === 'scene_plan' && checkpoint.status === 'succeeded');
+    const sourceDraft = sourceHistory.find((checkpoint) =>
+      checkpoint.node === 'draft' && checkpoint.status === 'succeeded');
+    expect(sourceScenePlan).toBeDefined();
+    expect(sourceDraft).toBeDefined();
+    if (!sourceScenePlan || !sourceDraft) throw new Error('source checkpoints missing');
+
+    // Seed a reusable checkpoint whose only lineage difference is the old prompt version.
+    const legacyInputFingerprint = computeScriptCheckpointInputFingerprint({
+      node: sourceDraft.node,
+      inputRevisionRefs: sourceDraft.inputRevisionRefs,
+      upstreamArtifactRefs: sourceDraft.upstreamArtifactRefs,
+      promptVersion: 'episode-draft-v2',
+      configRevision: sourceDraft.configRevision,
+    });
+    const checkpoints = new InMemoryScriptCheckpointStore();
+    await checkpoints.save(sourceScenePlan);
+    await checkpoints.save({
+      ...sourceDraft,
+      artifact: {
+        ...(sourceDraft.artifact as Record<string, unknown>),
+        promptVersion: 'episode-draft-v2',
+        inputFingerprint: legacyInputFingerprint,
+      },
+      promptVersion: 'episode-draft-v2',
+      inputFingerprint: legacyInputFingerprint,
+    });
+
+    store.state.episodes = [];
+    store.state.continuityCommits = [];
+    store.state.reviewIssues = [];
+    draftCalls = 0;
+    const director = new ScriptDirector({ store, checkpoints, model });
+
+    await expect(director.run({
+      ...request,
+      expectedPlanRevision: store.state.plan!.revision,
+    })).resolves.toMatchObject({ kind: 'episode_batch' });
+
+    expect(draftCalls).toBe(1);
+    const draftHistory = (await checkpoints.list(state.projectId, 'script_episode_batch:1:1'))
+      .filter((checkpoint) => checkpoint.node === 'draft');
+    expect(draftHistory).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        artifactRevision: 0, promptVersion: 'episode-draft-v2', status: 'stale',
+      }),
+      expect.objectContaining({
+        artifactRevision: 1, promptVersion: 'episode-draft-v3', status: 'succeeded',
+      }),
+    ]));
   });
 
   it('persists an AI hard finding as advisory without rewriting or blocking completion', async () => {
@@ -1395,7 +1551,7 @@ describe('ScriptDirector', () => {
         timeOfDay: 'day',
         interiorExterior: 'interior',
         characterIds: ['lead'],
-        blocks: [{ type: 'action', text: '剧情'.repeat(150) }],
+        blocks: balancedDraftBlocks(),
       }],
       summary: '',
       newFacts: [],
@@ -1457,8 +1613,410 @@ describe('ScriptDirector', () => {
     ]));
   });
 
+  it('rewrites a 515-char 1200-target draft as a complete episode before review', async () => {
+    const state = readySingleEpisodeState();
+    state.plan = { ...state.plan!, targetCharsPerEpisode: 1_200, dialogueDensityPercent: 60 };
+    state.characters.push({
+      ...structuredClone(state.characters[0]!),
+      id: 'witness',
+      name: '证人',
+    });
+    const draftPrompts: string[] = [];
+    let draftCalls = 0;
+    let reviewCalls = 0;
+    let revisionCalls = 0;
+    const draftPayload = (
+      actionChars: number,
+      dialogueChars: number,
+      characterIds: string[],
+    ) => ({
+      episodeNumber: 1,
+      title: '第一集',
+      scenes: [{
+        ordinal: 1,
+        location: '校报社',
+        timeOfDay: 'day',
+        interiorExterior: 'interior',
+        characterIds,
+        blocks: [
+          { type: 'action', text: '动'.repeat(actionChars) },
+          {
+            type: 'dialogue',
+            characterId: 'witness',
+            speaker: '证人',
+            text: '证'.repeat(dialogueChars),
+          },
+        ],
+      }],
+      summary: '',
+      newFacts: [],
+      openedThreads: [],
+      closedThreads: [],
+    });
+    const store = new MemoryScriptStore(state);
+    const director = new ScriptDirector({
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+      model: {
+        async complete(request) {
+          if (request.node === 'draft') {
+            draftCalls += 1;
+            draftPrompts.push(request.prompt);
+            return JSON.stringify(draftCalls === 1
+              ? draftPayload(500, 15, ['lead'])
+              : draftPayload(472, 708, ['lead', 'witness']));
+          }
+          if (request.node === 'review') {
+            reviewCalls += 1;
+            return JSON.stringify({
+              issues: [],
+              summary: '证人带着证据进入校报社，沈清决定继续调查。',
+              newFacts: [],
+              openedThreads: [],
+              closedThreads: [],
+              wardrobe: [],
+            });
+          }
+          if (request.node === 'revision') {
+            revisionCalls += 1;
+            throw new Error('fresh draft fixup must not enter revision');
+          }
+          throw new Error(`unexpected node: ${request.node}`);
+        },
+      },
+    });
+
+    await expect(director.run({
+      task: 'script_episode_batch',
+      projectId: state.projectId,
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: state.plan.revision,
+    })).resolves.toMatchObject({ kind: 'episode_batch' });
+
+    expect({ draftCalls, reviewCalls, revisionCalls }).toEqual({
+      draftCalls: 2,
+      reviewCalls: 1,
+      revisionCalls: 0,
+    });
+    expect(draftPrompts[0]).toContain('约包含 30 个');
+    expect(draftPrompts[0]).toContain('36—44 个可见字符');
+    expect(draftPrompts[0]).toContain('平均每场约 1200 字');
+    expect(draftPrompts[0]).toContain('目标约占正文 60%');
+    expect(draftPrompts[0]).toContain('episode_draft@v2');
+    expect(draftPrompts[1]).toContain('TOO_SHORT');
+    expect(draftPrompts[1]).toContain('SPEAKER_NOT_IN_SCENE');
+    expect(store.state.episodes[0]?.scenes.flatMap((scene) => scene.blocks)
+      .reduce((total, block) => total + block.text.replace(/\s/gu, '').length, 0))
+      .toBe(1_180);
+    expect(store.state.episodes[0]?.status).toBe('completed');
+  });
+
+  it('rewrites a length-valid fresh draft when dialogue density misses by over 15 points', async () => {
+    const state = readySingleEpisodeState();
+    let draftCalls = 0;
+    let reviewCalls = 0;
+    const draftPrompts: string[] = [];
+    const payload = (dialogueChars: number) => ({
+      episodeNumber: 1,
+      title: '第一集',
+      scenes: [{
+        ordinal: 1,
+        location: '校报社',
+        timeOfDay: 'day',
+        interiorExterior: 'interior',
+        characterIds: ['lead'],
+        blocks: dialogueChars === 0
+          ? [{ type: 'action', text: '动'.repeat(300) }]
+          : [
+              { type: 'action', text: '动'.repeat(300 - dialogueChars) },
+              {
+                type: 'dialogue', characterId: 'lead', speaker: '沈清',
+                text: '话'.repeat(dialogueChars),
+              },
+            ],
+      }],
+      summary: '', newFacts: [], openedThreads: [], closedThreads: [],
+    });
+    const store = new MemoryScriptStore(state);
+    const director = new ScriptDirector({
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+      model: {
+        async complete(request) {
+          if (request.node === 'draft') {
+            draftCalls += 1;
+            draftPrompts.push(request.prompt);
+            return JSON.stringify(draftCalls === 1 ? payload(0) : payload(180));
+          }
+          if (request.node === 'review') {
+            reviewCalls += 1;
+            return JSON.stringify({
+              issues: [], summary: '沈清取得证据并继续调查。', newFacts: [],
+              openedThreads: [], closedThreads: [], wardrobe: [],
+            });
+          }
+          throw new Error(`unexpected node: ${request.node}`);
+        },
+      },
+    });
+
+    await expect(director.run({
+      task: 'script_episode_batch', projectId: state.projectId,
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: state.plan!.revision,
+    })).resolves.toMatchObject({ kind: 'episode_batch' });
+
+    expect({ draftCalls, reviewCalls }).toEqual({ draftCalls: 2, reviewCalls: 1 });
+    expect(draftPrompts[1]).toContain('DIALOGUE_DENSITY');
+    expect(store.state.episodes[0]?.status).toBe('completed');
+  });
+
+  it.each(['plan', 'characters'] as const)(
+    'atomically rejects a candidate when %s changes while the review model is running',
+    async (resource) => {
+      const state = readySingleEpisodeState();
+      const store = new MemoryScriptStore(state);
+      const checkpoints = new InMemoryScriptCheckpointStore();
+      let draftRefsObservedAtReview: ScriptCommitEpisodeWithContinuityInput['inputRevisionRefs'] = [];
+      let planRevisionAtReviewEntry = 0;
+      let externalMutationApplied = false;
+      const director = new ScriptDirector({
+        store,
+        checkpoints,
+        model: {
+          async complete(request) {
+            if (request.node === 'draft') {
+              return JSON.stringify({
+                episodeNumber: 1,
+                title: '第一集',
+                scenes: [{
+                  ordinal: 1,
+                  location: '校报社',
+                  timeOfDay: 'day',
+                  interiorExterior: 'interior',
+                  characterIds: ['lead'],
+                  blocks: [
+                    { type: 'action', text: '动'.repeat(120) },
+                    {
+                      type: 'dialogue', characterId: 'lead', speaker: '沈清',
+                      text: '话'.repeat(180),
+                    },
+                  ],
+                }],
+                summary: '', newFacts: [], openedThreads: [], closedThreads: [],
+              });
+            }
+            if (request.node === 'review') {
+              if (!externalMutationApplied) {
+                planRevisionAtReviewEntry = store.state.plan!.revision;
+                draftRefsObservedAtReview = structuredClone((await checkpoints.list(
+                  state.projectId,
+                  'script_episode_batch:1:1',
+                )).find((checkpoint) => checkpoint.node === 'draft')?.inputRevisionRefs ?? []);
+                externalMutationApplied = true;
+                if (resource === 'plan') {
+                  store.state.plan = {
+                    ...store.state.plan!,
+                    title: '并发更新后的策划',
+                    revision: store.state.plan!.revision + 1,
+                  };
+                } else {
+                  store.state.characters[0] = {
+                    ...store.state.characters[0]!,
+                    biography: '模型运行期间被外部编辑。',
+                    revision: store.state.characters[0]!.revision + 1,
+                  };
+                }
+              }
+              return JSON.stringify({
+                issues: [], summary: '沈清取得证据并继续调查。', newFacts: [],
+                openedThreads: [], closedThreads: [], wardrobe: [],
+              });
+            }
+            throw new Error(`unexpected node: ${request.node}`);
+          },
+        },
+      });
+
+      await expect(director.run({
+        task: 'script_episode_batch', projectId: state.projectId,
+        startEpisode: 1, episodeCount: 1, expectedPlanRevision: state.plan!.revision,
+      })).rejects.toBeInstanceOf(ScriptConflictError);
+
+      expect(store.state.episodes).toEqual([]);
+      expect(store.state.continuityCommits ?? []).toEqual([]);
+      expect(store.atomicCommitCalls).toHaveLength(1);
+      expect(planRevisionAtReviewEntry).toBe(2);
+      expect(draftRefsObservedAtReview).toEqual(expect.arrayContaining([
+        expect.objectContaining({ resource: 'plan', revision: 2 }),
+      ]));
+      const draftCheckpoint = (await checkpoints.list(
+        state.projectId,
+        'script_episode_batch:1:1',
+      )).find((checkpoint) => checkpoint.node === 'draft' && checkpoint.status === 'succeeded');
+      expect(draftCheckpoint?.inputRevisionRefs).toEqual(expect.arrayContaining([
+        expect.objectContaining({ resource: 'plan', revision: 2 }),
+      ]));
+      const expectedResource = resource === 'plan' ? 'plan' : 'characters';
+      expect(store.atomicCommitCalls[0]?.inputRevisionRefs).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          resource: expectedResource,
+          revision: resource === 'plan' ? 2 : 1,
+        }),
+      ]));
+    },
+  );
+
+  it('stops at draft when primary, fixup, and fallback remain below the hard range', async () => {
+    const state = readySingleEpisodeState();
+    state.plan = { ...state.plan!, targetCharsPerEpisode: 1_200 };
+    const lengths = [515, 656, 693];
+    let draftCalls = 0;
+    let reviewCalls = 0;
+    const checkpoints = new InMemoryScriptCheckpointStore();
+    const store = new MemoryScriptStore(state);
+    const director = new ScriptDirector({
+      store,
+      checkpoints,
+      model: {
+        async getStructuredFallbackModelName() { return 'fallback-model'; },
+        async complete(request) {
+          if (request.node === 'draft') {
+            const visibleChars = lengths[draftCalls++] ?? lengths.at(-1)!;
+            return JSON.stringify({
+              episodeNumber: 1,
+              title: '第一集',
+              scenes: [{
+                ordinal: 1,
+                location: '校报社',
+                timeOfDay: 'day',
+                interiorExterior: 'interior',
+                characterIds: ['lead'],
+                blocks: [{ type: 'action', text: '短'.repeat(visibleChars) }],
+              }],
+              summary: '',
+              newFacts: [],
+              openedThreads: [],
+              closedThreads: [],
+            });
+          }
+          if (request.node === 'review') {
+            reviewCalls += 1;
+            throw new Error('invalid draft must not reach review');
+          }
+          throw new Error(`unexpected node: ${request.node}`);
+        },
+      },
+    });
+
+    let rejected: unknown;
+    try {
+      await director.run({
+        task: 'script_episode_batch',
+        projectId: state.projectId,
+        startEpisode: 1,
+        episodeCount: 1,
+        expectedPlanRevision: state.plan.revision,
+      });
+    } catch (error) {
+      rejected = error;
+    }
+
+    expect(rejected).toBeInstanceOf(ScriptStructuredNeedsReviewError);
+    expect(rejected).toMatchObject({ node: 'draft', recoverable: true });
+    expect((rejected as Error).message).toContain('TOO_SHORT');
+    expect({ draftCalls, reviewCalls }).toEqual({ draftCalls: 3, reviewCalls: 0 });
+    expect(store.state.episodes).toEqual([]);
+    expect((await checkpoints.list(state.projectId, 'script_episode_batch:1:1'))
+      .some((checkpoint) => checkpoint.node === 'draft' && checkpoint.status === 'succeeded'))
+      .toBe(false);
+  });
+
+  it('rejects a revision that fixes length but leaves a speaker outside the scene', async () => {
+    const state = readySingleEpisodeState();
+    state.characters.push({
+      ...structuredClone(state.characters[0]!),
+      id: 'witness',
+      name: '证人',
+    });
+    const candidate = reviewingEpisode(state, 'unused');
+    candidate.scenes[0]!.blocks = [
+      { id: 'candidate-action', type: 'action', text: '短'.repeat(190) },
+      {
+        id: 'candidate-dialogue',
+        type: 'dialogue',
+        characterId: 'witness',
+        speaker: '证人',
+        text: '话'.repeat(10),
+      },
+    ];
+    state.episodes = [candidate];
+    const revisionPrompts: string[] = [];
+    let revisionCalls = 0;
+    let reviewCalls = 0;
+    const store = new MemoryScriptStore(state);
+    const director = new ScriptDirector({
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+      model: {
+        async complete(request) {
+          if (request.node === 'review') {
+            reviewCalls += 1;
+            return JSON.stringify({
+              issues: [],
+              summary: '证人交出证据，沈清决定核查。',
+              newFacts: [],
+              openedThreads: [],
+              closedThreads: [],
+              wardrobe: [],
+            });
+          }
+          if (request.node === 'revision') {
+            revisionCalls += 1;
+            revisionPrompts.push(request.prompt);
+            const taskPrompt = request.prompt.split('\n结构契约：')[0] ?? request.prompt;
+            const current = JSON.parse(taskPrompt.split('当前候选：').at(-1) ?? '{}') as {
+              scenes: Array<{ id: string }>;
+            };
+            return JSON.stringify({
+              operations: [
+                ...(revisionCalls === 1 ? [] : [{
+                  op: 'updateSceneCharacters',
+                  sceneId: current.scenes[0]!.id,
+                  characterIds: ['lead', 'witness'],
+                }]),
+                {
+                  op: 'appendBlock',
+                  sceneId: current.scenes[0]!.id,
+                  block: { type: 'action', text: '补'.repeat(100) },
+                },
+              ],
+            });
+          }
+          if (request.node === 'draft') throw new Error('reviewing fixture must skip draft');
+          throw new Error(`unexpected node: ${request.node}`);
+        },
+      },
+    });
+
+    await expect(director.run({
+      task: 'script_episode_batch',
+      projectId: state.projectId,
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: state.plan!.revision,
+    })).resolves.toMatchObject({ kind: 'episode_batch' });
+
+    expect({ revisionCalls, reviewCalls }).toEqual({ revisionCalls: 2, reviewCalls: 2 });
+    expect(revisionPrompts[1]).toContain('revision.quality');
+    expect(revisionPrompts[1]).toContain('SPEAKER_NOT_IN_SCENE');
+    expect(store.state.episodes[0]?.scenes[0]?.characterIds).toEqual(['lead', 'witness']);
+    expect(store.state.episodes[0]?.status).toBe('completed');
+  });
+
   it('revises a deterministic blocking issue and completes after the follow-up review', async () => {
     const state = readySingleEpisodeState();
+    state.episodes = [reviewingEpisode(state, '剧情'.repeat(100))];
     let reviewCalls = 0;
     const episodePayload = {
       episodeNumber: 1,
@@ -1541,6 +2099,7 @@ describe('ScriptDirector', () => {
 
   it('repairs TOO_LONG through text-only reduction and commits once inside the target range', async () => {
     const state = readySingleEpisodeState();
+    state.episodes = [reviewingEpisode(state, '超长'.repeat(180), { title: '超长候选' })];
     let reviewCalls = 0;
     let revisionCalls = 0;
     let revisionPrompt = '';
@@ -1614,6 +2173,7 @@ describe('ScriptDirector', () => {
     { label: 'over-reduced', replacement: '过短'.repeat(125), expected: '变为 250 字' },
   ])('rejects a TOO_LONG patch that is $label', async ({ replacement, expected }) => {
     const state = readySingleEpisodeState();
+    state.episodes = [reviewingEpisode(state, '超长'.repeat(180), { title: '超长候选' })];
     const store = new MemoryScriptStore(state);
     const checkpoints = new InMemoryScriptCheckpointStore();
     const director = new ScriptDirector({
@@ -1659,7 +2219,9 @@ describe('ScriptDirector', () => {
       task: 'script_episode_batch', projectId: 'project-1',
       startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
     })).rejects.toMatchObject({ code: 'SCRIPT_BATCH_NEEDS_REVIEW', recoverable: true });
-    expect(store.state.episodes).toEqual([]);
+    expect(store.state.episodes).toEqual([
+      expect.objectContaining({ id: 'candidate-episode-1', status: 'reviewing' }),
+    ]);
     expect(store.atomicCommitCalls).toEqual([]);
     const history = await checkpoints.list('project-1', 'script_episode_batch:1:1');
     expect(history).toEqual(expect.arrayContaining([
@@ -1672,6 +2234,9 @@ describe('ScriptDirector', () => {
 
   it('fixes a 361-to-350 TOO_LONG semantic miss to 300 in the same run', async () => {
     const state = readySingleEpisodeState();
+    state.episodes = [reviewingEpisode(state, `${'超长'.repeat(180)}甲`, {
+      title: '超长候选',
+    })];
     const store = new MemoryScriptStore(state);
     const checkpoints = new InMemoryScriptCheckpointStore();
     let draftCalls = 0;
@@ -1727,7 +2292,7 @@ describe('ScriptDirector', () => {
 
     await expect(director.run(request)).resolves.toMatchObject({ kind: 'episode_batch' });
     expect({ draftCalls, reviewCalls, revisionCalls }).toEqual({
-      draftCalls: 1, reviewCalls: 2, revisionCalls: 2,
+      draftCalls: 0, reviewCalls: 2, revisionCalls: 2,
     });
     expect(revisionPrompts[0]).toContain('"current":361');
     expect(revisionPrompts[0]).toContain('"idealNetChange":-61');
@@ -1761,7 +2326,7 @@ describe('ScriptDirector', () => {
                 timeOfDay: 'day',
                 interiorExterior: 'interior',
                 characterIds: ['lead'],
-                blocks: [{ type: 'action', text: '沈清核验证据推进调查'.repeat(30) }],
+                blocks: balancedDraftBlocks(),
               }],
               summary: '',
               newFacts: [],
@@ -1825,7 +2390,12 @@ describe('ScriptDirector', () => {
       createdAt: '2026-08-14T00:00:00.000Z',
       updatedAt: '2026-08-14T00:00:00.000Z',
     };
-    state.episodes = [structuredClone(official)];
+    const candidate = reviewingEpisode(state, '剧情'.repeat(150), {
+      title: '候选稿',
+      revision: official.revision,
+      blockTextPrefix: '△',
+    });
+    state.episodes = [structuredClone(official), candidate];
     const checkpoints = new InMemoryScriptCheckpointStore();
     const store = new MemoryScriptStore(state);
     const director = new ScriptDirector({
@@ -1887,7 +2457,7 @@ describe('ScriptDirector', () => {
       episodeCount: 1,
       expectedPlanRevision: 1,
     })).rejects.toMatchObject({ code: 'SCRIPT_BATCH_NEEDS_REVIEW', recoverable: true });
-    expect(store.state.episodes).toEqual([official]);
+    expect(store.state.episodes.find((episode) => episode.id === official.id)).toEqual(official);
     expect(store.atomicCommitCalls).toHaveLength(0);
     const history = await checkpoints.list('project-1', 'script_episode_batch:1:1');
     expect(history).toEqual(expect.arrayContaining([
@@ -1915,7 +2485,11 @@ describe('ScriptDirector', () => {
       summary: '旧稿保留。', newFacts: [], openedThreads: [], closedThreads: [],
       revision: 6, createdAt: state.updatedAt, updatedAt: state.updatedAt,
     };
-    state.episodes = [structuredClone(official)];
+    const candidate = reviewingEpisode(state, '候选'.repeat(100), {
+      title: '候选短稿',
+      revision: official.revision,
+    });
+    state.episodes = [structuredClone(official), candidate];
     let reviewCalls = 0;
     let revisionCalls = 0;
     const store = new MemoryScriptStore(state);
@@ -1967,7 +2541,7 @@ describe('ScriptDirector', () => {
     })).rejects.toMatchObject({ code: 'SCRIPT_BATCH_NEEDS_REVIEW' });
     expect(reviewCalls).toBe(1);
     expect(revisionCalls).toBe(2);
-    expect(store.state.episodes).toEqual([official]);
+    expect(store.state.episodes.find((episode) => episode.id === official.id)).toEqual(official);
     expect(store.atomicCommitCalls).toHaveLength(0);
     const rejectedRevision = (await checkpoints.list('project-1', 'script_episode_batch:1:1'))
       .find((checkpoint) => checkpoint.node === 'revision' && checkpoint.status === 'needs_review');
@@ -2006,7 +2580,11 @@ describe('ScriptDirector', () => {
       createdAt: '2026-08-14T00:00:00.000Z',
       updatedAt: '2026-08-14T00:00:00.000Z',
     };
-    state.episodes = [structuredClone(official)];
+    const candidate = reviewingEpisode(state, '候选短稿'.repeat(50), {
+      title: '内存候选',
+      revision: official.revision,
+    });
+    state.episodes = [structuredClone(official), candidate];
     let revisionCalls = 0;
     const revisionPrompts: string[] = [];
     const leakedSecret = 'sk-this-must-never-be-persisted';
@@ -2089,7 +2667,7 @@ describe('ScriptDirector', () => {
     expect((paused as Error).message).toContain('REVISION_PATCH_REJECTED');
 
     expect(revisionCalls).toBe(2);
-    expect(store.state.episodes).toEqual([official]);
+    expect(store.state.episodes.find((episode) => episode.id === official.id)).toEqual(official);
     expect(store.saveEpisodeCalls).toHaveLength(0);
     expect(store.atomicCommitCalls).toHaveLength(0);
     const rejectedHistory = await checkpoints.list('project-1', 'script_episode_batch:1:1');
@@ -2120,6 +2698,22 @@ describe('ScriptDirector', () => {
 
   it('fixes mixed TOO_SHORT blockers from a non-tail anchor without leaking dry-run IDs', async () => {
     const state = readySingleEpisodeState();
+    state.episodes = [{
+      ...reviewingEpisode(state, 'unused'),
+      id: 'candidate-episode',
+      scenes: [{
+        id: 'candidate-scene',
+        ordinal: 1,
+        location: '校报社',
+        timeOfDay: 'day',
+        interiorExterior: 'interior',
+        characterIds: ['lead'],
+        blocks: [
+          { id: 'candidate-block-first', type: 'action', text: '△短' },
+          { id: 'candidate-block-last', type: 'action', text: '尾' },
+        ],
+      }],
+    }];
     const store = new MemoryScriptStore(state);
     const checkpoints = new InMemoryScriptCheckpointStore();
     let revisionCalls = 0;
@@ -2216,8 +2810,11 @@ describe('ScriptDirector', () => {
       .some((checkpoint) => checkpoint.status === 'needs_review')).toBe(false);
   });
 
-  it('resumes after two semantic failures without rerunning draft or first review', async () => {
+  it('resumes after two semantic failures and reuses the reviewing episode', async () => {
     const state = readySingleEpisodeState();
+    state.episodes = [reviewingEpisode(state, `${'超长'.repeat(180)}甲`, {
+      title: '超长候选',
+    })];
     const store = new MemoryScriptStore(state);
     const checkpoints = new InMemoryScriptCheckpointStore();
     let draftCalls = 0;
@@ -2292,11 +2889,13 @@ describe('ScriptDirector', () => {
       recoverable: true,
     });
     expect({ draftCalls, reviewCalls, revisionCalls }).toEqual({
-      draftCalls: 1,
+      draftCalls: 0,
       reviewCalls: 1,
       revisionCalls: 2,
     });
-    expect(store.state.episodes).toEqual([]);
+    expect(store.state.episodes).toEqual([
+      expect.objectContaining({ id: 'candidate-episode-1', status: 'reviewing' }),
+    ]);
     expect(store.state.continuityCommits ?? []).toEqual([]);
 
     await expect(director.run({
@@ -2305,8 +2904,8 @@ describe('ScriptDirector', () => {
     })).resolves.toMatchObject({ kind: 'episode_batch' });
 
     expect({ draftCalls, reviewCalls, revisionCalls }).toEqual({
-      draftCalls: 1,
-      reviewCalls: 2,
+      draftCalls: 0,
+      reviewCalls: 3,
       revisionCalls: 3,
     });
     expect(store.state.episodes).toEqual([
@@ -2362,7 +2961,7 @@ describe('ScriptDirector', () => {
               timeOfDay: 'day',
               interiorExterior: 'interior',
               characterIds: ['lead'],
-              blocks: [{ type: 'action', text: '剧情'.repeat(150) }],
+              blocks: balancedDraftBlocks(),
             }],
             summary: '',
             newFacts: [],
