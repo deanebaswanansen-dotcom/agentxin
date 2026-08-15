@@ -63,6 +63,50 @@ describe('agent job routes', () => {
     await app.close();
   });
 
+  it('automatically resumes an interrupted project job when polling supplies model config', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-job-route-restart-'));
+    const file = join(directory, 'runs.json');
+    const beforeRestart = await AgentRunStore.create(file);
+    const interrupted = await beforeRestart.create(CLIENT_A, {
+      task: 'script_episode_batch',
+      mode: 'draft',
+      prompt: '',
+      projectId: 'project-a',
+      scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 1 },
+    });
+    await beforeRestart.markRunning(interrupted.id);
+
+    const store = await AgentRunStore.create(file);
+    expect(store.get(interrupted.id)?.status).toBe('waiting_user');
+    const run = vi.fn(async (request) => ({
+      task: request.task,
+      mode: request.mode,
+      projectId: request.projectId,
+      summary: '从检查点恢复完成',
+      steps: [],
+      artifacts: [],
+    }));
+    const runner = new AgentJobRunner(store, { run });
+    const app = Fastify();
+    registerClientScope(app);
+    registerRequestModelConfig(app);
+    registerAgentJobRoutes(app, store, runner);
+
+    const listed = await app.inject({
+      method: 'GET',
+      url: '/api/projects/project-a/agent-jobs',
+      headers: { 'x-agentxin-client-id': CLIENT_A, 'x-agentxin-model-config': MODEL },
+    });
+    expect(listed.statusCode).toBe(200);
+    await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
+    await runner.waitUntilIdle(interrupted.id);
+    expect(store.get(interrupted.id)).toMatchObject({
+      status: 'completed',
+      result: { summary: '从检查点恢复完成' },
+    });
+    await app.close();
+  });
+
   it('does not expose unexpected storage or runtime errors', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'agentxin-job-route-error-'));
     const store = await AgentRunStore.create(join(directory, 'runs.json'));

@@ -27,6 +27,7 @@
 浏览器打开后：
 
 - 左侧新建/搜索/删除项目；章节可删；「管理」可批量删除
+- 开发环境可新建“短剧”项目，按策划问答、总纲、角色、世界、每批最多 5 集正文推进
 - 右侧对话：`/计划`、`/参考`、`/长篇` 等
 - 设置里填 API Key，或先用「演示模式」
 
@@ -57,6 +58,8 @@ npm test
 
 当前生产架构为 Nginx 托管前端、Fastify 常驻后端、`/var/lib/agentxin` 持久化数据；完整部署、更新、备份和排错命令见 [`docs/PROJECT_HANDBOOK.md`](docs/PROJECT_HANDBOOK.md)。前端生产构建必须设置 `VITE_AGENT_BACKGROUND_JOBS=false`；长篇任务使用服务器持久化任务队列，切项目、刷新或临时断网后可恢复。
 
+短剧入口使用构建期开关灰度发布：生产构建未设置时默认隐藏；验收环境设置 `VITE_SCRIPT_MODE_ENABLED=true` 后显示。关闭入口不会删除已经保存的短剧项目、正文或检查点。
+
 ## 兼容部署（Netlify，非当前主环境）
 
 > 前端、API 和长任务可部署在同一个 Netlify 站点。每个浏览器首次打开时生成 256 位随机库标识；项目、记忆和参考库按该标识写入同一个 Netlify Blobs 站点存储。API Key 只保存在浏览器，并仅随模型任务请求进入函数内存，不写入 Blobs。
@@ -83,5 +86,6 @@ LLM_API_KEY=你的密钥
 ## 测试
 
 - 单元 / 属性测试：Vitest + fast-check
+- 短剧真实模型验收不会读取或保存仓库内的 `.env` 密钥。请只在当前 PowerShell 进程临时设置 `SHORT_DRAMA_E2E_API_KEY`，再于 `backend` 运行 `npm run acceptance:short-drama`；脚本使用临时数据目录并在结束时自动清理。
 
 **注意**：Web 工作台是主界面；backend CLI 与 Python novel_agent 为辅助工具。

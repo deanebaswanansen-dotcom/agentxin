@@ -78,6 +78,7 @@ export interface ScriptPipelineCheckpoint {
 export interface ScriptCheckpointStore {
   list(projectId: string, runKey: string): Promise<ScriptPipelineCheckpoint[]>;
   save(checkpoint: ScriptPipelineCheckpoint): Promise<void>;
+  deleteProject(projectId: string): Promise<void>;
 }
 
 export class InMemoryScriptCheckpointStore implements ScriptCheckpointStore {
@@ -98,6 +99,12 @@ export class InMemoryScriptCheckpointStore implements ScriptCheckpointStore {
       checkpoint.chunkStart ?? '',
     ].join(':');
     this.items.set(key, structuredClone(checkpoint));
+  }
+
+  async deleteProject(projectId: string): Promise<void> {
+    for (const [key, checkpoint] of this.items.entries()) {
+      if (checkpoint.projectId === projectId) this.items.delete(key);
+    }
   }
 }
 
@@ -129,6 +136,7 @@ export type ScriptDirectorRequest =
       task: 'script_plan';
       projectId: string;
       planningSession: ScriptPlanningSession;
+      seedPrompt?: string;
       signal?: AbortSignal;
     }
   | {
@@ -178,7 +186,16 @@ export class ScriptBatchPausedError extends Error {
     readonly episodeNumber: number,
     readonly report: ScriptGateReport,
   ) {
-    super(`第 ${episodeNumber} 集未通过硬质量门，批次已暂停。`);
+    const hardIssueSummary = report.issues
+      .filter((issue) => issue.severity === 'hard')
+      .slice(0, 4)
+      .map((issue) => `${issue.code}：${issue.message}`)
+      .join('；');
+    super(
+      `第 ${episodeNumber} 集未通过硬质量门，批次已暂停。${hardIssueSummary
+        ? ` ${hardIssueSummary}`
+        : ''}`,
+    );
     this.name = 'ScriptBatchPausedError';
   }
 }
@@ -222,6 +239,23 @@ function optionalStringField(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
+function scriptLengthInstruction(targetChars: number, currentChars?: number): string {
+  const blockCount = Math.max(12, Math.min(100, Math.round(targetChars / 18)));
+  const charsPerBlock = Math.round(targetChars / blockCount);
+  const minimumPerBlock = Math.max(12, Math.floor(charsPerBlock * 0.9));
+  const maximumPerBlock = Math.ceil(charsPerBlock * 1.1);
+  const current = currentChars === undefined
+    ? ''
+    : `当前正文只有 ${currentChars} 个可见字符，需增删约 ${Math.abs(targetChars - currentChars)} 个字符。`;
+  return [
+    current,
+    `请让全部场景合计恰好包含 ${blockCount} 个 caption/action/dialogue 正文块，`,
+    `每个 blocks.text 约 ${minimumPerBlock}—${maximumPerBlock} 个可见字符；`,
+    '每个 text 至少写成一个完整句子，长度可参考“她攥紧彩票退到监控灯下，盯着老板把兑奖记录藏进抽屉”，不要用四五字短句凑块数；',
+    `篇幅只能写进 blocks.text，summary、newFacts、openedThreads、closedThreads 不计入正文。`,
+  ].join('');
+}
+
 export class ScriptDirector {
   constructor(private readonly dependencies: ScriptDirectorDependencies) {}
 
@@ -247,12 +281,24 @@ export class ScriptDirector {
     if (assessment.kind === 'waiting') {
       return { kind: 'planning_waiting', missingFields: assessment.missingFields };
     }
+    const current = (await this.dependencies.store.getProjectState(request.projectId))?.plan;
     const raw = await this.dependencies.model.complete({
       node: 'plan',
       projectId: request.projectId,
       prompt: [
         '你是短剧策划 Agent。根据已确认选项补全专业策划。',
         '只返回与 ScriptPlan 对应的 JSON，不输出思考过程或 Markdown 围栏。',
+        [
+          '必须返回以下全部字段：',
+          'title, theme, market, channel, genres, audience, coreConflict, logline, highlights,',
+          'totalEpisodes, episodeDurationSeconds, targetCharsPerEpisode, maxPrimaryCharacters,',
+          'maxScenesPerEpisode, dialogueDensityPercent, language, format, coreRequirements,',
+          'forbiddenElements, endingDirection；coverPrompt 可选。',
+        ].join(' '),
+        'episodeDurationSeconds 必须是 {"min":数字,"max":数字}；genres、highlights、forbiddenElements 必须是字符串数组。',
+        'market 只能是 domestic/overseas，channel 只能是 female/male/general，language 必须是 zh-CN，format 必须是 cn_short_drama。',
+        '范围：总集数1—200，时长30—180秒，单集300—3000字，主要角色1—20，场景1—5，对话密度20—90。',
+        `用户故事想法：${request.seedPrompt?.trim() || '未提供，由 Agent 原创'}`,
         `已确认：${JSON.stringify(assessment.values)}`,
         `委托 Agent 字段：${assessment.delegatedFields.join('、') || '无'}`,
       ].join('\n'),
@@ -262,7 +308,6 @@ export class ScriptDirector {
     const duration = recordField(parsed.episodeDurationSeconds, 'episodeDurationSeconds');
     const explicit = assessment.values;
     const now = this.dependencies.now?.() ?? new Date().toISOString();
-    const current = (await this.dependencies.store.getProjectState(request.projectId))?.plan;
     const plan: ScriptPlan = {
       id: current?.id ?? this.dependencies.id?.() ?? randomUUID(),
       projectId: request.projectId,
@@ -302,7 +347,7 @@ export class ScriptDirector {
       createdAt: current?.createdAt ?? now,
       updatedAt: now,
     };
-    const saved = await this.dependencies.store.savePlan(plan, current?.revision);
+    const saved = await this.dependencies.store.savePlan(plan, current?.revision ?? 0);
     await this.dependencies.checkpoints.save({
       projectId: request.projectId,
       runKey: 'script_plan',
@@ -353,6 +398,7 @@ export class ScriptDirector {
           '你是 SeriesOutlineAgent，生成全剧总纲和指定范围的轻量分集卡。',
           `本段只返回第 ${start}—${end} 集，集号必须连续。`,
           '只返回 JSON，字段：synopsis, openingState, midpointTurn, climax, endingState, mainArc, subplotArcs, episodeCards。',
+          '严格模板：{"synopsis":"字符串","openingState":"字符串","midpointTurn":"字符串","climax":"字符串","endingState":"字符串","mainArc":["字符串"],"subplotArcs":["字符串"],"episodeCards":[{"episodeNumber":1,"title":"字符串","logline":"字符串","mainEvent":"字符串","endingHook":"字符串"}]}。不得翻译、缩写或改名任何键。',
           `已锁定策划：${JSON.stringify(plan)}`,
         ].join('\n'),
         signal,
@@ -411,7 +457,7 @@ export class ScriptDirector {
     };
     const saved = await this.dependencies.store.saveSeriesOutline(
       outline,
-      state?.seriesOutline?.revision,
+      state?.seriesOutline?.revision ?? 0,
     );
     return { kind: 'series_outline', outline: saved };
   }
@@ -432,6 +478,8 @@ export class ScriptDirector {
           prompt: [
             '你是 CharacterDesignAgent。根据策划和大纲生成结构化人物圣经。',
             '只返回 JSON 对象 {"characters": [...]} ，不输出思考过程。',
+            '每个人物严格包含：id, name, aliases, role, age(可选), occupation(可选), identity, biography, motivation, goal, weakness, arc, appearance, hairstyle, physique, defaultOutfit, personality, skills, speechStyle, catchphrases, relationships。',
+            'role 只能是 lead/supporting/antagonist/minor；aliases/personality/skills/catchphrases/relationships 必须是数组；relationship 使用 {"characterId":"已存在人物id","label":"关系","notes":"可选说明"}。不得改名任何键。',
             `策划：${JSON.stringify(plan)}`,
             `大纲：${JSON.stringify(outline)}`,
           ].join('\n'),
@@ -445,6 +493,7 @@ export class ScriptDirector {
           prompt: [
             '你是 WorldDesignAgent。根据策划和大纲生成结构化世界圣经。',
             '只返回 JSON，不输出思考过程。',
+            '严格模板：{"era":"字符串","primaryLocations":["字符串"],"worldState":"字符串","rules":["字符串"],"transport":["字符串"],"communication":["字符串"],"organizations":["字符串"],"recurringProps":["字符串"],"forbiddenAnachronisms":["字符串"]}。不得翻译、缩写或改名任何键。',
             `策划：${JSON.stringify(plan)}`,
             `大纲：${JSON.stringify(outline)}`,
           ].join('\n'),
@@ -454,10 +503,10 @@ export class ScriptDirector {
     const [generatedCharacters, generatedWorld] = await Promise.all([characterTask, worldTask]);
     const characters = state.characters.length > 0
       ? generatedCharacters
-      : await this.dependencies.store.saveCharacters(projectId, generatedCharacters);
+      : await this.dependencies.store.saveCharacters(projectId, generatedCharacters, 0);
     const worldBible = state.worldBible
       ? generatedWorld
-      : await this.dependencies.store.saveWorldBible(generatedWorld);
+      : await this.dependencies.store.saveWorldBible(generatedWorld, 0);
     await Promise.all([
       this.dependencies.checkpoints.save({
         projectId,
@@ -606,20 +655,29 @@ export class ScriptDirector {
     }
 
     state = (await this.dependencies.store.getProjectState(request.projectId)) ?? state;
+    const seriesOutline = state.seriesOutline;
+    if (!seriesOutline) {
+      throw new ScriptModelOutputError('生成正文前必须先生成全剧大纲。');
+    }
     let outlines = state.episodeOutlines.filter((outline) => range.includes(outline.episodeNumber));
     const missingOutlineNumbers = range.filter(
       (episodeNumber) => !outlines.some((outline) => outline.episodeNumber === episodeNumber),
     );
     if (missingOutlineNumbers.length > 0) {
+      const registeredCharacterIds = new Set(
+        state.characters.map((character) => character.id),
+      );
       const raw = await this.callModel({
         node: 'episode_outline',
         projectId: request.projectId,
         prompt: [
           '你是 EpisodeOutlineAgent。只展开当前 1—5 集详细大纲。',
-          '只返回 JSON {"outlines":[...]} ，每集必须有冲突、场景意图和结尾卡点。',
+          '只返回 JSON {"outlines":[...]} ，每集必须有冲突、节拍和结尾卡点。',
+          '每项严格模板：{"episodeNumber":1,"title":"字符串","goal":"字符串","conflict":"字符串","beats":["字符串"],"characterIds":["人物id"],"plannedScenes":[],"reveal":"可选字符串","reversal":"可选字符串","endingHook":"字符串","requiredFacts":["字符串"],"forbiddenFacts":["字符串"]}。plannedScenes 必须原样返回空数组 []，场景由下一节点规划；不得改名任何键。',
+          `characterIds 只能从以下人物 ID 白名单选择：${JSON.stringify([...registeredCharacterIds])}。`,
           `需要集号：${missingOutlineNumbers.join('、')}`,
           `策划：${JSON.stringify(plan)}`,
-          `分集卡：${JSON.stringify(state.seriesOutline.episodeCards.filter((card) => range.includes(card.episodeNumber)))}`,
+          `分集卡：${JSON.stringify(seriesOutline.episodeCards.filter((card) => range.includes(card.episodeNumber)))}`,
           `当前连续性：${JSON.stringify(state.continuity)}`,
         ].join('\n'),
         signal: request.signal,
@@ -629,12 +687,21 @@ export class ScriptDirector {
         throw new ScriptModelOutputError('详细分集大纲 outlines 必须是数组。');
       }
       const generated = parsed.outlines.map((candidate) =>
-        this.parseEpisodeOutline(recordField(candidate, 'episodeOutline'), request.projectId),
+        this.parseEpisodeOutline(
+          recordField(candidate, 'episodeOutline'),
+          request.projectId,
+          registeredCharacterIds,
+        ),
       );
       for (const episodeNumber of missingOutlineNumbers) {
         const outline = generated.find((item) => item.episodeNumber === episodeNumber);
         if (!outline) throw new ScriptModelOutputError(`详细大纲缺少第 ${episodeNumber} 集。`);
-        const saved = await this.dependencies.store.saveEpisodeOutline(outline);
+        const saved = await this.dependencies.store.saveEpisodeOutline(
+          outline,
+          state.episodeOutlines.find(
+            (item) => item.episodeNumber === episodeNumber,
+          )?.revision ?? 0,
+        );
         outlines.push(saved);
       }
       const artifactRevision = Math.max(0, ...outlines.map((item) => item.revision));
@@ -674,6 +741,7 @@ export class ScriptDirector {
           prompt: [
             '你是 EpisodeScenePlanner。将详细大纲确认为 1—5 个可拍摄场景。',
             '只返回 JSON {"plannedScenes":[...]}。',
+            '每个场景严格使用 {"ordinal":1,"location":"地点","timeOfDay":"day|night|dawn|dusk","interiorExterior":"interior|exterior","purpose":"场景目的"}，场号从1连续递增，不得改名任何键。',
             `场景上限：${plan.maxScenesPerEpisode}`,
             `大纲：${JSON.stringify(outline)}`,
           ].join('\n'),
@@ -708,6 +776,11 @@ export class ScriptDirector {
           prompt: [
             '你是 ScriptWriterAgent。一次生成当前单集的结构化短剧正文。',
             '只返回 JSON，不输出思考过程、Markdown 或提示词。',
+            '严格顶层模板：{"episodeNumber":1,"title":"字符串","scenes":[...],"summary":"可为空字符串","newFacts":[],"openedThreads":[],"closedThreads":[]}。',
+            '每个 scene 严格包含 ordinal, location, timeOfDay(day|night|dawn|dusk), interiorExterior(interior|exterior), characterIds, blocks。每个 block 的 type 只能是 caption/action/dialogue 且必须有 text；dialogue 还必须有已登记人物的 characterId、speaker，可选 delivery 和 mode(normal|os|vo)。不得改名任何键。',
+            scriptLengthInstruction(plan.targetCharsPerEpisode),
+            `所有 blocks.text 去除空白后的总字符数以 ${plan.targetCharsPerEpisode} 为目标，必须在 ${Math.ceil(plan.targetCharsPerEpisode * 0.85)}—${Math.floor(plan.targetCharsPerEpisode * 1.15)} 之间；请在返回前逐块相加核对，优先贴近目标值。`,
+            `对白只能使用这些已登记人物：${JSON.stringify(state.characters.map((character) => ({ id: character.id, name: character.name })))}`,
             this.assembleEpisodeContext(state, plan, outline, episodeNumber),
           ].join('\n'),
           signal: request.signal,
@@ -721,7 +794,7 @@ export class ScriptDirector {
         );
         draft = await this.dependencies.store.saveEpisode(
           draft,
-          state.episodes.find((item) => item.episodeNumber === episodeNumber)?.revision,
+          state.episodes.find((item) => item.episodeNumber === episodeNumber)?.revision ?? 0,
         );
         await this.saveCheckpoint(request, {
           projectId: request.projectId,
@@ -742,6 +815,7 @@ export class ScriptDirector {
         prompt: [
           '你是 ScriptContinuityAgent。只返回定位到场景/字段的结构化问题与记忆写回。',
           '只返回 JSON，字段：issues, summary, newFacts, openedThreads, closedThreads, wardrobe。',
+          '严格模板：{"issues":[{"code":"字符串","severity":"hard|soft","message":"字符串","sceneId":"可选","path":"可选"}],"summary":"150—300字摘要","newFacts":["字符串"],"openedThreads":["字符串"],"closedThreads":["字符串"],"wardrobe":[{"characterId":"人物id","outfit":"服装"}]}。没有问题时 issues 返回空数组，不得改名任何键。',
           `策划：${JSON.stringify(plan)}`,
           `大纲：${JSON.stringify(outline)}`,
           `连续性：${JSON.stringify(state.continuity)}`,
@@ -785,6 +859,11 @@ export class ScriptDirector {
           prompt: [
             '你是 ScriptRevisionAgent。只修改硬错误指向的场景和字段，保持其他内容不变。',
             '只返回完整单集 JSON，不输出思考过程。',
+            '返回结构必须与输入正文完全同形：顶层保留 episodeNumber, title, scenes, summary, newFacts, openedThreads, closedThreads；场景和块不得改名或省略必填键。',
+            scriptLengthInstruction(plan.targetCharsPerEpisode, report.visibleChars),
+            `当前所有 blocks.text 去除空白后的总字符数是 ${report.visibleChars}，目标是 ${plan.targetCharsPerEpisode}；请据此精确增加或删除约 ${Math.abs(plan.targetCharsPerEpisode - report.visibleChars)} 个字符。最终必须在 ${Math.ceil(plan.targetCharsPerEpisode * 0.85)}—${Math.floor(plan.targetCharsPerEpisode * 1.15)} 之间，并优先贴近 ${plan.targetCharsPerEpisode}，返回前逐块相加核对。`,
+            `对白只能使用这些已登记人物；未知说话人必须改为其中一个人物：${JSON.stringify(state.characters.map((character) => ({ id: character.id, name: character.name })))}`,
+            `本集大纲：${JSON.stringify(outline)}`,
             `硬错误：${JSON.stringify(report.issues.filter((issue) => issue.severity === 'hard'))}`,
             `正文：${JSON.stringify(draft)}`,
           ].join('\n'),
@@ -862,10 +941,21 @@ export class ScriptDirector {
     };
   }
 
-  private parseEpisodeOutline(value: Record<string, unknown>, projectId: string): ScriptEpisodeOutline {
+  private parseEpisodeOutline(
+    value: Record<string, unknown>,
+    projectId: string,
+    registeredCharacterIds?: ReadonlySet<string>,
+  ): ScriptEpisodeOutline {
     const plannedScenes = Array.isArray(value.plannedScenes) && value.plannedScenes.length > 0
       ? this.parsePlannedScenes(value.plannedScenes, 5)
       : [];
+    const characterIds = stringsField(value.characterIds ?? [], 'characterIds');
+    const unknownCharacterId = characterIds.find(
+      (characterId) => registeredCharacterIds && !registeredCharacterIds.has(characterId),
+    );
+    if (unknownCharacterId) {
+      throw new ScriptModelOutputError(`详细大纲引用了未登记人物 ID：${unknownCharacterId}。`);
+    }
     return {
       id: optionalStringField(value.id) ?? this.createId(),
       projectId,
@@ -874,7 +964,7 @@ export class ScriptDirector {
       goal: stringField(value.goal, 'goal'),
       conflict: stringField(value.conflict, 'conflict'),
       beats: stringsField(value.beats, 'beats'),
-      characterIds: stringsField(value.characterIds ?? [], 'characterIds'),
+      characterIds,
       plannedScenes,
       ...(optionalStringField(value.reveal) ? { reveal: optionalStringField(value.reveal) } : {}),
       ...(optionalStringField(value.reversal) ? { reversal: optionalStringField(value.reversal) } : {}),

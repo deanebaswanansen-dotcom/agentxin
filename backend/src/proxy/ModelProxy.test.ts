@@ -121,6 +121,23 @@ describe('OpenAiCompatibleModelProxy request shape', () => {
     expect(body.top_p).toBe(0.8);
   });
 
+  it('allows a structured task to override temperature for one request', async () => {
+    const fetchMock = vi.fn(async () => streamingResponse(buildSseWire(['{}'])));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const proxy = new OpenAiCompatibleModelProxy();
+    await collect(proxy.streamCompletion(
+      { ...CONFIG, temperature: 0.9 },
+      MESSAGES,
+      new AbortController().signal,
+      { jsonMode: true, temperature: 0.2 },
+    ));
+
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.temperature).toBe(0.2);
+  });
+
   it('tolerates a baseUrl with a trailing slash (no double slash)', async () => {
     const fetchMock = vi.fn(async () => streamingResponse(buildSseWire(['x'])));
     vi.stubGlobal('fetch', fetchMock);

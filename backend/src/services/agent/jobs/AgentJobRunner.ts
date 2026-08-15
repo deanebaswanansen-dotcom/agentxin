@@ -109,6 +109,15 @@ export class AgentJobRunner {
     await this.active.get(id)?.promise;
   }
 
+  async cancelForProject(clientId: string, projectId: string): Promise<void> {
+    const activeIds = this.store
+      .listForClient(clientId, projectId)
+      .map((run) => run.id)
+      .filter((id) => this.active.has(id));
+    await Promise.all(activeIds.map((id) => this.cancel(clientId, id)));
+    await Promise.all(activeIds.map((id) => this.waitUntilIdle(id)));
+  }
+
   private launch(
     id: string,
     clientId: string,
@@ -122,19 +131,36 @@ export class AgentJobRunner {
         const maxAttempts = this.options.maxAttempts ?? 3;
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
           await this.store.markRunning(id);
+          let progressWrites: Promise<void> = Promise.resolve();
           try {
             const result = await runWithClientId(clientId, () =>
               runWithRequestModelConfig(modelConfig, () =>
                 this.executor.run(request, controller.signal, (event) => {
-                  void this.store.appendEvent(id, event);
+                  progressWrites = progressWrites.then(async () => {
+                    await this.store.appendEvent(id, event);
+                  });
                 }),
               ),
             );
+            // Completion must never overtake a checkpoint/progress write. Apart
+            // from preserving event order, this makes the latest resumable
+            // script node durable before the job becomes completed.
+            await progressWrites;
             await this.store.complete(id, result);
             return;
           } catch (error) {
-            if (controller.signal.aborted || attempt >= maxAttempts || !isRetryable(error)) throw error;
-            await this.store.markRetrying(id, safeError(error));
+            let effectiveError = error;
+            try {
+              await progressWrites;
+            } catch (progressError) {
+              effectiveError = progressError;
+            }
+            if (
+              controller.signal.aborted ||
+              attempt >= maxAttempts ||
+              !isRetryable(effectiveError)
+            ) throw effectiveError;
+            await this.store.markRetrying(id, safeError(effectiveError));
             await delay(this.options.retryDelayMs ?? 1_000 * attempt, controller.signal);
           }
         }

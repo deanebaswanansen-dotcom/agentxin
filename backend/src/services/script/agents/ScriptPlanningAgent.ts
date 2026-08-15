@@ -53,7 +53,7 @@ export type ScriptPlanningAssessment =
       delegatedFields: ScriptPlanningField[];
     };
 
-const REQUIRED_FIELDS: readonly ScriptPlanningField[] = [
+export const SCRIPT_PLANNING_FIELDS: readonly ScriptPlanningField[] = [
   'genres',
   'coreConflict',
   'audience',
@@ -98,7 +98,7 @@ function questionFor(field: ScriptPlanningField, genre: string): ScriptPlanningQ
 
 export function assessScriptPlanning(session: ScriptPlanningSession): ScriptPlanningAssessment {
   const delegated = new Set(session.delegatedFields);
-  const missingFields = REQUIRED_FIELDS.filter(
+  const missingFields = SCRIPT_PLANNING_FIELDS.filter(
     (field) => !hasValue(session.values, field) && !delegated.has(field),
   );
   if (missingFields.length === 0) {

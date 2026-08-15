@@ -244,5 +244,5 @@ export interface ScriptEpisodeSummary {
   updatedAt: string;
 }
 
-export type ScriptExportFormat = 'txt' | 'md';
+export type ScriptExportFormat = 'txt' | 'md' | 'fountain';
 

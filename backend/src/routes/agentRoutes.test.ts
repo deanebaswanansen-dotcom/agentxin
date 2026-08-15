@@ -7,6 +7,7 @@ import { buildServer } from '../index.js';
 import type { ModelProxy } from '../proxy/ModelProxy.js';
 import type { StreamDelta } from '../proxy/sseParser.js';
 import { FileDataStore } from '../store/FileDataStore.js';
+import { FileScriptStore } from '../services/script/FileScriptStore.js';
 import type { ChatMessage, ModelConfig } from '../types/index.js';
 import { parseAgentBody, parsePlanSummary } from './agentRoutes.js';
 
@@ -23,6 +24,24 @@ class FakeProxy implements ModelProxy {
     this.signalStates.push(signal.aborted);
     return (async function* () {
       yield { kind: 'content' as const, text: '自动控稿输出' };
+    })();
+  }
+}
+
+class JsonProxy implements ModelProxy {
+  readonly prompts: string[] = [];
+
+  constructor(private readonly response: string) {}
+
+  streamCompletion(
+    _config: ModelConfig,
+    messages: ChatMessage[],
+    _signal: AbortSignal,
+  ): AsyncIterable<StreamDelta> {
+    this.prompts.push(String(messages.at(-1)?.content ?? ''));
+    const response = this.response;
+    return (async function* () {
+      yield { kind: 'content' as const, text: response };
     })();
   }
 }
@@ -106,6 +125,37 @@ describe('agent routes', () => {
         expectedPlanRevision: 3,
       },
     });
+  });
+
+  it('routes short-drama tasks through ScriptDirector instead of the novel orchestrator', async () => {
+    const store = await FileDataStore.create(join(dir, 'store.json'));
+    const scriptStore = await FileScriptStore.create(join(dir, 'scripts'));
+    const project = await store.createProject('竖屏短剧', 'short_drama');
+    const proxy = new JsonProxy(JSON.stringify({
+      title: '她不再道歉', theme: '摆脱情绪勒索', market: 'domestic', channel: 'female',
+      genres: ['都市情感'], audience: '女性观众', coreConflict: '女主反抗家庭控制',
+      logline: '女主在婚礼前夜揭穿家人的控制骗局。', highlights: ['婚礼反转'], totalEpisodes: 10,
+      episodeDurationSeconds: { min: 60, max: 90 }, targetCharsPerEpisode: 1200,
+      maxPrimaryCharacters: 6, maxScenesPerEpisode: 3, dialogueDensityPercent: 60,
+      language: 'zh-CN', format: 'cn_short_drama', coreRequirements: '每集有卡点',
+      forbiddenElements: [], endingDirection: '女主赢回人生',
+    }));
+    const app = buildServer(
+      store, proxy, undefined, undefined, undefined, undefined, undefined, scriptStore,
+    );
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/agent/run',
+      headers: modelConfigHeaders(),
+      payload: { task: 'script_plan', projectId: project.id, prompt: '一个拒绝道德绑架的女孩' },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ task: 'script_plan', projectId: project.id });
+    expect((await scriptStore.getProjectState(project.id))?.plan?.title).toBe('她不再道歉');
+    expect(proxy.prompts.join('\n')).toContain('一个拒绝道德绑架的女孩');
+    await app.close();
   });
 
   it('runs draft automation from one sentence and persists project artifacts', async () => {

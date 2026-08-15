@@ -88,6 +88,20 @@ describe('FileScriptCheckpointStore', () => {
     ]);
   });
 
+  it('deletes only the requested project checkpoint directory', async () => {
+    const store = await FileScriptCheckpointStore.create(root);
+    const projectOne = checkpoint();
+    const projectTwo = checkpoint({ projectId: 'project-2' });
+    await store.save(projectOne);
+    await store.save(projectTwo);
+
+    await store.deleteProject('project-1');
+
+    await expect(store.list('project-1', projectOne.runKey)).resolves.toEqual([]);
+    await expect(store.list('project-2', projectTwo.runKey)).resolves.toEqual([projectTwo]);
+    await expect(readdir(join(root, 'project-1'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('serializes concurrent saves without losing a checkpoint or leaving temp files', async () => {
     const store = await FileScriptCheckpointStore.create(root);
     const scenePlan = checkpoint({ node: 'scene_plan' });

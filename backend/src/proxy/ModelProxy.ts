@@ -26,6 +26,8 @@ export interface StreamCompletionOptions {
   jsonMode?: boolean;
   /** Optional small output budget for connection probes and classifiers. */
   maxTokens?: number;
+  /** Optional per-call sampling override for deterministic structured tasks. */
+  temperature?: number;
   /** Official DeepSeek only: use non-thinking mode for bounded structured output. */
   disableThinking?: boolean;
 }
@@ -183,7 +185,10 @@ export class OpenAiCompatibleModelProxy implements ModelProxy {
         typeof options?.maxTokens === 'number' && Number.isFinite(options.maxTokens)
           ? Math.min(65536, Math.max(16, Math.round(options.maxTokens)))
           : DEFAULT_MAX_TOKENS,
-      temperature: config.temperature ?? DEFAULT_TEMPERATURE,
+      temperature:
+        typeof options?.temperature === 'number' && Number.isFinite(options.temperature)
+          ? Math.min(2, Math.max(0, options.temperature))
+          : config.temperature ?? DEFAULT_TEMPERATURE,
       top_p: config.topP ?? DEFAULT_TOP_P,
     };
     if (options?.jsonMode === true) {

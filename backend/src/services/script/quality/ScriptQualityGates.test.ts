@@ -66,6 +66,7 @@ describe('validateScriptEpisode', () => {
     const invalidScene = {
       ...validScene(1),
       location: '',
+      characterIds: ['ghost'],
       blocks: [
         { id: 'artifact', type: 'action' as const, text: '```json <think>提示词</think> 校园剧' },
         { id: 'speaker', type: 'dialogue' as const, speaker: '', text: '台词' },
@@ -101,6 +102,7 @@ describe('validateScriptEpisode', () => {
           'DUPLICATE_SCENE_ORDINAL',
           'MISSING_LOCATION',
           'MISSING_SPEAKER',
+          'UNKNOWN_CHARACTER_REFERENCE',
           'MODEL_ARTIFACT',
           'FORBIDDEN_ELEMENT',
           'MISSING_KEY_EVENT',
