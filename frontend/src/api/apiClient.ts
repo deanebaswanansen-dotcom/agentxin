@@ -61,13 +61,20 @@ import type {
   ScriptAgentJobRequest,
   ScriptAgentJobSnapshot,
   ScriptCharacter,
+  ScriptConceptResult,
   ScriptEpisode,
   ScriptEpisodeOutline,
+  ScriptEpisodeReviewResult,
   ScriptEpisodeSummary,
   ScriptPlan,
   ScriptPlanTurnRequest,
   ScriptPlanTurnResponse,
+  ScriptReviewIssue,
+  ScriptReviewIssueCollection,
+  ScriptReviewStatus,
+  ScriptReviewIssueUpdateResult,
   ScriptSeriesOutline,
+  ScriptWorkspaceSnapshot,
   ScriptWorldBible,
   WordCountReport,
   WorldSetting,
@@ -289,6 +296,43 @@ export class ApiClientError extends Error {
   }
 }
 
+export interface ScriptProjectStateResponse {
+  schemaVersion: 1;
+  projectId: Id;
+  plan?: ScriptPlan;
+  characters: ScriptCharacter[];
+  worldBible?: ScriptWorldBible;
+  seriesOutline?: ScriptSeriesOutline;
+  episodeOutlines: ScriptEpisodeOutline[];
+  episodes: ScriptEpisode[];
+  continuity: {
+    currentState: string[];
+    openThreads: string[];
+    wardrobeLedger: Array<{
+      episodeNumber: number;
+      characterId: Id;
+      outfit: string;
+    }>;
+  };
+  reviewRevision: number;
+  reviewIssues: ScriptReviewIssue[];
+  updatedAt: string;
+}
+
+export type ScriptExportFormat = 'txt' | 'md' | 'fountain';
+
+export interface ScriptExportRange {
+  startEpisode?: number;
+  episodeCount?: number;
+}
+
+/** A server-produced export together with its transport metadata. */
+export interface ScriptExportFile {
+  blob: Blob;
+  filename: string;
+  contentType: string;
+}
+
 /** Type guard for {@link ApiClientError}. */
 export function isApiClientError(value: unknown): value is ApiClientError {
   return value instanceof ApiClientError;
@@ -451,6 +495,110 @@ async function requestText(
   } finally {
     timeout.dispose();
   }
+}
+
+function decodeContentDispositionFilename(value: string | null): string | undefined {
+  if (value === null) return undefined;
+
+  const encoded = /(?:^|;)\s*filename\*\s*=\s*(?:UTF-8'')?([^;]+)/i.exec(value)?.[1]
+    ?.trim()
+    .replace(/^"|"$/g, '');
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded);
+    } catch {
+      // Fall back to the legacy filename parameter when the RFC 5987 value is malformed.
+    }
+  }
+
+  const quoted = /(?:^|;)\s*filename\s*=\s*"([^"]*)"/i.exec(value)?.[1];
+  if (quoted) return quoted;
+  const unquoted = /(?:^|;)\s*filename\s*=\s*([^;]+)/i.exec(value)?.[1]?.trim();
+  return unquoted || undefined;
+}
+
+function safeServerFilename(value: string | undefined, fallback: string): string {
+  const candidate = (value ?? fallback)
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .replace(/[\\/]/g, '_')
+    .trim();
+  return candidate || fallback;
+}
+
+async function requestFile(
+  baseUrl: string,
+  path: string,
+  fallbackFilename: string,
+  signal?: AbortSignal,
+): Promise<ScriptExportFile> {
+  const timeout = linkedTimeoutSignal(signal, REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${baseUrl}${path}`, {
+      method: 'GET',
+      headers: clientIdentityHeader(),
+      signal: timeout.signal,
+    });
+    if (!response.ok) {
+      throw toApiClientError(await readBody(response), response.status, response.statusText);
+    }
+
+    const disposition = response.headers.get('Content-Disposition');
+    const contentType = response.headers.get('Content-Type') ?? 'application/octet-stream';
+    if (contentType.toLowerCase().includes('text/html') && disposition === null) {
+      throw new ApiClientError(
+        {
+          error: {
+            code: 'STORE_ERROR',
+            message: '导出接口返回了网页内容，可能是后端 API 未部署或路径被静态站回退。',
+          },
+        },
+        response.status,
+      );
+    }
+
+    const blob = await response.blob();
+    if (blob.size === 0) {
+      throw new ApiClientError({
+        error: { code: 'STORE_ERROR', message: '导出接口返回了空文件。' },
+      });
+    }
+    return {
+      blob,
+      filename: safeServerFilename(decodeContentDispositionFilename(disposition), fallbackFilename),
+      contentType,
+    };
+  } catch (error) {
+    if (timeout.didTimeout()) {
+      throw new ApiClientError({
+        error: { code: 'PROVIDER_ERROR', message: '导出请求超过 45 秒没有响应，请检查后端服务。' },
+      });
+    }
+    throw error;
+  } finally {
+    timeout.dispose();
+  }
+}
+
+function scriptExportPath(
+  projectId: Id,
+  format: ScriptExportFormat,
+  range?: ScriptExportRange,
+): string {
+  const params = new URLSearchParams({ format });
+  if (range?.startEpisode !== undefined) params.set('startEpisode', String(range.startEpisode));
+  if (range?.episodeCount !== undefined) params.set('episodeCount', String(range.episodeCount));
+  return `/projects/${seg(projectId)}/script-export?${params.toString()}`;
+}
+
+function scriptReviewIssuesPath(
+  projectId: Id,
+  filters?: { episodeNumber?: number; status?: ScriptReviewStatus },
+): string {
+  const params = new URLSearchParams();
+  if (filters?.episodeNumber !== undefined) params.set('episodeNumber', String(filters.episodeNumber));
+  if (filters?.status !== undefined) params.set('status', filters.status);
+  const query = params.toString();
+  return `/projects/${seg(projectId)}/script-review-issues${query ? `?${query}` : ''}`;
 }
 
 /** Encode a path segment (typically an id) for safe URL interpolation. */
@@ -1305,11 +1453,20 @@ export interface ApiClient {
     remove(id: Id, signal?: AbortSignal): Promise<void>;
   };
   script: {
+    state: {
+      /** Load the complete persisted short-drama state in one request. */
+      get(projectId: Id, signal?: AbortSignal): Promise<ScriptProjectStateResponse>;
+    };
+    workspace: {
+      /** Load the product workspace shell, summaries, batches and review state in one request. */
+      get(projectId: Id, signal?: AbortSignal): Promise<ScriptWorkspaceSnapshot>;
+    };
     plan: {
       get(projectId: Id, signal?: AbortSignal): Promise<ScriptPlan>;
       save(projectId: Id, value: ScriptPlan, expectedRevision: number, signal?: AbortSignal): Promise<ScriptPlan>;
       approve(projectId: Id, expectedRevision: number, signal?: AbortSignal): Promise<ScriptPlan>;
       turn(body: ScriptPlanTurnRequest, signal?: AbortSignal): Promise<ScriptPlanTurnResponse>;
+      concepts(projectId: Id, seedPrompt?: string, signal?: AbortSignal): Promise<ScriptConceptResult>;
     };
     characters: {
       list(projectId: Id, signal?: AbortSignal): Promise<ScriptCharacter[]>;
@@ -1331,6 +1488,12 @@ export interface ApiClient {
       list(projectId: Id, signal?: AbortSignal): Promise<ScriptEpisodeSummary[]>;
       get(projectId: Id, episodeNumber: number, signal?: AbortSignal): Promise<ScriptEpisode>;
       save(projectId: Id, episodeNumber: number, value: ScriptEpisode, expectedRevision: number, signal?: AbortSignal): Promise<ScriptEpisode>;
+      review(projectId: Id, episodeNumber: number, expectedRevision: number, signal?: AbortSignal): Promise<ScriptEpisodeReviewResult>;
+    };
+    reviews: {
+      list(projectId: Id, filters?: { episodeNumber?: number; status?: ScriptReviewStatus }, signal?: AbortSignal): Promise<ScriptReviewIssueCollection>;
+      save(projectId: Id, items: ScriptReviewIssue[], expectedRevision: number, signal?: AbortSignal): Promise<ScriptReviewIssueCollection>;
+      updateStatus(projectId: Id, issueId: Id, status: ScriptReviewStatus, expectedRevision: number, signal?: AbortSignal): Promise<ScriptReviewIssueUpdateResult>;
     };
     jobs: {
       create(body: ScriptAgentJobRequest, signal?: AbortSignal): Promise<ScriptAgentJobSnapshot>;
@@ -1339,7 +1502,8 @@ export interface ApiClient {
       resume(jobId: string, signal?: AbortSignal): Promise<ScriptAgentJobSnapshot>;
       cancel(jobId: string, signal?: AbortSignal): Promise<ScriptAgentJobSnapshot>;
     };
-    export(projectId: Id, format: 'txt' | 'md' | 'fountain', range?: { startEpisode?: number; episodeCount?: number }, signal?: AbortSignal): Promise<string>;
+    export(projectId: Id, format: ScriptExportFormat, range?: ScriptExportRange, signal?: AbortSignal): Promise<string>;
+    exportFile(projectId: Id, format: ScriptExportFormat, range?: ScriptExportRange, signal?: AbortSignal): Promise<ScriptExportFile>;
   };
   chapters: {
     list(projectId: Id, signal?: AbortSignal): Promise<Chapter[]>;
@@ -1524,6 +1688,14 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
       remove: (id, signal) => request(b, 'DELETE', `/projects/${seg(id)}`, undefined, { signal }),
     },
     script: {
+      state: {
+        get: (projectId, signal) =>
+          request(b, 'GET', `/projects/${seg(projectId)}/script-state`, undefined, { signal }),
+      },
+      workspace: {
+        get: (projectId, signal) =>
+          request(b, 'GET', `/projects/${seg(projectId)}/script-workspace`, undefined, { signal }),
+      },
       plan: {
         get: (projectId, signal) =>
           request(b, 'GET', `/projects/${seg(projectId)}/script-plan`, undefined, { signal }),
@@ -1533,6 +1705,11 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
           request(b, 'POST', `/projects/${seg(projectId)}/script-plan/approve`, { expectedRevision }, { signal }),
         turn: (body, signal) =>
           request(b, 'POST', '/plan/script/turn', body, { signal, includeModelConfig: true }),
+        concepts: (projectId, seedPrompt = '', signal) =>
+          request(b, 'POST', '/plan/script/concepts', { projectId, seedPrompt }, {
+            signal,
+            includeModelConfig: true,
+          }),
       },
       characters: {
         list: (projectId, signal) =>
@@ -1565,6 +1742,16 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
           request(b, 'GET', `/projects/${seg(projectId)}/script-episodes/${episodeNumber}`, undefined, { signal }),
         save: (projectId, episodeNumber, value, expectedRevision, signal) =>
           request(b, 'PUT', `/projects/${seg(projectId)}/script-episodes/${episodeNumber}`, { expectedRevision, value }, { signal }),
+        review: (projectId, episodeNumber, expectedRevision, signal) =>
+          request(b, 'POST', `/projects/${seg(projectId)}/script-episodes/${episodeNumber}/review`, { expectedRevision }, { signal }),
+      },
+      reviews: {
+        list: (projectId, filters, signal) =>
+          request(b, 'GET', scriptReviewIssuesPath(projectId, filters), undefined, { signal }),
+        save: (projectId, items, expectedRevision, signal) =>
+          request(b, 'PUT', `/projects/${seg(projectId)}/script-review-issues`, { expectedRevision, items }, { signal }),
+        updateStatus: (projectId, issueId, status, expectedRevision, signal) =>
+          request(b, 'PATCH', `/projects/${seg(projectId)}/script-review-issues/${seg(issueId)}`, { expectedRevision, status }, { signal }),
       },
       jobs: {
         create: (body, signal) =>
@@ -1584,12 +1771,15 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
         cancel: (jobId, signal) =>
           request(b, 'POST', `/agent/jobs/${seg(jobId)}/cancel`, {}, { signal }),
       },
-      export: (projectId, format, range, signal) => {
-        const params = new URLSearchParams({ format });
-        if (range?.startEpisode !== undefined) params.set('startEpisode', String(range.startEpisode));
-        if (range?.episodeCount !== undefined) params.set('episodeCount', String(range.episodeCount));
-        return requestText(b, `/projects/${seg(projectId)}/script-export?${params.toString()}`, signal);
-      },
+      export: (projectId, format, range, signal) =>
+        requestText(b, scriptExportPath(projectId, format, range), signal),
+      exportFile: (projectId, format, range, signal) =>
+        requestFile(
+          b,
+          scriptExportPath(projectId, format, range),
+          `short-drama-${projectId}.${format}`,
+          signal,
+        ),
     },
     chapters: {
       list: (projectId, signal) =>

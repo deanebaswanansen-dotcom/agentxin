@@ -82,6 +82,17 @@ describe('App shell', () => {
     };
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, 'http://localhost');
+      if (url.pathname.endsWith('/script-workspace')) return Response.json({
+        schemaVersion: 1,
+        projectId: 'script-1',
+        plan,
+        characters: [],
+        episodeSummaries: [],
+        batchSummaries: [],
+        reviewRevision: 0,
+        reviewIssues: [],
+        updatedAt: '2026-08-14T00:00:00.000Z',
+      });
       if (url.pathname.endsWith('/script-plan')) return Response.json(plan);
       if (url.pathname.endsWith('/script-world') || url.pathname.endsWith('/script-outline')) {
         return Response.json({ error: { code: 'NOT_FOUND', message: 'missing' } }, { status: 404 });
@@ -94,7 +105,7 @@ describe('App shell', () => {
     fireEvent.click(await screen.findByTitle('竖屏短剧'));
 
     expect(await screen.findByRole('tab', { name: '剧本策划' })).toBeInTheDocument();
-    expect(screen.getByText('短剧制作台')).toBeInTheDocument();
+    expect(screen.getByText('短剧生产工作台')).toBeInTheDocument();
     await waitFor(() => expect(screen.queryByRole('textbox', { name: '对话输入' })).not.toBeInTheDocument());
   });
 

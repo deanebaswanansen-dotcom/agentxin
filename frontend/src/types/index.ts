@@ -1077,6 +1077,26 @@ export interface ScriptPlan {
   updatedAt: string;
 }
 
+export interface ScriptConceptProposal {
+  title: string;
+  theme: string;
+  market: 'domestic' | 'overseas';
+  channel: 'female' | 'male' | 'general';
+  genres: string[];
+  logline: string;
+  audience: string;
+  coreConflict: string;
+  highlights: string[];
+  mainArc: string;
+  endingDirection: string;
+  coverPrompt: string;
+  totalEpisodes: number;
+}
+
+export interface ScriptConceptResult {
+  proposals: ScriptConceptProposal[];
+}
+
 export type ScriptPlanAnswerValue = string | string[] | number | boolean;
 
 export interface ScriptPlanAnswer {
@@ -1254,6 +1274,96 @@ export interface ScriptEpisodeSummary {
   sceneCount: number;
   revision: number;
   updatedAt: string;
+}
+
+export type ScriptReviewSeverity = 'hard' | 'soft' | 'suggestion';
+export type ScriptReviewStatus = 'open' | 'fixed' | 'ignored';
+export type ScriptReviewSource = 'deterministic' | 'ai' | 'user';
+export type ScriptReviewCategory =
+  | 'format'
+  | 'continuity'
+  | 'logic'
+  | 'dialogue'
+  | 'character'
+  | 'pacing'
+  | 'spelling'
+  | 'hook';
+
+export interface ScriptReviewIssue {
+  id: Id;
+  projectId: Id;
+  episodeNumber: number;
+  sceneId?: Id;
+  blockId?: Id;
+  path?: string;
+  code: string;
+  severity: ScriptReviewSeverity;
+  category: ScriptReviewCategory;
+  message: string;
+  suggestion?: string;
+  status: ScriptReviewStatus;
+  source: ScriptReviewSource;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type ScriptBatchStatus =
+  | 'blocked'
+  | 'ready'
+  | 'generating'
+  | 'proofreading'
+  | 'completed'
+  | 'failed';
+
+export interface ScriptBatchSummary {
+  startEpisode: number;
+  endEpisode: number;
+  status: ScriptBatchStatus;
+  completedEpisodes: number;
+  visibleChars: number;
+  activeJobId?: string;
+  unresolvedHardIssues: number;
+  unresolvedSoftIssues: number;
+}
+
+export interface ScriptWorkspaceSnapshot {
+  schemaVersion: 1;
+  projectId: Id;
+  plan?: ScriptPlan;
+  outline?: ScriptSeriesOutline;
+  characters: ScriptCharacter[];
+  worldBible?: ScriptWorldBible;
+  episodeSummaries: ScriptEpisodeSummary[];
+  batchSummaries: ScriptBatchSummary[];
+  reviewRevision: number;
+  reviewIssues: ScriptReviewIssue[];
+  updatedAt: string;
+}
+
+export interface ScriptReviewIssueCollection {
+  revision: number;
+  items: ScriptReviewIssue[];
+}
+
+export interface ScriptReviewIssueUpdateResult {
+  revision: number;
+  item: ScriptReviewIssue;
+}
+
+export interface ScriptEpisodeReviewResult extends ScriptReviewIssueCollection {
+  report: {
+    hardFailed: boolean;
+    issues: Array<{
+      code: string;
+      severity: 'hard' | 'soft';
+      message: string;
+      sceneId?: Id;
+      blockId?: Id;
+      path?: string;
+    }>;
+    visibleChars: number;
+    dialogueDensityPercent: number;
+  };
 }
 
 export interface ScriptBatchOptions {

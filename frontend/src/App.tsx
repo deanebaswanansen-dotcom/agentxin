@@ -60,7 +60,7 @@ function BrandLogo(): JSX.Element {
 }
 
 function Workbench(): JSX.Element {
-  const { reportError } = useErrorReporter();
+  const { reportError, dismissError } = useErrorReporter();
   useDialogFocusTrap();
 
   // —— 抽屉控制 ——
@@ -483,6 +483,7 @@ function Workbench(): JSX.Element {
               projectId={selectedProjectId}
               projectName={selectedProjectName}
               onError={reportError}
+              onErrorClear={dismissError}
             />
           ) : <div className="nwa-editor-board">
             <div className="nwa-editor-board__toolbar">

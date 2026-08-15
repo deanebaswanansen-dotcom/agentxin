@@ -36,7 +36,8 @@ function renderBlock(block: ScriptBlock): string {
   const text = block.text.trim();
   if (block.type === 'caption') return `【字幕：${text}】`;
   if (block.type === 'action') return `△${text}`;
-  const parenthetical = block.delivery?.trim() || block.mode;
+  const mode = block.mode === 'os' || block.mode === 'vo' ? block.mode : '';
+  const parenthetical = block.delivery?.trim() || mode;
   return `${block.speaker.trim()}${parenthetical ? `（${parenthetical}）` : ''}：${text}`;
 }
 

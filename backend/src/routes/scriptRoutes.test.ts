@@ -369,6 +369,94 @@ describe('scriptRoutes', () => {
     });
   });
 
+  it('rejects completed status while the episode has a persisted open hard review issue', async () => {
+    await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-plan`,
+      payload: {
+        expectedRevision: 0,
+        value: { ...planInput(), targetCharsPerEpisode: 300 },
+      },
+    });
+    const outlineResponse = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/episode-outlines/1`,
+      payload: { expectedRevision: 0, value: episodeOutlineInput(1) },
+    });
+    const outlineId = outlineResponse.json().id as string;
+    await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-review-issues`,
+      payload: {
+        expectedRevision: 0,
+        items: [{
+          id: 'ai-hard-1',
+          episodeNumber: 1,
+          code: 'AI_LOGIC_CONFLICT',
+          severity: 'hard',
+          category: 'logic',
+          message: '人物动机与前集冲突。',
+          status: 'open',
+          source: 'ai',
+        }],
+      },
+    });
+
+    const completedValue = {
+      episodeNumber: 1,
+      title: '初入老宅',
+      outlineId,
+      status: 'completed' as const,
+      targetChars: 300,
+      scenes: [{
+        id: 'scene-valid',
+        ordinal: 1,
+        location: '沈家老宅大门',
+        timeOfDay: 'day',
+        interiorExterior: 'exterior',
+        characterIds: [],
+        blocks: [{ id: 'action-valid', type: 'action', text: '剧情'.repeat(135) }],
+      }],
+      summary: '沈清进入老宅并直面旧规。',
+      newFacts: [],
+      openedThreads: [],
+      closedThreads: [],
+    };
+    const response = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-episodes/1`,
+      payload: {
+        expectedRevision: 0,
+        value: completedValue,
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: expect.stringContaining('未解决的硬性校稿问题'),
+        details: {
+          issues: [expect.objectContaining({ id: 'ai-hard-1', status: 'open' })],
+        },
+      },
+    });
+
+    const fixed = await app.inject({
+      method: 'PATCH',
+      url: `/api/projects/${projectId}/script-review-issues/ai-hard-1`,
+      payload: { expectedRevision: 1, status: 'fixed' },
+    });
+    expect(fixed.statusCode).toBe(200);
+    const completed = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-episodes/1`,
+      payload: { expectedRevision: 0, value: completedValue },
+    });
+    expect(completed.statusCode).toBe(200);
+    expect(completed.json()).toMatchObject({ episodeNumber: 1, status: 'completed' });
+  });
+
   it('returns 404 for a missing single resource and [] for empty lists', async () => {
     const missing = await app.inject({
       method: 'GET',
@@ -382,5 +470,124 @@ describe('scriptRoutes', () => {
     expect(missing.statusCode).toBe(404);
     expect(missing.json().error.code).toBe('NOT_FOUND');
     expect(list.json()).toEqual([]);
+  });
+
+  it('returns a compact five-episode workspace and persists proofreading issue status', async () => {
+    await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-plan`,
+      payload: { expectedRevision: 0, value: planInput() },
+    });
+    await app.inject({
+      method: 'POST',
+      url: `/api/projects/${projectId}/script-plan/approve`,
+      payload: { expectedRevision: 1 },
+    });
+    await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-characters`,
+      payload: { expectedRevision: 0, items: charactersInput() },
+    });
+    await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-world`,
+      payload: { expectedRevision: 0, value: worldInput() },
+    });
+    await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-outline`,
+      payload: { expectedRevision: 0, value: outlineInput() },
+    });
+    await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-episodes/1`,
+      payload: { expectedRevision: 0, value: { ...episodeInput(1), status: 'reviewing' } },
+    });
+    const savedIssues = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-review-issues`,
+      payload: {
+        expectedRevision: 0,
+        items: [{
+          id: 'manual-1',
+          episodeNumber: 1,
+          code: 'WORDING',
+          severity: 'soft',
+          category: 'dialogue',
+          message: '台词可以更口语化。',
+          status: 'open',
+          source: 'user',
+        }],
+      },
+    });
+    expect(savedIssues.statusCode).toBe(200);
+    expect(savedIssues.json()).toMatchObject({ revision: 1, items: [{ id: 'manual-1' }] });
+
+    const workspace = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${projectId}/script-workspace`,
+    });
+    expect(workspace.statusCode).toBe(200);
+    expect(workspace.json()).toMatchObject({
+      schemaVersion: 1,
+      projectId,
+      plan: { title: '绝食逼我道歉？' },
+      outline: { synopsis: '沈清逐步打破沈家旧规。' },
+      characters: [{ name: '沈清' }],
+      worldBible: { era: '2026年' },
+      reviewRevision: 1,
+      episodeSummaries: [{ episodeNumber: 1, status: 'reviewing' }],
+      batchSummaries: [
+        {
+          startEpisode: 1,
+          endEpisode: 5,
+          status: 'proofreading',
+          completedEpisodes: 0,
+          unresolvedHardIssues: 0,
+          unresolvedSoftIssues: 1,
+        },
+        { startEpisode: 6, endEpisode: 10, status: 'ready' },
+      ],
+    });
+
+    const patched = await app.inject({
+      method: 'PATCH',
+      url: `/api/projects/${projectId}/script-review-issues/manual-1`,
+      payload: { expectedRevision: 1, status: 'ignored' },
+    });
+    expect(patched.json()).toMatchObject({
+      revision: 2,
+      item: { id: 'manual-1', status: 'ignored' },
+    });
+    const open = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${projectId}/script-review-issues?episodeNumber=1&status=open`,
+    });
+    expect(open.json()).toEqual({ revision: 2, items: [] });
+
+    const reviewed = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${projectId}/script-episodes/1/review`,
+      payload: { expectedRevision: 2 },
+    });
+    expect(reviewed.statusCode).toBe(200);
+    expect(reviewed.json()).toMatchObject({
+      revision: 3,
+      report: { hardFailed: true },
+      items: expect.arrayContaining([
+        expect.objectContaining({ code: 'TOO_SHORT', source: 'deterministic', status: 'open' }),
+        expect.objectContaining({ id: 'manual-1', source: 'user', status: 'ignored' }),
+      ]),
+    });
+    const hardIssue = reviewed.json().items.find((item: { severity: string }) => item.severity === 'hard');
+    const ignoreHard = await app.inject({
+      method: 'PATCH',
+      url: `/api/projects/${projectId}/script-review-issues/${hardIssue.id}`,
+      payload: { expectedRevision: 3, status: 'ignored' },
+    });
+    expect(ignoreHard.statusCode).toBe(400);
+    expect(ignoreHard.json()).toMatchObject({
+      error: { code: 'VALIDATION_ERROR', message: expect.stringContaining('不能忽略') },
+    });
   });
 });

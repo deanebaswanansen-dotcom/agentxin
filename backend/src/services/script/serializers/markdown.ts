@@ -36,7 +36,8 @@ export function serializeScriptMarkdown(
             if (block.type === 'caption') lines.push(`> 字幕：${text}`);
             else if (block.type === 'action') lines.push(`△${text}`);
             else {
-              const parenthetical = block.delivery?.trim() || block.mode;
+              const mode = block.mode === 'os' || block.mode === 'vo' ? block.mode : '';
+              const parenthetical = block.delivery?.trim() || mode;
               lines.push(`**${block.speaker.trim()}${parenthetical ? `（${parenthetical}）` : ''}：**${text}`);
             }
           }

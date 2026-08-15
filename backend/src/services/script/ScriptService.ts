@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { StoreError } from '../../store/StoreError.js';
 import type {
   ScriptBlock,
+  ScriptBatchSummary,
   ScriptCharacter,
   ScriptCharacterInput,
   ScriptEpisode,
@@ -14,17 +15,30 @@ import type {
   ScriptPlan,
   ScriptPlanInput,
   ScriptProjectState,
+  ScriptReviewCategory,
+  ScriptReviewIssue,
+  ScriptReviewIssueCollection,
+  ScriptReviewIssueInput,
+  ScriptReviewIssueUpdateResult,
+  ScriptReviewSeverity,
+  ScriptReviewSource,
+  ScriptReviewStatus,
   ScriptScene,
   ScriptSeriesOutline,
   ScriptSeriesOutlineInput,
   ScriptWorldBible,
   ScriptWorldBibleInput,
+  ScriptWorkspaceSnapshot,
 } from './domain.js';
 import { serializeChineseShortDrama } from './serializers/chineseShortDrama.js';
 import { serializeScriptMarkdown } from './serializers/markdown.js';
 import { serializeFountain } from './serializers/fountain.js';
 import { ScriptConflictError, type ScriptStore } from './ScriptStore.js';
-import { validateScriptEpisode } from './quality/ScriptQualityGates.js';
+import {
+  createScriptReviewIssues,
+  type ScriptGateReport,
+  validateScriptEpisode,
+} from './quality/ScriptQualityGates.js';
 
 const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const PLAN_STATUSES = ['draft', 'approved', 'locked'] as const;
@@ -33,6 +47,19 @@ const OUTLINE_STATUSES = ['card', 'expanded', 'approved'] as const;
 const EPISODE_STATUSES = ['planned', 'generating', 'reviewing', 'completed', 'failed'] as const;
 const TIMES = ['day', 'night', 'dawn', 'dusk'] as const;
 const IN_OUT = ['interior', 'exterior'] as const;
+const REVIEW_SEVERITIES = ['hard', 'soft', 'suggestion'] as const;
+const REVIEW_STATUSES = ['open', 'fixed', 'ignored'] as const;
+const REVIEW_SOURCES = ['deterministic', 'ai', 'user'] as const;
+const REVIEW_CATEGORIES = [
+  'format',
+  'continuity',
+  'logic',
+  'dialogue',
+  'character',
+  'pacing',
+  'spelling',
+  'hook',
+] as const;
 
 export type ScriptServiceErrorCode = 'VALIDATION_ERROR' | 'NOT_FOUND';
 
@@ -359,6 +386,46 @@ function parseEpisode(value: unknown): ScriptEpisodeInput {
   };
 }
 
+export interface ScriptEpisodeReviewResult extends ScriptReviewIssueCollection {
+  report: ScriptGateReport;
+}
+
+function parseReviewIssue(value: unknown, index: number): ScriptReviewIssueInput {
+  const input = record(value, `第${index + 1}条校稿问题`);
+  const sceneId = optionalId(input.sceneId);
+  const blockId = optionalId(input.blockId);
+  const path = optionalString(input.path, '问题路径', 500);
+  const suggestion = optionalString(input.suggestion, '修改建议', 4_000);
+  return {
+    ...(optionalId(input.id) ? { id: optionalId(input.id) } : {}),
+    episodeNumber: integer(input.episodeNumber, '问题集号', 1, 200),
+    ...(sceneId ? { sceneId } : {}),
+    ...(blockId ? { blockId } : {}),
+    ...(path !== undefined ? { path } : {}),
+    code: stringValue(input.code, '问题代码', 100),
+    severity: enumValue(input.severity, '问题严重度', REVIEW_SEVERITIES) as ScriptReviewSeverity,
+    category: enumValue(input.category, '问题分类', REVIEW_CATEGORIES) as ScriptReviewCategory,
+    message: stringValue(input.message, '问题描述', 4_000),
+    ...(suggestion !== undefined ? { suggestion } : {}),
+    status: enumValue(input.status ?? 'open', '问题状态', REVIEW_STATUSES) as ScriptReviewStatus,
+    source: enumValue(input.source ?? 'user', '问题来源', REVIEW_SOURCES) as ScriptReviewSource,
+  };
+}
+
+function parseReviewIssues(value: unknown): ScriptReviewIssueInput[] {
+  if (!Array.isArray(value)) throw ScriptServiceError.validation('校稿问题必须是数组');
+  if (value.length > 5_000) throw ScriptServiceError.validation('校稿问题不能超过5000条');
+  const parsed = value.map(parseReviewIssue);
+  if (parsed.some((item) => item.severity === 'hard' && item.status === 'ignored')) {
+    throw ScriptServiceError.validation('硬性校稿问题不能标记为已忽略');
+  }
+  const suppliedIds = parsed.flatMap((item) => item.id ? [item.id] : []);
+  if (new Set(suppliedIds).size !== suppliedIds.length) {
+    throw ScriptServiceError.validation('校稿问题 id 不能重复');
+  }
+  return parsed;
+}
+
 function currentRevision(items: Array<{ revision: number }>): number {
   return Math.max(0, ...items.map((item) => item.revision));
 }
@@ -368,6 +435,77 @@ export function countScriptVisibleChars(episode: ScriptEpisode): number {
     (total, scene) => total + scene.blocks.reduce((sum, block) => sum + block.text.replace(/\s/gu, '').length, 0),
     0,
   );
+}
+
+function episodeSummaries(state: ScriptProjectState | undefined): ScriptEpisodeSummary[] {
+  return (state?.episodes ?? [])
+    .map((episode) => ({
+      id: episode.id,
+      episodeNumber: episode.episodeNumber,
+      title: episode.title,
+      status: episode.status,
+      targetChars: episode.targetChars,
+      visibleChars: countScriptVisibleChars(episode),
+      sceneCount: episode.scenes.length,
+      revision: episode.revision,
+      updatedAt: episode.updatedAt,
+    }))
+    .sort((left, right) => left.episodeNumber - right.episodeNumber);
+}
+
+function batchSummaries(
+  state: ScriptProjectState | undefined,
+  summaries: readonly ScriptEpisodeSummary[],
+): ScriptBatchSummary[] {
+  const highestKnownEpisode = Math.max(
+    0,
+    ...summaries.map((item) => item.episodeNumber),
+    ...(state?.episodeOutlines ?? []).map((item) => item.episodeNumber),
+  );
+  const totalEpisodes = state?.plan?.totalEpisodes ?? highestKnownEpisode;
+  const frontMatterReady = Boolean(
+    state?.plan &&
+    state.plan.status !== 'draft' &&
+    state.characters.length > 0 &&
+    state.worldBible &&
+    state.seriesOutline,
+  );
+  const result: ScriptBatchSummary[] = [];
+  for (let startEpisode = 1; startEpisode <= totalEpisodes; startEpisode += 5) {
+    const endEpisode = Math.min(startEpisode + 4, totalEpisodes);
+    const episodes = summaries.filter(
+      (item) => item.episodeNumber >= startEpisode && item.episodeNumber <= endEpisode,
+    );
+    const unresolved = (state?.reviewIssues ?? []).filter(
+      (item) =>
+        item.status === 'open' &&
+        item.episodeNumber >= startEpisode &&
+        item.episodeNumber <= endEpisode,
+    );
+    const unresolvedHardIssues = unresolved.filter((item) => item.severity === 'hard').length;
+    const unresolvedSoftIssues = unresolved.length - unresolvedHardIssues;
+    const completedEpisodes = episodes.filter((item) => item.status === 'completed').length;
+    const batchSize = endEpisode - startEpisode + 1;
+    let status: ScriptBatchSummary['status'];
+    if (episodes.some((item) => item.status === 'generating')) status = 'generating';
+    else if (episodes.some((item) => item.status === 'failed') || unresolvedHardIssues > 0) status = 'failed';
+    else if (
+      episodes.some((item) => item.status === 'reviewing') ||
+      unresolvedSoftIssues > 0
+    ) status = 'proofreading';
+    else if (completedEpisodes === batchSize) status = 'completed';
+    else status = frontMatterReady ? 'ready' : 'blocked';
+    result.push({
+      startEpisode,
+      endEpisode,
+      status,
+      completedEpisodes,
+      visibleChars: episodes.reduce((sum, item) => sum + item.visibleChars, 0),
+      unresolvedHardIssues,
+      unresolvedSoftIssues,
+    });
+  }
+  return result;
 }
 
 export class ScriptService {
@@ -389,6 +527,25 @@ export class ScriptService {
   async getState(projectId: string): Promise<ScriptProjectState | undefined> {
     await this.assertProject(projectId);
     return this.store.getProjectState(projectId);
+  }
+
+  async getWorkspace(projectId: string): Promise<ScriptWorkspaceSnapshot> {
+    await this.assertProject(projectId);
+    const state = await this.store.getProjectState(projectId);
+    const summaries = episodeSummaries(state);
+    return {
+      schemaVersion: 1,
+      projectId,
+      ...(state?.plan ? { plan: state.plan } : {}),
+      ...(state?.seriesOutline ? { outline: state.seriesOutline } : {}),
+      characters: state?.characters ?? [],
+      ...(state?.worldBible ? { worldBible: state.worldBible } : {}),
+      episodeSummaries: summaries,
+      batchSummaries: batchSummaries(state, summaries),
+      reviewRevision: state?.reviewRevision ?? 0,
+      reviewIssues: state?.reviewIssues ?? [],
+      updatedAt: state?.updatedAt ?? new Date(0).toISOString(),
+    };
   }
 
   private async requireState(projectId: string): Promise<ScriptProjectState> {
@@ -550,20 +707,111 @@ export class ScriptService {
 
   async listEpisodes(projectId: string): Promise<ScriptEpisodeSummary[]> {
     await this.assertProject(projectId);
-    const episodes = (await this.store.getProjectState(projectId))?.episodes ?? [];
-    return episodes
-      .map((episode) => ({
-        id: episode.id,
-        episodeNumber: episode.episodeNumber,
-        title: episode.title,
-        status: episode.status,
-        targetChars: episode.targetChars,
-        visibleChars: countScriptVisibleChars(episode),
-        sceneCount: episode.scenes.length,
-        revision: episode.revision,
-        updatedAt: episode.updatedAt,
-      }))
-      .sort((a, b) => a.episodeNumber - b.episodeNumber);
+    return episodeSummaries(await this.store.getProjectState(projectId));
+  }
+
+  async listReviewIssues(
+    projectId: string,
+    filters: { episodeNumber?: number; status?: ScriptReviewStatus } = {},
+  ): Promise<ScriptReviewIssueCollection> {
+    await this.assertProject(projectId);
+    const state = await this.store.getProjectState(projectId);
+    const items = (state?.reviewIssues ?? []).filter(
+      (item) =>
+        (filters.episodeNumber === undefined || item.episodeNumber === filters.episodeNumber) &&
+        (filters.status === undefined || item.status === filters.status),
+    );
+    return { revision: state?.reviewRevision ?? 0, items };
+  }
+
+  async saveReviewIssues(
+    projectId: string,
+    value: unknown,
+    expectedRevision: number,
+  ): Promise<ScriptReviewIssueCollection> {
+    await this.assertProject(projectId);
+    const inputs = parseReviewIssues(value);
+    const state = await this.store.getProjectState(projectId);
+    const currentById = new Map((state?.reviewIssues ?? []).map((item) => [item.id, item]));
+    const now = new Date().toISOString();
+    const items = inputs.map((input) => {
+      const previous = input.id ? currentById.get(input.id) : undefined;
+      return {
+        ...input,
+        id: input.id ?? randomUUID(),
+        projectId,
+        createdAt: previous?.createdAt ?? now,
+        updatedAt: now,
+      } satisfies ScriptReviewIssue;
+    });
+    return this.store.saveReviewIssues(projectId, items, expectedRevision);
+  }
+
+  async updateReviewIssueStatus(
+    projectId: string,
+    issueId: string,
+    statusValue: unknown,
+    expectedRevision: number,
+  ): Promise<ScriptReviewIssueUpdateResult> {
+    await this.assertProject(projectId);
+    const id = idValue(issueId, '校稿问题 id');
+    const status = enumValue(statusValue, '问题状态', REVIEW_STATUSES) as ScriptReviewStatus;
+    const state = await this.store.getProjectState(projectId);
+    const current = state?.reviewIssues.find((item) => item.id === id);
+    if (!current) throw ScriptServiceError.notFound('校稿问题不存在');
+    if (current.severity === 'hard' && status === 'ignored') {
+      throw ScriptServiceError.validation('硬性校稿问题不能忽略，必须修复后重新校稿');
+    }
+    const item = { ...current, status, updatedAt: new Date().toISOString() };
+    const saved = await this.store.saveReviewIssues(
+      projectId,
+      (state?.reviewIssues ?? []).map((candidate) => candidate.id === id ? item : candidate),
+      expectedRevision,
+    );
+    return { revision: saved.revision, item };
+  }
+
+  async reviewEpisode(
+    projectId: string,
+    episodeNumber: number,
+    expectedReviewRevision: number,
+  ): Promise<ScriptEpisodeReviewResult> {
+    const state = await this.requireState(projectId);
+    const plan = state.plan;
+    if (!plan) throw ScriptServiceError.validation('校稿前必须先保存短剧策划');
+    const episode = state.episodes.find((item) => item.episodeNumber === episodeNumber);
+    if (!episode) throw ScriptServiceError.notFound(`第${episodeNumber}集正文尚未创建`);
+    const outline = state.episodeOutlines.find((item) => item.episodeNumber === episodeNumber);
+    const charactersById = new Map(state.characters.map((item) => [item.id, item.name]));
+    const report = validateScriptEpisode(episode, plan, {
+      expectedEpisodeNumber: episodeNumber,
+      registeredCharacterIds: new Set(charactersById.keys()),
+      registeredCharacterNames: new Set(charactersById.values()),
+      characterNamesById: charactersById,
+      ...(outline ? { outline } : {}),
+      previousEpisode: state.episodes
+        .filter((item) => item.episodeNumber < episodeNumber)
+        .sort((left, right) => right.episodeNumber - left.episodeNumber)[0],
+      continuity: state.continuity,
+    });
+    const generated = createScriptReviewIssues(
+      projectId,
+      episodeNumber,
+      'deterministic',
+      report.issues,
+    );
+    const saved = await this.store.replaceEpisodeReviewIssues(
+      projectId,
+      episodeNumber,
+      ['deterministic'],
+      generated,
+      expectedReviewRevision,
+    );
+    return {
+      revision: saved.revision,
+      items: saved.items.filter((item) => item.episodeNumber === episodeNumber),
+      report,
+    };
   }
 
   async saveEpisode(
@@ -600,6 +848,17 @@ export class ScriptService {
       if (!plan) {
         throw ScriptServiceError.validation('完成正文前必须先保存并确认短剧策划');
       }
+      const unresolvedHardIssues = (state?.reviewIssues ?? []).filter(
+        (item) =>
+          item.episodeNumber === episodeNumber &&
+          item.severity === 'hard' &&
+          item.status === 'open',
+      );
+      if (unresolvedHardIssues.length > 0) {
+        throw ScriptServiceError.validation('本集仍有未解决的硬性校稿问题，不能标记为已完成', {
+          issues: unresolvedHardIssues,
+        });
+      }
       const outline = state?.episodeOutlines.find((item) => item.episodeNumber === episodeNumber);
       if (!outline) {
         throw ScriptServiceError.validation('完成正文前必须先保存本集详细大纲');
@@ -611,7 +870,12 @@ export class ScriptService {
           .map((item) => item.episodeNumber),
         registeredCharacterIds: new Set((state?.characters ?? []).map((item) => item.id)),
         registeredCharacterNames: new Set((state?.characters ?? []).map((item) => item.name)),
+        characterNamesById: new Map((state?.characters ?? []).map((item) => [item.id, item.name])),
         outline,
+        previousEpisode: (state?.episodes ?? [])
+          .filter((item) => item.episodeNumber < episodeNumber)
+          .sort((left, right) => right.episodeNumber - left.episodeNumber)[0],
+        continuity: state?.continuity,
       });
       if (report.hardFailed) {
         throw ScriptServiceError.validation('本集未通过短剧质量门，不能标记为已完成', {

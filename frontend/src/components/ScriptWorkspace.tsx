@@ -3,25 +3,42 @@ import apiClient, { isApiClientError, type ApiClient } from '../api/apiClient.js
 import type {
   Id,
   ScriptAgentJobSnapshot,
+  ScriptBatchSummary,
   ScriptCharacter,
+  ScriptConceptProposal,
   ScriptEpisode,
   ScriptEpisodeSummary,
   ScriptPlan,
   ScriptPlanAnswer,
   ScriptPlanQuestion,
+  ScriptReviewIssue,
+  ScriptReviewStatus,
   ScriptSeriesOutline,
+  ScriptWorkspaceSnapshot,
   ScriptWorldBible,
 } from '../types/index.js';
-import { buildProjectDocxBlob, sanitizeDownloadName } from '../lib/projectExport.js';
+import { buildProjectDocxBlob, downloadBlobFile, sanitizeDownloadName } from '../lib/projectExport.js';
+import {
+  buildScriptBatchNavigation,
+  ScriptCharactersReadView,
+  ScriptEpisodeReader,
+  ScriptOutlineReadView,
+  ScriptPlanReadView,
+  ScriptProductionSidebar,
+  ScriptWorldReadView,
+  type ScriptPrimaryStage,
+} from './script/ScriptProductViews.js';
 import './script-workspace.css';
 
-type ScriptStage = 'plan' | 'outline' | 'characters' | 'world' | 'episodes';
+type ScriptStage = ScriptPrimaryStage;
 type ScriptExportRange = { startEpisode: number; episodeCount: number };
 
 export interface ScriptWorkspaceProps {
   projectId: Id;
   projectName?: string;
-  onError?: (error: unknown) => void;
+  onError?: (error: unknown) => string | void;
+  /** Dismisses only the transient polling error previously returned by onError. */
+  onErrorClear?: (errorId: string) => void;
   client?: Pick<ApiClient, 'script'>;
 }
 
@@ -32,15 +49,29 @@ interface ScriptWorkspaceData {
   world?: ScriptWorldBible;
   episodes: ScriptEpisodeSummary[];
   jobs: ScriptAgentJobSnapshot[];
+  batchSummaries: ScriptBatchSummary[];
+  reviewRevision: number;
+  reviewIssues: ScriptReviewIssue[];
 }
 
-const STAGES: Array<{ id: ScriptStage; label: string }> = [
-  { id: 'plan', label: '剧本策划' },
-  { id: 'outline', label: '剧本大纲' },
-  { id: 'characters', label: '角色设定' },
-  { id: 'world', label: '世界设定' },
-  { id: 'episodes', label: '分批正文' },
-];
+type EditableScriptResource = 'plan' | 'outline' | 'characters' | 'world';
+type ScriptResourceFlags = Record<EditableScriptResource, boolean>;
+type ScriptResourceVersions = Record<EditableScriptResource, number>;
+
+const SCRIPT_RESOURCE_LABEL: Record<EditableScriptResource, string> = {
+  plan: '策划',
+  outline: '大纲',
+  characters: '角色设定',
+  world: '世界设定',
+};
+
+function cleanResourceFlags(): ScriptResourceFlags {
+  return { plan: false, outline: false, characters: false, world: false };
+}
+
+function cleanResourceVersions(): ScriptResourceVersions {
+  return { plan: 0, outline: 0, characters: 0, world: 0 };
+}
 
 function emptyPlan(projectId: Id, projectName?: string): ScriptPlan {
   const now = new Date().toISOString();
@@ -123,9 +154,15 @@ async function optional<T>(request: Promise<T>): Promise<T | undefined> {
 function PlanEditor({
   value,
   busy,
+  conceptBusy,
+  conceptPrompt,
+  concepts,
   questions,
   answers,
   onChange,
+  onConceptPromptChange,
+  onGenerateConcepts,
+  onAdoptConcept,
   onSave,
   onAgentPlan,
   onAnswer,
@@ -135,9 +172,15 @@ function PlanEditor({
 }: {
   value: ScriptPlan;
   busy: boolean;
+  conceptBusy: boolean;
+  conceptPrompt: string;
+  concepts: ScriptConceptProposal[];
   questions: ScriptPlanQuestion[];
   answers: Record<string, ScriptPlanAnswer>;
   onChange: (value: ScriptPlan) => void;
+  onConceptPromptChange: (value: string) => void;
+  onGenerateConcepts: () => void;
+  onAdoptConcept: (concept: ScriptConceptProposal) => void;
   onSave: () => void;
   onAgentPlan: () => void;
   onAnswer: (field: string, value: NonNullable<ScriptPlanAnswer['value']>) => void;
@@ -145,14 +188,27 @@ function PlanEditor({
   onSubmitAnswers: () => void;
   onApprove: () => void;
 }): JSX.Element {
+  const [mode, setMode] = useState<'read' | 'edit'>(() => value.status === 'draft' ? 'edit' : 'read');
   const patch = <K extends keyof ScriptPlan>(key: K, next: ScriptPlan[K]) =>
     onChange({ ...value, [key]: next });
   return (
     <section className="script-stage-panel" aria-labelledby="script-plan-heading">
       <header className="script-stage-heading">
         <div><span>第一阶段</span><h2 id="script-plan-heading">剧本策划</h2></div>
-        <span className="script-status-chip">{value.status === 'draft' ? '草稿' : value.status === 'approved' ? '已确认' : '已锁定'}</span>
+        <div className="script-stage-heading__actions">
+          <div className="script-view-switch" role="group" aria-label="策划查看模式">
+            <button type="button" aria-pressed={mode === 'read'} onClick={() => setMode('read')}>阅读模式</button>
+            <button type="button" aria-pressed={mode === 'edit'} onClick={() => setMode('edit')}>编辑模式</button>
+          </div>
+          <span className="script-status-chip">{value.status === 'draft' ? '草稿' : value.status === 'approved' ? '已确认' : '已锁定'}</span>
+        </div>
       </header>
+      <section className="script-concept-studio" aria-labelledby="script-concept-heading">
+        <div className="script-concept-studio__intro"><span>从一个灵感开始</span><h3 id="script-concept-heading">AI 选题</h3><p>输入题材、冲突或受众，生成 3 个可继续深化的短剧方向。</p></div>
+        <div className="script-concept-input"><input aria-label="选题灵感" value={conceptPrompt} onChange={(event) => onConceptPromptChange(event.target.value)} placeholder="例如：都市女频，儿媳用美食反击情绪勒索" /><button type="button" className="nwa-button" disabled={conceptBusy} onClick={onGenerateConcepts}>{conceptBusy ? '选题生成中…' : '生成 3 个选题'}</button></div>
+        {concepts.length ? <div className="script-concept-cards">{concepts.map((concept, index) => <article key={`${concept.title}-${index}`}><header><span>方向 {index + 1}</span><strong>{concept.title}</strong></header><p>{concept.logline}</p><div className="script-read-tags">{concept.genres.map((genre) => <span key={genre}>{genre}</span>)}</div><dl><div><dt>受众</dt><dd>{concept.audience}</dd></div><div><dt>核心冲突</dt><dd>{concept.coreConflict}</dd></div></dl><button type="button" className="nwa-button nwa-button--ghost" onClick={() => onAdoptConcept(concept)}>采用此方案</button></article>)}</div> : <div className="script-concept-empty">还没有候选方案。AI 只会基于你的灵感生成真实候选，不会用占位内容覆盖现有策划。</div>}
+      </section>
+      {mode === 'read' ? <ScriptPlanReadView value={value} /> : <>
       <div className="script-form-grid">
         <label className="script-field script-field--wide">剧本名称<input value={value.title} onChange={(e) => patch('title', e.target.value)} /></label>
         <label className="script-field script-field--wide">主题<textarea value={value.theme} onChange={(e) => patch('theme', e.target.value)} /></label>
@@ -161,6 +217,7 @@ function PlanEditor({
         <label className="script-field script-field--wide">题材（逗号分隔）<input value={value.genres.join('，')} onChange={(e) => patch('genres', e.target.value.split(/[，,]/).map((item) => item.trim()).filter(Boolean))} /></label>
         <label className="script-field script-field--wide">一句话梗概<textarea value={value.logline} onChange={(e) => patch('logline', e.target.value)} /></label>
         <label className="script-field script-field--wide">核心冲突<textarea value={value.coreConflict} onChange={(e) => patch('coreConflict', e.target.value)} /></label>
+        <label className="script-field script-field--wide">核心亮点（每行一项）<textarea value={value.highlights.join('\n')} onChange={(e) => patch('highlights', e.target.value.split('\n').map((item) => item.trim()).filter(Boolean))} /></label>
         <label className="script-field">总集数<input type="number" min={1} max={200} value={value.totalEpisodes} onChange={(e) => patch('totalEpisodes', Number(e.target.value))} /></label>
         <label className="script-field">单集目标字数<input type="number" min={300} max={3000} value={value.targetCharsPerEpisode} onChange={(e) => patch('targetCharsPerEpisode', Number(e.target.value))} /></label>
         <label className="script-field">单集时长下限（秒）<input type="number" min={30} max={180} value={value.episodeDurationSeconds.min} onChange={(e) => patch('episodeDurationSeconds', { ...value.episodeDurationSeconds, min: Number(e.target.value) })} /></label>
@@ -169,7 +226,9 @@ function PlanEditor({
         <label className="script-field">每集场景上限<input type="number" min={1} max={5} value={value.maxScenesPerEpisode} onChange={(e) => patch('maxScenesPerEpisode', Number(e.target.value))} /></label>
         <label className="script-field script-field--wide">目标受众<input value={value.audience} onChange={(e) => patch('audience', e.target.value)} /></label>
         <label className="script-field script-field--wide">核心要求<textarea rows={5} value={value.coreRequirements} onChange={(e) => patch('coreRequirements', e.target.value)} /></label>
+        <label className="script-field script-field--wide">禁用元素（每行一项）<textarea value={value.forbiddenElements.join('\n')} onChange={(e) => patch('forbiddenElements', e.target.value.split('\n').map((item) => item.trim()).filter(Boolean))} /></label>
         <label className="script-field script-field--wide">结局方向<textarea value={value.endingDirection} onChange={(e) => patch('endingDirection', e.target.value)} /></label>
+        <label className="script-field script-field--wide">9:16 封面视觉提示词<textarea rows={4} value={value.coverPrompt ?? ''} onChange={(e) => patch('coverPrompt', e.target.value)} /></label>
       </div>
       {questions.length > 0 ? (
         <section className="script-plan-interview" aria-label="短剧策划问题">
@@ -212,6 +271,7 @@ function PlanEditor({
           <button type="button" className="nwa-button" disabled={busy} onClick={onSubmitAnswers}>提交本轮答案</button>
         </section>
       ) : null}
+      </>}
       <footer className="script-stage-actions">
         <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={onAgentPlan}>Agent 帮我策划</button>
         <button type="button" className="nwa-button" disabled={busy} onClick={onSave}>{busy ? '保存中…' : '保存策划'}</button>
@@ -219,6 +279,58 @@ function PlanEditor({
       </footer>
     </section>
   );
+}
+
+function fromWorkspaceSnapshot(
+  snapshot: ScriptWorkspaceSnapshot,
+  jobs: ScriptAgentJobSnapshot[],
+  projectId: Id,
+  projectName?: string,
+): ScriptWorkspaceData {
+  return {
+    plan: snapshot.plan ?? emptyPlan(projectId, projectName),
+    outline: snapshot.outline,
+    characters: snapshot.characters ?? [],
+    world: snapshot.worldBible,
+    episodes: snapshot.episodeSummaries ?? [],
+    jobs,
+    batchSummaries: snapshot.batchSummaries ?? [],
+    reviewRevision: Number.isInteger(snapshot.reviewRevision) ? snapshot.reviewRevision : 0,
+    reviewIssues: snapshot.reviewIssues ?? [],
+  };
+}
+
+function mergeWorkspaceSnapshot(
+  current: ScriptWorkspaceData,
+  incoming: ScriptWorkspaceData,
+  dirty: ScriptResourceFlags,
+): ScriptWorkspaceData {
+  return {
+    ...incoming,
+    plan: dirty.plan ? current.plan : incoming.plan,
+    outline: dirty.outline ? current.outline : incoming.outline,
+    characters: dirty.characters ? current.characters : incoming.characters,
+    world: dirty.world ? current.world : incoming.world,
+  };
+}
+
+const ACTIVE_JOB_STATUSES = new Set<ScriptAgentJobSnapshot['status']>([
+  'queued',
+  'running',
+  'retrying',
+]);
+
+function jobResourceSignature(jobs: ScriptAgentJobSnapshot[]): string {
+  return jobs
+    .map((job) => [
+      job.id,
+      job.status,
+      job.checkpoint?.episodeNumber ?? '',
+      job.checkpoint?.node ?? '',
+      job.checkpoint?.artifactRevision ?? '',
+    ].join(':'))
+    .sort()
+    .join('|');
 }
 
 function OutlineEditor({
@@ -234,11 +346,13 @@ function OutlineEditor({
   onSave: () => void;
   onGenerate: () => void;
 }): JSX.Element {
+  const [mode, setMode] = useState<'read' | 'edit'>(() => value.revision > 0 ? 'read' : 'edit');
   const patch = <K extends keyof ScriptSeriesOutline>(key: K, next: ScriptSeriesOutline[K]) =>
     onChange({ ...value, [key]: next });
   return (
     <section className="script-stage-panel" aria-labelledby="script-outline-heading">
-      <header className="script-stage-heading"><div><span>第二阶段</span><h2 id="script-outline-heading">剧本大纲</h2></div><span className="script-status-chip">{value.episodeCards.length} 张分集卡</span></header>
+      <header className="script-stage-heading"><div><span>第二阶段</span><h2 id="script-outline-heading">剧本大纲</h2></div><div className="script-stage-heading__actions"><div className="script-view-switch" role="group" aria-label="大纲查看模式"><button type="button" aria-pressed={mode === 'read'} onClick={() => setMode('read')}>阅读模式</button><button type="button" aria-pressed={mode === 'edit'} onClick={() => setMode('edit')}>编辑模式</button></div><span className="script-status-chip">{value.episodeCards.length} 张分集卡</span></div></header>
+      {mode === 'read' ? <ScriptOutlineReadView value={value} /> : <>
       <div className="script-form-grid">
         <label className="script-field script-field--wide">全剧梗概<textarea rows={8} value={value.synopsis} onChange={(e) => patch('synopsis', e.target.value)} /></label>
         <label className="script-field">开局状态<textarea value={value.openingState} onChange={(e) => patch('openingState', e.target.value)} /></label>
@@ -249,7 +363,8 @@ function OutlineEditor({
         <label className="script-field script-field--wide">支线（每行一条）<textarea rows={4} value={value.subplotArcs.join('\n')} onChange={(e) => patch('subplotArcs', e.target.value.split('\n').map((item) => item.trim()).filter(Boolean))} /></label>
       </div>
       {value.episodeCards.length > 0 ? <div className="script-outline-cards"><h3>分集卡</h3>{value.episodeCards.map((card, index) => <article key={card.episodeNumber}><strong>第 {card.episodeNumber} 集</strong><input aria-label={`第 ${card.episodeNumber} 集标题`} value={card.title} onChange={(e) => patch('episodeCards', value.episodeCards.map((item, itemIndex) => itemIndex === index ? { ...item, title: e.target.value } : item))} /><textarea aria-label={`第 ${card.episodeNumber} 集梗概`} value={card.logline} onChange={(e) => patch('episodeCards', value.episodeCards.map((item, itemIndex) => itemIndex === index ? { ...item, logline: e.target.value } : item))} /></article>)}</div> : <p className="script-muted">保存策划后，可让 Agent 生成全剧总纲与连续分集卡。</p>}
-      <footer className="script-stage-actions"><button type="button" className="nwa-button nwa-button--ghost" onClick={onGenerate}>Agent 生成大纲</button><button type="button" className="nwa-button" disabled={busy} onClick={onSave}>{busy ? '保存中…' : '保存大纲'}</button></footer>
+      </>}
+      <footer className="script-stage-actions"><button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={onGenerate}>Agent 生成大纲</button><button type="button" className="nwa-button" disabled={busy} onClick={onSave}>{busy ? '保存中…' : '保存大纲'}</button></footer>
     </section>
   );
 }
@@ -296,12 +411,14 @@ function CharacterEditor({
   onSave: () => void;
   onGenerate: () => void;
 }): JSX.Element {
+  const [mode, setMode] = useState<'read' | 'edit'>(() => value.length > 0 ? 'read' : 'edit');
   const update = (index: number, fields: Partial<ScriptCharacter>) =>
     onChange(value.map((item, itemIndex) => itemIndex === index ? { ...item, ...fields } : item));
   return (
     <section className="script-stage-panel" aria-labelledby="script-characters-heading">
-      <header className="script-stage-heading"><div><span>第三阶段</span><h2 id="script-characters-heading">角色设定</h2></div><div className="script-stage-heading__actions"><button type="button" className="nwa-button nwa-button--ghost" onClick={onGenerate}>Agent 生成角色</button><button type="button" className="nwa-button nwa-button--ghost" onClick={() => onChange([...value, emptyCharacter(projectId, value.length + 1)])}>添加角色</button></div></header>
-      {value.length === 0 ? <p className="script-muted">尚无角色。可手动添加，或让 Agent 根据策划和总纲生成角色圣经。</p> : <div className="script-character-list">{value.map((character, index) => (
+      <header className="script-stage-heading"><div><span>第三阶段</span><h2 id="script-characters-heading">角色设定</h2></div><div className="script-stage-heading__actions"><div className="script-view-switch" role="group" aria-label="角色查看模式"><button type="button" aria-pressed={mode === 'read'} onClick={() => setMode('read')}>人物卡</button><button type="button" aria-pressed={mode === 'edit'} onClick={() => setMode('edit')}>编辑模式</button></div><button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={onGenerate}>Agent 补全人物与世界</button><button type="button" className="nwa-button nwa-button--ghost" onClick={() => onChange([...value, emptyCharacter(projectId, value.length + 1)])}>添加角色</button></div></header>
+      {mode === 'read' ? <ScriptCharactersReadView value={value} /> : <>
+      {value.length === 0 ? <p className="script-muted">尚无角色。可手动添加，或让 Agent 根据策划和总纲补全人物与世界圣经。</p> : <div className="script-character-list">{value.map((character, index) => (
         <article key={character.id} className="script-character-card">
           <header><strong>{character.name || `角色 ${index + 1}`}</strong><button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" onClick={() => onChange(value.filter((_, itemIndex) => itemIndex !== index))}>删除</button></header>
           <div className="script-form-grid">
@@ -319,6 +436,7 @@ function CharacterEditor({
           </div>
         </article>
       ))}</div>}
+      </>}
       <footer className="script-stage-actions"><button type="button" className="nwa-button" disabled={busy} onClick={onSave}>{busy ? '保存中…' : '保存角色设定'}</button></footer>
     </section>
   );
@@ -337,12 +455,14 @@ function WorldEditor({
   onSave: () => void;
   onGenerate: () => void;
 }): JSX.Element {
+  const [mode, setMode] = useState<'read' | 'edit'>(() => value.revision > 0 ? 'read' : 'edit');
   const patch = <K extends keyof ScriptWorldBible>(key: K, next: ScriptWorldBible[K]) =>
     onChange({ ...value, [key]: next });
   const lines = (text: string) => text.split('\n').map((item) => item.trim()).filter(Boolean);
   return (
     <section className="script-stage-panel" aria-labelledby="script-world-heading">
-      <header className="script-stage-heading"><div><span>第四阶段</span><h2 id="script-world-heading">世界设定</h2></div><div className="script-stage-heading__actions"><button type="button" className="nwa-button nwa-button--ghost" onClick={onGenerate}>Agent 生成世界</button><span className="script-status-chip">版本 {value.revision}</span></div></header>
+      <header className="script-stage-heading"><div><span>第四阶段</span><h2 id="script-world-heading">世界设定</h2></div><div className="script-stage-heading__actions"><div className="script-view-switch" role="group" aria-label="世界设定查看模式"><button type="button" aria-pressed={mode === 'read'} onClick={() => setMode('read')}>阅读模式</button><button type="button" aria-pressed={mode === 'edit'} onClick={() => setMode('edit')}>编辑模式</button></div><button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={onGenerate}>Agent 补全人物与世界</button><span className="script-status-chip">版本 {value.revision}</span></div></header>
+      {mode === 'read' ? <ScriptWorldReadView value={value} /> : <>
       <div className="script-form-grid">
         <label className="script-field">时代<input aria-label="时代" value={value.era} onChange={(e) => patch('era', e.target.value)} /></label>
         <label className="script-field">主要地点（每行一项）<textarea value={value.primaryLocations.join('\n')} onChange={(e) => patch('primaryLocations', lines(e.target.value))} /></label>
@@ -354,6 +474,7 @@ function WorldEditor({
         <label className="script-field">关键道具<textarea value={value.recurringProps.join('\n')} onChange={(e) => patch('recurringProps', lines(e.target.value))} /></label>
         <label className="script-field">禁止的时代错误<textarea value={value.forbiddenAnachronisms.join('\n')} onChange={(e) => patch('forbiddenAnachronisms', lines(e.target.value))} /></label>
       </div>
+      </>}
       <footer className="script-stage-actions"><button type="button" className="nwa-button" disabled={busy} onClick={onSave}>{busy ? '保存中…' : '保存世界设定'}</button></footer>
     </section>
   );
@@ -378,6 +499,18 @@ const CHECKPOINT_LABEL: Record<NonNullable<ScriptAgentJobSnapshot['checkpoint']>
   batch_report: '批次报告',
 };
 
+const REVIEW_SEVERITY_LABEL: Record<ScriptReviewIssue['severity'], string> = {
+  hard: '硬性问题',
+  soft: '软性问题',
+  suggestion: '优化建议',
+};
+
+const REVIEW_STATUS_LABEL: Record<ScriptReviewIssue['status'], string> = {
+  open: '待处理',
+  fixed: '已修复',
+  ignored: '已忽略',
+};
+
 function nextBatchStart(episodes: ScriptEpisodeSummary[], totalEpisodes: number): number {
   const completed = new Set(
     episodes.filter((item) => item.status === 'completed').map((item) => item.episodeNumber),
@@ -391,6 +524,9 @@ function nextBatchStart(episodes: ScriptEpisodeSummary[], totalEpisodes: number)
 function EpisodeBatchPanel({
   data,
   busy,
+  batchStart,
+  batchEpisodes,
+  batchLoading,
   episode,
   episodeLoading,
   onStart,
@@ -399,10 +535,15 @@ function EpisodeBatchPanel({
   onOpenEpisode,
   onEpisodeChange,
   onSaveEpisode,
+  onReviewEpisode,
+  onReviewStatus,
   onExport,
 }: {
   data: ScriptWorkspaceData;
   busy: boolean;
+  batchStart: number;
+  batchEpisodes: ScriptEpisode[];
+  batchLoading: boolean;
   episode?: ScriptEpisode;
   episodeLoading: boolean;
   onStart: (startEpisode: number, episodeCount: number) => void;
@@ -411,22 +552,40 @@ function EpisodeBatchPanel({
   onOpenEpisode: (episodeNumber: number) => void;
   onEpisodeChange: (episode: ScriptEpisode) => void;
   onSaveEpisode: () => void;
+  onReviewEpisode: (episodeNumber: number) => void;
+  onReviewStatus: (issueId: Id, status: ScriptReviewStatus) => void;
   onExport: (format: 'txt' | 'md' | 'docx' | 'fountain', range?: ScriptExportRange) => void;
 }): JSX.Element {
   const [exportScope, setExportScope] = useState<'all' | 'batch'>('all');
+  const [contentMode, setContentMode] = useState<'read' | 'edit'>('read');
+  const [fullscreen, setFullscreen] = useState(false);
   const start = nextBatchStart(data.episodes, data.plan.totalEpisodes);
   const count = Math.min(5, Math.max(0, data.plan.totalEpisodes - start + 1));
   const end = start + count - 1;
-  const referenceEpisode = episode?.episodeNumber ?? Math.max(1, start - 1);
+  const batchEnd = Math.min(batchStart + 4, data.plan.totalEpisodes);
+  const batchSummaries = data.episodes.filter((item) => item.episodeNumber >= batchStart && item.episodeNumber <= batchEnd);
+  const batchIssues = data.reviewIssues
+    .filter((item) => item.episodeNumber >= batchStart && item.episodeNumber <= batchEnd)
+    .sort((left, right) => {
+      if (left.status === 'open' && right.status !== 'open') return -1;
+      if (left.status !== 'open' && right.status === 'open') return 1;
+      if (left.episodeNumber !== right.episodeNumber) return left.episodeNumber - right.episodeNumber;
+      return left.createdAt.localeCompare(right.createdAt);
+    });
+  const unresolvedIssues = batchIssues.filter((item) => item.status === 'open');
+  const unresolvedHardIssues = unresolvedIssues.filter((item) => item.severity === 'hard').length;
+  const referenceEpisode = episode?.episodeNumber ?? batchStart;
   const exportBatchStart = Math.floor((referenceEpisode - 1) / 5) * 5 + 1;
   const exportRange = exportScope === 'batch'
     ? { startEpisode: exportBatchStart, episodeCount: Math.min(5, data.plan.totalEpisodes - exportBatchStart + 1) }
     : undefined;
   return (
-    <section className="script-stage-panel script-episodes-panel" aria-labelledby="script-episodes-heading">
+    <section className={`script-stage-panel script-episodes-panel${fullscreen ? ' is-fullscreen' : ''}`} aria-labelledby="script-episodes-heading">
       <header className="script-stage-heading">
-        <div><span>第五阶段</span><h2 id="script-episodes-heading">分批正文</h2></div>
+        <div><span>第五阶段 · 五集一批</span><h2 id="script-episodes-heading">{batchStart}–{batchEnd}集剧本正文</h2></div>
         <div className="script-stage-heading__actions">
+          <div className="script-view-switch" role="group" aria-label="正文查看模式"><button type="button" aria-pressed={contentMode === 'read'} onClick={() => setContentMode('read')}>成品阅读</button><button type="button" aria-pressed={contentMode === 'edit'} onClick={() => setContentMode('edit')}>编辑模式</button></div>
+          <button type="button" className="nwa-button nwa-button--ghost" onClick={() => setFullscreen((value) => !value)}>{fullscreen ? '退出全屏' : '全屏阅读'}</button>
           <select aria-label="导出范围" value={exportScope} onChange={(event) => setExportScope(event.target.value as 'all' | 'batch')}><option value="all">整本</option><option value="batch">当前五集</option></select>
           <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => onExport('txt', exportRange)}>导出 TXT</button>
           <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => onExport('md', exportRange)}>导出 MD</button>
@@ -438,9 +597,9 @@ function EpisodeBatchPanel({
       <div className="script-production-grid">
         <div>
           <h3>分集进度</h3>
-          {data.episodes.length === 0 ? <p className="script-muted">尚未生成正文。每批最多 5 集，完成一集立即保存。</p> : (
+          {batchSummaries.length === 0 ? <p className="script-muted">本批尚未生成正文。每批最多 5 集，完成一集立即保存。</p> : (
             <ol className="script-episode-list">
-              {data.episodes.map((item) => <li key={item.episodeNumber}><button type="button" className="script-episode-open" aria-label={`打开第 ${item.episodeNumber} 集`} onClick={() => onOpenEpisode(item.episodeNumber)}>打开第 {item.episodeNumber} 集<span>{item.title}</span></button><span>{JOB_STATUS_LABEL[item.status === 'generating' || item.status === 'reviewing' ? 'running' : item.status === 'planned' ? 'queued' : item.status]} · {item.visibleChars} 字</span></li>)}
+              {batchSummaries.map((item) => <li key={item.episodeNumber}><button type="button" className="script-episode-open" aria-label={`打开第 ${item.episodeNumber} 集`} onClick={() => { setContentMode('edit'); onOpenEpisode(item.episodeNumber); }}>打开第 {item.episodeNumber} 集<span>{item.title}</span></button><span>{JOB_STATUS_LABEL[item.status === 'generating' || item.status === 'reviewing' ? 'running' : item.status === 'planned' ? 'queued' : item.status]} · {item.visibleChars} 字</span></li>)}
             </ol>
           )}
         </div>
@@ -457,8 +616,54 @@ function EpisodeBatchPanel({
           ))}
         </aside>
       </div>
+      <section className="script-proofread-panel" aria-labelledby="script-proofread-heading">
+        <header>
+          <div>
+            <span>质量门</span>
+            <h3 id="script-proofread-heading">校稿与连续性检查</h3>
+            <p>AI也可能会走神，请注意校稿。硬性问题会阻止本集进入完成状态。</p>
+          </div>
+          <div className="script-proofread-summary" aria-label="校稿问题统计">
+            <span className={unresolvedHardIssues > 0 ? 'is-danger' : ''}>{unresolvedHardIssues} 个硬性</span>
+            <span>{unresolvedIssues.length - unresolvedHardIssues} 个待优化</span>
+          </div>
+        </header>
+        {batchSummaries.length > 0 ? (
+          <div className="script-proofread-actions" aria-label="运行单集校稿">
+            {batchSummaries.map((item) => (
+              <button key={item.episodeNumber} type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={busy} onClick={() => onReviewEpisode(item.episodeNumber)}>
+                校稿第 {item.episodeNumber} 集
+              </button>
+            ))}
+          </div>
+        ) : <p className="script-muted">正文生成后，可在这里逐集运行格式、人物、伏笔和连续性检查。</p>}
+        {batchIssues.length > 0 ? (
+          <div className="script-proofread-list">
+            {batchIssues.map((issue) => (
+              <article key={issue.id} className={`script-proofread-issue is-${issue.severity} is-${issue.status}`}>
+                <header>
+                  <div><strong>第 {issue.episodeNumber} 集 · {REVIEW_SEVERITY_LABEL[issue.severity]}</strong><span>{issue.category} · {issue.source === 'deterministic' ? '规则检查' : issue.source === 'ai' ? 'AI 审读' : '人工标注'}</span></div>
+                  <span>{REVIEW_STATUS_LABEL[issue.status]}</span>
+                </header>
+                <p>{issue.message}</p>
+                {issue.suggestion ? <p className="script-proofread-suggestion">建议：{issue.suggestion}</p> : null}
+                <footer>
+                  {issue.status === 'open' ? <>
+                    <button type="button" className="nwa-button nwa-button--sm" disabled={busy} onClick={() => onReviewStatus(issue.id, 'fixed')}>标记已修复</button>
+                    {issue.severity !== 'hard'
+                      ? <button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={busy} onClick={() => onReviewStatus(issue.id, 'ignored')}>忽略</button>
+                      : <span className="script-proofread-required">硬性问题不可忽略</span>}
+                  </> : <button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={busy} onClick={() => onReviewStatus(issue.id, 'open')}>重新打开</button>}
+                </footer>
+              </article>
+            ))}
+          </div>
+        ) : <div className="script-proofread-empty">当前批次暂无校稿问题。建议在正文修改后重新运行单集校稿。</div>}
+      </section>
       {episodeLoading ? <div className="script-loading script-loading--compact" role="status">正在加载单集正文…</div> : null}
-      {episode ? (
+      {contentMode === 'read' ? <ScriptEpisodeReader episodes={batchEpisodes} summaries={data.episodes} characters={data.characters} batchStart={batchStart} batchEnd={batchEnd} loading={batchLoading} onEditEpisode={(episodeNumber) => { setContentMode('edit'); onOpenEpisode(episodeNumber); }} /> : null}
+      {contentMode === 'edit' && !episode ? <div className="script-editor-empty"><strong>请选择要编辑的单集</strong><span>从上方分集进度中打开一集，或切回“成品阅读”连续查看本批正文。</span></div> : null}
+      {contentMode === 'edit' && episode ? (
         <section className="script-episode-editor" aria-label={`第 ${episode.episodeNumber} 集编辑器`}>
           <header>
             <div><span>第 {episode.episodeNumber} 集</span><input aria-label={`第 ${episode.episodeNumber} 集标题`} value={episode.title} onChange={(event) => onEpisodeChange({ ...episode, title: event.target.value })} /></div>
@@ -497,16 +702,43 @@ function EpisodeBatchPanel({
   );
 }
 
-export function ScriptWorkspace({ projectId, projectName, onError, client = apiClient }: ScriptWorkspaceProps): JSX.Element {
+export function ScriptWorkspace({
+  projectId,
+  projectName,
+  onError,
+  onErrorClear,
+  client = apiClient,
+}: ScriptWorkspaceProps): JSX.Element {
   const [stage, setStage] = useState<ScriptStage>('plan');
   const [data, setData] = useState<ScriptWorkspaceData | null>(null);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState('');
   const [selectedEpisode, setSelectedEpisode] = useState<ScriptEpisode>();
   const [episodeLoading, setEpisodeLoading] = useState(false);
+  const [selectedBatchStart, setSelectedBatchStart] = useState(1);
+  const [batchEpisodes, setBatchEpisodes] = useState<ScriptEpisode[]>([]);
+  const [batchLoading, setBatchLoading] = useState(false);
+  const [conceptPrompt, setConceptPrompt] = useState('');
+  const [concepts, setConcepts] = useState<ScriptConceptProposal[]>([]);
+  const [conceptBusy, setConceptBusy] = useState(false);
   const [planQuestions, setPlanQuestions] = useState<ScriptPlanQuestion[]>([]);
   const [planAnswers, setPlanAnswers] = useState<Record<string, ScriptPlanAnswer>>({});
   const episodeRequest = useRef<AbortController>();
+  const batchRequest = useRef<AbortController>();
+  const jobSignature = useRef('');
+  const pollErrorReported = useRef(false);
+  const pollErrorId = useRef<string>();
+  const dirtyResources = useRef<ScriptResourceFlags>(cleanResourceFlags());
+  const resourceEditVersions = useRef<ScriptResourceVersions>(cleanResourceVersions());
+  const stageRef = useRef<ScriptStage>('plan');
+  const selectedBatchStartRef = useRef(1);
+  const selectedEpisodeRef = useRef<ScriptEpisode>();
+  const selectedEpisodeDirty = useRef(false);
+  const selectedEpisodeEditVersion = useRef(0);
+
+  useEffect(() => {
+    stageRef.current = stage;
+  }, [stage]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -515,53 +747,191 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
     setNotice('');
     setSelectedEpisode(undefined);
     setEpisodeLoading(false);
+    setSelectedBatchStart(1);
+    setBatchEpisodes([]);
+    setBatchLoading(false);
+    setConceptPrompt('');
+    setConcepts([]);
+    setConceptBusy(false);
     setPlanQuestions([]);
     setPlanAnswers({});
     episodeRequest.current?.abort();
-    void Promise.all([
-      optional(client.script.plan.get(projectId, controller.signal)),
-      client.script.characters.list(projectId, controller.signal),
-      optional(client.script.world.get(projectId, controller.signal)),
-      optional(client.script.outline.get(projectId, controller.signal)),
-      client.script.episodes.list(projectId, controller.signal),
-      client.script.jobs.list(projectId, controller.signal),
-    ]).then(([plan, characters, world, outline, episodes, jobs]) => {
-      if (controller.signal.aborted) return;
-      setData({ plan: plan ?? emptyPlan(projectId, projectName), characters, world, outline, episodes, jobs });
-    }).catch((error) => {
-      if (!controller.signal.aborted) onError?.(error);
-    });
+    batchRequest.current?.abort();
+    jobSignature.current = '';
+    pollErrorReported.current = false;
+    pollErrorId.current = undefined;
+    dirtyResources.current = cleanResourceFlags();
+    resourceEditVersions.current = cleanResourceVersions();
+    stageRef.current = 'plan';
+    selectedBatchStartRef.current = 1;
+    selectedEpisodeRef.current = undefined;
+    selectedEpisodeDirty.current = false;
+    selectedEpisodeEditVersion.current = 0;
+    void (async () => {
+      try {
+        const jobs = await client.script.jobs.list(projectId, controller.signal);
+        if (controller.signal.aborted) return;
+        const workspaceRequest = client.script.workspace?.get;
+        if (workspaceRequest) {
+          try {
+            const snapshot = await workspaceRequest(projectId, controller.signal);
+            if (controller.signal.aborted) return;
+            jobSignature.current = jobResourceSignature(jobs);
+            setData(fromWorkspaceSnapshot(snapshot, jobs, projectId, projectName));
+            return;
+          } catch (error) {
+            if (!isMissing(error)) throw error;
+          }
+        }
+
+        // Backward-compatible fallback for an older backend during rolling deploys.
+        const [plan, characters, world, outline, episodes] = await Promise.all([
+          optional(client.script.plan.get(projectId, controller.signal)),
+          client.script.characters.list(projectId, controller.signal),
+          optional(client.script.world.get(projectId, controller.signal)),
+          optional(client.script.outline.get(projectId, controller.signal)),
+          client.script.episodes.list(projectId, controller.signal),
+        ]);
+        if (controller.signal.aborted) return;
+        jobSignature.current = jobResourceSignature(jobs);
+        setData({
+          plan: plan ?? emptyPlan(projectId, projectName),
+          characters,
+          world,
+          outline,
+          episodes,
+          jobs,
+          batchSummaries: [],
+          reviewRevision: 0,
+          reviewIssues: [],
+        });
+      } catch (error) {
+        if (!controller.signal.aborted) onError?.(error);
+      }
+    })();
     return () => {
       controller.abort();
       episodeRequest.current?.abort();
+      batchRequest.current?.abort();
     };
   }, [client, onError, projectId, projectName]);
 
+  const hasActiveJobs = data?.jobs.some((job) => ACTIVE_JOB_STATUSES.has(job.status)) ?? false;
+
   useEffect(() => {
+    if (!hasActiveJobs) return undefined;
     const controller = new AbortController();
+    let inFlight = false;
     const poll = async (): Promise<void> => {
+      if (inFlight) return;
+      inFlight = true;
       try {
-        const [jobs, episodes] = await Promise.all([
-          client.script.jobs.list(projectId, controller.signal),
-          client.script.episodes.list(projectId, controller.signal),
-        ]);
-        if (!controller.signal.aborted) {
-          setData((current) => current ? { ...current, jobs, episodes } : current);
+        const jobs = await client.script.jobs.list(projectId, controller.signal);
+        if (controller.signal.aborted) return;
+        const nextSignature = jobResourceSignature(jobs);
+        const resourcesChanged = nextSignature !== jobSignature.current;
+        if (resourcesChanged && client.script.workspace?.get) {
+          const snapshot = await client.script.workspace.get(projectId, controller.signal);
+          if (controller.signal.aborted) return;
+
+          let refreshedBatch: ScriptEpisode[] | undefined;
+          const batchStart = selectedBatchStartRef.current;
+          if (stageRef.current === 'episodes') {
+            const batchEnd = Math.min(batchStart + 4, snapshot.plan?.totalEpisodes ?? batchStart + 4);
+            const episodeNumbers = snapshot.episodeSummaries
+              .filter((item) => item.episodeNumber >= batchStart && item.episodeNumber <= batchEnd)
+              .map((item) => item.episodeNumber);
+            refreshedBatch = await Promise.all(
+              episodeNumbers.map((episodeNumber) => (
+                client.script.episodes.get(projectId, episodeNumber, controller.signal)
+              )),
+            );
+            if (controller.signal.aborted) return;
+          }
+
+          jobSignature.current = nextSignature;
+          const incoming = fromWorkspaceSnapshot(snapshot, jobs, projectId, projectName);
+          setData((current) => current
+            ? mergeWorkspaceSnapshot(current, incoming, dirtyResources.current)
+            : incoming);
+
+          if (
+            refreshedBatch !== undefined &&
+            stageRef.current === 'episodes' &&
+            selectedBatchStartRef.current === batchStart
+          ) {
+            const dirtyEpisode = selectedEpisodeDirty.current ? selectedEpisodeRef.current : undefined;
+            const mergedBatch = refreshedBatch
+              .map((episode) => episode.episodeNumber === dirtyEpisode?.episodeNumber ? dirtyEpisode : episode)
+              .sort((left, right) => left.episodeNumber - right.episodeNumber);
+            setBatchEpisodes(mergedBatch);
+            const currentSelection = selectedEpisodeRef.current;
+            if (currentSelection && !selectedEpisodeDirty.current) {
+              const refreshedSelection = mergedBatch.find(
+                (episode) => episode.episodeNumber === currentSelection.episodeNumber,
+              );
+              if (refreshedSelection) {
+                selectedEpisodeRef.current = refreshedSelection;
+                setSelectedEpisode(refreshedSelection);
+              }
+            }
+          }
+        } else if (!controller.signal.aborted) {
+          jobSignature.current = nextSignature;
+          setData((current) => current ? { ...current, jobs } : current);
+        }
+
+        if (pollErrorReported.current) {
+          if (pollErrorId.current !== undefined) onErrorClear?.(pollErrorId.current);
+          pollErrorId.current = undefined;
+          pollErrorReported.current = false;
         }
       } catch (error) {
-        if (!controller.signal.aborted) onError?.(error);
+        if (!controller.signal.aborted && !pollErrorReported.current) {
+          pollErrorReported.current = true;
+          const errorId = onError?.(error);
+          if (typeof errorId === 'string') pollErrorId.current = errorId;
+        }
+      } finally {
+        inFlight = false;
       }
     };
     const timer = setInterval(poll, 2_000);
     return () => {
       controller.abort();
       clearInterval(timer);
+      if (pollErrorId.current !== undefined) onErrorClear?.(pollErrorId.current);
+      pollErrorId.current = undefined;
+      pollErrorReported.current = false;
     };
-  }, [client, onError, projectId]);
+  }, [client, hasActiveJobs, onError, onErrorClear, projectId, projectName]);
+
+  const markResourceDirty = useCallback((resource: EditableScriptResource) => {
+    dirtyResources.current[resource] = true;
+    resourceEditVersions.current[resource] += 1;
+  }, []);
 
   const applyPlanTurn = useCallback((
     result: Awaited<ReturnType<ApiClient['script']['plan']['turn']>>,
+    requestEditVersion: number,
   ) => {
+    if (resourceEditVersions.current.plan !== requestEditVersion) {
+      if (result.status === 'ready' && result.plan) {
+        setData((current) => current ? {
+          ...current,
+          plan: {
+            ...current.plan,
+            status: result.plan!.status,
+            revision: result.plan!.revision,
+            updatedAt: result.plan!.updatedAt,
+          },
+        } : current);
+      }
+      setPlanQuestions([]);
+      setPlanAnswers({});
+      setNotice('策划已修改，已保留本地内容，请保存后重新发起 Agent 策划');
+      return;
+    }
     if (result.status === 'asking') {
       setPlanQuestions(result.questions ?? []);
       setPlanAnswers({});
@@ -569,6 +939,7 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
       return;
     }
     if (result.plan) {
+      dirtyResources.current.plan = false;
       setData((current) => current ? { ...current, plan: result.plan! } : current);
       setPlanQuestions([]);
       setPlanAnswers({});
@@ -576,8 +947,57 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
     }
   }, []);
 
+  const generateConcepts = useCallback(async () => {
+    if (!data) return;
+    setConceptBusy(true);
+    setNotice('');
+    try {
+      const fallbackPrompt = [data.plan.title, data.plan.logline, data.plan.coreRequirements]
+        .map((item) => item.trim()).filter(Boolean).join('\n');
+      const result = await client.script.plan.concepts(projectId, conceptPrompt.trim() || fallbackPrompt);
+      setConcepts(result.proposals);
+      setNotice('AI 已生成 3 个选题方向，采用前不会覆盖当前策划');
+    } catch (error) {
+      onError?.(error);
+    } finally {
+      setConceptBusy(false);
+    }
+  }, [client, conceptPrompt, data, onError, projectId]);
+
+  const adoptConcept = useCallback((concept: ScriptConceptProposal) => {
+    markResourceDirty('plan');
+    setData((current) => {
+      if (!current) return current;
+      const seedsOutline = !current.outline || current.outline.revision === 0;
+      if (seedsOutline) markResourceDirty('outline');
+      return {
+        ...current,
+        plan: {
+          ...current.plan,
+          title: concept.title,
+          theme: concept.theme,
+          market: concept.market,
+          channel: concept.channel,
+          genres: concept.genres,
+          logline: concept.logline,
+          audience: concept.audience,
+          coreConflict: concept.coreConflict,
+          highlights: concept.highlights,
+          endingDirection: concept.endingDirection,
+          coverPrompt: concept.coverPrompt,
+          totalEpisodes: concept.totalEpisodes,
+        },
+        outline: seedsOutline
+          ? { ...(current.outline ?? emptyOutline(projectId)), mainArc: [concept.mainArc] }
+          : current.outline,
+      };
+    });
+    setNotice(`已采用选题《${concept.title}》，请检查后保存策划`);
+  }, [markResourceDirty, projectId]);
+
   const startPlanInterview = useCallback(async () => {
     if (!data) return;
+    const editVersion = resourceEditVersions.current.plan;
     setBusy(true);
     setNotice('');
     try {
@@ -588,7 +1008,7 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
         seedPrompt,
         answers: [],
         reset: true,
-      }));
+      }), editVersion);
     } catch (error) {
       onError?.(error);
     } finally {
@@ -607,13 +1027,14 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
       setNotice('请回答本轮全部问题，或明确选择“交给 Agent”。');
       return;
     }
+    const editVersion = resourceEditVersions.current.plan;
     setBusy(true);
     setNotice('');
     try {
       applyPlanTurn(await client.script.plan.turn({
         projectId,
         answers: planQuestions.map((question) => planAnswers[question.field]!),
-      }));
+      }), editVersion);
     } catch (error) {
       onError?.(error);
     } finally {
@@ -623,12 +1044,30 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
 
   const approvePlan = useCallback(async () => {
     if (!data) return;
+    if (dirtyResources.current.plan) {
+      setNotice('请先保存策划，再确认');
+      return;
+    }
+    const editVersion = resourceEditVersions.current.plan;
     setBusy(true);
     setNotice('');
     try {
       const plan = await client.script.plan.approve(projectId, data.plan.revision);
-      setData((current) => current ? { ...current, plan } : current);
-      setNotice('策划已确认，可生成大纲、角色与世界设定');
+      const unchangedWhileApproving = resourceEditVersions.current.plan === editVersion;
+      setData((current) => current ? {
+        ...current,
+        plan: unchangedWhileApproving
+          ? plan
+          : {
+              ...current.plan,
+              status: plan.status,
+              revision: plan.revision,
+              updatedAt: plan.updatedAt,
+            },
+      } : current);
+      setNotice(unchangedWhileApproving
+        ? '策划已确认，可生成大纲、角色与世界设定'
+        : '策划已确认，仍有未保存修改');
     } catch (error) {
       onError?.(error);
     } finally {
@@ -638,12 +1077,20 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
 
   const savePlan = useCallback(async () => {
     if (!data) return;
+    const editVersion = resourceEditVersions.current.plan;
     setBusy(true);
     setNotice('');
     try {
       const saved = await client.script.plan.save(projectId, data.plan, data.plan.revision);
-      setData((current) => current ? { ...current, plan: saved } : current);
-      setNotice('策划已保存');
+      const unchangedWhileSaving = resourceEditVersions.current.plan === editVersion;
+      if (unchangedWhileSaving) dirtyResources.current.plan = false;
+      setData((current) => current ? {
+        ...current,
+        plan: unchangedWhileSaving
+          ? saved
+          : { ...current.plan, revision: saved.revision, updatedAt: saved.updatedAt },
+      } : current);
+      setNotice(unchangedWhileSaving ? '策划已保存' : '策划已保存，仍有未保存修改');
     } catch (error) {
       onError?.(error);
     } finally {
@@ -654,12 +1101,20 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
   const saveOutline = useCallback(async () => {
     if (!data) return;
     const outline = data.outline ?? emptyOutline(projectId);
+    const editVersion = resourceEditVersions.current.outline;
     setBusy(true);
     setNotice('');
     try {
       const saved = await client.script.outline.save(projectId, outline, outline.revision);
-      setData((current) => current ? { ...current, outline: saved } : current);
-      setNotice('大纲已保存');
+      const unchangedWhileSaving = resourceEditVersions.current.outline === editVersion;
+      if (unchangedWhileSaving) dirtyResources.current.outline = false;
+      setData((current) => current ? {
+        ...current,
+        outline: unchangedWhileSaving
+          ? saved
+          : { ...(current.outline ?? emptyOutline(projectId)), revision: saved.revision },
+      } : current);
+      setNotice(unchangedWhileSaving ? '大纲已保存' : '大纲已保存，仍有未保存修改');
     } catch (error) {
       onError?.(error);
     } finally {
@@ -669,13 +1124,24 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
 
   const saveCharacters = useCallback(async () => {
     if (!data) return;
+    const editVersion = resourceEditVersions.current.characters;
     setBusy(true);
     setNotice('');
     try {
       const revision = data.characters.reduce((max, item) => Math.max(max, item.revision), 0);
       const saved = await client.script.characters.save(projectId, data.characters, revision);
-      setData((current) => current ? { ...current, characters: saved } : current);
-      setNotice('角色设定已保存');
+      const unchangedWhileSaving = resourceEditVersions.current.characters === editVersion;
+      if (unchangedWhileSaving) dirtyResources.current.characters = false;
+      setData((current) => current ? {
+        ...current,
+        characters: unchangedWhileSaving
+          ? saved
+          : current.characters.map((item) => {
+              const persisted = saved.find((candidate) => candidate.id === item.id);
+              return persisted ? { ...item, revision: persisted.revision, updatedAt: persisted.updatedAt } : item;
+            }),
+      } : current);
+      setNotice(unchangedWhileSaving ? '角色设定已保存' : '角色设定已保存，仍有未保存修改');
     } catch (error) {
       onError?.(error);
     } finally {
@@ -686,12 +1152,20 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
   const saveWorld = useCallback(async () => {
     if (!data) return;
     const world = data.world ?? emptyWorld(projectId);
+    const editVersion = resourceEditVersions.current.world;
     setBusy(true);
     setNotice('');
     try {
       const saved = await client.script.world.save(projectId, world, world.revision);
-      setData((current) => current ? { ...current, world: saved } : current);
-      setNotice('世界设定已保存');
+      const unchangedWhileSaving = resourceEditVersions.current.world === editVersion;
+      if (unchangedWhileSaving) dirtyResources.current.world = false;
+      setData((current) => current ? {
+        ...current,
+        world: unchangedWhileSaving
+          ? saved
+          : { ...(current.world ?? emptyWorld(projectId)), revision: saved.revision, updatedAt: saved.updatedAt },
+      } : current);
+      setNotice(unchangedWhileSaving ? '世界设定已保存' : '世界设定已保存，仍有未保存修改');
     } catch (error) {
       onError?.(error);
     } finally {
@@ -701,6 +1175,28 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
 
   const startEpisodeBatch = useCallback(async (startEpisode: number, episodeCount: number) => {
     if (!data) return;
+    const unsavedResources = (Object.keys(dirtyResources.current) as EditableScriptResource[])
+      .filter((resource) => dirtyResources.current[resource]);
+    if (unsavedResources.length > 0) {
+      setNotice(`请先保存${unsavedResources.map((resource) => SCRIPT_RESOURCE_LABEL[resource]).join('、')}，再生成正文`);
+      return;
+    }
+    if (selectedEpisodeDirty.current) {
+      setNotice('请先保存当前集');
+      return;
+    }
+    const endEpisode = startEpisode + episodeCount - 1;
+    const hasOverlappingBatch = data.jobs.some((job) => {
+      if (job.task !== 'script_episode_batch' || !ACTIVE_JOB_STATUSES.has(job.status)) return false;
+      const options = job.scriptBatchOptions;
+      if (!options) return false;
+      const jobEnd = options.startEpisode + options.episodeCount - 1;
+      return options.startEpisode <= endEpisode && startEpisode <= jobEnd;
+    });
+    if (hasOverlappingBatch) {
+      setNotice(`第 ${startEpisode}–${endEpisode} 集已有生成任务正在运行`);
+      return;
+    }
     setBusy(true);
     setNotice('');
     try {
@@ -724,26 +1220,52 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
 
   const startMaterialJob = useCallback(async (
     task: 'script_series_outline' | 'script_bible',
-    prompt?: string,
+    requiredCleanResources: EditableScriptResource[],
   ) => {
+    const unsavedResources = requiredCleanResources
+      .filter((resource) => dirtyResources.current[resource]);
+    if (unsavedResources.length > 0) {
+      setNotice(`请先保存${unsavedResources.map((resource) => SCRIPT_RESOURCE_LABEL[resource]).join('、')}，再启动 Agent`);
+      return;
+    }
+    if (data?.jobs.some((job) => job.task === task && ACTIVE_JOB_STATUSES.has(job.status))) {
+      setNotice(task === 'script_bible'
+        ? '人物与世界补全任务正在运行，请勿重复提交'
+        : '大纲生成任务正在运行，请勿重复提交');
+      return;
+    }
+    setBusy(true);
     setNotice('');
     try {
       const job = await client.script.jobs.create({
         projectId,
         task,
-        ...(prompt ? { prompt } : {}),
       });
       setData((current) => current ? {
         ...current,
         jobs: [job, ...current.jobs.filter((item) => item.id !== job.id)],
       } : current);
-      setNotice('Agent 任务已提交，可切换项目后继续后台运行');
+      setNotice(task === 'script_bible'
+        ? '人物与世界补全任务已提交，可切换项目后继续后台运行'
+        : '大纲生成任务已提交，可切换项目后继续后台运行');
     } catch (error) {
       onError?.(error);
+    } finally {
+      setBusy(false);
     }
-  }, [client, onError, projectId]);
+  }, [client, data?.jobs, onError, projectId]);
 
   const resumeJob = useCallback(async (jobId: string) => {
+    const unsavedResources = (Object.keys(dirtyResources.current) as EditableScriptResource[])
+      .filter((resource) => dirtyResources.current[resource]);
+    if (unsavedResources.length > 0) {
+      setNotice(`请先保存${unsavedResources.map((resource) => SCRIPT_RESOURCE_LABEL[resource]).join('、')}，再继续任务`);
+      return;
+    }
+    if (selectedEpisodeDirty.current) {
+      setNotice('请先保存当前集');
+      return;
+    }
     setBusy(true);
     setNotice('');
     try {
@@ -771,7 +1293,78 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
     }
   }, [client, onError]);
 
+  const openBatch = useCallback(async (startEpisode: number) => {
+    if (selectedEpisodeDirty.current) {
+      stageRef.current = 'episodes';
+      setStage('episodes');
+      setNotice('请先保存当前集');
+      return;
+    }
+    const editVersion = selectedEpisodeEditVersion.current;
+    const selectionAtStart = selectedEpisodeRef.current;
+    stageRef.current = 'episodes';
+    setStage('episodes');
+    setNotice('');
+    episodeRequest.current?.abort();
+    episodeRequest.current = undefined;
+    setEpisodeLoading(false);
+    batchRequest.current?.abort();
+    const controller = new AbortController();
+    batchRequest.current = controller;
+    const endEpisode = Math.min(startEpisode + 4, data?.plan.totalEpisodes ?? startEpisode + 4);
+    const episodeNumbers = (data?.episodes ?? [])
+      .filter((item) => item.episodeNumber >= startEpisode && item.episodeNumber <= endEpisode)
+      .map((item) => item.episodeNumber);
+    const selectionChanged = () => (
+      selectedEpisodeDirty.current ||
+      selectedEpisodeEditVersion.current !== editVersion ||
+      selectedEpisodeRef.current !== selectionAtStart
+    );
+    const commitBatch = (episodes: ScriptEpisode[]) => {
+      selectedBatchStartRef.current = startEpisode;
+      setSelectedBatchStart(startEpisode);
+      setSelectedEpisode(undefined);
+      selectedEpisodeRef.current = undefined;
+      selectedEpisodeDirty.current = false;
+      selectedEpisodeEditVersion.current = 0;
+      setBatchEpisodes(episodes);
+    };
+    if (episodeNumbers.length === 0) {
+      if (selectionChanged()) setNotice('请先保存当前集');
+      else commitBatch([]);
+      setBatchLoading(false);
+      return;
+    }
+    setBatchLoading(true);
+    try {
+      const results = await Promise.allSettled(
+        episodeNumbers.map((episodeNumber) => client.script.episodes.get(projectId, episodeNumber, controller.signal)),
+      );
+      if (!controller.signal.aborted) {
+        if (selectionChanged()) {
+          setNotice('请先保存当前集');
+          return;
+        }
+        const episodes = results
+          .filter((result): result is PromiseFulfilledResult<ScriptEpisode> => result.status === 'fulfilled' && Boolean(result.value))
+          .map((result) => result.value)
+          .sort((left, right) => left.episodeNumber - right.episodeNumber);
+        commitBatch(episodes);
+        const rejected = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+        if (rejected) onError?.(rejected.reason);
+      }
+    } finally {
+      if (!controller.signal.aborted) setBatchLoading(false);
+    }
+  }, [client, data?.episodes, data?.plan.totalEpisodes, onError, projectId]);
+
   const openEpisode = useCallback(async (episodeNumber: number) => {
+    if (selectedEpisodeDirty.current) {
+      setNotice('请先保存当前集');
+      return;
+    }
+    const editVersion = selectedEpisodeEditVersion.current;
+    const selectionAtStart = selectedEpisodeRef.current;
     episodeRequest.current?.abort();
     const controller = new AbortController();
     episodeRequest.current = controller;
@@ -779,7 +1372,23 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
     setNotice('');
     try {
       const episode = await client.script.episodes.get(projectId, episodeNumber, controller.signal);
-      if (!controller.signal.aborted) setSelectedEpisode(episode);
+      if (!controller.signal.aborted && episode) {
+        if (
+          selectedEpisodeDirty.current ||
+          selectedEpisodeEditVersion.current !== editVersion ||
+          selectedEpisodeRef.current !== selectionAtStart
+        ) {
+          setNotice('请先保存当前集');
+          return;
+        }
+        selectedEpisodeRef.current = episode;
+        selectedEpisodeDirty.current = false;
+        selectedEpisodeEditVersion.current = 0;
+        setSelectedEpisode(episode);
+        setBatchEpisodes((current) => current.some((item) => item.episodeNumber === episode.episodeNumber)
+          ? current.map((item) => item.episodeNumber === episode.episodeNumber ? episode : item)
+          : [...current, episode].sort((left, right) => left.episodeNumber - right.episodeNumber));
+      }
     } catch (error) {
       if (!controller.signal.aborted) onError?.(error);
     } finally {
@@ -787,13 +1396,30 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
     }
   }, [client, onError, projectId]);
 
+  const editSelectedEpisode = useCallback((episode: ScriptEpisode) => {
+    selectedEpisodeRef.current = episode;
+    selectedEpisodeDirty.current = true;
+    selectedEpisodeEditVersion.current += 1;
+    setSelectedEpisode(episode);
+    setBatchEpisodes((current) => current.some((item) => item.episodeNumber === episode.episodeNumber)
+      ? current.map((item) => item.episodeNumber === episode.episodeNumber ? episode : item)
+      : [...current, episode].sort((left, right) => left.episodeNumber - right.episodeNumber));
+  }, []);
+
   const saveEpisode = useCallback(async () => {
     if (!selectedEpisode) return;
+    const editVersion = selectedEpisodeEditVersion.current;
     setBusy(true);
     setNotice('');
     try {
       const saved = await client.script.episodes.save(projectId, selectedEpisode.episodeNumber, selectedEpisode, selectedEpisode.revision);
-      const visibleChars = saved.scenes.reduce((total, scene) => total + scene.blocks.reduce((sceneTotal, block) => sceneTotal + block.text.length, 0), 0);
+      const visibleChars = saved.scenes.reduce(
+        (total, scene) => total + scene.blocks.reduce(
+          (sceneTotal, block) => sceneTotal + block.text.replace(/\s/gu, '').length,
+          0,
+        ),
+        0,
+      );
       const summary: ScriptEpisodeSummary = {
         id: saved.id,
         episodeNumber: saved.episodeNumber,
@@ -805,14 +1431,32 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
         revision: saved.revision,
         updatedAt: saved.updatedAt,
       };
-      setSelectedEpisode(saved);
+      const sameEpisodeStillSelected = selectedEpisodeRef.current?.episodeNumber === saved.episodeNumber;
+      const unchangedWhileSaving = selectedEpisodeEditVersion.current === editVersion;
+      const editorEpisode = sameEpisodeStillSelected && !unchangedWhileSaving
+        ? {
+            ...selectedEpisodeRef.current!,
+            revision: saved.revision,
+            updatedAt: saved.updatedAt,
+          }
+        : saved;
+      if (sameEpisodeStillSelected) {
+        selectedEpisodeRef.current = editorEpisode;
+        if (unchangedWhileSaving) selectedEpisodeDirty.current = false;
+        setSelectedEpisode(editorEpisode);
+      }
+      setBatchEpisodes((current) => current.some((item) => item.episodeNumber === saved.episodeNumber)
+        ? current.map((item) => item.episodeNumber === saved.episodeNumber ? editorEpisode : item)
+        : [...current, editorEpisode].sort((left, right) => left.episodeNumber - right.episodeNumber));
       setData((current) => current ? {
         ...current,
         episodes: current.episodes.some((item) => item.episodeNumber === saved.episodeNumber)
           ? current.episodes.map((item) => item.episodeNumber === saved.episodeNumber ? summary : item)
           : [...current.episodes, summary].sort((left, right) => left.episodeNumber - right.episodeNumber),
       } : current);
-      setNotice(`第 ${saved.episodeNumber} 集已保存`);
+      setNotice(unchangedWhileSaving
+        ? `第 ${saved.episodeNumber} 集已保存`
+        : `第 ${saved.episodeNumber} 集已保存，仍有未保存修改`);
     } catch (error) {
       onError?.(error);
     } finally {
@@ -820,30 +1464,120 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
     }
   }, [client, onError, projectId, selectedEpisode]);
 
+  const reviewEpisode = useCallback(async (episodeNumber: number) => {
+    if (!data) return;
+    if (
+      selectedEpisodeDirty.current &&
+      selectedEpisodeRef.current?.episodeNumber === episodeNumber
+    ) {
+      setNotice('请先保存当前集');
+      return;
+    }
+    setBusy(true);
+    setNotice('');
+    try {
+      const result = await client.script.episodes.review(projectId, episodeNumber, data.reviewRevision);
+      setData((current) => current ? {
+        ...current,
+        reviewRevision: result.revision,
+        reviewIssues: [
+          ...current.reviewIssues.filter((item) => item.episodeNumber !== episodeNumber),
+          ...result.items,
+        ],
+      } : current);
+      const hardCount = result.items.filter((item) => item.status === 'open' && item.severity === 'hard').length;
+      setNotice(hardCount > 0
+        ? `第 ${episodeNumber} 集校稿完成：发现 ${hardCount} 个必须修复的硬性问题`
+        : `第 ${episodeNumber} 集校稿完成：未发现阻断完成的硬性问题`);
+    } catch (error) {
+      if (isApiClientError(error) && error.status === 409) {
+        try {
+          const latest = await client.script.reviews.list(projectId);
+          setData((current) => current ? {
+            ...current,
+            reviewRevision: latest.revision,
+            reviewIssues: latest.items,
+          } : current);
+          setNotice('校稿状态已被其他页面更新，已同步最新结果，请重试。');
+        } catch {
+          // The original conflict is the most useful error for the user.
+        }
+      }
+      onError?.(error);
+    } finally {
+      setBusy(false);
+    }
+  }, [client, data, onError, projectId]);
+
+  const updateReviewStatus = useCallback(async (issueId: Id, status: ScriptReviewStatus) => {
+    if (!data) return;
+    setBusy(true);
+    setNotice('');
+    try {
+      const result = await client.script.reviews.updateStatus(
+        projectId,
+        issueId,
+        status,
+        data.reviewRevision,
+      );
+      setData((current) => current ? {
+        ...current,
+        reviewRevision: result.revision,
+        reviewIssues: current.reviewIssues.map((item) => item.id === result.item.id ? result.item : item),
+      } : current);
+      setNotice(status === 'fixed' ? '校稿问题已标记为修复' : status === 'ignored' ? '校稿问题已忽略' : '校稿问题已重新打开');
+    } catch (error) {
+      if (isApiClientError(error) && error.status === 409) {
+        try {
+          const latest = await client.script.reviews.list(projectId);
+          setData((current) => current ? {
+            ...current,
+            reviewRevision: latest.revision,
+            reviewIssues: latest.items,
+          } : current);
+          setNotice('校稿状态已被其他页面更新，已同步最新结果，请重新操作。');
+        } catch {
+          // The original conflict is the most useful error for the user.
+        }
+      }
+      onError?.(error);
+    } finally {
+      setBusy(false);
+    }
+  }, [client, data, onError, projectId]);
+
   const exportScript = useCallback(async (
     format: 'txt' | 'md' | 'docx' | 'fountain',
     range?: ScriptExportRange,
   ) => {
+    const unsavedResources = (Object.keys(dirtyResources.current) as EditableScriptResource[])
+      .filter((resource) => dirtyResources.current[resource]);
+    if (unsavedResources.length > 0) {
+      setNotice(`请先保存${unsavedResources.map((resource) => SCRIPT_RESOURCE_LABEL[resource]).join('、')}，再导出`);
+      return;
+    }
+    if (selectedEpisodeDirty.current) {
+      setNotice('请先保存当前集');
+      return;
+    }
     setBusy(true);
     setNotice('');
     try {
-      const sourceFormat = format === 'docx' ? 'txt' : format;
-      const content = range
-        ? await client.script.export(projectId, sourceFormat, range)
-        : await client.script.export(projectId, sourceFormat);
-      if (typeof URL.createObjectURL === 'function') {
-        const title = projectName ?? data?.plan.title ?? '短剧';
-        const blob = format === 'docx'
-          ? buildProjectDocxBlob(title, [{ title: '短剧剧本', content, position: 0 }])
-          : new Blob([content], {
-              type: format === 'md' ? 'text/markdown;charset=utf-8' : 'text/plain;charset=utf-8',
-            });
-        const url = URL.createObjectURL(blob);
-        const anchor = document.createElement('a');
-        anchor.href = url;
-        anchor.download = `${sanitizeDownloadName(title)}.${format}`;
-        anchor.click();
-        URL.revokeObjectURL(url);
+      const title = projectName ?? data?.plan.title ?? '短剧';
+      if (format === 'docx') {
+        const file = range
+          ? await client.script.exportFile(projectId, 'txt', range)
+          : await client.script.exportFile(projectId, 'txt');
+        const content = await file.blob.text();
+        downloadBlobFile(
+          buildProjectDocxBlob(title, [{ title: '短剧剧本', content, position: 0 }]),
+          `${sanitizeDownloadName(title)}.docx`,
+        );
+      } else {
+        const file = range
+          ? await client.script.exportFile(projectId, format, range)
+          : await client.script.exportFile(projectId, format);
+        downloadBlobFile(file.blob, file.filename);
       }
       setNotice(`已导出 ${format.toUpperCase()}`);
     } catch (error) {
@@ -853,19 +1587,67 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
     }
   }, [client, data?.plan.title, onError, projectId, projectName]);
 
+  const workspaceTitle = data?.plan.title || projectName || '未命名短剧';
+  const totalEpisodes = data?.plan.totalEpisodes ?? 0;
+  const completedEpisodes = data?.episodes.filter((item) => item.status === 'completed').length ?? 0;
+  const totalVisibleChars = data?.episodes.reduce((total, item) => total + item.visibleChars, 0) ?? 0;
+  const prerequisitesReady = Boolean(
+    data && data.plan.status !== 'draft' && data.outline && data.characters.length > 0 && data.world,
+  );
+  const batches = data
+    ? buildScriptBatchNavigation(data.plan.totalEpisodes, data.episodes, data.jobs, prerequisitesReady).map((batch) => {
+        const serverSummary = data.batchSummaries.find((item) => item.startEpisode === batch.startEpisode);
+        const openIssues = data.reviewIssues.filter((item) => (
+          item.status === 'open' &&
+          item.episodeNumber >= batch.startEpisode &&
+          item.episodeNumber <= batch.endEpisode
+        ));
+        const hasHardIssue = openIssues.some((item) => item.severity === 'hard');
+        const status = batch.status === 'generating'
+          ? batch.status
+          : hasHardIssue
+            ? 'failed'
+            : openIssues.length > 0
+              ? 'proofreading'
+              : serverSummary?.status ?? batch.status;
+        return {
+          ...batch,
+          status,
+          completedEpisodes: serverSummary?.completedEpisodes ?? batch.completedEpisodes,
+          visibleChars: serverSummary?.visibleChars ?? batch.visibleChars,
+        };
+      })
+    : [];
+
   return (
     <div className="script-workspace" data-project-id={projectId}>
-      <header className="script-workspace-header"><div><span className="script-workspace-kicker">短剧制作台</span><h1>{projectName ?? data?.plan.title ?? '未命名短剧'}</h1></div><div className="script-workspace-summary"><span>{data?.plan.totalEpisodes ?? 0} 集</span><span>{data?.episodes.filter((item) => item.status === 'completed').length ?? 0} 已完成</span></div></header>
-      <nav className="script-stage-tabs" role="tablist" aria-label="短剧制作阶段">
-        {STAGES.map((item) => <button key={item.id} type="button" role="tab" aria-selected={stage === item.id} className={stage === item.id ? 'is-active' : ''} onClick={() => { setStage(item.id); setNotice(''); }}>{item.label}</button>)}
-      </nav>
-      {notice ? <div className="script-notice" role="status">{notice}</div> : null}
-      {!data ? <div className="script-loading" role="status">正在加载短剧资料…</div> : null}
-      {data && stage === 'plan' ? <PlanEditor value={data.plan} busy={busy} questions={planQuestions} answers={planAnswers} onChange={(plan) => setData({ ...data, plan })} onSave={() => void savePlan()} onAgentPlan={() => void startPlanInterview()} onAnswer={(field, value) => setPlanAnswers((current) => ({ ...current, [field]: { field, value } }))} onDelegate={(field) => setPlanAnswers((current) => ({ ...current, [field]: { field, delegate: true } }))} onSubmitAnswers={() => void submitPlanAnswers()} onApprove={() => void approvePlan()} /> : null}
-      {data && stage === 'outline' ? <OutlineEditor value={data.outline ?? emptyOutline(projectId)} busy={busy} onChange={(outline) => setData({ ...data, outline })} onSave={() => void saveOutline()} onGenerate={() => void startMaterialJob('script_series_outline')} /> : null}
-      {data && stage === 'characters' ? <CharacterEditor projectId={projectId} value={data.characters} busy={busy} onChange={(characters) => setData({ ...data, characters })} onSave={() => void saveCharacters()} onGenerate={() => void startMaterialJob('script_bible', '仅生成角色设定')} /> : null}
-      {data && stage === 'episodes' ? <EpisodeBatchPanel data={data} busy={busy} episode={selectedEpisode} episodeLoading={episodeLoading} onStart={(start, count) => void startEpisodeBatch(start, count)} onResume={(jobId) => void resumeJob(jobId)} onCancel={(jobId) => void cancelJob(jobId)} onOpenEpisode={(episodeNumber) => void openEpisode(episodeNumber)} onEpisodeChange={setSelectedEpisode} onSaveEpisode={() => void saveEpisode()} onExport={(format, range) => void exportScript(format, range)} /> : null}
-      {data && stage === 'world' ? <WorldEditor value={data.world ?? emptyWorld(projectId)} busy={busy} onChange={(world) => setData({ ...data, world })} onSave={() => void saveWorld()} onGenerate={() => void startMaterialJob('script_bible', '仅生成世界设定')} /> : null}
+      <ScriptProductionSidebar
+        title={workspaceTitle}
+        activeStage={stage}
+        activeBatchStart={selectedBatchStart}
+        totalEpisodes={totalEpisodes}
+        completedEpisodes={completedEpisodes}
+        totalVisibleChars={totalVisibleChars}
+        batches={batches}
+        onStageChange={(nextStage) => {
+          if (nextStage === 'episodes') void openBatch(selectedBatchStart);
+          else {
+            setStage(nextStage);
+            setNotice('');
+          }
+        }}
+        onBatchChange={(startEpisode) => void openBatch(startEpisode)}
+      />
+      <main className="script-workspace-main">
+        <header className="script-workspace-header"><div><span className="script-workspace-kicker">短剧生产工作台</span><h1>{workspaceTitle}</h1></div><div className="script-workspace-summary"><span>{totalEpisodes} 集</span><span>{completedEpisodes} 已完成</span><span>{totalVisibleChars.toLocaleString('zh-CN')} 字</span></div></header>
+        {notice ? <div className="script-notice" role="status">{notice}</div> : null}
+        {!data ? <div className="script-loading" role="status">正在加载短剧资料…</div> : null}
+        {data && stage === 'plan' ? <PlanEditor value={data.plan} busy={busy} conceptBusy={conceptBusy} conceptPrompt={conceptPrompt} concepts={concepts} questions={planQuestions} answers={planAnswers} onChange={(plan) => { markResourceDirty('plan'); setData((current) => current ? { ...current, plan } : current); }} onConceptPromptChange={setConceptPrompt} onGenerateConcepts={() => void generateConcepts()} onAdoptConcept={adoptConcept} onSave={() => void savePlan()} onAgentPlan={() => void startPlanInterview()} onAnswer={(field, value) => setPlanAnswers((current) => ({ ...current, [field]: { field, value } }))} onDelegate={(field) => setPlanAnswers((current) => ({ ...current, [field]: { field, delegate: true } }))} onSubmitAnswers={() => void submitPlanAnswers()} onApprove={() => void approvePlan()} /> : null}
+        {data && stage === 'outline' ? <OutlineEditor value={data.outline ?? emptyOutline(projectId)} busy={busy} onChange={(outline) => { markResourceDirty('outline'); setData((current) => current ? { ...current, outline } : current); }} onSave={() => void saveOutline()} onGenerate={() => void startMaterialJob('script_series_outline', ['plan', 'outline'])} /> : null}
+        {data && stage === 'characters' ? <CharacterEditor projectId={projectId} value={data.characters} busy={busy} onChange={(characters) => { markResourceDirty('characters'); setData((current) => current ? { ...current, characters } : current); }} onSave={() => void saveCharacters()} onGenerate={() => void startMaterialJob('script_bible', ['plan', 'outline', 'characters', 'world'])} /> : null}
+        {data && stage === 'episodes' ? <EpisodeBatchPanel data={data} busy={busy} batchStart={selectedBatchStart} batchEpisodes={batchEpisodes} batchLoading={batchLoading} episode={selectedEpisode} episodeLoading={episodeLoading} onStart={(start, count) => void startEpisodeBatch(start, count)} onResume={(jobId) => void resumeJob(jobId)} onCancel={(jobId) => void cancelJob(jobId)} onOpenEpisode={(episodeNumber) => void openEpisode(episodeNumber)} onEpisodeChange={editSelectedEpisode} onSaveEpisode={() => void saveEpisode()} onReviewEpisode={(episodeNumber) => void reviewEpisode(episodeNumber)} onReviewStatus={(issueId, status) => void updateReviewStatus(issueId, status)} onExport={(format, range) => void exportScript(format, range)} /> : null}
+        {data && stage === 'world' ? <WorldEditor value={data.world ?? emptyWorld(projectId)} busy={busy} onChange={(world) => { markResourceDirty('world'); setData((current) => current ? { ...current, world } : current); }} onSave={() => void saveWorld()} onGenerate={() => void startMaterialJob('script_bible', ['plan', 'outline', 'characters', 'world'])} /> : null}
+      </main>
     </div>
   );
 }

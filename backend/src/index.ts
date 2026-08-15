@@ -110,6 +110,7 @@ import {
 } from './services/script/agents/ScriptDirector.js';
 import { ProxyScriptModelAdapter } from './services/script/agents/ProxyScriptModelAdapter.js';
 import { ScriptPlanTurnService } from './services/script/agents/ScriptPlanTurnService.js';
+import { ScriptConceptService } from './services/script/agents/ScriptConceptService.js';
 import { registerScriptPlanRoutes } from './routes/scriptPlanRoutes.js';
 
 /**
@@ -153,6 +154,7 @@ export function buildServer(
       'Content-Type, Accept, x-agentxin-model-config, x-agentxin-client-id',
     );
     reply.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+    reply.header('Access-Control-Expose-Headers', 'Content-Disposition');
     if (request.headers.origin && CORS_ALLOW_ORIGIN !== '*') {
       reply.header('Vary', 'Origin');
     }
@@ -199,9 +201,12 @@ export function buildServer(
   const chapterService = new ChapterService(store);
   const settingService = new SettingService(store);
   const modelConfigService = new ModelConfigService(store, { allowStoredConfig: false });
-  const scriptDirector = scriptStore
+  const scriptModelAdapter = scriptStore
+    ? new ProxyScriptModelAdapter(modelConfigService, proxy)
+    : undefined;
+  const scriptDirector = scriptStore && scriptModelAdapter
     ? new ScriptDirector({
-        model: new ProxyScriptModelAdapter(modelConfigService, proxy),
+        model: scriptModelAdapter,
         store: scriptStore,
         checkpoints: scriptCheckpoints!,
       })
@@ -212,6 +217,9 @@ export function buildServer(
         scriptCheckpoints,
         (projectId) => store.getProject(projectId),
       )
+    : undefined;
+  const scriptConceptService = scriptModelAdapter
+    ? new ScriptConceptService(scriptModelAdapter, (projectId) => store.getProject(projectId))
     : undefined;
   const writingService = new WritingService(store, modelConfigService, proxy);
   const freeChatService = new FreeChatService(store, modelConfigService, proxy);
@@ -271,7 +279,7 @@ export function buildServer(
   // Transport layer — register every route group against its service.
   registerProjectRoutes(app, projectService);
   if (scriptService) registerScriptRoutes(app, scriptService);
-  if (scriptPlanTurnService) registerScriptPlanRoutes(app, scriptPlanTurnService);
+  if (scriptPlanTurnService) registerScriptPlanRoutes(app, scriptPlanTurnService, scriptConceptService);
   registerChapterRoutes(app, chapterService);
   registerSettingRoutes(app, settingService);
   registerModelConfigRoutes(app, modelConfigService, proxy);

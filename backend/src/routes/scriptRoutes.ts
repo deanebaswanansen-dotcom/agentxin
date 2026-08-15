@@ -1,6 +1,9 @@
 import type { FastifyInstance } from 'fastify';
 
-import type { ScriptExportFormat } from '../services/script/domain.js';
+import type {
+  ScriptExportFormat,
+  ScriptReviewStatus,
+} from '../services/script/domain.js';
 import {
   ScriptService,
   ScriptServiceError,
@@ -10,14 +13,17 @@ import { StoreError } from '../store/StoreError.js';
 
 interface ProjectParams { id: string }
 interface EpisodeParams extends ProjectParams { number: string }
+interface ReviewIssueParams extends ProjectParams { issueId: string }
 interface PutValueBody { expectedRevision?: unknown; value?: unknown }
 interface PutItemsBody { expectedRevision?: unknown; items?: unknown }
 interface RevisionBody { expectedRevision?: unknown }
+interface ReviewStatusBody extends RevisionBody { status?: unknown }
 interface ExportQuery {
   format?: string;
   startEpisode?: string;
   episodeCount?: string;
 }
+interface ReviewQuery { episodeNumber?: string; status?: string }
 
 function revision(value: unknown): number {
   if (!Number.isInteger(value) || (value as number) < 0) {
@@ -41,6 +47,14 @@ function positiveQueryInteger(value: string | undefined, label: string): number 
     throw ScriptServiceError.validation(`${label}必须是1到200的整数`);
   }
   return number;
+}
+
+function reviewStatus(value: string | undefined): ScriptReviewStatus | undefined {
+  if (value === undefined) return undefined;
+  if (value !== 'open' && value !== 'fixed' && value !== 'ignored') {
+    throw ScriptServiceError.validation('status必须是open、fixed或ignored');
+  }
+  return value;
 }
 
 function mapScriptError(error: unknown): {
@@ -104,8 +118,14 @@ export function registerScriptRoutes(app: FastifyInstance, service: ScriptServic
       episodeOutlines: [],
       episodes: [],
       continuity: { currentState: [], openThreads: [], wardrobeLedger: [] },
+      reviewRevision: 0,
+      reviewIssues: [],
       updatedAt: new Date(0).toISOString(),
     }),
+  );
+
+  app.get<{ Params: ProjectParams }>('/api/projects/:id/script-workspace', (request, reply) =>
+    send(reply, () => service.getWorkspace(request.params.id)),
   );
 
   app.get<{ Params: ProjectParams }>('/api/projects/:id/script-plan', (request, reply) =>
@@ -154,6 +174,35 @@ export function registerScriptRoutes(app: FastifyInstance, service: ScriptServic
   );
   app.put<{ Params: EpisodeParams; Body: PutValueBody }>('/api/projects/:id/script-episodes/:number', (request, reply) =>
     send(reply, () => service.saveEpisode(request.params.id, episodeNumber(request.params.number), request.body?.value, revision(request.body?.expectedRevision))),
+  );
+  app.post<{ Params: EpisodeParams; Body: RevisionBody }>('/api/projects/:id/script-episodes/:number/review', (request, reply) =>
+    send(reply, () => service.reviewEpisode(
+      request.params.id,
+      episodeNumber(request.params.number),
+      revision(request.body?.expectedRevision),
+    )),
+  );
+
+  app.get<{ Params: ProjectParams; Querystring: ReviewQuery }>('/api/projects/:id/script-review-issues', (request, reply) =>
+    send(reply, () => service.listReviewIssues(request.params.id, {
+      episodeNumber: positiveQueryInteger(request.query.episodeNumber, 'episodeNumber'),
+      status: reviewStatus(request.query.status),
+    })),
+  );
+  app.put<{ Params: ProjectParams; Body: PutItemsBody }>('/api/projects/:id/script-review-issues', (request, reply) =>
+    send(reply, () => service.saveReviewIssues(
+      request.params.id,
+      request.body?.items,
+      revision(request.body?.expectedRevision),
+    )),
+  );
+  app.patch<{ Params: ReviewIssueParams; Body: ReviewStatusBody }>('/api/projects/:id/script-review-issues/:issueId', (request, reply) =>
+    send(reply, () => service.updateReviewIssueStatus(
+      request.params.id,
+      request.params.issueId,
+      request.body?.status,
+      revision(request.body?.expectedRevision),
+    )),
   );
 
   app.get<{ Params: ProjectParams; Querystring: ExportQuery }>('/api/projects/:id/script-export', async (request, reply) => {

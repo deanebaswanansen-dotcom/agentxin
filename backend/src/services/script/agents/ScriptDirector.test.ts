@@ -11,6 +11,8 @@ import type {
   ScriptEpisodeOutline,
   ScriptPlan,
   ScriptProjectState,
+  ScriptReviewIssue,
+  ScriptReviewSource,
   ScriptSeriesOutline,
   ScriptWorldBible,
 } from '../domain.js';
@@ -18,6 +20,7 @@ import { FileScriptStore } from '../FileScriptStore.js';
 import { ScriptConflictError, type ScriptStore } from '../ScriptStore.js';
 import {
   InMemoryScriptCheckpointStore,
+  ScriptBatchPausedError,
   ScriptDirector,
   type ScriptModelAdapter,
 } from './ScriptDirector.js';
@@ -76,6 +79,30 @@ class MemoryScriptStore implements ScriptStore {
     return structuredClone(value);
   }
 
+  async saveReviewIssues(
+    _projectId: string,
+    items: ScriptReviewIssue[],
+  ): Promise<{ revision: number; items: ScriptReviewIssue[] }> {
+    this.state.reviewRevision += 1;
+    this.state.reviewIssues = structuredClone(items);
+    return { revision: this.state.reviewRevision, items: structuredClone(items) };
+  }
+
+  async replaceEpisodeReviewIssues(
+    projectId: string,
+    episodeNumber: number,
+    sources: readonly ScriptReviewSource[],
+    items: ScriptReviewIssue[],
+  ): Promise<{ revision: number; items: ScriptReviewIssue[] }> {
+    const sourceSet = new Set(sources);
+    return this.saveReviewIssues(projectId, [
+      ...this.state.reviewIssues.filter(
+        (item) => item.episodeNumber !== episodeNumber || !sourceSet.has(item.source),
+      ),
+      ...items,
+    ]);
+  }
+
   async deleteProject(): Promise<void> {}
 }
 
@@ -87,6 +114,8 @@ function emptyState(): ScriptProjectState {
     episodeOutlines: [],
     episodes: [],
     continuity: { currentState: [], openThreads: [], wardrobeLedger: [] },
+    reviewRevision: 0,
+    reviewIssues: [],
     updatedAt: '2026-08-14T00:00:00.000Z',
   };
 }
@@ -120,6 +149,90 @@ function approvedPlan(totalEpisodes = 10): ScriptPlan {
     createdAt: '2026-08-14T00:00:00.000Z',
     updatedAt: '2026-08-14T00:00:00.000Z',
   };
+}
+
+function readySingleEpisodeState(): ScriptProjectState {
+  const state = emptyState();
+  state.plan = approvedPlan(1);
+  state.seriesOutline = {
+    projectId: 'project-1',
+    synopsis: '调查真相。',
+    openingState: '受压制。',
+    midpointTurn: '证人倒戈。',
+    climax: '直播证据。',
+    endingState: '制度改变。',
+    mainArc: ['调查'],
+    subplotArcs: [],
+    episodeCards: [{
+      episodeNumber: 1,
+      title: '第一集',
+      logline: '推进调查。',
+      mainEvent: '取得证据。',
+      endingHook: '新线索。',
+    }],
+    revision: 1,
+  };
+  state.characters = [{
+    id: 'lead',
+    projectId: 'project-1',
+    name: '沈清',
+    aliases: [],
+    role: 'lead',
+    identity: '校报主编',
+    biography: '坚持调查真相。',
+    motivation: '保护受害者',
+    goal: '公开证据',
+    weakness: '不愿求助',
+    arc: '学会信任同伴',
+    appearance: '利落短发',
+    hairstyle: '齐肩短发',
+    physique: '高挑',
+    defaultOutfit: '白衬衫与黑色长裤',
+    personality: ['冷静'],
+    skills: ['采访'],
+    speechStyle: '简洁直接',
+    catchphrases: [],
+    relationships: [],
+    revision: 1,
+    updatedAt: '2026-08-14T00:00:00.000Z',
+  }];
+  state.worldBible = {
+    projectId: 'project-1',
+    era: '2026年',
+    primaryLocations: ['校报社'],
+    worldState: '当代校园。',
+    rules: ['遵守现实法律'],
+    transport: ['公交'],
+    communication: ['手机'],
+    organizations: ['校报社'],
+    recurringProps: ['录音笔'],
+    forbiddenAnachronisms: [],
+    revision: 1,
+    updatedAt: '2026-08-14T00:00:00.000Z',
+  };
+  state.episodeOutlines = [{
+    id: 'outline-1',
+    projectId: 'project-1',
+    episodeNumber: 1,
+    title: '第一集',
+    goal: '取得证据',
+    conflict: '对方阻止调查',
+    beats: ['发现线索', '遭遇阻止'],
+    characterIds: ['lead'],
+    plannedScenes: [{
+      ordinal: 1,
+      location: '校报社',
+      timeOfDay: 'day',
+      interiorExterior: 'interior',
+      purpose: '推进调查',
+    }],
+    endingHook: '新证人出现',
+    requiredFacts: [],
+    forbiddenFacts: [],
+    status: 'approved',
+    revision: 1,
+  }];
+  return state;
 }
 
 describe('ScriptDirector', () => {
@@ -557,6 +670,11 @@ describe('ScriptDirector', () => {
     expect(result.kind).toBe('episode_batch');
     expect(store.state.episodes.map((item) => item.status)).toEqual(['completed', 'completed']);
     expect(store.state.continuity.wardrobeLedger).toHaveLength(2);
+    expect(store.state.reviewRevision).toBe(2);
+    expect(store.state.reviewIssues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ episodeNumber: 1, code: 'DIALOGUE_DENSITY', source: 'deterministic' }),
+      expect.objectContaining({ episodeNumber: 2, code: 'DIALOGUE_DENSITY', source: 'deterministic' }),
+    ]));
     expect(progress).toContain('completed');
     expect(calls.filter((call) => call.node === 'draft')).toHaveLength(2);
 
@@ -569,5 +687,214 @@ describe('ScriptDirector', () => {
       expectedPlanRevision: store.state.plan?.revision ?? 2,
     });
     expect(calls).toHaveLength(callCount);
+  });
+
+  it('re-runs AI review after revision and never completes while an AI hard issue remains', async () => {
+    const state = readySingleEpisodeState();
+    let reviewCalls = 0;
+    let revisionCalls = 0;
+    const episodePayload = {
+      episodeNumber: 1,
+      title: '第一集',
+      scenes: [{
+        ordinal: 1,
+        location: '校报社',
+        timeOfDay: 'day',
+        interiorExterior: 'interior',
+        characterIds: ['lead'],
+        blocks: [{ type: 'action', text: '剧情'.repeat(150) }],
+      }],
+      summary: '',
+      newFacts: [],
+      openedThreads: [],
+      closedThreads: [],
+    };
+    const model: ScriptModelAdapter = {
+      async complete(request) {
+        if (request.node === 'draft') return JSON.stringify(episodePayload);
+        if (request.node === 'revision') {
+          revisionCalls += 1;
+          return JSON.stringify(episodePayload);
+        }
+        if (request.node === 'review') {
+          reviewCalls += 1;
+          return JSON.stringify({
+            issues: [{
+              code: 'AI_CHARACTER_LOGIC',
+              severity: 'hard',
+              message: '人物动机仍与上一集冲突。',
+              path: 'summary',
+            }],
+            summary: '沈清继续调查。',
+            newFacts: [],
+            openedThreads: [],
+            closedThreads: [],
+            wardrobe: [],
+          });
+        }
+        throw new Error(`unexpected node: ${request.node}`);
+      },
+    };
+    const store = new MemoryScriptStore(state);
+    const director = new ScriptDirector({
+      model,
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+    });
+
+    await expect(director.run({
+      task: 'script_episode_batch',
+      projectId: 'project-1',
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: 1,
+    })).rejects.toBeInstanceOf(ScriptBatchPausedError);
+
+    expect(reviewCalls).toBe(2);
+    expect(revisionCalls).toBe(1);
+    expect(store.state.episodes[0]?.status).toBe('failed');
+    expect(store.state.reviewIssues).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'AI_CHARACTER_LOGIC',
+        severity: 'hard',
+        source: 'ai',
+        status: 'open',
+      }),
+    ]));
+  });
+
+  it('completes only after the post-revision AI review confirms the hard issue is gone', async () => {
+    const state = readySingleEpisodeState();
+    let reviewCalls = 0;
+    const episodePayload = {
+      episodeNumber: 1,
+      title: '第一集',
+      scenes: [{
+        ordinal: 1,
+        location: '校报社',
+        timeOfDay: 'day',
+        interiorExterior: 'interior',
+        characterIds: ['lead'],
+        blocks: [{ type: 'action', text: '剧情'.repeat(150) }],
+      }],
+      summary: '',
+      newFacts: [],
+      openedThreads: [],
+      closedThreads: [],
+    };
+    const model: ScriptModelAdapter = {
+      async complete(request) {
+        if (request.node === 'draft' || request.node === 'revision') {
+          return JSON.stringify(episodePayload);
+        }
+        if (request.node === 'review') {
+          reviewCalls += 1;
+          return JSON.stringify({
+            issues: reviewCalls === 1 ? [{
+              code: 'AI_CHARACTER_LOGIC',
+              severity: 'hard',
+              message: '人物动机与上一集冲突。',
+              path: 'summary',
+            }] : [],
+            summary: '沈清继续调查。',
+            newFacts: [],
+            openedThreads: [],
+            closedThreads: [],
+            wardrobe: [],
+          });
+        }
+        throw new Error(`unexpected node: ${request.node}`);
+      },
+    };
+    const store = new MemoryScriptStore(state);
+    const director = new ScriptDirector({
+      model,
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+    });
+
+    const result = await director.run({
+      task: 'script_episode_batch',
+      projectId: 'project-1',
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: 1,
+    });
+
+    expect(result.kind).toBe('episode_batch');
+    expect(reviewCalls).toBe(2);
+    expect(store.state.episodes[0]?.status).toBe('completed');
+    expect(store.state.reviewIssues).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'AI_CHARACTER_LOGIC', status: 'open' }),
+    ]));
+  });
+
+  it('does not bypass a retained user-authored open hard issue when the director saves completed', async () => {
+    const state = readySingleEpisodeState();
+    state.reviewRevision = 1;
+    state.reviewIssues = [{
+      id: 'user-hard-1',
+      projectId: 'project-1',
+      episodeNumber: 1,
+      code: 'USER_CONTINUITY_BLOCKER',
+      severity: 'hard',
+      category: 'continuity',
+      message: '人工确认的连续性冲突尚未解决。',
+      status: 'open',
+      source: 'user',
+      createdAt: '2026-08-15T00:00:00.000Z',
+      updatedAt: '2026-08-15T00:00:00.000Z',
+    }];
+    const model: ScriptModelAdapter = {
+      async complete(request) {
+        if (request.node === 'draft') {
+          return JSON.stringify({
+            episodeNumber: 1,
+            title: '第一集',
+            scenes: [{
+              ordinal: 1,
+              location: '校报社',
+              timeOfDay: 'day',
+              interiorExterior: 'interior',
+              characterIds: ['lead'],
+              blocks: [{ type: 'action', text: '剧情'.repeat(150) }],
+            }],
+            summary: '',
+            newFacts: [],
+            openedThreads: [],
+            closedThreads: [],
+          });
+        }
+        if (request.node === 'review') {
+          return JSON.stringify({
+            issues: [],
+            summary: '沈清继续调查。',
+            newFacts: [],
+            openedThreads: [],
+            closedThreads: [],
+            wardrobe: [],
+          });
+        }
+        throw new Error(`unexpected node: ${request.node}`);
+      },
+    };
+    const store = new MemoryScriptStore(state);
+    const director = new ScriptDirector({
+      model,
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+    });
+
+    await expect(director.run({
+      task: 'script_episode_batch',
+      projectId: 'project-1',
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: 1,
+    })).rejects.toBeInstanceOf(ScriptBatchPausedError);
+    expect(store.state.episodes[0]?.status).toBe('failed');
+    expect(store.state.reviewIssues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'user-hard-1', status: 'open' }),
+    ]));
   });
 });

@@ -8,12 +8,14 @@ import type {
   ScriptEpisodeOutline,
   ScriptPlannedScene,
   ScriptPlan,
+  ScriptReviewIssueCollection,
   ScriptScene,
   ScriptSeriesOutline,
   ScriptWorldBible,
 } from '../domain.js';
 import type { ScriptStore } from '../ScriptStore.js';
 import {
+  createScriptReviewIssues,
   validateScriptEpisode,
   type ScriptGateIssue,
   type ScriptGateReport,
@@ -742,6 +744,8 @@ export class ScriptDirector {
             '你是 EpisodeScenePlanner。将详细大纲确认为 1—5 个可拍摄场景。',
             '只返回 JSON {"plannedScenes":[...]}。',
             '每个场景严格使用 {"ordinal":1,"location":"地点","timeOfDay":"day|night|dawn|dusk","interiorExterior":"interior|exterior","purpose":"场景目的"}，场号从1连续递增，不得改名任何键。',
+            '每个场景必须承担不同的戏剧任务，依次完成开场抓人、冲突升级、反转或结尾卡点；地点要具体且可拍摄，禁止用“某处”“未知地点”等占位词。',
+            '优先复用人物与世界圣经已有地点，控制换景成本；结尾卡点必须落实在最后一个场景的 purpose 中。',
             `场景上限：${plan.maxScenesPerEpisode}`,
             `大纲：${JSON.stringify(outline)}`,
           ].join('\n'),
@@ -778,6 +782,11 @@ export class ScriptDirector {
             '只返回 JSON，不输出思考过程、Markdown 或提示词。',
             '严格顶层模板：{"episodeNumber":1,"title":"字符串","scenes":[...],"summary":"可为空字符串","newFacts":[],"openedThreads":[],"closedThreads":[]}。',
             '每个 scene 严格包含 ordinal, location, timeOfDay(day|night|dawn|dusk), interiorExterior(interior|exterior), characterIds, blocks。每个 block 的 type 只能是 caption/action/dialogue 且必须有 text；dialogue 还必须有已登记人物的 characterId、speaker，可选 delivery 和 mode(normal|os|vo)。不得改名任何键。',
+            'blocks.text 只写内容本身：caption 不要包“【字幕：】”，action 不要带“△”，dialogue 不要重复说话人或冒号；这些格式由序列化器统一添加。',
+            'scene.characterIds 必须列出本场所有实际出场或说话人物，且对白 speaker 与 characterId 必须一一匹配。普通对白 mode 使用 normal；只有画外音和内心独白才使用 vo/os。',
+            '正文必须是可拍摄的竖屏短剧：前三个正文块内出现人物、处境与冲突；动作使用镜头可见行为，避免小说式心理概述；单句对白简洁、有对抗性，不写大段说教。',
+            '首次出现的重要人物或地点可用 caption 交代身份；后续不得机械重复字幕。最后一至两个正文块必须兑现本集 endingHook，以反转、证据、人物闯入或未完成动作收尾。',
+            '严格遵守大纲 requiredFacts 与 forbiddenFacts；继承上一集结尾状态、服装、道具、人物已知信息和未回收伏笔，禁止让角色无理由换装、瞬移或提前知道秘密。',
             scriptLengthInstruction(plan.targetCharsPerEpisode),
             `所有 blocks.text 去除空白后的总字符数以 ${plan.targetCharsPerEpisode} 为目标，必须在 ${Math.ceil(plan.targetCharsPerEpisode * 0.85)}—${Math.floor(plan.targetCharsPerEpisode * 1.15)} 之间；请在返回前逐块相加核对，优先贴近目标值。`,
             `对白只能使用这些已登记人物：${JSON.stringify(state.characters.map((character) => ({ id: character.id, name: character.name })))}`,
@@ -808,33 +817,47 @@ export class ScriptDirector {
         }, `第 ${episodeNumber} 集初稿已保存，进入审查。`);
       }
 
-      const reviewRaw = await this.callModel({
-        node: 'review',
-        projectId: request.projectId,
-        episodeNumber,
-        prompt: [
-          '你是 ScriptContinuityAgent。只返回定位到场景/字段的结构化问题与记忆写回。',
-          '只返回 JSON，字段：issues, summary, newFacts, openedThreads, closedThreads, wardrobe。',
-          '严格模板：{"issues":[{"code":"字符串","severity":"hard|soft","message":"字符串","sceneId":"可选","path":"可选"}],"summary":"150—300字摘要","newFacts":["字符串"],"openedThreads":["字符串"],"closedThreads":["字符串"],"wardrobe":[{"characterId":"人物id","outfit":"服装"}]}。没有问题时 issues 返回空数组，不得改名任何键。',
-          `策划：${JSON.stringify(plan)}`,
-          `大纲：${JSON.stringify(outline)}`,
-          `连续性：${JSON.stringify(state.continuity)}`,
-          `正文：${JSON.stringify(draft)}`,
-        ].join('\n'),
-        signal: request.signal,
-      });
-      const review = this.parseReview(parseStructuredModelOutput(reviewRaw));
-      await this.saveCheckpoint(request, {
-        projectId: request.projectId,
-        runKey,
-        node: 'review',
-        status: 'completed',
-        attempt: 1,
-        artifactRevision: draft.revision,
-        episodeNumber,
-        artifact: review,
-        updatedAt: this.now(),
-      }, `第 ${episodeNumber} 集审查完成。`);
+      if (!state) throw new ScriptModelOutputError('短剧项目状态丢失。');
+      const reviewState = state;
+      const reviewDraft = async (
+        candidate: ScriptEpisode,
+        attempt: number,
+      ): Promise<ReturnType<ScriptDirector['parseReview']>> => {
+        const reviewRaw = await this.callModel({
+          node: 'review',
+          projectId: request.projectId,
+          episodeNumber,
+          prompt: [
+            '你是 ScriptContinuityAgent。只返回定位到场景/字段的结构化问题与记忆写回。',
+            '只返回 JSON，字段：issues, summary, newFacts, openedThreads, closedThreads, wardrobe。',
+            '严格模板：{"issues":[{"code":"字符串","severity":"hard|soft","message":"字符串","sceneId":"可选","path":"可选"}],"summary":"150—300字摘要","newFacts":["字符串"],"openedThreads":["字符串"],"closedThreads":["字符串"],"wardrobe":[{"characterId":"人物id","outfit":"服装"}]}。没有问题时 issues 返回空数组，不得改名任何键。',
+            '逐项检查：人物身份与口吻、场景人物和说话人、时间地点衔接、服装道具、人物已知信息、requiredFacts、forbiddenFacts、重复台词、不可拍摄动作、冲突升级、反转铺垫和结尾卡点。',
+            '会造成剧情矛盾、人物串线、关键事实缺失、结尾无卡点或无法拍摄的问题标为 hard；措辞、节奏、对白密度等可优化项标为 soft。每条问题必须尽量给出 sceneId 和精确 path。',
+            attempt > 1 ? '这是修订后复检。不得假设上一轮问题已解决，必须以当前正文重新判断。' : '',
+            `策划：${JSON.stringify(plan)}`,
+            `大纲：${JSON.stringify(outline)}`,
+            `连续性：${JSON.stringify(reviewState.continuity)}`,
+            `正文：${JSON.stringify(candidate)}`,
+          ].filter(Boolean).join('\n'),
+          signal: request.signal,
+        });
+        const parsedReview = this.parseReview(parseStructuredModelOutput(reviewRaw));
+        await this.saveCheckpoint(request, {
+          projectId: request.projectId,
+          runKey,
+          node: 'review',
+          status: 'completed',
+          attempt,
+          artifactRevision: candidate.revision,
+          episodeNumber,
+          artifact: parsedReview,
+          updatedAt: this.now(),
+        }, attempt > 1
+          ? `第 ${episodeNumber} 集修订后复检完成。`
+          : `第 ${episodeNumber} 集审查完成。`);
+        return parsedReview;
+      };
+      let review = await reviewDraft(draft, 1);
       draft = {
         ...draft,
         summary: review.summary,
@@ -843,13 +866,23 @@ export class ScriptDirector {
         closedThreads: review.closedThreads,
         updatedAt: this.now(),
       };
-      let report = validateScriptEpisode(draft, plan, {
+      const validateDraft = (
+        candidate: ScriptEpisode,
+        reviewIssues?: readonly ScriptGateIssue[],
+      ): ScriptGateReport => validateScriptEpisode(candidate, plan, {
         expectedEpisodeNumber: episodeNumber,
-        registeredCharacterIds: new Set(state.characters.map((character) => character.id)),
-        registeredCharacterNames: new Set(state.characters.map((character) => character.name)),
+        registeredCharacterIds: new Set(reviewState.characters.map((character) => character.id)),
+        registeredCharacterNames: new Set(reviewState.characters.map((character) => character.name)),
+        characterNamesById: new Map(reviewState.characters.map((character) => [character.id, character.name])),
         outline,
-        reviewIssues: review.issues,
+        previousEpisode: reviewState.episodes
+          .filter((item) => item.episodeNumber < episodeNumber)
+          .sort((left, right) => right.episodeNumber - left.episodeNumber)[0],
+        continuity: reviewState.continuity,
+        ...(reviewIssues ? { reviewIssues } : {}),
       });
+      let deterministicReport = validateDraft(draft);
+      let report = validateDraft(draft, review.issues);
 
       if (report.hardFailed) {
         const raw = await this.callModel({
@@ -860,6 +893,8 @@ export class ScriptDirector {
             '你是 ScriptRevisionAgent。只修改硬错误指向的场景和字段，保持其他内容不变。',
             '只返回完整单集 JSON，不输出思考过程。',
             '返回结构必须与输入正文完全同形：顶层保留 episodeNumber, title, scenes, summary, newFacts, openedThreads, closedThreads；场景和块不得改名或省略必填键。',
+            '必须保留所有未命中硬错误的 scene.id、block.id、场景顺序和正文原文；只改问题定位到的最小范围。blocks.text 不得加入“△”“【字幕：】”或说话人前缀。',
+            '修订后重新核对本集 requiredFacts、forbiddenFacts、人物白名单、上下集连续性与最后卡点，不能为修一个错误制造新的剧情事实。',
             scriptLengthInstruction(plan.targetCharsPerEpisode, report.visibleChars),
             `当前所有 blocks.text 去除空白后的总字符数是 ${report.visibleChars}，目标是 ${plan.targetCharsPerEpisode}；请据此精确增加或删除约 ${Math.abs(plan.targetCharsPerEpisode - report.visibleChars)} 个字符。最终必须在 ${Math.ceil(plan.targetCharsPerEpisode * 0.85)}—${Math.floor(plan.targetCharsPerEpisode * 1.15)} 之间，并优先贴近 ${plan.targetCharsPerEpisode}，返回前逐块相加核对。`,
             `对白只能使用这些已登记人物；未知说话人必须改为其中一个人物：${JSON.stringify(state.characters.map((character) => ({ id: character.id, name: character.name })))}`,
@@ -888,14 +923,62 @@ export class ScriptDirector {
           updatedAt: this.now(),
         }, `第 ${episodeNumber} 集定点修订已保存。`);
         draft = { ...revised, summary: review.summary, newFacts: review.newFacts, openedThreads: review.openedThreads, closedThreads: review.closedThreads };
-        report = validateScriptEpisode(draft, plan, {
-          expectedEpisodeNumber: episodeNumber,
-          registeredCharacterIds: new Set(state.characters.map((character) => character.id)),
-          registeredCharacterNames: new Set(state.characters.map((character) => character.name)),
-          outline,
-        });
+        review = await reviewDraft(draft, 2);
+        draft = {
+          ...draft,
+          summary: review.summary,
+          newFacts: review.newFacts,
+          openedThreads: review.openedThreads,
+          closedThreads: review.closedThreads,
+          updatedAt: this.now(),
+        };
+        deterministicReport = validateDraft(draft);
+        report = validateDraft(draft, review.issues);
       }
       if (report.hardFailed) {
+        const failed = await this.dependencies.store.saveEpisode(
+          { ...draft, status: 'failed', updatedAt: this.now() },
+          draft.revision,
+        );
+        await this.persistReviewIssues(
+          request.projectId,
+          episodeNumber,
+          deterministicReport.issues,
+          review.issues,
+        );
+        reports.push({ episodeNumber, report });
+        throw new ScriptBatchPausedError(failed.episodeNumber, report);
+      }
+
+      const persistedReview = await this.persistReviewIssues(
+        request.projectId,
+        episodeNumber,
+        deterministicReport.issues,
+        review.issues,
+      );
+      const retainedOpenHard = persistedReview.items.filter(
+        (item) =>
+          item.episodeNumber === episodeNumber &&
+          item.severity === 'hard' &&
+          item.status === 'open',
+      );
+      if (retainedOpenHard.length > 0) {
+        const known = new Set(report.issues.map((issue) =>
+          [issue.code, issue.sceneId ?? '', issue.blockId ?? '', issue.path ?? ''].join('\u0000'),
+        ));
+        const additional = retainedOpenHard
+          .filter((issue) => !known.has(
+            [issue.code, issue.sceneId ?? '', issue.blockId ?? '', issue.path ?? ''].join('\u0000'),
+          ))
+          .map((issue): ScriptGateIssue => ({
+            code: issue.code,
+            severity: 'hard',
+            message: issue.message,
+            ...(issue.sceneId ? { sceneId: issue.sceneId } : {}),
+            ...(issue.blockId ? { blockId: issue.blockId } : {}),
+            ...(issue.path ? { path: issue.path } : {}),
+          }));
+        report = { ...report, hardFailed: true, issues: [...report.issues, ...additional] };
         const failed = await this.dependencies.store.saveEpisode(
           { ...draft, status: 'failed', updatedAt: this.now() },
           draft.revision,
@@ -903,7 +986,6 @@ export class ScriptDirector {
         reports.push({ episodeNumber, report });
         throw new ScriptBatchPausedError(failed.episodeNumber, report);
       }
-
       const saved = await this.dependencies.store.saveEpisode(
         { ...draft, status: 'completed', updatedAt: this.now() },
         draft.revision,
@@ -1090,6 +1172,30 @@ export class ScriptDirector {
       closedThreads: stringsField(value.closedThreads ?? [], 'closedThreads'),
       wardrobe,
     };
+  }
+
+  private async persistReviewIssues(
+    projectId: string,
+    episodeNumber: number,
+    deterministicIssues: readonly ScriptGateIssue[],
+    aiIssues: readonly ScriptGateIssue[],
+  ): Promise<ScriptReviewIssueCollection> {
+    const now = this.now();
+    return this.dependencies.store.replaceEpisodeReviewIssues(
+      projectId,
+      episodeNumber,
+      ['deterministic', 'ai'],
+      [
+        ...createScriptReviewIssues(
+          projectId,
+          episodeNumber,
+          'deterministic',
+          deterministicIssues,
+          now,
+        ),
+        ...createScriptReviewIssues(projectId, episodeNumber, 'ai', aiIssues, now),
+      ],
+    );
   }
 
   private mergeContinuity(

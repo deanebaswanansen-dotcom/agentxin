@@ -219,6 +219,53 @@ export interface ScriptContinuityState {
   }>;
 }
 
+export type ScriptReviewSeverity = 'hard' | 'soft' | 'suggestion';
+export type ScriptReviewStatus = 'open' | 'fixed' | 'ignored';
+export type ScriptReviewSource = 'deterministic' | 'ai' | 'user';
+export type ScriptReviewCategory =
+  | 'format'
+  | 'continuity'
+  | 'logic'
+  | 'dialogue'
+  | 'character'
+  | 'pacing'
+  | 'spelling'
+  | 'hook';
+
+/** A localized proofreading finding. It is persisted independently from episode text. */
+export interface ScriptReviewIssue {
+  id: ScriptId;
+  projectId: ScriptId;
+  episodeNumber: number;
+  sceneId?: ScriptId;
+  blockId?: ScriptId;
+  path?: string;
+  code: string;
+  severity: ScriptReviewSeverity;
+  category: ScriptReviewCategory;
+  message: string;
+  suggestion?: string;
+  status: ScriptReviewStatus;
+  source: ScriptReviewSource;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type ScriptReviewIssueInput = Omit<
+  ScriptReviewIssue,
+  'id' | 'projectId' | 'createdAt' | 'updatedAt'
+> & { id?: ScriptId };
+
+export interface ScriptReviewIssueCollection {
+  revision: number;
+  items: ScriptReviewIssue[];
+}
+
+export interface ScriptReviewIssueUpdateResult {
+  revision: number;
+  item: ScriptReviewIssue;
+}
+
 export interface ScriptProjectState {
   schemaVersion: 1;
   projectId: ScriptId;
@@ -229,6 +276,9 @@ export interface ScriptProjectState {
   episodeOutlines: ScriptEpisodeOutline[];
   episodes: ScriptEpisode[];
   continuity: ScriptContinuityState;
+  /** Aggregate compare-and-save revision for the review issue collection. */
+  reviewRevision: number;
+  reviewIssues: ScriptReviewIssue[];
   updatedAt: string;
 }
 
@@ -241,6 +291,40 @@ export interface ScriptEpisodeSummary {
   visibleChars: number;
   sceneCount: number;
   revision: number;
+  updatedAt: string;
+}
+
+export type ScriptBatchStatus =
+  | 'blocked'
+  | 'ready'
+  | 'generating'
+  | 'proofreading'
+  | 'completed'
+  | 'failed';
+
+export interface ScriptBatchSummary {
+  startEpisode: number;
+  endEpisode: number;
+  status: ScriptBatchStatus;
+  completedEpisodes: number;
+  visibleChars: number;
+  activeJobId?: string;
+  unresolvedHardIssues: number;
+  unresolvedSoftIssues: number;
+}
+
+/** Compact, single-request payload used by the production workspace shell. */
+export interface ScriptWorkspaceSnapshot {
+  schemaVersion: 1;
+  projectId: ScriptId;
+  plan?: ScriptPlan;
+  outline?: ScriptSeriesOutline;
+  characters: ScriptCharacter[];
+  worldBible?: ScriptWorldBible;
+  episodeSummaries: ScriptEpisodeSummary[];
+  batchSummaries: ScriptBatchSummary[];
+  reviewRevision: number;
+  reviewIssues: ScriptReviewIssue[];
   updatedAt: string;
 }
 

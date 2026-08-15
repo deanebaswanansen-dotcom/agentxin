@@ -17,7 +17,50 @@ function orderedChapters(chapters: ExportChapter[]): ExportChapter[] {
 }
 
 export function sanitizeDownloadName(name: string): string {
-  return name.replace(/[\\/:*?"<>|]/g, '_').trim() || 'novel';
+  const cleaned = name
+    .replace(/[\u0000-\u001f\u007f\\/:*?"<>|]/g, '_')
+    .trim()
+    .replace(/[ .]+$/g, '');
+  if (cleaned.length === 0) return 'novel';
+  return /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(cleaned)
+    ? `_${cleaned}`
+    : cleaned;
+}
+
+/**
+ * Keep object URLs alive long enough for Chromium to finish acquiring them.
+ * Revoking synchronously after `click()` can leave downloads stuck as
+ * `.crdownload`, especially for generated DOCX blobs.
+ */
+export const DOWNLOAD_URL_REVOKE_DELAY_MS = 60_000;
+
+export function downloadBlobFile(
+  blob: Blob,
+  filename: string,
+  revokeDelayMs = DOWNLOAD_URL_REVOKE_DELAY_MS,
+): void {
+  if (typeof document === 'undefined' || typeof URL.createObjectURL !== 'function') {
+    throw new Error('当前环境不支持浏览器文件下载。');
+  }
+
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = sanitizeDownloadName(filename);
+  anchor.rel = 'noopener';
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
+
+  try {
+    anchor.click();
+  } catch (error) {
+    anchor.remove();
+    URL.revokeObjectURL(url);
+    throw error;
+  }
+
+  globalThis.setTimeout(() => anchor.remove(), 0);
+  globalThis.setTimeout(() => URL.revokeObjectURL(url), Math.max(0, revokeDelayMs));
 }
 
 export function buildProjectTextExport(
