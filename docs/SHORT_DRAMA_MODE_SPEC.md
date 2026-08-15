@@ -366,6 +366,7 @@ export interface ScriptStore {
   saveSeriesOutline(value: ScriptSeriesOutline): Promise<void>;
   saveEpisodeOutline(value: ScriptEpisodeOutline): Promise<void>;
   saveEpisode(value: ScriptEpisode, expectedRevision?: number): Promise<void>;
+  commitEpisodeWithContinuity(input: ScriptEpisodeAtomicCommitInput): Promise<void>;
   deleteProject(projectId: Id): Promise<void>;
 }
 ```
@@ -405,9 +406,16 @@ export interface ScriptProjectState {
       outfit: string;
     }>;
   };
+  continuityCommits: ScriptEpisodeContinuityCommit[];
   updatedAt: string;
 }
 ```
+
+`continuity` 保留为旧数据的兼容投影；v1.2 起写入事实源为版本化的
+`continuityCommits[]`。每条提交必须绑定最终 `episodeRevision`、稳定的
+`threadId/propId/timelineEventId`、因果关系、`evidenceBlockIds`、前序提交
+revision、输入 revision 引用和 canonical fingerprint，并标记为
+`current | stale`。同一集最多只能有一个 `current` 提交。
 
 ### 9.3 迁移
 
@@ -451,16 +459,23 @@ ScriptDirector
 
 ### 10.4 单集生成策略
 
-单集逻辑调用上限为 4 次：
+单集按 Dramatron 式层次生成，但第一阶段不增加逐场模型调用：
 
 ```text
-1. EpisodeScenePlanner：把详细大纲确认成 1–5 场
-2. ScriptWriterAgent：一次生成全剧本结构 JSON
-3. ScriptContinuityAgent：输出结构化审查结果
-4. ScriptRevisionAgent：仅在硬错误时定点修订失败场景
+1. EpisodeScenePlanner：把详细大纲展开为 1–5 场，并允许在当前五集进入正文前确认
+2. ScriptWriterAgent：一次生成当前单集的结构化候选稿
+3. deterministic gate：检查结构、ID、人物引用、禁项和可见字数
+4. ScriptContinuityAgent：输出 advisory 审查与连续性候选
+5. ScriptRevisionAgent：只对可定位的 blocking issue 返回白名单 Patch
 ```
 
-临时网络错误允许每个步骤额外重试 2 次，使用指数退避 2 秒、5 秒。模型返回空内容、截断 JSON 或 429/5xx 时不得写入 `completed`。
+场景计划、候选稿和修订候选只保存在 checkpoint；在 blocking gate 全部通过前，
+不得覆盖正式 Episode。结构输出使用版本化 `StructuredContract<T>`：先做本地
+JSON 修复和全量解码，再允许一次携带字段级 `path/code` 的 Fixup；Fixup 必须返回
+完整条目，服务端只按领域白名单合并并重新全量解码。若用户显式配置同供应商
+fallback model，可在固定总调用预算内再尝试一次，否则进入 `waiting_user`。
+网络层只由一个所有者执行最多 2 次指数退避，禁止 JobRunner、模型客户端和结构层
+相乘重试。模型返回空内容、截断 JSON 或 429/5xx 时不得写入 `completed`。
 
 ### 10.5 上下文预算
 
@@ -480,7 +495,8 @@ ScriptDirector
 
 ### 10.6 记忆写回
 
-每集通过质量门后写回：
+每集通过质量门后，在同一次项目文件 mutation 中原子提交 completed Episode 和
+current continuity commit。写回内容包括：
 
 - 150–300 字单集摘要。
 - 人物地点、关系、已知信息和情绪变化。
@@ -488,6 +504,12 @@ ScriptDirector
 - 关键道具归属和状态。
 - 每个出场人物的服装。
 - 下一集必须继承的结束状态。
+- 有稳定 ID 的时间线事件、因果关系和正文 `evidenceBlockIds`。
+
+用户编辑已完成 Episode 时，同一次 mutation 必须把 Episode 降为 `reviewing`，并把
+旧 continuity commit 标为 `stale`。现有“校稿第 N 集”流程在无 blocking issue 后
+重新生成连续性候选，再以同一原子操作恢复 `completed/current`。启动下一集前，
+后端必须验证紧邻前一集存在与最新 Episode revision 一致的 current commit。
 
 原始剧本是召回源；摘要和账本是提示词源。不得把完整历史正文逐集累加到提示词。
 
@@ -516,15 +538,23 @@ interface ScriptBatchOptions {
 
 ### 11.2 节点检查点
 
-`script_episode_batch` 在以下位置同步保存检查点：
+`script_episode_batch` 使用外层 `CheckpointFile.schemaVersion = 2`，并在以下位置同步保存检查点：
 
 1. 当前 5 集详细大纲保存后。
 2. 单集场景计划保存后。
-3. 单集初稿保存为 `reviewing` 后。
-4. 审查或修订完成并保存为 `completed` 后。
-5. 批次报告生成后。
+3. 单集候选稿写入 checkpoint 后（不覆盖正式 Episode）。
+4. 审查或 Patch 候选写入 checkpoint 后。
+5. Episode 与 continuity commit 原子保存为 `completed/current` 后。
+6. 批次报告生成后。
 
-任务检查点必须记录 `projectId、episodeNumber、node、attempt、artifactRevision`。恢复时查询第一个未完成节点；已完成集只读复用，不重新调用模型。
+节点状态至少包括 `pending | running | retrying | succeeded | needs_review | failed | stale`；
+对外将 `needs_review` 映射为 Job `waiting_user`，`failed` 只表示不可自动恢复错误。
+任务检查点必须记录 `projectId、episodeNumber、node、attempt、artifactRevision、
+inputRevisionRefs、promptVersion、configRevision、inputFingerprint、validationErrors`，
+并可保存 raw/repaired/candidate artifact。只有 canonical fingerprint 相同的
+`succeeded` 节点才允许只读复用；输入 revision 变化时节点及下游标为 `stale`。
+恢复从原失败节点或 Fixup attempt 继续，不能跳过候选验证。v1 检查点读取后按幂等
+规则迁移为 v2，未知 schemaVersion 必须拒绝写回。
 
 ### 11.3 项目隔离
 
@@ -600,7 +630,7 @@ Fountain 只作为交换格式：场景标题使用 `.INT.`/`.EXT.` 兼容写法
 
 ### 14.1 硬错误
 
-出现任意一项时不得标记 `completed`：
+blocking issue 出现任意一项时不得标记 `completed`：
 
 - 集号与请求集号不一致或同一项目集号重复。
 - 正文没有场景，或场景数超出 `maxScenesPerEpisode`。
@@ -609,9 +639,14 @@ Fountain 只作为交换格式：场景标题使用 `.INT.`/`.EXT.` 兼容写法
 - 可见字符少于目标的 85%，或超过目标的 115%。
 - 模型思维链、JSON 标签、Markdown 围栏或系统提示混入正文。
 - 与锁定策划的题材、时代或硬禁忌直接冲突。
-- 本集关键事件或结尾卡点为空。
+- 本集关键事件或结尾卡点为空（由确定性 evidence 证明）。
 
 可见字符定义：序列化后的中文、字母、数字和标点，排除空白、格式前缀和场景编号。
+
+`hard` 严重度不再单独决定是否 blocking：确定性规则和用户明确创建的 open hard
+问题参与阻断；AI review 默认是 advisory，即使模型自报 hard 也不能单独阻断。
+AI 只有提供可由确定性规则复核的具体 `sceneId/blockId/path/evidence` 时，才转换为
+对应的确定性 blocking issue。`requiredFacts` 不再用正文精确字符串匹配同义表达。
 
 ### 14.2 软问题
 
@@ -622,7 +657,11 @@ Fountain 只作为交换格式：场景标题使用 `.INT.`/`.EXT.` 兼容写法
 - 本集前 20% 没有建立冲突，后 15% 没有形成卡点。
 - 对话密度偏离策划值超过 15 个百分点。
 
-软问题写入批次报告，不自动整集重写。只有能定位到具体场景和具体字段的问题才允许调用 `ScriptRevisionAgent`。
+软问题和 AI advisory 写入批次报告，不自动整集重写。只有能定位到具体场景、正文块
+和字段的 blocking issue 才允许调用 `ScriptRevisionAgent`。修订响应必须是
+`replaceBlockText | insertBlockAfter | appendBlock | updateSceneCharacters` 之一，引用
+既有稳定 ID；服务端在候选副本应用 Patch，验证未触及块的 ID、顺序和内容哈希不变，
+通过全部 gate 后才允许提交。
 
 ## 15. 前端工作台
 
@@ -779,6 +818,14 @@ npm test -- --run src/components/script src/lib/scriptFormat.test.ts src/lib/scr
 - 切换项目后右侧运行记录、计划会话和正文不串线。
 - 用户编辑已完成集后，旧后台任务写入触发 HTTP 409。
 - 模型返回空内容、截断 JSON、429、502 和超时时不产生空集。
+- primary 结构失败后依次验证本地修复、一次 Fixup、可选 fallback；无 fallback 时进入 `waiting_user`。
+- v1 checkpoint 幂等迁移到 v2；fingerprint 不同时旧候选变 stale，恢复不得复用。
+- 场景计划确认后修改会使 draft/review/Patch 下游失效，新候选必须读取新 fingerprint。
+- 修订只改变白名单 Patch 路径，正常正文块的 ID、顺序和哈希保持不变。
+- AI 自报 hard 不单独阻断，用户 hard 和可确定性复核的 hard 仍阻断。
+- completed Episode 与同 revision 的 current continuity commit 必须原子出现；编辑后同一原子操作降为 reviewing/stale。
+- 进程在候选与正式提交之间中断，重启后不得产生半完成 Episode 或半份 continuity。
+- 后续批次在上一集 continuity 缺失、stale 或 revision 不匹配时被后端拒绝。
 
 ### 19.4 浏览器验收
 
@@ -791,8 +838,9 @@ npm test -- --run src/components/script src/lib/scriptFormat.test.ts src/lib/scr
 
 ## 20. 性能与可靠性指标
 
-- 单集 1,200 字、最多 3 场时，正常逻辑调用不超过 4 次。
-- 5 集批次正常逻辑调用不超过 21 次：1 次详细大纲＋每集最多 4 次。
+- 单集 1,200 字、最多 3 场时，正常路径不超过 3 次模型调用：场景计划、正文候选、AI advisory；只有结构失败或确定性 blocking issue 才使用 Fixup/Patch 预算。
+- 结构层每个 artifact 最多一次 Fixup 和一次显式配置的 fallback；网络重试由单一层拥有，所有尝试都写入 checkpoint 指标。
+- 5 集批次分别记录正常调用、结构 Fixup、fallback、Patch 和网络重试，禁止把不同重试层相乘成无界调用。
 - 每个模型步骤收到首个 SSE 心跳的时间不超过 8 秒。
 - 后台任务每完成一个节点即持久化；服务器重启后最多重复当前未完成节点。
 - 项目切换后 2 秒内显示该项目已持久化的任务状态，不展示其他项目消息。
@@ -966,7 +1014,7 @@ v1.1 不替换 v1.0 的结构化领域模型和后台任务，而是在其上补
 
 ### 27.3 可见校稿
 
-质量问题必须持久化并可定位到集、场景和正文块。问题分为 `hard | soft | suggestion`，状态分为 `open | fixed | ignored`。硬问题未解决时单集不得进入 `completed`。
+质量问题必须持久化并可定位到集、场景和正文块。问题分为 `hard | soft | suggestion`，状态分为 `open | fixed | ignored`，并记录 `source = deterministic | ai | user`。只有确定性规则或用户创建的 open hard 问题属于 blocking；AI 问题默认 advisory，必须经确定性 evidence 复核后才能转为 blocking。未解决 blocking issue 时单集不得进入 `completed`。
 
 除 v1.0 已有检查外，v1.1 至少覆盖：人物表与说话人一致性、空动作/空对白、字幕污染、过长对白、场景人物缺失、关键冲突和结尾卡点、重复台词、上下集人物/服装/道具/已知信息连续性。修订只允许作用于失败场景或正文块，不能覆盖用户已经修改的完整单集。
 
