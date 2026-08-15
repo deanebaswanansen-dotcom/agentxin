@@ -49,6 +49,11 @@ export class ServiceError extends Error {
     return new ServiceError(ERROR_CODES.NOT_FOUND, message);
   }
 
+  /** Build a `CONFLICT` (HTTP 409) domain error for optimistic revisions. */
+  static conflict(message: string): ServiceError {
+    return new ServiceError(ERROR_CODES.CONFLICT, message);
+  }
+
   /** Build a `MODEL_NOT_CONFIGURED` (HTTP 409) domain error. */
   static modelNotConfigured(message: string): ServiceError {
     return new ServiceError(ERROR_CODES.MODEL_NOT_CONFIGURED, message);

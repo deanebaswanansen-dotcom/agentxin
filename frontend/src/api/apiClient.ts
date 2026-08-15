@@ -58,6 +58,17 @@ import type {
   RewriteSceneBody,
   SimilarityCheckRequest,
   SimilarityCheckResult,
+  ScriptAgentJobRequest,
+  ScriptAgentJobSnapshot,
+  ScriptCharacter,
+  ScriptEpisode,
+  ScriptEpisodeOutline,
+  ScriptEpisodeSummary,
+  ScriptPlan,
+  ScriptPlanTurnRequest,
+  ScriptPlanTurnResponse,
+  ScriptSeriesOutline,
+  ScriptWorldBible,
   WordCountReport,
   WorldSetting,
   WritingRequestBody,
@@ -295,7 +306,7 @@ function statusToCode(status: number): ErrorCode {
     case 404:
       return 'NOT_FOUND';
     case 409:
-      return 'MODEL_NOT_CONFIGURED';
+      return 'CONFLICT';
     case 401:
     case 402:
     case 403:
@@ -407,6 +418,34 @@ async function request<T>(
       throw new ApiClientError(
         { error: { code: 'PROVIDER_ERROR', message: '请求超过 45 秒没有响应，请检查后端或模型服务。' } },
       );
+    }
+    throw error;
+  } finally {
+    timeout.dispose();
+  }
+}
+
+async function requestText(
+  baseUrl: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const timeout = linkedTimeoutSignal(signal, REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${baseUrl}${path}`, {
+      method: 'GET',
+      headers: clientIdentityHeader(),
+      signal: timeout.signal,
+    });
+    if (!response.ok) {
+      throw toApiClientError(await readBody(response), response.status, response.statusText);
+    }
+    return await response.text();
+  } catch (error) {
+    if (timeout.didTimeout()) {
+      throw new ApiClientError({
+        error: { code: 'PROVIDER_ERROR', message: '请求超过 45 秒没有响应，请检查后端或模型服务。' },
+      });
     }
     throw error;
   } finally {
@@ -1259,10 +1298,48 @@ export interface ApiClient {
     cancelJob(jobId: string, signal?: AbortSignal): Promise<PersistentAgentJobSnapshot>;
   };
   projects: {
-    list(signal?: AbortSignal): Promise<Pick<Project, 'id' | 'name'>[]>;
-    create(name: string, signal?: AbortSignal): Promise<{ id: Id }>;
+    list(signal?: AbortSignal): Promise<Array<Pick<Project, 'id' | 'name' | 'kind'>>>;
+    get(id: Id, signal?: AbortSignal): Promise<Project>;
+    create(name: string, kind?: Project['kind'], signal?: AbortSignal): Promise<{ id: Id }>;
     rename(id: Id, name: string, signal?: AbortSignal): Promise<void>;
     remove(id: Id, signal?: AbortSignal): Promise<void>;
+  };
+  script: {
+    plan: {
+      get(projectId: Id, signal?: AbortSignal): Promise<ScriptPlan>;
+      save(projectId: Id, value: ScriptPlan, expectedRevision: number, signal?: AbortSignal): Promise<ScriptPlan>;
+      approve(projectId: Id, expectedRevision: number, signal?: AbortSignal): Promise<ScriptPlan>;
+      turn(body: ScriptPlanTurnRequest, signal?: AbortSignal): Promise<ScriptPlanTurnResponse>;
+    };
+    characters: {
+      list(projectId: Id, signal?: AbortSignal): Promise<ScriptCharacter[]>;
+      save(projectId: Id, items: ScriptCharacter[], expectedRevision: number, signal?: AbortSignal): Promise<ScriptCharacter[]>;
+    };
+    world: {
+      get(projectId: Id, signal?: AbortSignal): Promise<ScriptWorldBible>;
+      save(projectId: Id, value: ScriptWorldBible, expectedRevision: number, signal?: AbortSignal): Promise<ScriptWorldBible>;
+    };
+    outline: {
+      get(projectId: Id, signal?: AbortSignal): Promise<ScriptSeriesOutline>;
+      save(projectId: Id, value: ScriptSeriesOutline, expectedRevision: number, signal?: AbortSignal): Promise<ScriptSeriesOutline>;
+    };
+    episodeOutlines: {
+      get(projectId: Id, episodeNumber: number, signal?: AbortSignal): Promise<ScriptEpisodeOutline>;
+      save(projectId: Id, episodeNumber: number, value: ScriptEpisodeOutline, expectedRevision: number, signal?: AbortSignal): Promise<ScriptEpisodeOutline>;
+    };
+    episodes: {
+      list(projectId: Id, signal?: AbortSignal): Promise<ScriptEpisodeSummary[]>;
+      get(projectId: Id, episodeNumber: number, signal?: AbortSignal): Promise<ScriptEpisode>;
+      save(projectId: Id, episodeNumber: number, value: ScriptEpisode, expectedRevision: number, signal?: AbortSignal): Promise<ScriptEpisode>;
+    };
+    jobs: {
+      create(body: ScriptAgentJobRequest, signal?: AbortSignal): Promise<ScriptAgentJobSnapshot>;
+      list(projectId: Id, signal?: AbortSignal): Promise<ScriptAgentJobSnapshot[]>;
+      get(jobId: string, signal?: AbortSignal): Promise<ScriptAgentJobSnapshot>;
+      resume(jobId: string, signal?: AbortSignal): Promise<ScriptAgentJobSnapshot>;
+      cancel(jobId: string, signal?: AbortSignal): Promise<ScriptAgentJobSnapshot>;
+    };
+    export(projectId: Id, format: 'txt' | 'md', range?: { startEpisode?: number; episodeCount?: number }, signal?: AbortSignal): Promise<string>;
   };
   chapters: {
     list(projectId: Id, signal?: AbortSignal): Promise<Chapter[]>;
@@ -1439,10 +1516,74 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
     },
     projects: {
       list: (signal) => request(b, 'GET', '/projects', undefined, { signal }),
-      create: (name, signal) => request(b, 'POST', '/projects', { name }, { signal }),
+      get: (id, signal) => request(b, 'GET', `/projects/${seg(id)}`, undefined, { signal }),
+      create: (name, kind, signal) =>
+        request(b, 'POST', '/projects', kind === undefined ? { name } : { name, kind }, { signal }),
       rename: (id, name, signal) =>
         request(b, 'PATCH', `/projects/${seg(id)}`, { name }, { signal }),
       remove: (id, signal) => request(b, 'DELETE', `/projects/${seg(id)}`, undefined, { signal }),
+    },
+    script: {
+      plan: {
+        get: (projectId, signal) =>
+          request(b, 'GET', `/projects/${seg(projectId)}/script-plan`, undefined, { signal }),
+        save: (projectId, value, expectedRevision, signal) =>
+          request(b, 'PUT', `/projects/${seg(projectId)}/script-plan`, { expectedRevision, value }, { signal }),
+        approve: (projectId, expectedRevision, signal) =>
+          request(b, 'POST', `/projects/${seg(projectId)}/script-plan/approve`, { expectedRevision }, { signal }),
+        turn: (body, signal) =>
+          request(b, 'POST', '/plan/script/turn', body, { signal, includeModelConfig: true }),
+      },
+      characters: {
+        list: (projectId, signal) =>
+          request(b, 'GET', `/projects/${seg(projectId)}/script-characters`, undefined, { signal }),
+        save: (projectId, items, expectedRevision, signal) =>
+          request(b, 'PUT', `/projects/${seg(projectId)}/script-characters`, { expectedRevision, items }, { signal }),
+      },
+      world: {
+        get: (projectId, signal) =>
+          request(b, 'GET', `/projects/${seg(projectId)}/script-world`, undefined, { signal }),
+        save: (projectId, value, expectedRevision, signal) =>
+          request(b, 'PUT', `/projects/${seg(projectId)}/script-world`, { expectedRevision, value }, { signal }),
+      },
+      outline: {
+        get: (projectId, signal) =>
+          request(b, 'GET', `/projects/${seg(projectId)}/script-outline`, undefined, { signal }),
+        save: (projectId, value, expectedRevision, signal) =>
+          request(b, 'PUT', `/projects/${seg(projectId)}/script-outline`, { expectedRevision, value }, { signal }),
+      },
+      episodeOutlines: {
+        get: (projectId, episodeNumber, signal) =>
+          request(b, 'GET', `/projects/${seg(projectId)}/episode-outlines/${episodeNumber}`, undefined, { signal }),
+        save: (projectId, episodeNumber, value, expectedRevision, signal) =>
+          request(b, 'PUT', `/projects/${seg(projectId)}/episode-outlines/${episodeNumber}`, { expectedRevision, value }, { signal }),
+      },
+      episodes: {
+        list: (projectId, signal) =>
+          request(b, 'GET', `/projects/${seg(projectId)}/script-episodes`, undefined, { signal }),
+        get: (projectId, episodeNumber, signal) =>
+          request(b, 'GET', `/projects/${seg(projectId)}/script-episodes/${episodeNumber}`, undefined, { signal }),
+        save: (projectId, episodeNumber, value, expectedRevision, signal) =>
+          request(b, 'PUT', `/projects/${seg(projectId)}/script-episodes/${episodeNumber}`, { expectedRevision, value }, { signal }),
+      },
+      jobs: {
+        create: (body, signal) =>
+          request(b, 'POST', '/agent/jobs', body, { signal, includeModelConfig: true }),
+        list: (projectId, signal) =>
+          request(b, 'GET', `/projects/${seg(projectId)}/agent-jobs`, undefined, { signal }),
+        get: (jobId, signal) =>
+          request(b, 'GET', `/agent/jobs/${seg(jobId)}`, undefined, { signal }),
+        resume: (jobId, signal) =>
+          request(b, 'POST', `/agent/jobs/${seg(jobId)}/resume`, {}, { signal, includeModelConfig: true }),
+        cancel: (jobId, signal) =>
+          request(b, 'POST', `/agent/jobs/${seg(jobId)}/cancel`, {}, { signal }),
+      },
+      export: (projectId, format, range, signal) => {
+        const params = new URLSearchParams({ format });
+        if (range?.startEpisode !== undefined) params.set('startEpisode', String(range.startEpisode));
+        if (range?.episodeCount !== undefined) params.set('episodeCount', String(range.episodeCount));
+        return requestText(b, `/projects/${seg(projectId)}/script-export?${params.toString()}`, signal);
+      },
     },
     chapters: {
       list: (projectId, signal) =>

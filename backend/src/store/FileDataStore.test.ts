@@ -28,6 +28,15 @@ afterEach(async () => {
 });
 
 describe('FileDataStore project operations', () => {
+  it('persists the explicit project kind for a short-drama project', async () => {
+    const store = await FileDataStore.create(file);
+    const project = await store.createProject('我的短剧', 'short_drama');
+
+    expect(project.kind).toBe('short_drama');
+    await expect(FileDataStore.create(file).then((reloaded) => reloaded.getProject(project.id)))
+      .resolves.toMatchObject({ kind: 'short_drama' });
+  });
+
   it('creates a project with a UUID, timestamps and returns id+name in list', async () => {
     const store = await FileDataStore.create(file);
     const project = await store.createProject('我的小说');
@@ -40,7 +49,7 @@ describe('FileDataStore project operations', () => {
     expect(new Date(project.createdAt).toISOString()).toBe(project.createdAt);
 
     const list = await store.listProjects();
-    expect(list).toEqual([{ id: project.id, name: '我的小说' }]);
+    expect(list).toEqual([{ id: project.id, name: '我的小说', kind: 'novel' }]);
   });
 
   it('generates unique ids across multiple creations', async () => {
@@ -255,7 +264,18 @@ describe('FileDataStore storage engine', () => {
     // No leftover temp files should remain after an atomic write.
     const second = await FileDataStore.create(file);
     const list = await second.listProjects();
-    expect(list).toEqual([{ id: created.id, name: 'persist-me' }]);
+    expect(list).toEqual([{ id: created.id, name: 'persist-me', kind: 'novel' }]);
+  });
+
+  it('migrates legacy projects without a kind to novel on load', async () => {
+    await writeFile(file, JSON.stringify({
+      projects: [{ id: 'legacy', name: '旧项目', createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' }],
+    }), 'utf8');
+
+    const store = await FileDataStore.create(file);
+    await expect(store.getProject('legacy')).resolves.toMatchObject({ kind: 'novel' });
+    const migrated = JSON.parse(await readFile(file, 'utf8'));
+    expect(migrated.projects[0].kind).toBe('novel');
   });
 
   it('throws StoreError when the data file contains invalid JSON', async () => {

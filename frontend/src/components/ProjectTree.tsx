@@ -9,12 +9,12 @@ import type { Chapter, Id, Project } from '../types/index.js';
 import { Icon } from './Icon.js';
 import './components.css';
 
-type ProjectItem = Pick<Project, 'id' | 'name'>;
+type ProjectItem = Pick<Project, 'id' | 'name' | 'kind'>;
 
 export interface ProjectTreeProps {
   selectedProjectId?: Id | null;
   selectedChapterId?: Id | null;
-  onSelectProject: (projectId: Id) => void;
+  onSelectProject: (projectId: Id, kind: Project['kind']) => void;
   onSelectChapter: (chapterId: Id) => void;
   onProjectDeleted?: (projectId: Id) => void;
   onChapterDeleted?: (chapterId: Id) => void;
@@ -42,6 +42,7 @@ export function ProjectTree({
   const [chaptersByProject, setChaptersByProject] = useState<Record<string, Chapter[]>>({});
   const [loading, setLoading] = useState(false);
   const [newName, setNewName] = useState('');
+  const [newKind, setNewKind] = useState<Project['kind']>('novel');
   const [query, setQuery] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -73,7 +74,7 @@ export function ProjectTree({
           throw new Error('项目列表接口返回格式错误：期望数组。');
         }
         // 新项目在上，方便管理
-        setProjects([...list].reverse());
+        setProjects(list.map((project) => ({ ...project, kind: project.kind ?? 'novel' })).reverse());
       } catch (error) {
         handleError(error);
       } finally {
@@ -103,10 +104,12 @@ export function ProjectTree({
 
   useEffect(() => {
     if (selectedProjectId == null) return;
+    const selectedProject = projects.find((project) => project.id === selectedProjectId);
+    if (!selectedProject || selectedProject.kind !== 'novel') return;
     const controller = new AbortController();
     void refreshChapters(selectedProjectId, controller.signal);
     return () => controller.abort();
-  }, [selectedProjectId, refreshChapters, refreshToken]);
+  }, [projects, selectedProjectId, refreshChapters, refreshToken]);
 
   const filteredProjects = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -119,18 +122,18 @@ export function ProjectTree({
     if (name.length === 0 || busy) return;
     setBusy(true);
     try {
-      const { id } = await client.projects.create(name);
-      setProjects((current) => [{ id, name }, ...current]);
+      const { id } = await client.projects.create(name, newKind);
+      setProjects((current) => [{ id, name, kind: newKind }, ...current]);
       setChaptersByProject((current) => ({ ...current, [id]: [] }));
       setNewName('');
       setQuery('');
-      onSelectProject(id);
+      onSelectProject(id, newKind);
     } catch (error) {
       handleError(error);
     } finally {
       setBusy(false);
     }
-  }, [newName, busy, client, onSelectProject, handleError]);
+  }, [newName, newKind, busy, client, onSelectProject, handleError]);
 
   const doRename = useCallback(async () => {
     if (!renameTarget) return;
@@ -399,6 +402,16 @@ export function ProjectTree({
 
         <div className="nwa-project-tree__new">
           <div className="nwa-project-tree__create-row">
+            <select
+              className="nwa-input nwa-project-tree__kind-select"
+              aria-label="新项目类型"
+              value={newKind}
+              disabled={busy}
+              onChange={(event) => setNewKind(event.target.value as Project['kind'])}
+            >
+              <option value="novel">小说</option>
+              <option value="short_drama">短剧</option>
+            </select>
             <input
               className="nwa-input nwa-project-tree__new-input"
               type="text"
@@ -474,13 +487,14 @@ export function ProjectTree({
                     type="button"
                     className="nwa-project-tree__label"
                     aria-pressed={isProjectSelected}
-                    onClick={() => onSelectProject(project.id)}
+                    onClick={() => onSelectProject(project.id, project.kind)}
                     title={project.name}
                   >
                     <span className="nwa-project-tree__icon">
                       <Icon name={isProjectSelected ? 'folderOpen' : 'folder'} />
                     </span>
                     <span className="nwa-project-tree__name">{project.name}</span>
+                    {project.kind === 'short_drama' ? <span className="nwa-project-tree__kind-badge">短剧</span> : null}
                     {isProjectSelected && chapters.length > 0 ? (
                       <span className="nwa-project-tree__badge">{chapters.length}</span>
                     ) : null}
@@ -519,7 +533,9 @@ export function ProjectTree({
                 </div>
                 {isProjectSelected && !selectMode ? (
                   <ul className="nwa-project-tree__sublist">
-                    {chapters.length === 0 ? (
+                    {project.kind === 'short_drama' ? (
+                      <li className="nwa-project-tree__sub-empty">短剧制作台</li>
+                    ) : chapters.length === 0 ? (
                       <li className="nwa-project-tree__sub-empty">暂无章节</li>
                     ) : (
                       chapters.map((chapter) => {

@@ -50,6 +50,7 @@ import type {
   Outline,
   PacingReport,
   Project,
+  ProjectKind,
   SceneDraft,
   WordCountReport,
   WorldSetting,
@@ -112,6 +113,9 @@ export class FileDataStore implements DataStore {
    */
   private writeQueue: Promise<void> = Promise.resolve();
 
+  /** True when an older on-disk project needs its default workspace kind persisted. */
+  private needsProjectKindMigration = false;
+
   /**
    * Prefer {@link FileDataStore.create} which also loads existing data. The
    * constructor only records the path and starts from an empty state so that
@@ -134,7 +138,7 @@ export class FileDataStore implements DataStore {
   ): Promise<FileDataStore> {
     const store = new FileDataStore(filePath);
     await store.load();
-    if (store.migrateLegacyAgentMaterials()) {
+    if (store.needsProjectKindMigration || store.migrateLegacyAgentMaterials()) {
       await store.persist();
     }
     return store;
@@ -215,6 +219,8 @@ export class FileDataStore implements DataStore {
 
     try {
       const parsed = JSON.parse(raw) as Partial<FileDataStoreState> | null;
+      this.needsProjectKindMigration = Array.isArray(parsed?.projects) &&
+        parsed.projects.some((project) => project.kind !== 'novel' && project.kind !== 'short_drama');
       this.state = normalizeState(parsed);
     } catch (error) {
       throw new StoreError(
@@ -291,11 +297,12 @@ export class FileDataStore implements DataStore {
    * domain concern handled by the service layer (task 3.1); the store stores
    * the name as given.
    */
-  async createProject(name: string): Promise<Project> {
+  async createProject(name: string, kind: ProjectKind = 'novel'): Promise<Project> {
     const now = new Date().toISOString();
     const project: Project = {
       id: randomUUID(),
       name,
+      kind,
       createdAt: now,
       updatedAt: now,
     };
@@ -304,9 +311,9 @@ export class FileDataStore implements DataStore {
     return { ...project };
   }
 
-  /** Return id + name for every project (Requirement 1.2). */
-  async listProjects(): Promise<Pick<Project, 'id' | 'name'>[]> {
-    return this.state.projects.map(({ id, name }) => ({ id, name }));
+  /** Return the identity, display name and workspace kind for every project. */
+  async listProjects(): Promise<Pick<Project, 'id' | 'name' | 'kind'>[]> {
+    return this.state.projects.map(({ id, name, kind }) => ({ id, name, kind }));
   }
 
   /** Return a copy of the project, or `undefined` if it does not exist. */
@@ -1041,7 +1048,12 @@ function normalizeState(
     return base;
   }
   return {
-    projects: Array.isArray(parsed.projects) ? parsed.projects : base.projects,
+    projects: Array.isArray(parsed.projects)
+      ? parsed.projects.map((project) => ({
+          ...project,
+          kind: project.kind === 'short_drama' ? 'short_drama' : 'novel',
+        }))
+      : base.projects,
     chapters: Array.isArray(parsed.chapters) ? parsed.chapters : base.chapters,
     characters: Array.isArray(parsed.characters)
       ? parsed.characters

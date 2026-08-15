@@ -9,7 +9,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { DataStore } from '../../store/DataStore.js';
-import type { Id, Project } from '../../types/index.js';
+import type { Id, Project, ProjectKind } from '../../types/index.js';
 import { ServiceError, isServiceError } from '../ServiceError.js';
 import { ProjectService } from './ProjectService.js';
 
@@ -19,19 +19,20 @@ function makeFakeStore(): DataStore {
   let seq = 0;
 
   const fake: Partial<DataStore> = {
-    async createProject(name: string): Promise<Project> {
+    async createProject(name: string, kind: ProjectKind = 'novel'): Promise<Project> {
       const now = new Date().toISOString();
       const project: Project = {
         id: `id-${++seq}`,
         name,
+        kind,
         createdAt: now,
         updatedAt: now,
       };
       projects.set(project.id, project);
       return { ...project };
     },
-    async listProjects(): Promise<Pick<Project, 'id' | 'name'>[]> {
-      return [...projects.values()].map(({ id, name }) => ({ id, name }));
+    async listProjects(): Promise<Pick<Project, 'id' | 'name' | 'kind'>[]> {
+      return [...projects.values()].map(({ id, name, kind }) => ({ id, name, kind }));
     },
     async getProject(id: Id): Promise<Project | undefined> {
       const found = projects.get(id);
@@ -66,6 +67,14 @@ describe('ProjectService.create', () => {
     expect(project.name).toBe('  有空格的名称  ');
   });
 
+  it('creates a short-drama project when explicitly requested', async () => {
+    const service = new ProjectService(makeFakeStore());
+    await expect(service.create('竖屏短剧', 'short_drama')).resolves.toMatchObject({
+      name: '竖屏短剧',
+      kind: 'short_drama',
+    });
+  });
+
   it.each(['', '   ', '\t\n', '\u00A0'])(
     'rejects empty/whitespace-only name %j with VALIDATION_ERROR (Req 1.5)',
     async (name) => {
@@ -87,8 +96,8 @@ describe('ProjectService.list', () => {
     const b = await service.create('b');
     const list = await service.list();
     expect(list).toEqual([
-      { id: a.id, name: 'a' },
-      { id: b.id, name: 'b' },
+      { id: a.id, name: 'a', kind: 'novel' },
+      { id: b.id, name: 'b', kind: 'novel' },
     ]);
   });
 });
@@ -99,7 +108,7 @@ describe('ProjectService.rename', () => {
     const created = await service.create('old');
     const renamed = await service.rename(created.id, 'new');
     expect(renamed.name).toBe('new');
-    expect((await service.list())[0]).toEqual({ id: created.id, name: 'new' });
+    expect((await service.list())[0]).toEqual({ id: created.id, name: 'new', kind: 'novel' });
   });
 
   it('throws NOT_FOUND for an unknown id (Req 1.6)', async () => {
@@ -116,7 +125,7 @@ describe('ProjectService.rename', () => {
       (e: unknown) => isServiceError(e) && e.code === 'VALIDATION_ERROR',
     );
     // Name unchanged.
-    expect((await service.list())[0]).toEqual({ id: created.id, name: 'old' });
+    expect((await service.list())[0]).toEqual({ id: created.id, name: 'old', kind: 'novel' });
   });
 });
 
@@ -133,6 +142,20 @@ describe('ProjectService.remove', () => {
     await expect(service.remove('missing')).rejects.toSatisfy(
       (e: unknown) => isServiceError(e) && e.code === 'NOT_FOUND',
     );
+  });
+
+  it('removes project-scoped auxiliary data after deleting the project', async () => {
+    const removed: string[] = [];
+    const service = new ProjectService(makeFakeStore(), {
+      afterRemove: async (projectId) => {
+        removed.push(projectId);
+      },
+    });
+    const created = await service.create('短剧', 'short_drama');
+
+    await service.remove(created.id);
+
+    expect(removed).toEqual([created.id]);
   });
 });
 

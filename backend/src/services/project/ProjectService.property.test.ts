@@ -136,7 +136,7 @@ describe('ProjectService create/list', () => {
         // creation order (which the store preserves). The ordered deep-equal
         // simultaneously checks count, id→name mapping and order.
         const list = await service.list();
-        expect(list).toEqual(created.map((p) => ({ id: p.id, name: p.name })));
+        expect(list).toEqual(created.map((p) => ({ id: p.id, name: p.name, kind: 'novel' })));
       }),
       { numRuns: NUM_RUNS },
     );

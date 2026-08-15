@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 import fc from 'fast-check';
 import { App } from './App.js';
@@ -68,6 +68,34 @@ describe('App shell', () => {
   it('exposes DOCX export and disables it until a project is selected', async () => {
     render(<App />);
     expect(await screen.findByRole('button', { name: '导出 DOCX' })).toBeDisabled();
+  });
+
+  it('opens a short-drama project in its isolated five-stage workspace', async () => {
+    const plan = {
+      id: 'plan-script-1', projectId: 'script-1', status: 'draft', revision: 1,
+      title: '竖屏短剧', theme: '', market: 'domestic', channel: 'female', genres: [], audience: '',
+      coreConflict: '', logline: '', highlights: [], totalEpisodes: 60,
+      episodeDurationSeconds: { min: 60, max: 90 }, targetCharsPerEpisode: 1200,
+      maxPrimaryCharacters: 10, maxScenesPerEpisode: 3, dialogueDensityPercent: 60,
+      language: 'zh-CN', format: 'cn_short_drama', coreRequirements: '', forbiddenElements: [],
+      endingDirection: '', createdAt: '2026-08-14T00:00:00.000Z', updatedAt: '2026-08-14T00:00:00.000Z',
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, 'http://localhost');
+      if (url.pathname.endsWith('/script-plan')) return Response.json(plan);
+      if (url.pathname.endsWith('/script-world') || url.pathname.endsWith('/script-outline')) {
+        return Response.json({ error: { code: 'NOT_FOUND', message: 'missing' } }, { status: 404 });
+      }
+      if (url.pathname.endsWith('/projects')) return Response.json([{ id: 'script-1', name: '竖屏短剧', kind: 'short_drama' }]);
+      return Response.json([]);
+    }));
+
+    render(<App />);
+    fireEvent.click(await screen.findByTitle('竖屏短剧'));
+
+    expect(await screen.findByRole('tab', { name: '剧本策划' })).toBeInTheDocument();
+    expect(screen.getByText('短剧制作台')).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: '对话输入' })).not.toBeInTheDocument());
   });
 
   it('fast-check is wired up (array reverse twice is identity)', () => {

@@ -84,7 +84,15 @@ export class AgentJobRunner {
   ): Promise<StoredAgentRun | undefined> {
     const run = this.store.getForClient(clientId, id);
     if (!run) return undefined;
-    if (run.status === 'waiting_user' || run.status === 'queued' || run.status === 'retrying') {
+    const resumableScriptFailure =
+      run.request.task.startsWith('script_') &&
+      (run.status === 'failed' || run.status === 'cancelled');
+    if (
+      run.status === 'waiting_user' ||
+      run.status === 'queued' ||
+      run.status === 'retrying' ||
+      resumableScriptFailure
+    ) {
       this.launch(id, clientId, run.request, modelConfig);
     }
     return this.store.getForClient(clientId, id);

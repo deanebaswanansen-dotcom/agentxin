@@ -16,9 +16,12 @@
 // 唯一标识符统一使用 string（UUID v4）
 export type Id = string;
 
+export type ProjectKind = 'novel' | 'short_drama';
+
 export interface Project {
   id: Id;
   name: string;
+  kind: ProjectKind;
   createdAt: string; // ISO 8601
   updatedAt: string;
 }
@@ -145,6 +148,7 @@ export interface WritingContextInput {
 export type ErrorCode =
   | 'VALIDATION_ERROR'
   | 'NOT_FOUND'
+  | 'CONFLICT'
   | 'MODEL_NOT_CONFIGURED'
   | 'PROVIDER_ERROR'
   | 'STORE_ERROR';
@@ -156,6 +160,7 @@ export type ErrorCode =
 export const ERROR_CODES = {
   VALIDATION_ERROR: 'VALIDATION_ERROR',
   NOT_FOUND: 'NOT_FOUND',
+  CONFLICT: 'CONFLICT',
   MODEL_NOT_CONFIGURED: 'MODEL_NOT_CONFIGURED',
   PROVIDER_ERROR: 'PROVIDER_ERROR',
   STORE_ERROR: 'STORE_ERROR',
@@ -189,6 +194,10 @@ export type AgentTask =
   | 'full_novel'
   /** 长篇小说模式：多子代理规划 + 章节循环 + Gate（SPEC V1）。 */
   | 'long_novel'
+  | 'script_plan'
+  | 'script_series_outline'
+  | 'script_bible'
+  | 'script_episode_batch'
   // Blueprint scenario tasks delegated to Python LangGraph core (refactor spec)
   | 'plan_blueprint'
   | 'write_scene'
@@ -229,6 +238,11 @@ export interface AgentRunRequest {
   prompt: string;
   projectId?: Id;
   chapterId?: Id;
+  scriptBatchOptions?: {
+    startEpisode: number;
+    episodeCount: number;
+    expectedPlanRevision: number;
+  };
   options?: {
     targetWords?: number;
     /** full_novel / long_novel：本批章节数（1-500）。 */

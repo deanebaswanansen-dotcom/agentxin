@@ -19,6 +19,7 @@ import type {
   Outline,
   PacingReport,
   Project,
+  ProjectKind,
   SceneDraft,
   WordCountReport,
   WorldSetting,
@@ -26,8 +27,8 @@ import type {
 
 export interface DataStore {
   // 项目（Projects）
-  createProject(name: string): Promise<Project>;
-  listProjects(): Promise<Pick<Project, 'id' | 'name'>[]>;
+  createProject(name: string, kind?: ProjectKind): Promise<Project>;
+  listProjects(): Promise<Pick<Project, 'id' | 'name' | 'kind'>[]>;
   getProject(id: Id): Promise<Project | undefined>;
   renameProject(id: Id, name: string): Promise<Project>;
   deleteProject(id: Id): Promise<void>; // 级联删除关联实体

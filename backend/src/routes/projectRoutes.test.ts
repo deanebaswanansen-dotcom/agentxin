@@ -13,7 +13,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { DataStore } from '../store/DataStore.js';
-import type { Id, Project } from '../types/index.js';
+import type { Id, Project, ProjectKind } from '../types/index.js';
 import { ProjectService } from '../services/project/ProjectService.js';
 import { registerProjectRoutes } from './projectRoutes.js';
 
@@ -23,14 +23,14 @@ function makeFakeStore(): DataStore {
   let seq = 0;
 
   const fake: Partial<DataStore> = {
-    async createProject(name: string): Promise<Project> {
+    async createProject(name: string, kind: ProjectKind = 'novel'): Promise<Project> {
       const now = new Date().toISOString();
-      const project: Project = { id: `id-${++seq}`, name, createdAt: now, updatedAt: now };
+      const project: Project = { id: `id-${++seq}`, name, kind, createdAt: now, updatedAt: now };
       projects.set(project.id, project);
       return { ...project };
     },
-    async listProjects(): Promise<Pick<Project, 'id' | 'name'>[]> {
-      return [...projects.values()].map(({ id, name }) => ({ id, name }));
+    async listProjects(): Promise<Pick<Project, 'id' | 'name' | 'kind'>[]> {
+      return [...projects.values()].map(({ id, name, kind }) => ({ id, name, kind }));
     },
     async getProject(id: Id): Promise<Project | undefined> {
       const found = projects.get(id);
@@ -77,6 +77,26 @@ describe('POST /api/projects', () => {
     expect(res.statusCode).toBe(400);
     expect(res.json()).toEqual({ error: { code: 'VALIDATION_ERROR', message: expect.any(String) } });
   });
+
+  it('creates a short-drama project and exposes its kind', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/projects',
+      payload: { name: '我的短剧', kind: 'short_drama' },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json()).toMatchObject({ name: '我的短剧', kind: 'short_drama' });
+  });
+
+  it('rejects an unknown project kind', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/projects',
+      payload: { name: '错误类型', kind: 'video' },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe('VALIDATION_ERROR');
+  });
 });
 
 describe('GET /api/projects', () => {
@@ -86,9 +106,23 @@ describe('GET /api/projects', () => {
     const res = await app.inject({ method: 'GET', url: '/api/projects' });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual([
-      { id: 'id-1', name: 'a' },
-      { id: 'id-2', name: 'b' },
+      { id: 'id-1', name: 'a', kind: 'novel' },
+      { id: 'id-2', name: 'b', kind: 'novel' },
     ]);
+  });
+});
+
+describe('GET /api/projects/:id', () => {
+  it('returns the complete project including kind', async () => {
+    const created = (await app.inject({
+      method: 'POST',
+      url: '/api/projects',
+      payload: { name: '短剧', kind: 'short_drama' },
+    })).json();
+
+    const res = await app.inject({ method: 'GET', url: `/api/projects/${created.id}` });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ id: created.id, name: '短剧', kind: 'short_drama' });
   });
 });
 

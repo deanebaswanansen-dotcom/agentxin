@@ -16,9 +16,12 @@
 // 唯一标识符统一使用 string（UUID v4）
 export type Id = string;
 
+export type ProjectKind = 'novel' | 'short_drama';
+
 export interface Project {
   id: Id;
   name: string;
+  kind: ProjectKind;
   createdAt: string; // ISO 8601
   updatedAt: string;
 }
@@ -145,6 +148,7 @@ export interface WritingContextInput {
 export type ErrorCode =
   | 'VALIDATION_ERROR'
   | 'NOT_FOUND'
+  | 'CONFLICT'
   | 'MODEL_NOT_CONFIGURED'
   | 'PROVIDER_ERROR'
   | 'STORE_ERROR';
@@ -156,6 +160,7 @@ export type ErrorCode =
 export const ERROR_CODES = {
   VALIDATION_ERROR: 'VALIDATION_ERROR',
   NOT_FOUND: 'NOT_FOUND',
+  CONFLICT: 'CONFLICT',
   MODEL_NOT_CONFIGURED: 'MODEL_NOT_CONFIGURED',
   PROVIDER_ERROR: 'PROVIDER_ERROR',
   STORE_ERROR: 'STORE_ERROR',
@@ -189,6 +194,10 @@ export type AgentTask =
   | 'full_novel'
   /** 长篇小说模式：多子代理规划 + 章节循环 + Gate（SPEC V1）。 */
   | 'long_novel'
+  | 'script_plan'
+  | 'script_series_outline'
+  | 'script_bible'
+  | 'script_episode_batch'
   // Blueprint scenario tasks delegated to Python LangGraph core (refactor spec)
   | 'plan_blueprint'
   | 'write_scene'
@@ -229,6 +238,7 @@ export interface AgentRunRequest {
   prompt: string;
   projectId?: Id;
   chapterId?: Id;
+  scriptBatchOptions?: ScriptBatchOptions;
   options?: {
     targetWords?: number;
     /** full_novel / long_novel：本批章节数（1-500）。 */
@@ -1015,4 +1025,272 @@ export interface FreeChatRequestBody {
   chapterId?: Id;
   attachedSettingIds?: Id[];
   sessionHistory?: ChatTurn[];
+}
+
+// ---------------------------------------------------------------------------
+// Short-drama workspace (SPEC: docs/SHORT_DRAMA_MODE_SPEC.md)
+// ---------------------------------------------------------------------------
+
+export type ScriptPlanStatus = 'draft' | 'approved' | 'locked';
+export type ScriptOutlineStatus = 'card' | 'expanded' | 'approved';
+export type ScriptEpisodeStatus =
+  | 'planned'
+  | 'generating'
+  | 'reviewing'
+  | 'completed'
+  | 'failed';
+
+export interface ScriptPlan {
+  id: Id;
+  projectId: Id;
+  status: ScriptPlanStatus;
+  revision: number;
+  title: string;
+  theme: string;
+  market: 'domestic' | 'overseas';
+  channel: 'female' | 'male' | 'general';
+  genres: string[];
+  audience: string;
+  coreConflict: string;
+  logline: string;
+  highlights: string[];
+  totalEpisodes: number;
+  episodeDurationSeconds: { min: number; max: number };
+  targetCharsPerEpisode: number;
+  maxPrimaryCharacters: number;
+  maxScenesPerEpisode: number;
+  dialogueDensityPercent: number;
+  language: 'zh-CN';
+  format: 'cn_short_drama';
+  coreRequirements: string;
+  forbiddenElements: string[];
+  endingDirection: string;
+  coverPrompt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type ScriptPlanAnswerValue = string | string[] | number | boolean;
+
+export interface ScriptPlanAnswer {
+  field: string;
+  value?: ScriptPlanAnswerValue;
+  delegate?: boolean;
+}
+
+export interface ScriptPlanQuestionOption {
+  label: string;
+  value: string;
+  description?: string;
+}
+
+export interface ScriptPlanQuestion {
+  field: string;
+  label: string;
+  help?: string;
+  kind: 'single' | 'multi' | 'text' | 'number';
+  required: boolean;
+  options?: ScriptPlanQuestionOption[];
+}
+
+export interface ScriptPlanTurnRequest {
+  projectId: Id;
+  seedPrompt?: string;
+  answers: ScriptPlanAnswer[];
+  reset?: boolean;
+}
+
+export interface ScriptPlanTurnResponse {
+  status: 'asking' | 'ready';
+  session: string;
+  round: number;
+  questions?: ScriptPlanQuestion[];
+  plan?: ScriptPlan;
+}
+
+export interface ScriptCharacter {
+  id: Id;
+  projectId: Id;
+  name: string;
+  aliases: string[];
+  role: 'lead' | 'supporting' | 'antagonist' | 'minor';
+  age?: number;
+  occupation?: string;
+  identity: string;
+  biography: string;
+  motivation: string;
+  goal: string;
+  weakness: string;
+  arc: string;
+  appearance: string;
+  hairstyle: string;
+  physique: string;
+  defaultOutfit: string;
+  personality: string[];
+  skills: string[];
+  speechStyle: string;
+  catchphrases: string[];
+  relationships: Array<{ characterId: Id; label: string; notes?: string }>;
+  revision: number;
+  updatedAt: string;
+}
+
+export interface ScriptWorldBible {
+  projectId: Id;
+  era: string;
+  primaryLocations: string[];
+  worldState: string;
+  rules: string[];
+  transport: string[];
+  communication: string[];
+  organizations: string[];
+  recurringProps: string[];
+  forbiddenAnachronisms: string[];
+  revision: number;
+  updatedAt: string;
+}
+
+export interface ScriptEpisodeCard {
+  episodeNumber: number;
+  title: string;
+  logline: string;
+  mainEvent: string;
+  endingHook: string;
+}
+
+export interface ScriptSeriesOutline {
+  projectId: Id;
+  synopsis: string;
+  openingState: string;
+  midpointTurn: string;
+  climax: string;
+  endingState: string;
+  mainArc: string[];
+  subplotArcs: string[];
+  episodeCards: ScriptEpisodeCard[];
+  revision: number;
+}
+
+export interface ScriptEpisodeOutline {
+  id: Id;
+  projectId: Id;
+  episodeNumber: number;
+  title: string;
+  goal: string;
+  conflict: string;
+  beats: string[];
+  characterIds: Id[];
+  plannedScenes: Array<{
+    ordinal: number;
+    location: string;
+    timeOfDay: 'day' | 'night' | 'dawn' | 'dusk';
+    interiorExterior: 'interior' | 'exterior';
+    purpose: string;
+  }>;
+  reveal?: string;
+  reversal?: string;
+  endingHook: string;
+  requiredFacts: string[];
+  forbiddenFacts: string[];
+  status: ScriptOutlineStatus;
+  revision: number;
+}
+
+export type ScriptBlock =
+  | { id: Id; type: 'caption'; text: string }
+  | { id: Id; type: 'action'; text: string }
+  | {
+      id: Id;
+      type: 'dialogue';
+      characterId?: Id;
+      speaker: string;
+      delivery?: string;
+      mode?: 'normal' | 'os' | 'vo';
+      text: string;
+    };
+
+export interface ScriptScene {
+  id: Id;
+  ordinal: number;
+  location: string;
+  timeOfDay: 'day' | 'night' | 'dawn' | 'dusk';
+  interiorExterior: 'interior' | 'exterior';
+  characterIds: Id[];
+  blocks: ScriptBlock[];
+}
+
+export interface ScriptEpisode {
+  id: Id;
+  projectId: Id;
+  episodeNumber: number;
+  title: string;
+  outlineId: Id;
+  status: ScriptEpisodeStatus;
+  targetChars: number;
+  scenes: ScriptScene[];
+  summary: string;
+  newFacts: string[];
+  openedThreads: string[];
+  closedThreads: string[];
+  revision: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ScriptEpisodeSummary {
+  id: Id;
+  episodeNumber: number;
+  title: string;
+  status: ScriptEpisodeStatus;
+  targetChars: number;
+  visibleChars: number;
+  sceneCount: number;
+  revision: number;
+  updatedAt: string;
+}
+
+export interface ScriptBatchOptions {
+  startEpisode: number;
+  episodeCount: number;
+  expectedPlanRevision: number;
+}
+
+export type ScriptAgentTask =
+  | 'script_plan'
+  | 'script_series_outline'
+  | 'script_bible'
+  | 'script_episode_batch';
+
+export type ScriptCheckpointNode =
+  | 'episode_outline'
+  | 'scene_plan'
+  | 'draft'
+  | 'review'
+  | 'completed'
+  | 'batch_report';
+
+export interface ScriptAgentJobCheckpoint {
+  episodeNumber: number;
+  node: ScriptCheckpointNode;
+  attempt: number;
+  artifactRevision: number;
+}
+
+export interface ScriptAgentJobSnapshot {
+  id: string;
+  projectId: Id;
+  task: ScriptAgentTask;
+  status: 'queued' | 'running' | 'waiting_user' | 'retrying' | 'completed' | 'failed' | 'cancelled';
+  checkpoint?: ScriptAgentJobCheckpoint;
+  error?: { code?: string; message: string };
+  continuable?: boolean;
+  updatedAt?: string;
+  scriptBatchOptions?: ScriptBatchOptions;
+}
+
+export interface ScriptAgentJobRequest {
+  projectId: Id;
+  task: ScriptAgentTask;
+  prompt?: string;
+  scriptBatchOptions?: ScriptBatchOptions;
 }

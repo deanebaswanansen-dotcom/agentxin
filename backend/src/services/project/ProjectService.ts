@@ -19,27 +19,45 @@
  * layer can map them to the unified API error response.
  */
 import type { DataStore } from '../../store/DataStore.js';
-import type { Id, Project } from '../../types/index.js';
+import type { Id, Project, ProjectKind } from '../../types/index.js';
 import { ServiceError } from '../ServiceError.js';
 
+export interface ProjectServiceOptions {
+  /** Remove project-scoped data that lives outside the primary DataStore. */
+  afterRemove?: (projectId: Id) => Promise<void>;
+}
+
 export class ProjectService {
-  constructor(private readonly store: DataStore) {}
+  constructor(
+    private readonly store: DataStore,
+    private readonly options: ProjectServiceOptions = {},
+  ) {}
 
   /**
    * Create a project (Requirement 1.1). The name must contain at least one
    * non-whitespace character; otherwise a `VALIDATION_ERROR` is thrown
    * (Requirement 1.5).
    */
-  async create(name: string): Promise<Project> {
+  async create(name: string, kind: ProjectKind = 'novel'): Promise<Project> {
     assertNonEmptyName(name);
+    assertProjectKind(kind);
     // Persist the name exactly as provided (Requirement 1.1); validation only
     // rejects empty/whitespace-only names, it does not mutate a valid name.
-    return this.store.createProject(name);
+    return this.store.createProject(name, kind);
   }
 
   /** List all projects' id + name (Requirement 1.2). */
-  async list(): Promise<Pick<Project, 'id' | 'name'>[]> {
+  async list(): Promise<Pick<Project, 'id' | 'name' | 'kind'>[]> {
     return this.store.listProjects();
+  }
+
+  /** Return one complete project so the client can select its workspace kind. */
+  async get(id: Id): Promise<Project> {
+    const project = await this.store.getProject(id);
+    if (project === undefined) {
+      throw ServiceError.notFound(`项目不存在: ${id}`);
+    }
+    return project;
   }
 
   /**
@@ -62,6 +80,7 @@ export class ProjectService {
   async remove(id: Id): Promise<void> {
     await this.assertExists(id);
     await this.store.deleteProject(id);
+    await this.options.afterRemove?.(id);
   }
 
   /** Throw `NOT_FOUND` when no project exists for `id` (Requirement 1.6). */
@@ -82,5 +101,11 @@ export class ProjectService {
 function assertNonEmptyName(name: string): void {
   if (name.trim().length === 0) {
     throw ServiceError.validation('项目名称不能为空');
+  }
+}
+
+function assertProjectKind(kind: string): asserts kind is ProjectKind {
+  if (kind !== 'novel' && kind !== 'short_drama') {
+    throw ServiceError.validation('项目类型必须是 novel 或 short_drama');
   }
 }

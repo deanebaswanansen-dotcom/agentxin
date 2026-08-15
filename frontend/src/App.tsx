@@ -19,6 +19,7 @@ import { ChapterToolsDrawer } from './components/ChapterToolsDrawer.js';
 import { ResourceDrawer } from './components/ResourceDrawer.js';
 import { ReaderWorkspace } from './components/ReaderWorkspace.js';
 import { ProjectTree } from './components/ProjectTree.js';
+import { ScriptWorkspace } from './components/ScriptWorkspace.js';
 import { SettingsPanel } from './components/SettingsPanel.js';
 import { ErrorProvider, useErrorReporter } from './components/ErrorToast.js';
 import { Icon } from './components/Icon.js';
@@ -32,7 +33,7 @@ import {
 import { useWorkspaceSelection } from './hooks/useWorkspaceSelection.js';
 import { usePaneLayout } from './hooks/usePaneLayout.js';
 import { useNovelImportDrop } from './hooks/useNovelImportDrop.js';
-import type { AgentArtifact, Id } from './types/index.js';
+import type { AgentArtifact, Id, ProjectKind } from './types/index.js';
 import type { WorkspaceTab } from './components/ProjectWorkspaceView.js';
 import type { EditorSelectionRequest } from './components/ChapterEditor.js';
 import './components/components.css';
@@ -65,6 +66,7 @@ function Workbench(): JSX.Element {
   // —— 抽屉控制 ——
   const [drawer, setDrawer] = useState<DrawerKind>('none');
   const [appMode, setAppMode] = useState<AppMode>('agent');
+  const [selectedProjectKind, setSelectedProjectKind] = useState<ProjectKind>('novel');
   const openChapterTools = useCallback(() => setDrawer('chapterTools'), []);
   const clearChapterTools = useCallback(() => {
     setDrawer((current) => (current === 'chapterTools' ? 'none' : current));
@@ -92,6 +94,7 @@ function Workbench(): JSX.Element {
     onOpenChapterTools: openChapterTools,
     onClearChapterTools: clearChapterTools,
   });
+  const isScriptProject = selectedProjectId !== null && selectedProjectKind === 'short_drama';
   const {
     sidebarCollapsed,
     setSidebarCollapsed,
@@ -139,6 +142,17 @@ function Workbench(): JSX.Element {
     thinking: string;
   }>({ streaming: false, content: '', thinking: '' });
   const [selectionRequest, setSelectionRequest] = useState<EditorSelectionRequest | null>(null);
+
+  const handleSelectProject = useCallback((projectId: Id, kind: ProjectKind) => {
+    setSelectedProjectKind(kind);
+    setDrawer('none');
+    setStreamingState({ streaming: false, content: '', thinking: '' });
+    selectProject(projectId);
+  }, [selectProject]);
+  const handleProjectDeleted = useCallback((projectId: Id) => {
+    setSelectedProjectKind('novel');
+    clearSelectedProject(projectId);
+  }, [clearSelectedProject]);
 
   useEffect(() => {
     try {
@@ -309,12 +323,12 @@ function Workbench(): JSX.Element {
   return (
     <div
       className={`nwa-tavern-app nwa-theme-${themeMode}`}
-      onDragEnter={handleDragEnter}
-      onDragOver={handleDragOver}
-      onDragLeave={handleDragLeave}
-      onDrop={(event) => void handleDrop(event)}
+      onDragEnter={isScriptProject ? undefined : handleDragEnter}
+      onDragOver={isScriptProject ? undefined : handleDragOver}
+      onDragLeave={isScriptProject ? undefined : handleDragLeave}
+      onDrop={isScriptProject ? undefined : (event) => void handleDrop(event)}
     >
-      {(importDragActive || importBusy) ? (
+      {!isScriptProject && (importDragActive || importBusy) ? (
         <div className="nwa-import-overlay" role="status" aria-live="polite">
           <div className="nwa-import-overlay__box">
             <Icon name={importBusy ? 'refresh' : 'folderOpen'} />
@@ -341,7 +355,7 @@ function Workbench(): JSX.Element {
               <Icon name={sidebarCollapsed ? 'panelLeft' : 'panelRight'} />
             </button>
             <BrandLogo />
-            <h1 className="nwa-app-title">小说 Agent</h1>
+            <h1 className="nwa-app-title">{isScriptProject ? '短剧 Agent' : '小说 Agent'}</h1>
             <nav className="nwa-breadcrumb" aria-label="上下文">
               {selectedProjectName ? (
                 <>
@@ -375,15 +389,17 @@ function Workbench(): JSX.Element {
             >
               <Icon name="edit" /> Agent
             </button>
-            <button
-              type="button"
-              className="nwa-button nwa-button--ghost nwa-button--sm"
-              onClick={openReaderMode}
-              title="进入书架模式"
-            >
-              <Icon name="bookOpen" /> 书架
-            </button>
-            {selectedProjectId !== null ? (
+            {!isScriptProject ? (
+              <button
+                type="button"
+                className="nwa-button nwa-button--ghost nwa-button--sm"
+                onClick={openReaderMode}
+                title="进入书架模式"
+              >
+                <Icon name="bookOpen" /> 书架
+              </button>
+            ) : null}
+            {selectedProjectId !== null && !isScriptProject ? (
               <button
                 type="button"
                 className="nwa-button nwa-button--ghost nwa-button--sm"
@@ -420,7 +436,7 @@ function Workbench(): JSX.Element {
           className="nwa-tavern-workspace"
           style={
             {
-              gridTemplateColumns: `${sidebarCollapsed ? '' : `${sidebarWidth}px 6px `}minmax(0, 1fr)${chatCollapsed ? '' : ` 6px ${chatWidth}px`}`,
+              gridTemplateColumns: `${sidebarCollapsed ? '' : `${sidebarWidth}px 6px `}minmax(0, 1fr)${isScriptProject || chatCollapsed ? '' : ` 6px ${chatWidth}px`}`,
             } as CSSProperties
           }
         >
@@ -434,9 +450,9 @@ function Workbench(): JSX.Element {
               <ProjectTree
                 selectedProjectId={selectedProjectId}
                 selectedChapterId={selectedChapterId}
-                onSelectProject={selectProject}
+                onSelectProject={handleSelectProject}
                 onSelectChapter={(id) => void handleSelectChapter(id)}
-                onProjectDeleted={clearSelectedProject}
+                onProjectDeleted={handleProjectDeleted}
                 onChapterDeleted={clearSelectedChapter}
                 refreshToken={projectListVersion}
                 onError={reportError}
@@ -461,7 +477,14 @@ function Workbench(): JSX.Element {
 
         {/* 中间：章节编辑板 */}
         <section className="nwa-tavern-center">
-          <div className="nwa-editor-board">
+          {isScriptProject && selectedProjectId ? (
+            <ScriptWorkspace
+              key={selectedProjectId}
+              projectId={selectedProjectId}
+              projectName={selectedProjectName}
+              onError={reportError}
+            />
+          ) : <div className="nwa-editor-board">
             <div className="nwa-editor-board__toolbar">
               <div className="nwa-editor-board__meta">
                 <span className="nwa-editor-board__eyebrow">编辑板</span>
@@ -566,10 +589,10 @@ function Workbench(): JSX.Element {
                 </div>
               ) : null}
             </div>
-          </div>
+          </div>}
         </section>
 
-        {!chatCollapsed ? (
+        {!isScriptProject && !chatCollapsed ? (
           <div
             className="nwa-resizer nwa-resizer--right"
             role="separator"
@@ -585,7 +608,7 @@ function Workbench(): JSX.Element {
         ) : null}
 
         {/* 右侧：AI 对话栏 */}
-        {!chatCollapsed ? (
+        {!isScriptProject && !chatCollapsed ? (
           <aside className="nwa-tavern-right" aria-label="AI 对话">
             <div className="nwa-right-header">
               <div>
@@ -636,6 +659,7 @@ function Workbench(): JSX.Element {
             onError={reportError}
             onProjectCreated={(projectId) => {
               bumpProjectList();
+              setSelectedProjectKind('novel');
               selectProject(projectId);
             }}
             onChapterUpdated={handleSaved}
@@ -644,7 +668,7 @@ function Workbench(): JSX.Element {
         </main>
       )}
 
-      {appMode === 'agent' ? (
+      {appMode === 'agent' && !isScriptProject ? (
         <>
           {/* —— 章节工具抽屉 —— */}
           <ChapterToolsDrawer

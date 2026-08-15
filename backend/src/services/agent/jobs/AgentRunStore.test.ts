@@ -57,4 +57,27 @@ describe('AgentRunStore', () => {
       error: { message: expect.stringContaining('重新连接') },
     });
   });
+
+  it('deletes only jobs owned by the selected client and project', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-runs-delete-'));
+    const file = join(directory, 'runs.json');
+    const store = await AgentRunStore.create(file);
+    const target = await store.create(CLIENT_A, {
+      task: 'script_episode_batch', mode: 'draft', prompt: '', projectId: 'project-a',
+    });
+    const otherProject = await store.create(CLIENT_A, {
+      task: 'script_episode_batch', mode: 'draft', prompt: '', projectId: 'project-b',
+    });
+    const otherClient = await store.create(CLIENT_B, {
+      task: 'script_episode_batch', mode: 'draft', prompt: '', projectId: 'project-a',
+    });
+
+    await store.deleteForProject(CLIENT_A, 'project-a');
+
+    expect(store.get(target.id)).toBeUndefined();
+    expect(store.get(otherProject.id)).toBeDefined();
+    expect(store.get(otherClient.id)).toBeDefined();
+    const reloaded = await AgentRunStore.create(file);
+    expect(reloaded.get(target.id)).toBeUndefined();
+  });
 });

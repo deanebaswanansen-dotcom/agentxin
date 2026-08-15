@@ -83,6 +83,74 @@ const client = () => createApiClient('/api');
 // ---------------------------------------------------------------------------
 
 describe('apiClient request building', () => {
+  it('loads and saves the versioned short-drama plan through the script namespace', async () => {
+    const plan = {
+      id: 'plan-1',
+      projectId: 'project-1',
+      status: 'draft' as const,
+      revision: 2,
+      title: '绝食逼我道歉？我当面吃香喝辣',
+      theme: '打破情绪勒索',
+      market: 'domestic' as const,
+      channel: 'female' as const,
+      genres: ['都市', '家庭'],
+      audience: '女性用户',
+      coreConflict: '新媳妇对抗家族情绪勒索',
+      logline: '新媳妇用美食拆穿绝食骗局。',
+      highlights: ['当面烧烤'],
+      totalEpisodes: 60,
+      episodeDurationSeconds: { min: 60, max: 90 },
+      targetCharsPerEpisode: 1200,
+      maxPrimaryCharacters: 10,
+      maxScenesPerEpisode: 3,
+      dialogueDensityPercent: 60,
+      language: 'zh-CN' as const,
+      format: 'cn_short_drama' as const,
+      coreRequirements: '每集有反转和卡点',
+      forbiddenElements: [],
+      endingDirection: '家庭秩序重建',
+      createdAt: '2026-08-14T00:00:00.000Z',
+      updatedAt: '2026-08-14T00:00:00.000Z',
+    };
+    const mock = installFetch((url, init) => {
+      expect(url).toBe('/api/projects/project-1/script-plan');
+      if (init?.method === 'PUT') return jsonResponse({ ...plan, revision: 3 });
+      return jsonResponse(plan);
+    });
+
+    await expect(client().script.plan.get('project-1')).resolves.toEqual(plan);
+    await expect(client().script.plan.save('project-1', plan, 2)).resolves.toMatchObject({ revision: 3 });
+    expect(JSON.parse(String(mock.mock.calls[1]?.[1]?.body))).toEqual({ expectedRevision: 2, value: plan });
+  });
+
+  it('starts and resumes a five-episode script job with checkpoint-safe options', async () => {
+    const running = {
+      id: 'job-1',
+      projectId: 'project-1',
+      task: 'script_episode_batch' as const,
+      status: 'running' as const,
+      continuable: false,
+      checkpoint: { episodeNumber: 1, node: 'draft' as const, attempt: 1, artifactRevision: 0 },
+    };
+    const mock = installFetch((url) => {
+      if (url.endsWith('/resume')) return jsonResponse({ ...running, status: 'queued' });
+      return jsonResponse(running);
+    });
+
+    await expect(
+      client().script.jobs.create({
+        projectId: 'project-1',
+        task: 'script_episode_batch',
+        scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 3 },
+      }),
+    ).resolves.toEqual(running);
+    await expect(client().script.jobs.resume('job-1')).resolves.toMatchObject({ status: 'queued' });
+    expect(mock.mock.calls.map((call) => [call[0], call[1]?.method])).toEqual([
+      ['/api/agent/jobs', 'POST'],
+      ['/api/agent/jobs/job-1/resume', 'POST'],
+    ]);
+  });
+
   it('runs production planning in a background job and polls the result', async () => {
     const result = {
       status: 'ready' as const,
@@ -346,7 +414,7 @@ describe('apiClient unified error handling', () => {
     const cases: Array<[number, string]> = [
       [400, 'VALIDATION_ERROR'],
       [404, 'NOT_FOUND'],
-      [409, 'MODEL_NOT_CONFIGURED'],
+      [409, 'CONFLICT'],
       [502, 'PROVIDER_ERROR'],
       [504, 'PROVIDER_ERROR'],
     ];

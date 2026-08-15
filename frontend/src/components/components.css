@@ -1233,9 +1233,17 @@
 
 .nwa-project-tree__create-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: 4.5rem minmax(0, 1fr) auto;
   gap: 0.35rem;
   align-items: center;
+}
+
+.nwa-project-tree__kind-select {
+  height: 2.25rem;
+  min-width: 0;
+  padding: 0 0.4rem;
+  font-size: var(--fs-xs);
+  border-radius: 10px;
 }
 
 .nwa-project-tree__new-input {
@@ -1388,6 +1396,16 @@
   font-weight: 700;
   line-height: 1.15rem;
   text-align: center;
+}
+
+.nwa-project-tree__kind-badge {
+  flex: 0 0 auto;
+  padding: 0.1rem 0.35rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--text-on-dark-muted, var(--text-muted));
+  font-size: 0.65rem;
+  line-height: 1;
 }
 
 .nwa-project-tree__actions {

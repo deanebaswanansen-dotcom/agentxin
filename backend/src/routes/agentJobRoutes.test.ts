@@ -41,11 +41,25 @@ describe('agent job routes', () => {
     await runner.waitUntilIdle(id);
 
     const polled = await app.inject({ method: 'GET', url: `/api/agent/jobs/${id}`, headers: { 'x-agentxin-client-id': CLIENT_A } });
-    expect(polled.json()).toMatchObject({ status: 'completed', result: { summary: '完成' } });
+    expect(polled.json()).toMatchObject({
+      projectId: 'project-a',
+      task: 'long_novel',
+      status: 'completed',
+      continuable: false,
+      result: { summary: '完成' },
+    });
     const listed = await app.inject({ method: 'GET', url: '/api/projects/project-a/agent-jobs', headers: { 'x-agentxin-client-id': CLIENT_A } });
     expect(listed.json()).toHaveLength(1);
     const hidden = await app.inject({ method: 'GET', url: `/api/agent/jobs/${id}`, headers: { 'x-agentxin-client-id': CLIENT_B } });
     expect(hidden.statusCode).toBe(404);
+
+    const resumed = await app.inject({
+      method: 'POST',
+      url: `/api/agent/jobs/${id}/resume`,
+      headers: { 'x-agentxin-client-id': CLIENT_A, 'x-agentxin-model-config': MODEL },
+    });
+    expect(resumed.statusCode).toBe(200);
+    expect(resumed.json()).toMatchObject({ id, projectId: 'project-a', task: 'long_novel' });
     await app.close();
   });
 

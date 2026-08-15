@@ -25,11 +25,13 @@
  */
 import type { FastifyInstance } from 'fastify';
 import type { ProjectService } from '../services/project/ProjectService.js';
+import type { ProjectKind } from '../types/index.js';
 import { toErrorResponse } from './errorMapping.js';
 
 /** Request body accepted by `POST /api/projects` and `PATCH /api/projects/:id`. */
 interface ProjectNameBody {
   name?: unknown;
+  kind?: unknown;
 }
 
 /** Route params carrying a project id. */
@@ -61,7 +63,9 @@ export function registerProjectRoutes(
   app.post<{ Body: ProjectNameBody }>('/api/projects', async (request, reply) => {
     try {
       const name = asString(request.body?.name);
-      const project = await projectService.create(name);
+      const rawKind = request.body?.kind;
+      const kind = (rawKind === undefined ? 'novel' : asString(rawKind)) as ProjectKind;
+      const project = await projectService.create(name, kind);
       return reply.code(201).send(project);
     } catch (error) {
       const { status, body } = toErrorResponse(error);
@@ -74,6 +78,15 @@ export function registerProjectRoutes(
     try {
       const projects = await projectService.list();
       return reply.code(200).send(projects);
+    } catch (error) {
+      const { status, body } = toErrorResponse(error);
+      return reply.code(status).send(body);
+    }
+  });
+
+  app.get<{ Params: ProjectIdParams }>('/api/projects/:id', async (request, reply) => {
+    try {
+      return reply.code(200).send(await projectService.get(request.params.id));
     } catch (error) {
       const { status, body } = toErrorResponse(error);
       return reply.code(status).send(body);

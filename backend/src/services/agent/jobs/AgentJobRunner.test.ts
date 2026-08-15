@@ -87,6 +87,47 @@ describe('AgentJobRunner', () => {
     expect(persisted).toContain('[API_KEY]');
   });
 
+  it('can resume a failed script job so its executor restores persisted checkpoints', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-resume-'));
+    const store = await AgentRunStore.create(join(directory, 'runs.json'));
+    let shouldFail = true;
+    const runner = new AgentJobRunner(store, {
+      run: async (request) => {
+        if (shouldFail) throw new Error('structured output incomplete');
+        return {
+          task: request.task,
+          mode: request.mode,
+          projectId: request.projectId ?? 'p1',
+          summary: '从检查点完成',
+          steps: [],
+          artifacts: [],
+        };
+      },
+    });
+    const created = await runner.start(
+      CLIENT_ID,
+      {
+        task: 'script_episode_batch',
+        mode: 'draft',
+        prompt: '',
+        projectId: 'p1',
+        scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 1 },
+      },
+      undefined,
+    );
+    await runner.waitUntilIdle(created.id);
+    expect(store.get(created.id)?.status).toBe('failed');
+
+    shouldFail = false;
+    await runner.resume(CLIENT_ID, created.id, undefined);
+    await runner.waitUntilIdle(created.id);
+
+    expect(store.get(created.id)).toMatchObject({
+      status: 'completed',
+      result: { summary: '从检查点完成' },
+    });
+  });
+
   it('keeps a cancelled job cancelled when an executor returns late', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-cancel-'));
     const store = await AgentRunStore.create(join(directory, 'runs.json'));

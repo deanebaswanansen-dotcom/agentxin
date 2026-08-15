@@ -46,7 +46,7 @@ import {
   createClientScopedPlanSessionStore,
   createClientScopedReferenceStore,
 } from './store/ClientScopedAuxiliaryStores.js';
-import { registerClientScope } from './services/client/clientScope.js';
+import { getCurrentClientId, registerClientScope } from './services/client/clientScope.js';
 import type { ModelProxy } from './proxy/ModelProxy.js';
 import { OpenAiCompatibleModelProxy } from './proxy/ModelProxy.js';
 import { CachingModelProxy } from './proxy/CachingModelProxy.js';
@@ -95,6 +95,10 @@ import {
 import { getCacheStatsSummary, resetCacheStats } from './proxy/cacheStats.js';
 import { AgentRunStore } from './services/agent/jobs/AgentRunStore.js';
 import { AgentJobRunner } from './services/agent/jobs/AgentJobRunner.js';
+import { FileScriptStore, createClientScopedScriptStore } from './services/script/FileScriptStore.js';
+import type { ScriptStore } from './services/script/ScriptStore.js';
+import { ScriptService } from './services/script/ScriptService.js';
+import { registerScriptRoutes } from './routes/scriptRoutes.js';
 
 /**
  * Build a fully wired Fastify application from an already-constructed
@@ -120,6 +124,7 @@ export function buildServer(
   longNovelConfigStore?: LongNovelConfigStorePort,
   planSessionStore?: PlanSessionStorePort,
   agentRunStore?: AgentRunStore,
+  scriptStore?: ScriptStore,
 ): FastifyInstance {
   const app = Fastify({ logger: false });
 
@@ -159,7 +164,18 @@ export function buildServer(
   const refs = referenceStore ?? ReferenceStore.ephemeral();
   const longNovelConfigs = longNovelConfigStore ?? LongNovelConfigStore.ephemeral();
   const planSessions = planSessionStore ?? PlanSessionStore.ephemeral();
-  const projectService = new ProjectService(store);
+  const scriptService = scriptStore
+    ? new ScriptService(scriptStore, { projectLookup: (id) => store.getProject(id) })
+    : undefined;
+  const projectService = new ProjectService(store, {
+    afterRemove: async (projectId) => {
+      if (scriptStore) await scriptStore.deleteProject(projectId);
+      await planSessions.clear(projectId);
+      if (agentRunStore) {
+        await agentRunStore.deleteForProject(getCurrentClientId(), projectId);
+      }
+    },
+  });
   const chapterService = new ChapterService(store);
   const settingService = new SettingService(store);
   const modelConfigService = new ModelConfigService(store, { allowStoredConfig: false });
@@ -216,6 +232,7 @@ export function buildServer(
 
   // Transport layer — register every route group against its service.
   registerProjectRoutes(app, projectService);
+  if (scriptService) registerScriptRoutes(app, scriptService);
   registerChapterRoutes(app, chapterService);
   registerSettingRoutes(app, settingService);
   registerModelConfigRoutes(app, modelConfigService, proxy);
@@ -276,6 +293,9 @@ export async function start(): Promise<FastifyInstance> {
   const agentRunStore = await AgentRunStore.create(
     process.env.AGENT_RUN_FILE ?? join(clientRoot ?? 'data', 'agent-runs.json'),
   );
+  const scriptStore = clientRoot
+    ? createClientScopedScriptStore(join(clientRoot, 'scripts'))
+    : await FileScriptStore.create(process.env.SCRIPT_DATA_DIR ?? join('data', 'scripts'));
   const app = buildServer(
     store,
     undefined,
@@ -284,6 +304,7 @@ export async function start(): Promise<FastifyInstance> {
     longNovelConfigStore,
     planSessionStore,
     agentRunStore,
+    scriptStore,
   );
 
   const port = Number(process.env.PORT ?? 3000);

@@ -18,6 +18,7 @@ import type { FastifyInstance } from 'fastify';
 
 import { buildServer } from './index.js';
 import { FileDataStore } from './store/FileDataStore.js';
+import { FileScriptStore } from './services/script/FileScriptStore.js';
 
 describe('buildServer wiring', () => {
   let dir: string;
@@ -26,7 +27,8 @@ describe('buildServer wiring', () => {
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'nwa-wiring-'));
     const store = await FileDataStore.create(join(dir, 'store.json'));
-    app = buildServer(store);
+    const scriptStore = await FileScriptStore.create(join(dir, 'scripts'));
+    app = buildServer(store, undefined, undefined, undefined, undefined, undefined, undefined, scriptStore);
     await app.ready();
   });
 
@@ -71,7 +73,7 @@ describe('buildServer wiring', () => {
     const projectId = created.json().id as string;
 
     const list = await app.inject({ method: 'GET', url: '/api/projects' });
-    expect(list.json()).toEqual([{ id: projectId, name: 'Wired Project' }]);
+    expect(list.json()).toEqual([{ id: projectId, name: 'Wired Project', kind: 'novel' }]);
 
     const chapters = await app.inject({
       method: 'GET',
@@ -79,6 +81,30 @@ describe('buildServer wiring', () => {
     });
     expect(chapters.statusCode).toBe(200);
     expect(chapters.json()).toEqual([]);
+  });
+
+  it('wires isolated short-drama state and cascades it when a project is deleted', async () => {
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/projects',
+      payload: { name: '短剧', kind: 'short_drama' },
+    });
+    const projectId = created.json().id as string;
+
+    const state = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${projectId}/script-state`,
+    });
+    expect(state.statusCode).toBe(200);
+    expect(state.json()).toMatchObject({ projectId, episodes: [] });
+
+    const removed = await app.inject({ method: 'DELETE', url: `/api/projects/${projectId}` });
+    expect(removed.statusCode).toBe(204);
+    const missing = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${projectId}/script-state`,
+    });
+    expect(missing.statusCode).toBe(404);
   });
 
   it('registers the setting routes (GET /api/projects/:id/characters → 200 [])', async () => {

@@ -25,6 +25,7 @@ describe('errorCodeToStatus', () => {
   it.each<[ErrorCode, number]>([
     ['VALIDATION_ERROR', 400],
     ['NOT_FOUND', 404],
+    ['CONFLICT', 409],
     ['MODEL_NOT_CONFIGURED', 409],
     ['PROVIDER_ERROR', 502],
     ['STORE_ERROR', 500],

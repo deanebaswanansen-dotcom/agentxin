@@ -84,6 +84,30 @@ describe('agent routes', () => {
     });
   });
 
+  it('parses a five-episode short-drama background job without legacy mode fields', () => {
+    const parsed = parseAgentBody({
+      task: 'script_episode_batch',
+      projectId: 'script-project',
+      scriptBatchOptions: {
+        startEpisode: 6,
+        episodeCount: 5,
+        expectedPlanRevision: 3,
+      },
+    });
+
+    expect(parsed).toMatchObject({
+      task: 'script_episode_batch',
+      mode: 'draft',
+      prompt: '',
+      projectId: 'script-project',
+      scriptBatchOptions: {
+        startEpisode: 6,
+        episodeCount: 5,
+        expectedPlanRevision: 3,
+      },
+    });
+  });
+
   it('runs draft automation from one sentence and persists project artifacts', async () => {
     const store = await FileDataStore.create(join(dir, 'store.json'));
     const proxy = new FakeProxy();

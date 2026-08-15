@@ -29,6 +29,10 @@ const AGENT_TASKS: readonly AgentTask[] = [
   'auto_next',
   'full_novel',
   'long_novel',
+  'script_plan',
+  'script_series_outline',
+  'script_bible',
+  'script_episode_batch',
   // New blueprint-centric tasks (Python LangGraph core)
   'plan_blueprint',
   'write_scene',
@@ -42,6 +46,7 @@ interface RunAgentBody {
   projectId?: unknown;
   chapterId?: unknown;
   options?: unknown;
+  scriptBatchOptions?: unknown;
 }
 
 function isAgentTask(value: unknown): value is AgentTask {
@@ -137,6 +142,26 @@ function parseAgentOptions(raw: unknown): AgentRunRequest['options'] | undefined
   return Object.keys(options).length > 0 ? options : undefined;
 }
 
+function isScriptTask(task: AgentTask): boolean {
+  return task === 'script_plan' || task === 'script_series_outline' ||
+    task === 'script_bible' || task === 'script_episode_batch';
+}
+
+function parseScriptBatchOptions(raw: unknown): AgentRunRequest['scriptBatchOptions'] | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const value = raw as Record<string, unknown>;
+  const startEpisode = asOptionalPositiveInt(value.startEpisode);
+  const episodeCount = asOptionalPositiveInt(value.episodeCount);
+  const expectedPlanRevision = asOptionalPositiveInt(value.expectedPlanRevision);
+  if (startEpisode === undefined || episodeCount === undefined || expectedPlanRevision === undefined) {
+    throw ServiceError.validation('短剧批次必须包含起始集、1–5 集数量和策划版本。');
+  }
+  if (episodeCount > 5) {
+    throw ServiceError.validation('短剧每批最多生成 5 集。');
+  }
+  return { startEpisode, episodeCount, expectedPlanRevision };
+}
+
 /**
  * Validate and narrow a raw agent request body into an {@link AgentRunRequest}.
  * Throws `VALIDATION_ERROR` on malformed input (shared by REST and SSE routes).
@@ -145,10 +170,11 @@ export function parseAgentBody(raw: RunAgentBody): AgentRunRequest {
   if (!isAgentTask(raw.task)) {
     throw ServiceError.validation(`Agent 任务无效，必须是：${AGENT_TASKS.join('、')}。`);
   }
-  if (raw.mode !== 'reference' && raw.mode !== 'draft') {
+  const scriptTask = isScriptTask(raw.task);
+  if (!scriptTask && raw.mode !== 'reference' && raw.mode !== 'draft') {
     throw ServiceError.validation('Agent 模式必须是 reference 或 draft。');
   }
-  if (typeof raw.prompt !== 'string') {
+  if (!scriptTask && typeof raw.prompt !== 'string') {
     throw ServiceError.validation('prompt 必须为字符串。');
   }
   if (raw.projectId !== undefined && typeof raw.projectId !== 'string') {
@@ -161,17 +187,24 @@ export function parseAgentBody(raw: RunAgentBody): AgentRunRequest {
     raw.task !== 'auto_next' &&
     raw.task !== 'workspace_review' &&
     raw.task !== 'chapter_diagnosis' &&
-    raw.prompt.trim().length === 0
+    typeof raw.prompt === 'string' && raw.prompt.trim().length === 0
   ) {
     throw ServiceError.validation('一句话需求不能为空。');
   }
+  if (scriptTask && (typeof raw.projectId !== 'string' || raw.projectId.trim().length === 0)) {
+    throw ServiceError.validation('短剧 Agent 任务必须绑定 projectId。');
+  }
+  const scriptBatchOptions = raw.task === 'script_episode_batch'
+    ? parseScriptBatchOptions(raw.scriptBatchOptions)
+    : undefined;
   return {
     task: raw.task,
-    mode: raw.mode as AgentRunMode,
-    prompt: raw.prompt,
+    mode: scriptTask ? 'draft' : raw.mode as AgentRunMode,
+    prompt: typeof raw.prompt === 'string' ? raw.prompt : '',
     projectId: raw.projectId,
     chapterId: raw.chapterId,
     options: parseAgentOptions(raw.options),
+    scriptBatchOptions,
   };
 }
 

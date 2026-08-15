@@ -6,7 +6,7 @@ import { ProjectTree, type ProjectTreeProps } from './ProjectTree.js';
 type Client = NonNullable<ProjectTreeProps['client']>;
 
 function makeClient(options: {
-  projects?: Array<{ id: string; name: string }>;
+  projects?: Array<{ id: string; name: string; kind?: 'novel' | 'short_drama' }>;
   chapters?: Record<string, Chapter[]>;
 } = {}): Client {
   return {
@@ -45,9 +45,32 @@ describe('ProjectTree', () => {
     fireEvent.keyDown(screen.getByLabelText('新项目名称'), { key: 'Enter' });
 
     expect(await screen.findByText('新书计划')).toBeInTheDocument();
-    expect(client.projects.create).toHaveBeenCalledWith('新书计划');
-    expect(onSelectProject).toHaveBeenCalledWith('p-new');
+    expect(client.projects.create).toHaveBeenCalledWith('新书计划', 'novel');
+    expect(onSelectProject).toHaveBeenCalledWith('p-new', 'novel');
     expect(client.projects.list).toHaveBeenCalledTimes(1);
+  });
+
+  it('creates a short-drama project and selects its dedicated workspace kind', async () => {
+    const client = makeClient();
+    const onSelectProject = vi.fn();
+    render(
+      <ProjectTree
+        onSelectProject={onSelectProject}
+        onSelectChapter={vi.fn()}
+        client={client}
+      />,
+    );
+
+    await waitFor(() => expect(client.projects.list).toHaveBeenCalledTimes(1));
+    fireEvent.change(screen.getByLabelText('新项目类型'), { target: { value: 'short_drama' } });
+    fireEvent.change(screen.getByLabelText('新项目名称'), { target: { value: '竖屏短剧' } });
+    fireEvent.click(screen.getByRole('button', { name: '新建' }));
+
+    expect(await screen.findByText('竖屏短剧')).toBeInTheDocument();
+    expect(screen.getAllByText('短剧')).toHaveLength(2);
+    expect(client.projects.create).toHaveBeenCalledWith('竖屏短剧', 'short_drama');
+    expect(onSelectProject).toHaveBeenCalledWith('p-new', 'short_drama');
+    expect(client.chapters.list).not.toHaveBeenCalled();
   });
 
   it('deletes the selected project locally and notifies the parent', async () => {

@@ -111,6 +111,15 @@ export class AgentRunStore {
       .map(clone);
   }
 
+  async deleteForProject(clientId: string, projectId: string): Promise<void> {
+    for (const [id, run] of Object.entries(this.data.runs)) {
+      if (run.clientId === clientId && run.request.projectId === projectId) {
+        delete this.data.runs[id];
+      }
+    }
+    await this.persist();
+  }
+
   async appendEvent(id: string, event: AgentProgressEvent): Promise<StoredAgentRun> {
     return this.update(id, (run) => {
       run.events.push(clone(event));

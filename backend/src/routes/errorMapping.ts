@@ -39,6 +39,8 @@ export function errorCodeToStatus(code: ErrorCode): number {
       return 400;
     case ERROR_CODES.NOT_FOUND:
       return 404;
+    case ERROR_CODES.CONFLICT:
+      return 409;
     case ERROR_CODES.MODEL_NOT_CONFIGURED:
       return 409;
     case ERROR_CODES.PROVIDER_ERROR:

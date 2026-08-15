@@ -27,8 +27,8 @@ describe('useWorkspaceSelection', () => {
   });
 
   it('ignores a slower project-name response after the user selects another project', async () => {
-    const first = deferred<Array<{ id: string; name: string }>>();
-    const second = deferred<Array<{ id: string; name: string }>>();
+    const first = deferred<Array<{ id: string; name: string; kind: 'novel' }>>();
+    const second = deferred<Array<{ id: string; name: string; kind: 'novel' }>>();
     vi.mocked(apiClient.projects.list)
       .mockReturnValueOnce(first.promise)
       .mockReturnValueOnce(second.promise);
@@ -36,9 +36,9 @@ describe('useWorkspaceSelection', () => {
 
     act(() => result.current.selectProject('p-1'));
     act(() => result.current.selectProject('p-2'));
-    await act(async () => second.resolve([{ id: 'p-2', name: '新项目' }]));
+    await act(async () => second.resolve([{ id: 'p-2', name: '新项目', kind: 'novel' }]));
     await waitFor(() => expect(result.current.selectedProjectName).toBe('新项目'));
-    await act(async () => first.resolve([{ id: 'p-1', name: '旧项目' }]));
+    await act(async () => first.resolve([{ id: 'p-1', name: '旧项目', kind: 'novel' }]));
 
     expect(result.current.selectedProjectId).toBe('p-2');
     expect(result.current.selectedProjectName).toBe('新项目');
