@@ -264,6 +264,49 @@ describe('ScriptWorkspace', () => {
     expect(workspaceGet).toHaveBeenCalledWith('project-1', expect.any(AbortSignal));
   });
 
+  it('shows an AI hard finding as advisory instead of a blocking hard count', async () => {
+    const client = createClient();
+    const aiIssue = {
+      id: 'ai-hard-1', projectId: 'project-1', episodeNumber: 1, code: 'AI_WEAK_HOOK',
+      severity: 'hard' as const, category: 'hook' as const, message: 'AI 认为卡点还可以更强。',
+      status: 'open' as const, source: 'ai' as const,
+      createdAt: '2026-08-15T00:00:00.000Z', updatedAt: '2026-08-15T00:00:00.000Z',
+    };
+    Object.assign(client.script, {
+      workspace: {
+        get: vi.fn().mockResolvedValue(buildWorkspaceSnapshot({
+          episodeSummaries: [summarizeEpisode(buildEpisode())],
+          reviewIssues: [aiIssue],
+        })),
+      },
+      reviews: { list: vi.fn(), save: vi.fn(), updateStatus: vi.fn() },
+    });
+
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
+
+    expect(await screen.findByText('第 1 集 · AI 重点建议')).toBeInTheDocument();
+    expect(screen.getByText('0 个硬性')).toBeInTheDocument();
+    expect(screen.getByText('1 个待优化')).toBeInTheDocument();
+  });
+
+  it('does not offer a later fixed batch until every preceding episode is completed', async () => {
+    const client = createClient();
+    const first = { ...buildNumberedEpisode(1, '第一集未完成'), status: 'reviewing' as const };
+    vi.mocked(client.script.episodes.list).mockResolvedValue([
+      { ...summarizeEpisode(first), status: 'reviewing' },
+    ]);
+
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
+    fireEvent.click(screen.getByText('6–10集剧本正文').closest('button')!);
+
+    expect(screen.getByText('请先完成第 1–5 集')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '生成第 6–10 集' })).not.toBeInTheDocument();
+  });
+
   it('saves the edited plan with the loaded revision', async () => {
     const client = createClient();
     render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);

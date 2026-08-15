@@ -653,6 +653,16 @@ const REVIEW_STATUS_LABEL: Record<ScriptReviewIssue['status'], string> = {
   ignored: '已忽略',
 };
 
+function isBlockingReviewIssue(issue: ScriptReviewIssue): boolean {
+  return issue.status === 'open' && issue.severity === 'hard' && issue.source !== 'ai';
+}
+
+function reviewSeverityLabel(issue: ScriptReviewIssue): string {
+  return issue.source === 'ai' && issue.severity === 'hard'
+    ? 'AI 重点建议'
+    : REVIEW_SEVERITY_LABEL[issue.severity];
+}
+
 function fixedBatchStartForEpisode(episodeNumber: number): number {
   return Math.floor((Math.max(1, episodeNumber) - 1) / 5) * 5 + 1;
 }
@@ -708,6 +718,13 @@ function EpisodeBatchPanel({
   const completedBatchEpisodes = new Set(batchSummaries.filter((item) => item.status === 'completed').map((item) => item.episodeNumber));
   const batchCompleted = batchCount > 0 && Array.from({ length: batchCount }, (_, index) => fixedBatchStart + index)
     .every((episodeNumber) => completedBatchEpisodes.has(episodeNumber));
+  const allCompletedEpisodes = new Set(
+    data.episodes.filter((item) => item.status === 'completed').map((item) => item.episodeNumber),
+  );
+  const precedingEpisodesCompleted = fixedBatchStart === 1 || Array.from(
+    { length: fixedBatchStart - 1 },
+    (_, index) => index + 1,
+  ).every((episodeNumber) => allCompletedEpisodes.has(episodeNumber));
   const continuableBatchJob = data.jobs.find((job) => (
     job.task === 'script_episode_batch' && job.continuable && jobBatchStart(job) === fixedBatchStart
   ));
@@ -723,7 +740,7 @@ function EpisodeBatchPanel({
       return left.createdAt.localeCompare(right.createdAt);
     });
   const unresolvedIssues = batchIssues.filter((item) => item.status === 'open');
-  const unresolvedHardIssues = unresolvedIssues.filter((item) => item.severity === 'hard').length;
+  const unresolvedHardIssues = unresolvedIssues.filter(isBlockingReviewIssue).length;
   const referenceEpisode = episode?.episodeNumber ?? batchStart;
   const exportBatchStart = Math.floor((referenceEpisode - 1) / 5) * 5 + 1;
   const exportRange = exportScope === 'batch'
@@ -743,6 +760,7 @@ function EpisodeBatchPanel({
           <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => onExport('fountain', exportRange)}>导出 Fountain</button>
           {continuableBatchJob ? <button type="button" className="nwa-button" disabled={busy} onClick={() => onResume(continuableBatchJob.id)}>继续第 {continuableBatchJob.checkpoint?.episodeNumber ?? fixedBatchStart} 集所在的 {fixedBatchStart}–{batchEnd} 集任务</button>
             : batchCompleted ? <span className="script-status-chip">本批已完成</span>
+              : !precedingEpisodesCompleted ? <span className="script-status-chip">请先完成第 1–{fixedBatchStart - 1} 集</span>
               : batchCount > 0 ? <button type="button" className="nwa-button" disabled={busy} onClick={() => onStart(fixedBatchStart, batchCount)}>生成第 {fixedBatchStart}–{batchEnd} 集</button>
                 : <span className="script-status-chip">全剧已完成</span>}
         </div>
@@ -774,7 +792,7 @@ function EpisodeBatchPanel({
           <div>
             <span>质量门</span>
             <h3 id="script-proofread-heading">校稿与连续性检查</h3>
-            <p>AI也可能会走神，请注意校稿。硬性问题会阻止本集进入完成状态。</p>
+            <p>AI也可能会走神，请注意校稿。规则检查或人工标注的硬性问题会阻止完成；AI 判断默认作为建议展示。</p>
           </div>
           <div className="script-proofread-summary" aria-label="校稿问题统计">
             <span className={unresolvedHardIssues > 0 ? 'is-danger' : ''}>{unresolvedHardIssues} 个硬性</span>
@@ -793,9 +811,9 @@ function EpisodeBatchPanel({
         {batchIssues.length > 0 ? (
           <div className="script-proofread-list">
             {batchIssues.map((issue) => (
-              <article key={issue.id} className={`script-proofread-issue is-${issue.severity} is-${issue.status}`}>
+              <article key={issue.id} className={`script-proofread-issue is-${issue.source === 'ai' && issue.severity === 'hard' ? 'suggestion' : issue.severity} is-${issue.status}`}>
                 <header>
-                  <div><strong>第 {issue.episodeNumber} 集 · {REVIEW_SEVERITY_LABEL[issue.severity]}</strong><span>{issue.category} · {issue.source === 'deterministic' ? '规则检查' : issue.source === 'ai' ? 'AI 审读' : '人工标注'}</span></div>
+                  <div><strong>第 {issue.episodeNumber} 集 · {reviewSeverityLabel(issue)}</strong><span>{issue.category} · {issue.source === 'deterministic' ? '规则检查' : issue.source === 'ai' ? 'AI 审读' : '人工标注'}</span></div>
                   <span>{REVIEW_STATUS_LABEL[issue.status]}</span>
                 </header>
                 <p>{issue.message}</p>
