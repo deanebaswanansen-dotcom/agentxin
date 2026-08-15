@@ -1,9 +1,12 @@
 import { createHash } from 'node:crypto';
 
 import type {
+  ScriptEpisode,
   ScriptInputRevisionRef,
+  ScriptPlannedScene,
   ScriptUpstreamArtifactRef,
 } from '../domain.js';
+import { computeScriptEpisodeCandidateHash } from '../ScriptStore.js';
 
 export type ScriptCheckpointNode =
   | 'plan'
@@ -34,6 +37,55 @@ export interface ScriptCheckpointValidationError {
   path?: string;
   code: string;
   message: string;
+}
+
+export type ScriptArtifactStage = 'scene_plan' | 'draft' | 'patched';
+
+export interface ScriptCheckpointArtifactMeta {
+  schemaVersion: 1;
+  stage: ScriptArtifactStage;
+  projectId: string;
+  episodeNumber: number;
+  baseEpisodeRevision: number;
+  inputRevisionRefs: ScriptInputRevisionRef[];
+  upstreamArtifactRefs: ScriptUpstreamArtifactRef[];
+  promptVersion: string;
+  configRevision: string;
+  inputFingerprint: string;
+  candidateHash: string;
+  validationErrors: ScriptCheckpointValidationError[];
+  createdAt: string;
+}
+
+export interface ScriptScenePlanArtifact extends ScriptCheckpointArtifactMeta {
+  stage: 'scene_plan';
+  plannedScenes: ScriptPlannedScene[];
+}
+
+export interface ScriptEpisodeCandidateArtifact extends ScriptCheckpointArtifactMeta {
+  stage: 'draft' | 'patched';
+  episode: ScriptEpisode;
+}
+
+export interface ScriptCheckpointArtifactBuildContext {
+  projectId: string;
+  episodeNumber: number;
+  baseEpisodeRevision: number;
+  inputRevisionRefs: readonly ScriptInputRevisionRef[];
+  upstreamArtifactRefs?: readonly ScriptUpstreamArtifactRef[];
+  promptVersion: string;
+  configRevision: string;
+  validationErrors?: readonly ScriptCheckpointValidationError[];
+  createdAt: string;
+}
+
+export interface ScriptCheckpointArtifactExpectation {
+  projectId: string;
+  episodeNumber: number;
+  baseEpisodeRevision: number;
+  /** Recomputed from the current canon, Prompt and model configuration. */
+  inputFingerprint: string;
+  candidateHash?: string;
 }
 
 /** Canonical v2 checkpoint returned by every checkpoint store. */
@@ -150,9 +202,18 @@ function canonicalize(value: unknown): unknown {
 }
 
 function canonicalHash(value: unknown): string {
+  const serialized = JSON.stringify(canonicalize(value));
+  if (serialized === undefined) {
+    throw new TypeError('checkpoint artifact 无法进行 canonical JSON 序列化');
+  }
   return createHash('sha256')
-    .update(JSON.stringify(canonicalize(value)), 'utf8')
+    .update(serialized, 'utf8')
     .digest('hex');
+}
+
+/** Stable hash for an immutable checkpoint artifact or artifact payload. */
+export function computeScriptCheckpointArtifactHash(value: unknown): string {
+  return canonicalHash(value);
 }
 
 /**
@@ -180,6 +241,359 @@ export function computeScriptCheckpointInputFingerprint(
     promptVersion: input.promptVersion,
     configRevision: input.configRevision,
   });
+}
+
+export function buildScriptScenePlanArtifact(
+  context: ScriptCheckpointArtifactBuildContext,
+  plannedScenes: readonly ScriptPlannedScene[],
+): ScriptScenePlanArtifact {
+  const scenes = structuredClone([...plannedScenes]);
+  const inputFingerprint = artifactInputFingerprint('scene_plan', context);
+  const artifact: ScriptScenePlanArtifact = {
+    ...artifactMeta(context, 'scene_plan', inputFingerprint),
+    candidateHash: computeScriptCheckpointArtifactHash(scenes),
+    plannedScenes: scenes,
+  };
+  return decodeScriptScenePlanArtifact(artifact, artifactExpectation(artifact));
+}
+
+export function buildScriptEpisodeCandidateArtifact(
+  context: ScriptCheckpointArtifactBuildContext,
+  stage: 'draft' | 'patched',
+  episode: ScriptEpisode,
+): ScriptEpisodeCandidateArtifact {
+  const candidate = structuredClone(episode);
+  const inputFingerprint = artifactInputFingerprint(
+    stage === 'draft' ? 'draft' : 'revision',
+    context,
+  );
+  const artifact: ScriptEpisodeCandidateArtifact = {
+    ...artifactMeta(context, stage, inputFingerprint),
+    candidateHash: computeScriptEpisodeCandidateHash(candidate),
+    episode: candidate,
+  };
+  return decodeScriptEpisodeCandidateArtifact(artifact, artifactExpectation(artifact));
+}
+
+export function buildScriptUpstreamArtifactRef(
+  node: string,
+  artifactRevision: number,
+  artifact: ScriptScenePlanArtifact | ScriptEpisodeCandidateArtifact | unknown,
+): ScriptUpstreamArtifactRef {
+  if (!node.trim()) throw new TypeError('upstream artifact node 不能为空');
+  if (!Number.isInteger(artifactRevision) || artifactRevision < 0) {
+    throw new TypeError('upstream artifact revision 必须是非负整数');
+  }
+  return {
+    node: node.trim(),
+    artifactRevision,
+    artifactHash: computeScriptCheckpointArtifactHash(artifact),
+  };
+}
+
+export function decodeScriptScenePlanArtifact(
+  value: unknown,
+  expected: ScriptCheckpointArtifactExpectation,
+): ScriptScenePlanArtifact {
+  const record = artifactRecord(value);
+  const meta = decodeArtifactMeta(record, 'scene_plan', expected);
+  const plannedScenes = decodePlannedScenes(record.plannedScenes);
+  const candidateHash = computeScriptCheckpointArtifactHash(plannedScenes);
+  verifyCandidateHash(meta.candidateHash, candidateHash, expected);
+  return { ...meta, stage: 'scene_plan', plannedScenes };
+}
+
+export function decodeScriptEpisodeCandidateArtifact(
+  value: unknown,
+  expected: ScriptCheckpointArtifactExpectation,
+): ScriptEpisodeCandidateArtifact {
+  const record = artifactRecord(value);
+  if (record.stage !== 'draft' && record.stage !== 'patched') {
+    throw new TypeError(`单集候选 artifact stage 无效: ${String(record.stage)}`);
+  }
+  const meta = decodeArtifactMeta(record, record.stage, expected);
+  const episode = decodeCandidateEpisode(record.episode);
+  if (episode.projectId !== meta.projectId || episode.episodeNumber !== meta.episodeNumber) {
+    throw new TypeError('单集候选 artifact 的项目或集号与正文不一致');
+  }
+  if (episode.revision !== meta.baseEpisodeRevision) {
+    throw new TypeError('单集候选 artifact 的 baseEpisodeRevision 与正文 revision 不一致');
+  }
+  if (episode.status !== 'reviewing') {
+    throw new TypeError('单集候选 artifact 正文状态必须是 reviewing');
+  }
+  const candidateHash = computeScriptEpisodeCandidateHash(episode);
+  verifyCandidateHash(meta.candidateHash, candidateHash, expected);
+  return { ...meta, stage: record.stage, episode };
+}
+
+function artifactInputFingerprint(
+  node: 'scene_plan' | 'draft' | 'revision',
+  context: ScriptCheckpointArtifactBuildContext,
+): string {
+  return computeScriptCheckpointInputFingerprint({
+    node,
+    inputRevisionRefs: context.inputRevisionRefs,
+    upstreamArtifactRefs: context.upstreamArtifactRefs,
+    promptVersion: context.promptVersion,
+    configRevision: context.configRevision,
+  });
+}
+
+function artifactMeta<TStage extends ScriptArtifactStage>(
+  context: ScriptCheckpointArtifactBuildContext,
+  stage: TStage,
+  inputFingerprint: string,
+): Omit<ScriptCheckpointArtifactMeta, 'candidateHash' | 'stage'> & { stage: TStage } {
+  const inputRevisionRefs = [...context.inputRevisionRefs].sort((left, right) =>
+    left.resource.localeCompare(right.resource) ||
+    left.id.localeCompare(right.id) ||
+    left.revision - right.revision,
+  );
+  const upstreamArtifactRefs = [...(context.upstreamArtifactRefs ?? [])].sort(
+    (left, right) =>
+      left.node.localeCompare(right.node) ||
+      left.artifactRevision - right.artifactRevision ||
+      left.artifactHash.localeCompare(right.artifactHash),
+  );
+  return {
+    schemaVersion: 1,
+    stage,
+    projectId: context.projectId,
+    episodeNumber: context.episodeNumber,
+    baseEpisodeRevision: context.baseEpisodeRevision,
+    inputRevisionRefs: structuredClone(inputRevisionRefs),
+    upstreamArtifactRefs: structuredClone(upstreamArtifactRefs),
+    promptVersion: context.promptVersion,
+    configRevision: context.configRevision,
+    inputFingerprint,
+    validationErrors: structuredClone([...(context.validationErrors ?? [])]),
+    createdAt: context.createdAt,
+  };
+}
+
+function artifactExpectation(
+  artifact: ScriptCheckpointArtifactMeta,
+): ScriptCheckpointArtifactExpectation {
+  return {
+    projectId: artifact.projectId,
+    episodeNumber: artifact.episodeNumber,
+    baseEpisodeRevision: artifact.baseEpisodeRevision,
+    inputFingerprint: artifact.inputFingerprint,
+    candidateHash: artifact.candidateHash,
+  };
+}
+
+function artifactRecord(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) throw new TypeError('短剧 checkpoint artifact 必须是对象');
+  return value;
+}
+
+function decodeArtifactMeta(
+  record: Record<string, unknown>,
+  stage: ScriptArtifactStage,
+  expected: ScriptCheckpointArtifactExpectation,
+): ScriptCheckpointArtifactMeta {
+  if (record.schemaVersion !== 1) {
+    throw new TypeError(`短剧 checkpoint artifact schemaVersion 无效: ${String(record.schemaVersion)}`);
+  }
+  if (record.stage !== stage) {
+    throw new TypeError(`短剧 checkpoint artifact stage 无效: ${String(record.stage)}`);
+  }
+  if (typeof record.projectId !== 'string' || !record.projectId.trim()) {
+    throw new TypeError('短剧 checkpoint artifact projectId 无效');
+  }
+  if (!Number.isInteger(record.episodeNumber) || (record.episodeNumber as number) < 1) {
+    throw new TypeError('短剧 checkpoint artifact episodeNumber 无效');
+  }
+  if (!Number.isInteger(record.baseEpisodeRevision) ||
+    (record.baseEpisodeRevision as number) < 0) {
+    throw new TypeError('短剧 checkpoint artifact baseEpisodeRevision 无效');
+  }
+  if (
+    record.projectId !== expected.projectId ||
+    record.episodeNumber !== expected.episodeNumber ||
+    record.baseEpisodeRevision !== expected.baseEpisodeRevision
+  ) {
+    throw new TypeError('短剧 checkpoint artifact 与当前项目、集号或 base revision 不匹配');
+  }
+  if (
+    !isInputRevisionRefs(record.inputRevisionRefs) ||
+    !isUpstreamArtifactRefs(record.upstreamArtifactRefs) ||
+    typeof record.promptVersion !== 'string' ||
+    !record.promptVersion.trim() ||
+    typeof record.configRevision !== 'string' ||
+    !record.configRevision.trim() ||
+    typeof record.inputFingerprint !== 'string' ||
+    !SHA256_HEX.test(record.inputFingerprint) ||
+    typeof record.candidateHash !== 'string' ||
+    !SHA256_HEX.test(record.candidateHash) ||
+    !isValidationErrors(record.validationErrors) ||
+    typeof record.createdAt !== 'string' ||
+    !record.createdAt.trim()
+  ) {
+    throw new TypeError('短剧 checkpoint artifact 缺少有效的版本、fingerprint 或校验元数据');
+  }
+  const inputFingerprint = computeScriptCheckpointInputFingerprint({
+    node: stage === 'patched' ? 'revision' : stage,
+    inputRevisionRefs: record.inputRevisionRefs,
+    upstreamArtifactRefs: record.upstreamArtifactRefs,
+    promptVersion: record.promptVersion,
+    configRevision: record.configRevision,
+  });
+  if (
+    inputFingerprint !== record.inputFingerprint ||
+    record.inputFingerprint !== expected.inputFingerprint
+  ) {
+    throw new TypeError('短剧 checkpoint artifact inputFingerprint 校验失败');
+  }
+  return {
+    schemaVersion: 1,
+    stage,
+    projectId: record.projectId,
+    episodeNumber: record.episodeNumber as number,
+    baseEpisodeRevision: record.baseEpisodeRevision as number,
+    inputRevisionRefs: structuredClone(record.inputRevisionRefs),
+    upstreamArtifactRefs: structuredClone(record.upstreamArtifactRefs),
+    promptVersion: record.promptVersion,
+    configRevision: record.configRevision,
+    inputFingerprint: record.inputFingerprint,
+    candidateHash: record.candidateHash,
+    validationErrors: structuredClone(record.validationErrors),
+    createdAt: record.createdAt,
+  };
+}
+
+function verifyCandidateHash(
+  storedHash: string,
+  computedHash: string,
+  expected: ScriptCheckpointArtifactExpectation,
+): void {
+  if (
+    storedHash !== computedHash ||
+    (expected.candidateHash !== undefined && storedHash !== expected.candidateHash)
+  ) {
+    throw new TypeError('短剧 checkpoint artifact candidateHash 校验失败');
+  }
+}
+
+function decodePlannedScenes(value: unknown): ScriptPlannedScene[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 5) {
+    throw new TypeError('scene plan artifact 的 plannedScenes 必须包含 1—5 场');
+  }
+  const ordinals = new Set<number>();
+  const scenes = value.map((candidate, index): ScriptPlannedScene => {
+    if (!isRecord(candidate)) {
+      throw new TypeError(`scene plan artifact plannedScenes[${index}] 必须是对象`);
+    }
+    if (!Number.isInteger(candidate.ordinal) || (candidate.ordinal as number) < 1) {
+      throw new TypeError(`scene plan artifact plannedScenes[${index}].ordinal 无效`);
+    }
+    const ordinal = candidate.ordinal as number;
+    if (ordinals.has(ordinal)) {
+      throw new TypeError(`scene plan artifact 场号 ${ordinal} 重复`);
+    }
+    ordinals.add(ordinal);
+    if (
+      !isNonEmptyString(candidate.location) ||
+      !isNonEmptyString(candidate.purpose) ||
+      !['day', 'night', 'dawn', 'dusk'].includes(String(candidate.timeOfDay)) ||
+      !['interior', 'exterior'].includes(String(candidate.interiorExterior))
+    ) {
+      throw new TypeError(`scene plan artifact plannedScenes[${index}] 字段无效`);
+    }
+    return {
+      ordinal,
+      location: candidate.location,
+      timeOfDay: candidate.timeOfDay as ScriptPlannedScene['timeOfDay'],
+      interiorExterior:
+        candidate.interiorExterior as ScriptPlannedScene['interiorExterior'],
+      purpose: candidate.purpose,
+    };
+  });
+  if (scenes.some((scene, index) => scene.ordinal !== index + 1)) {
+    throw new TypeError('scene plan artifact 场号必须从 1 连续递增');
+  }
+  return scenes;
+}
+
+function decodeCandidateEpisode(value: unknown): ScriptEpisode {
+  if (!isRecord(value)) throw new TypeError('单集候选 artifact episode 必须是对象');
+  if (
+    !isNonEmptyString(value.id) ||
+    !isNonEmptyString(value.projectId) ||
+    !Number.isInteger(value.episodeNumber) ||
+    (value.episodeNumber as number) < 1 ||
+    !isNonEmptyString(value.title) ||
+    !isNonEmptyString(value.outlineId) ||
+    !['planned', 'generating', 'reviewing', 'completed', 'failed'].includes(
+      String(value.status),
+    ) ||
+    !Number.isInteger(value.targetChars) ||
+    (value.targetChars as number) < 1 ||
+    !Array.isArray(value.scenes) ||
+    !isString(value.summary) ||
+    !isStringArray(value.newFacts) ||
+    !isStringArray(value.openedThreads) ||
+    !isStringArray(value.closedThreads) ||
+    !Number.isInteger(value.revision) ||
+    (value.revision as number) < 0 ||
+    !isNonEmptyString(value.createdAt) ||
+    !isNonEmptyString(value.updatedAt)
+  ) {
+    throw new TypeError('单集候选 artifact episode 基础字段无效');
+  }
+  for (const [sceneIndex, sceneValue] of value.scenes.entries()) {
+    if (!isRecord(sceneValue)) {
+      throw new TypeError(`单集候选 artifact scenes[${sceneIndex}] 必须是对象`);
+    }
+    if (
+      !isNonEmptyString(sceneValue.id) ||
+      !Number.isInteger(sceneValue.ordinal) ||
+      (sceneValue.ordinal as number) < 1 ||
+      !isNonEmptyString(sceneValue.location) ||
+      !['day', 'night', 'dawn', 'dusk'].includes(String(sceneValue.timeOfDay)) ||
+      !['interior', 'exterior'].includes(String(sceneValue.interiorExterior)) ||
+      !isStringArray(sceneValue.characterIds) ||
+      !Array.isArray(sceneValue.blocks)
+    ) {
+      throw new TypeError(`单集候选 artifact scenes[${sceneIndex}] 字段无效`);
+    }
+    for (const [blockIndex, blockValue] of sceneValue.blocks.entries()) {
+      if (!isRecord(blockValue) ||
+        !isNonEmptyString(blockValue.id) ||
+        !['caption', 'action', 'dialogue'].includes(String(blockValue.type)) ||
+        !isString(blockValue.text)) {
+        throw new TypeError(
+          `单集候选 artifact scenes[${sceneIndex}].blocks[${blockIndex}] 字段无效`,
+        );
+      }
+      if (blockValue.type === 'dialogue' && (
+        !isNonEmptyString(blockValue.speaker) ||
+        (blockValue.characterId !== undefined && !isNonEmptyString(blockValue.characterId)) ||
+        (blockValue.delivery !== undefined && !isString(blockValue.delivery)) ||
+        (blockValue.mode !== undefined &&
+          !['normal', 'os', 'vo'].includes(String(blockValue.mode)))
+      )) {
+        throw new TypeError(
+          `单集候选 artifact scenes[${sceneIndex}].blocks[${blockIndex}] 对白字段无效`,
+        );
+      }
+    }
+  }
+  return structuredClone(value as unknown as ScriptEpisode);
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === 'string';
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(isString);
 }
 
 /**

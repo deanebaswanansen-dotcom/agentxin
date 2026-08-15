@@ -1,8 +1,17 @@
 import { describe, expect, it } from 'vitest';
 
+import type { ScriptEpisode, ScriptPlannedScene } from '../domain.js';
 import {
+  buildScriptEpisodeCandidateArtifact,
+  buildScriptScenePlanArtifact,
+  buildScriptUpstreamArtifactRef,
+  computeScriptCheckpointArtifactHash,
   computeScriptCheckpointInputFingerprint,
+  decodeScriptEpisodeCandidateArtifact,
+  decodeScriptScenePlanArtifact,
   decideScriptCheckpointResume,
+  type ScriptCheckpointArtifactBuildContext,
+  type ScriptCheckpointArtifactExpectation,
   type ScriptPipelineCheckpoint,
 } from './ScriptCheckpoint.js';
 
@@ -32,6 +41,80 @@ function checkpoint(
     artifact: { title: '第二集' },
     updatedAt: '2026-08-15T00:00:00.000Z',
     ...overrides,
+  };
+}
+
+function artifactContext(
+  overrides: Partial<ScriptCheckpointArtifactBuildContext> = {},
+): ScriptCheckpointArtifactBuildContext {
+  return {
+    projectId: 'project-1',
+    episodeNumber: 2,
+    baseEpisodeRevision: 7,
+    inputRevisionRefs: [
+      { resource: 'plan', id: 'plan-1', revision: 3 },
+      { resource: 'outline', id: 'outline-2', revision: 4 },
+    ],
+    upstreamArtifactRefs: [],
+    promptVersion: 'draft-v2',
+    configRevision: 'model-config-v3',
+    validationErrors: [],
+    createdAt: '2026-08-15T00:00:00.000Z',
+    ...overrides,
+  };
+}
+
+function plannedScenes(): ScriptPlannedScene[] {
+  return [{
+    ordinal: 1,
+    location: '校报社',
+    timeOfDay: 'day',
+    interiorExterior: 'interior',
+    purpose: '取得关键证据',
+  }];
+}
+
+function candidateEpisode(): ScriptEpisode {
+  return {
+    id: 'episode-2',
+    projectId: 'project-1',
+    episodeNumber: 2,
+    title: '证人出现',
+    outlineId: 'outline-2',
+    status: 'reviewing',
+    targetChars: 600,
+    scenes: [{
+      id: 'scene-2-1',
+      ordinal: 1,
+      location: '校报社',
+      timeOfDay: 'day',
+      interiorExterior: 'interior',
+      characterIds: ['lead'],
+      blocks: [{ id: 'block-2-1', type: 'action', text: '沈清打开录音笔。' }],
+    }],
+    summary: '沈清取得关键证据。',
+    newFacts: ['录音笔保存着证词'],
+    openedThreads: ['证人为何失踪'],
+    closedThreads: [],
+    revision: 7,
+    createdAt: '2026-08-15T00:00:00.000Z',
+    updatedAt: '2026-08-15T00:00:00.000Z',
+  };
+}
+
+function expectation(artifact: {
+  projectId: string;
+  episodeNumber: number;
+  baseEpisodeRevision: number;
+  inputFingerprint: string;
+  candidateHash: string;
+}): ScriptCheckpointArtifactExpectation {
+  return {
+    projectId: artifact.projectId,
+    episodeNumber: artifact.episodeNumber,
+    baseEpisodeRevision: artifact.baseEpisodeRevision,
+    inputFingerprint: artifact.inputFingerprint,
+    candidateHash: artifact.candidateHash,
   };
 }
 
@@ -125,5 +208,137 @@ describe('script checkpoint v2 recovery', () => {
     expect(changed).toMatchObject({ disposition: 'stale', checkpoint: { status: 'stale' } });
     expect(legacy).toMatchObject({ disposition: 'stale', checkpoint: { status: 'stale' } });
     expect(original.status).toBe('succeeded');
+  });
+
+  it('builds and strictly decodes a versioned scene-plan artifact', () => {
+    const context = artifactContext({
+      baseEpisodeRevision: 4,
+      promptVersion: 'scene-plan-v1',
+    });
+    const artifact = buildScriptScenePlanArtifact(context, plannedScenes());
+
+    expect(artifact).toMatchObject({
+      schemaVersion: 1,
+      stage: 'scene_plan',
+      projectId: 'project-1',
+      episodeNumber: 2,
+      baseEpisodeRevision: 4,
+      inputFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+      candidateHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      validationErrors: [],
+      plannedScenes: plannedScenes(),
+    });
+    expect(decodeScriptScenePlanArtifact(artifact, expectation(artifact))).toEqual(artifact);
+    expect(buildScriptUpstreamArtifactRef('scene_plan', 5, artifact)).toEqual({
+      node: 'scene_plan',
+      artifactRevision: 5,
+      artifactHash: computeScriptCheckpointArtifactHash(artifact),
+    });
+  });
+
+  it('builds and strictly decodes draft and patched episode artifacts', () => {
+    const draft = buildScriptEpisodeCandidateArtifact(
+      artifactContext(),
+      'draft',
+      candidateEpisode(),
+    );
+    const patched = buildScriptEpisodeCandidateArtifact(
+      artifactContext({
+        upstreamArtifactRefs: [buildScriptUpstreamArtifactRef('draft', 1, draft)],
+        promptVersion: 'revision-v1',
+      }),
+      'patched',
+      candidateEpisode(),
+    );
+
+    expect(draft).toMatchObject({
+      schemaVersion: 1,
+      stage: 'draft',
+      episodeNumber: 2,
+      baseEpisodeRevision: 7,
+      episode: { id: 'episode-2', revision: 7, status: 'reviewing' },
+    });
+    expect(decodeScriptEpisodeCandidateArtifact(draft, expectation(draft))).toEqual(draft);
+    expect(patched.stage).toBe('patched');
+    expect(decodeScriptEpisodeCandidateArtifact(patched, expectation(patched))).toEqual(patched);
+  });
+
+  it('rejects tampered artifact schema, episode number, hash and base revision', () => {
+    const artifact = buildScriptEpisodeCandidateArtifact(
+      artifactContext(),
+      'draft',
+      candidateEpisode(),
+    );
+    const expected = expectation(artifact);
+
+    expect(() => decodeScriptEpisodeCandidateArtifact(
+      { ...artifact, schemaVersion: 2 },
+      expected,
+    )).toThrow(/schemaVersion/);
+    expect(() => decodeScriptEpisodeCandidateArtifact(
+      { ...artifact, episodeNumber: 3 },
+      expected,
+    )).toThrow(/集号|episodeNumber|不匹配/);
+    expect(() => decodeScriptEpisodeCandidateArtifact(
+      { ...artifact, candidateHash: '0'.repeat(64) },
+      expected,
+    )).toThrow(/candidateHash/);
+    expect(() => decodeScriptEpisodeCandidateArtifact(
+      { ...artifact, baseEpisodeRevision: 8 },
+      expected,
+    )).toThrow(/base revision|baseEpisodeRevision|不匹配/);
+    expect(() => decodeScriptEpisodeCandidateArtifact(
+      {
+        ...artifact,
+        episode: {
+          ...artifact.episode,
+          scenes: [{
+            ...artifact.episode.scenes[0]!,
+            blocks: [{
+              ...artifact.episode.scenes[0]!.blocks[0]!,
+              text: '被篡改的正文',
+            }],
+          }],
+        },
+      },
+      expected,
+    )).toThrow(/candidateHash/);
+    expect(() => buildScriptEpisodeCandidateArtifact(
+      artifactContext({ episodeNumber: 3 }),
+      'draft',
+      candidateEpisode(),
+    )).toThrow(/集号|episodeNumber|不一致/);
+    expect(() => buildScriptEpisodeCandidateArtifact(
+      artifactContext({ baseEpisodeRevision: 8 }),
+      'draft',
+      candidateEpisode(),
+    )).toThrow(/baseEpisodeRevision|revision 不一致/);
+  });
+
+  it('rejects a tampered scene-plan payload or current-input fingerprint', () => {
+    const artifact = buildScriptScenePlanArtifact(
+      artifactContext({ baseEpisodeRevision: 4, promptVersion: 'scene-plan-v1' }),
+      plannedScenes(),
+    );
+    const expected = expectation(artifact);
+
+    expect(() => decodeScriptScenePlanArtifact({
+      ...artifact,
+      plannedScenes: [{ ...artifact.plannedScenes[0]!, purpose: '被替换的场景目的' }],
+    }, expected)).toThrow(/candidateHash/);
+    expect(() => decodeScriptScenePlanArtifact(artifact, {
+      ...expected,
+      inputFingerprint: 'f'.repeat(64),
+    })).toThrow(/inputFingerprint/);
+  });
+
+  it('hashes artifacts canonically without depending on object key order', () => {
+    expect(computeScriptCheckpointArtifactHash({
+      stage: 'draft',
+      nested: { revision: 3, id: 'candidate-1' },
+    })).toBe(computeScriptCheckpointArtifactHash({
+      nested: { id: 'candidate-1', revision: 3 },
+      stage: 'draft',
+    }));
   });
 });
