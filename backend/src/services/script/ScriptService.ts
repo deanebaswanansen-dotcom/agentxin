@@ -22,6 +22,7 @@ import type {
 } from './domain.js';
 import { serializeChineseShortDrama } from './serializers/chineseShortDrama.js';
 import { serializeScriptMarkdown } from './serializers/markdown.js';
+import { serializeFountain } from './serializers/fountain.js';
 import { ScriptConflictError, type ScriptStore } from './ScriptStore.js';
 import { validateScriptEpisode } from './quality/ScriptQualityGates.js';
 
@@ -640,12 +641,15 @@ export class ScriptService {
     );
     if (episodes.length === 0) throw ScriptServiceError.notFound('指定范围内没有可导出的剧本正文');
     const title = state.plan?.title ?? `短剧-${projectId}`;
+    const extension = format === 'md' ? 'md' : format === 'fountain' ? 'fountain' : 'txt';
+    const content = format === 'md'
+      ? serializeScriptMarkdown(episodes, state.characters, { title })
+      : format === 'fountain'
+        ? serializeFountain(episodes, state.characters)
+        : serializeChineseShortDrama(episodes, state.characters);
     return {
-      filename: `${title}.${format === 'md' ? 'md' : 'txt'}`,
-      content:
-        format === 'md'
-          ? `${serializeScriptMarkdown(episodes, state.characters, { title })}\n`
-          : `${serializeChineseShortDrama(episodes, state.characters)}\n`,
+      filename: `${title}.${extension}`,
+      content: `${content}\n`,
       contentType: format === 'md' ? 'text/markdown; charset=utf-8' : 'text/plain; charset=utf-8',
     };
   }

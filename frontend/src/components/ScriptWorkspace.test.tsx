@@ -305,7 +305,7 @@ describe('ScriptWorkspace', () => {
     expect(client.script.episodes.list).toHaveBeenCalledTimes(2);
   });
 
-  it('exports TXT, Markdown, and DOCX from the completed script', async () => {
+  it('exports TXT, Markdown, DOCX, and Fountain from the completed script', async () => {
     const client = createClient();
     vi.mocked(client.script.export).mockResolvedValue('第一集\n1-1 沈家老宅 日/外');
     vi.stubGlobal('URL', {
@@ -324,5 +324,7 @@ describe('ScriptWorkspace', () => {
     await waitFor(() => expect(client.script.export).toHaveBeenCalledWith('project-1', 'md'));
     fireEvent.click(screen.getByRole('button', { name: '导出 DOCX' }));
     await waitFor(() => expect(client.script.export).toHaveBeenCalledWith('project-1', 'txt'));
+    fireEvent.click(screen.getByRole('button', { name: '导出 Fountain' }));
+    await waitFor(() => expect(client.script.export).toHaveBeenCalledWith('project-1', 'fountain'));
   });
 });

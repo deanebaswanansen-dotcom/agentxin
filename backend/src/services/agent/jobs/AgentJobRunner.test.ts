@@ -47,6 +47,57 @@ describe('AgentJobRunner', () => {
     expect(await readFile(file, 'utf8')).not.toContain('secret-key');
   });
 
+  it('persists progress before exposing the job as completed', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-progress-order-'));
+    const store = await AgentRunStore.create(join(directory, 'runs.json'));
+    const originalAppendEvent = store.appendEvent.bind(store);
+    let releaseWrite!: () => void;
+    const writeGate = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    const appendEvent = vi.spyOn(store, 'appendEvent').mockImplementation(async (id, event) => {
+      await writeGate;
+      return originalAppendEvent(id, event);
+    });
+    const runner = new AgentJobRunner(store, {
+      run: async (request, _signal, onProgress) => {
+        onProgress?.({
+          phase: 'info',
+          message: '草稿检查点完成',
+          scriptCheckpoint: {
+            episodeNumber: 1,
+            node: 'draft',
+            attempt: 1,
+            artifactRevision: 1,
+          },
+        });
+        return {
+          task: request.task,
+          mode: request.mode,
+          projectId: request.projectId ?? 'p1',
+          summary: '完成',
+          steps: [],
+          artifacts: [],
+        };
+      },
+    });
+
+    const created = await runner.start(
+      CLIENT_ID,
+      { task: 'script_episode_batch', mode: 'draft', prompt: '', projectId: 'p1' },
+      undefined,
+    );
+    await vi.waitFor(() => expect(appendEvent).toHaveBeenCalledOnce());
+    expect(store.get(created.id)?.status).toBe('running');
+
+    releaseWrite();
+    await runner.waitUntilIdle(created.id);
+    expect(store.get(created.id)).toMatchObject({
+      status: 'completed',
+      events: [{ scriptCheckpoint: { node: 'draft', artifactRevision: 1 } }],
+    });
+  });
+
   it('retries temporary provider failures before marking a job failed', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-retry-'));
     const store = await AgentRunStore.create(join(directory, 'runs.json'));

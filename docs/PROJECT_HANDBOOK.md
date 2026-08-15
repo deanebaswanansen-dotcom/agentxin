@@ -174,7 +174,7 @@ npm run build
 
 cd /root/agentxin/frontend
 npm ci
-VITE_AGENT_BACKGROUND_JOBS=false npm run build
+VITE_AGENT_BACKGROUND_JOBS=false VITE_SCRIPT_MODE_ENABLED=false npm run build
 
 mkdir -p /var/www/agentxin /var/lib/agentxin
 cp -a /root/agentxin/frontend/dist/. /var/www/agentxin/
@@ -264,7 +264,7 @@ npm run build
 
 cd ../frontend
 npm ci
-VITE_AGENT_BACKGROUND_JOBS=false npm run build
+VITE_AGENT_BACKGROUND_JOBS=false VITE_SCRIPT_MODE_ENABLED=false npm run build
 cp -a dist/. /var/www/agentxin/
 
 systemctl restart agentxin
@@ -380,3 +380,19 @@ systemctl status agentxin --no-pager
 - 增加正式健康检查路由及部署回归脚本。
 - 账号登录、跨设备同步、客户端编号恢复和共享项目尚未实现。
 - systemd 当前以 root 运行；后续应在保持数据权限正确的前提下迁移到专用低权限用户。
+
+## 13. 短剧模式本地验收
+
+短剧入口由前端构建变量 `VITE_SCRIPT_MODE_ENABLED` 控制；生产环境未显式开启时默认隐藏，关闭入口不会删除已有短剧资料。
+
+真实模型验收脚本会创建独立临时项目，依次执行策划、总纲、圣经、单集正文、质量门和 TXT/Markdown/Fountain 导出。密钥只允许通过当前进程的 `SHORT_DRAMA_E2E_API_KEY` 提供，不要写入仓库、命令历史、日志或测试夹具。运行方式：
+
+```powershell
+cd backend
+$secureKey = Read-Host -AsSecureString 'API Key'
+$env:SHORT_DRAMA_E2E_API_KEY = [Net.NetworkCredential]::new('', $secureKey).Password
+npm run acceptance:short-drama
+Remove-Item Env:SHORT_DRAMA_E2E_API_KEY
+```
+
+可按供应商设置 `SHORT_DRAMA_E2E_BASE_URL` 和 `SHORT_DRAMA_E2E_MODEL`。验收脚本默认使用一个 300 字、单场、单集样例以控制调用成本，但仍严格执行正文 ±15% 字数门禁；失败时不得通过放宽门禁伪造成功结果。

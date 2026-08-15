@@ -75,9 +75,21 @@ export function registerAgentJobRoutes(
 
   app.get<{ Params: { projectId: string } }>(
     '/api/projects/:projectId/agent-jobs',
-    async (request, reply) => reply.code(200).send(
-      store.listForClient(getCurrentClientId(), request.params.projectId).map(toClientRun),
-    ),
+    async (request, reply) => {
+      const clientId = getCurrentClientId();
+      const modelConfig = getRequestModelConfig();
+      const runs = store.listForClient(clientId, request.params.projectId);
+      if (modelConfig) {
+        await Promise.all(
+          runs
+            .filter((run) => run.status === 'waiting_user')
+            .map((run) => runner.resume(clientId, run.id, modelConfig)),
+        );
+      }
+      return reply.code(200).send(
+        store.listForClient(clientId, request.params.projectId).map(toClientRun),
+      );
+    },
   );
 
   app.post<{ Params: { id: string } }>('/api/agent/jobs/:id/resume', async (request, reply) => {

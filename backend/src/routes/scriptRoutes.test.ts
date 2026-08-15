@@ -277,7 +277,7 @@ describe('scriptRoutes', () => {
     expect(response.json().error.code).toBe('VALIDATION_ERROR');
   });
 
-  it('saves episodes, lists ordered summaries and exports TXT and Markdown', async () => {
+  it('saves episodes, lists ordered summaries and exports TXT, Markdown and Fountain', async () => {
     await app.inject({
       method: 'PUT',
       url: `/api/projects/${projectId}/script-plan`,
@@ -327,6 +327,14 @@ describe('scriptRoutes', () => {
     expect(md.headers['content-type']).toContain('text/markdown');
     expect(md.body).toContain('# 绝食逼我道歉？');
     expect(md.body).toContain('## 第一集 · 初入老宅');
+
+    const fountain = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${projectId}/script-export?format=fountain`,
+    });
+    expect(fountain.statusCode).toBe(200);
+    expect(fountain.headers['content-disposition']).toContain('.fountain');
+    expect(fountain.body).toContain('沈清');
   });
 
   it('rejects marking an episode completed when it fails the hard quality gate', async () => {

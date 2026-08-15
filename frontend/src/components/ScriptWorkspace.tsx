@@ -7,12 +7,16 @@ import type {
   ScriptEpisode,
   ScriptEpisodeSummary,
   ScriptPlan,
+  ScriptPlanAnswer,
+  ScriptPlanQuestion,
   ScriptSeriesOutline,
   ScriptWorldBible,
 } from '../types/index.js';
+import { buildProjectDocxBlob, sanitizeDownloadName } from '../lib/projectExport.js';
 import './script-workspace.css';
 
 type ScriptStage = 'plan' | 'outline' | 'characters' | 'world' | 'episodes';
+type ScriptExportRange = { startEpisode: number; episodeCount: number };
 
 export interface ScriptWorkspaceProps {
   projectId: Id;
@@ -119,13 +123,27 @@ async function optional<T>(request: Promise<T>): Promise<T | undefined> {
 function PlanEditor({
   value,
   busy,
+  questions,
+  answers,
   onChange,
   onSave,
+  onAgentPlan,
+  onAnswer,
+  onDelegate,
+  onSubmitAnswers,
+  onApprove,
 }: {
   value: ScriptPlan;
   busy: boolean;
+  questions: ScriptPlanQuestion[];
+  answers: Record<string, ScriptPlanAnswer>;
   onChange: (value: ScriptPlan) => void;
   onSave: () => void;
+  onAgentPlan: () => void;
+  onAnswer: (field: string, value: NonNullable<ScriptPlanAnswer['value']>) => void;
+  onDelegate: (field: string) => void;
+  onSubmitAnswers: () => void;
+  onApprove: () => void;
 }): JSX.Element {
   const patch = <K extends keyof ScriptPlan>(key: K, next: ScriptPlan[K]) =>
     onChange({ ...value, [key]: next });
@@ -153,7 +171,52 @@ function PlanEditor({
         <label className="script-field script-field--wide">核心要求<textarea rows={5} value={value.coreRequirements} onChange={(e) => patch('coreRequirements', e.target.value)} /></label>
         <label className="script-field script-field--wide">结局方向<textarea value={value.endingDirection} onChange={(e) => patch('endingDirection', e.target.value)} /></label>
       </div>
-      <footer className="script-stage-actions"><button type="button" className="nwa-button" disabled={busy} onClick={onSave}>{busy ? '保存中…' : '保存策划'}</button></footer>
+      {questions.length > 0 ? (
+        <section className="script-plan-interview" aria-label="短剧策划问题">
+          <h3>Agent 还需要确认</h3>
+          {questions.map((question) => {
+            const answer = answers[question.field];
+            const selected = answer?.value;
+            return (
+              <fieldset key={question.field} className="script-plan-question">
+                <legend>{question.label}</legend>
+                {question.help ? <p>{question.help}</p> : null}
+                {question.options?.length ? (
+                  <div className="script-plan-options">
+                    {question.options.map((option) => {
+                      const pressed = Array.isArray(selected)
+                        ? selected.includes(option.value)
+                        : selected === option.value;
+                      return <button key={option.value} type="button" className={pressed ? 'is-selected' : ''} aria-pressed={pressed} onClick={() => {
+                        if (question.kind === 'multi') {
+                          const values = Array.isArray(selected) ? selected : [];
+                          onAnswer(question.field, pressed ? values.filter((item) => item !== option.value) : [...values, option.value]);
+                        } else {
+                          onAnswer(question.field, option.value);
+                        }
+                      }}>{option.label}</button>;
+                    })}
+                  </div>
+                ) : (
+                  <input
+                    aria-label={question.label}
+                    type={question.kind === 'number' ? 'number' : 'text'}
+                    value={typeof selected === 'string' || typeof selected === 'number' ? selected : ''}
+                    onChange={(event) => onAnswer(question.field, question.kind === 'number' ? Number(event.target.value) : event.target.value)}
+                  />
+                )}
+                <button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" aria-pressed={answer?.delegate === true} onClick={() => onDelegate(question.field)}>交给 Agent</button>
+              </fieldset>
+            );
+          })}
+          <button type="button" className="nwa-button" disabled={busy} onClick={onSubmitAnswers}>提交本轮答案</button>
+        </section>
+      ) : null}
+      <footer className="script-stage-actions">
+        <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={onAgentPlan}>Agent 帮我策划</button>
+        <button type="button" className="nwa-button" disabled={busy} onClick={onSave}>{busy ? '保存中…' : '保存策划'}</button>
+        {value.status === 'draft' ? <button type="button" className="nwa-button" disabled={busy} onClick={onApprove}>确认策划</button> : null}
+      </footer>
     </section>
   );
 }
@@ -163,11 +226,13 @@ function OutlineEditor({
   busy,
   onChange,
   onSave,
+  onGenerate,
 }: {
   value: ScriptSeriesOutline;
   busy: boolean;
   onChange: (value: ScriptSeriesOutline) => void;
   onSave: () => void;
+  onGenerate: () => void;
 }): JSX.Element {
   const patch = <K extends keyof ScriptSeriesOutline>(key: K, next: ScriptSeriesOutline[K]) =>
     onChange({ ...value, [key]: next });
@@ -184,7 +249,7 @@ function OutlineEditor({
         <label className="script-field script-field--wide">支线（每行一条）<textarea rows={4} value={value.subplotArcs.join('\n')} onChange={(e) => patch('subplotArcs', e.target.value.split('\n').map((item) => item.trim()).filter(Boolean))} /></label>
       </div>
       {value.episodeCards.length > 0 ? <div className="script-outline-cards"><h3>分集卡</h3>{value.episodeCards.map((card, index) => <article key={card.episodeNumber}><strong>第 {card.episodeNumber} 集</strong><input aria-label={`第 ${card.episodeNumber} 集标题`} value={card.title} onChange={(e) => patch('episodeCards', value.episodeCards.map((item, itemIndex) => itemIndex === index ? { ...item, title: e.target.value } : item))} /><textarea aria-label={`第 ${card.episodeNumber} 集梗概`} value={card.logline} onChange={(e) => patch('episodeCards', value.episodeCards.map((item, itemIndex) => itemIndex === index ? { ...item, logline: e.target.value } : item))} /></article>)}</div> : <p className="script-muted">保存策划后，可让 Agent 生成全剧总纲与连续分集卡。</p>}
-      <footer className="script-stage-actions"><button type="button" className="nwa-button" disabled={busy} onClick={onSave}>{busy ? '保存中…' : '保存大纲'}</button></footer>
+      <footer className="script-stage-actions"><button type="button" className="nwa-button nwa-button--ghost" onClick={onGenerate}>Agent 生成大纲</button><button type="button" className="nwa-button" disabled={busy} onClick={onSave}>{busy ? '保存中…' : '保存大纲'}</button></footer>
     </section>
   );
 }
@@ -222,18 +287,20 @@ function CharacterEditor({
   busy,
   onChange,
   onSave,
+  onGenerate,
 }: {
   projectId: Id;
   value: ScriptCharacter[];
   busy: boolean;
   onChange: (value: ScriptCharacter[]) => void;
   onSave: () => void;
+  onGenerate: () => void;
 }): JSX.Element {
   const update = (index: number, fields: Partial<ScriptCharacter>) =>
     onChange(value.map((item, itemIndex) => itemIndex === index ? { ...item, ...fields } : item));
   return (
     <section className="script-stage-panel" aria-labelledby="script-characters-heading">
-      <header className="script-stage-heading"><div><span>第三阶段</span><h2 id="script-characters-heading">角色设定</h2></div><button type="button" className="nwa-button nwa-button--ghost" onClick={() => onChange([...value, emptyCharacter(projectId, value.length + 1)])}>添加角色</button></header>
+      <header className="script-stage-heading"><div><span>第三阶段</span><h2 id="script-characters-heading">角色设定</h2></div><div className="script-stage-heading__actions"><button type="button" className="nwa-button nwa-button--ghost" onClick={onGenerate}>Agent 生成角色</button><button type="button" className="nwa-button nwa-button--ghost" onClick={() => onChange([...value, emptyCharacter(projectId, value.length + 1)])}>添加角色</button></div></header>
       {value.length === 0 ? <p className="script-muted">尚无角色。可手动添加，或让 Agent 根据策划和总纲生成角色圣经。</p> : <div className="script-character-list">{value.map((character, index) => (
         <article key={character.id} className="script-character-card">
           <header><strong>{character.name || `角色 ${index + 1}`}</strong><button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" onClick={() => onChange(value.filter((_, itemIndex) => itemIndex !== index))}>删除</button></header>
@@ -262,18 +329,20 @@ function WorldEditor({
   busy,
   onChange,
   onSave,
+  onGenerate,
 }: {
   value: ScriptWorldBible;
   busy: boolean;
   onChange: (value: ScriptWorldBible) => void;
   onSave: () => void;
+  onGenerate: () => void;
 }): JSX.Element {
   const patch = <K extends keyof ScriptWorldBible>(key: K, next: ScriptWorldBible[K]) =>
     onChange({ ...value, [key]: next });
   const lines = (text: string) => text.split('\n').map((item) => item.trim()).filter(Boolean);
   return (
     <section className="script-stage-panel" aria-labelledby="script-world-heading">
-      <header className="script-stage-heading"><div><span>第四阶段</span><h2 id="script-world-heading">世界设定</h2></div><span className="script-status-chip">版本 {value.revision}</span></header>
+      <header className="script-stage-heading"><div><span>第四阶段</span><h2 id="script-world-heading">世界设定</h2></div><div className="script-stage-heading__actions"><button type="button" className="nwa-button nwa-button--ghost" onClick={onGenerate}>Agent 生成世界</button><span className="script-status-chip">版本 {value.revision}</span></div></header>
       <div className="script-form-grid">
         <label className="script-field">时代<input aria-label="时代" value={value.era} onChange={(e) => patch('era', e.target.value)} /></label>
         <label className="script-field">主要地点（每行一项）<textarea value={value.primaryLocations.join('\n')} onChange={(e) => patch('primaryLocations', lines(e.target.value))} /></label>
@@ -342,18 +411,27 @@ function EpisodeBatchPanel({
   onOpenEpisode: (episodeNumber: number) => void;
   onEpisodeChange: (episode: ScriptEpisode) => void;
   onSaveEpisode: () => void;
-  onExport: (format: 'txt' | 'md') => void;
+  onExport: (format: 'txt' | 'md' | 'docx' | 'fountain', range?: ScriptExportRange) => void;
 }): JSX.Element {
+  const [exportScope, setExportScope] = useState<'all' | 'batch'>('all');
   const start = nextBatchStart(data.episodes, data.plan.totalEpisodes);
   const count = Math.min(5, Math.max(0, data.plan.totalEpisodes - start + 1));
   const end = start + count - 1;
+  const referenceEpisode = episode?.episodeNumber ?? Math.max(1, start - 1);
+  const exportBatchStart = Math.floor((referenceEpisode - 1) / 5) * 5 + 1;
+  const exportRange = exportScope === 'batch'
+    ? { startEpisode: exportBatchStart, episodeCount: Math.min(5, data.plan.totalEpisodes - exportBatchStart + 1) }
+    : undefined;
   return (
     <section className="script-stage-panel script-episodes-panel" aria-labelledby="script-episodes-heading">
       <header className="script-stage-heading">
         <div><span>第五阶段</span><h2 id="script-episodes-heading">分批正文</h2></div>
         <div className="script-stage-heading__actions">
-          <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => onExport('txt')}>导出 TXT</button>
-          <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => onExport('md')}>导出 MD</button>
+          <select aria-label="导出范围" value={exportScope} onChange={(event) => setExportScope(event.target.value as 'all' | 'batch')}><option value="all">整本</option><option value="batch">当前五集</option></select>
+          <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => onExport('txt', exportRange)}>导出 TXT</button>
+          <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => onExport('md', exportRange)}>导出 MD</button>
+          <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => onExport('docx', exportRange)}>导出 DOCX</button>
+          <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => onExport('fountain', exportRange)}>导出 Fountain</button>
           {count > 0 ? <button type="button" className="nwa-button" disabled={busy} onClick={() => onStart(start, count)}>生成第 {start}–{end} 集</button> : <span className="script-status-chip">全剧已完成</span>}
         </div>
       </header>
@@ -373,7 +451,7 @@ function EpisodeBatchPanel({
               <div className="script-job-card__status"><strong>{JOB_STATUS_LABEL[job.status]}</strong><span>{job.task === 'script_episode_batch' ? '分批正文' : '资料生成'}</span></div>
               {job.checkpoint ? <p>第 {job.checkpoint.episodeNumber} 集 · {CHECKPOINT_LABEL[job.checkpoint.node]}</p> : <p>等待首个检查点</p>}
               {job.error ? <p className="script-job-error">{job.error.message}</p> : null}
-              {job.status === 'failed' && job.continuable ? <button type="button" className="nwa-button nwa-button--sm" disabled={busy} onClick={() => onResume(job.id)}>从检查点继续</button> : null}
+              {job.continuable ? <button type="button" className="nwa-button nwa-button--sm" disabled={busy} onClick={() => onResume(job.id)}>从检查点继续</button> : null}
               {job.status === 'queued' || job.status === 'running' || job.status === 'retrying' ? <button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={busy} onClick={() => onCancel(job.id)}>取消任务</button> : null}
             </article>
           ))}
@@ -426,6 +504,8 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
   const [notice, setNotice] = useState('');
   const [selectedEpisode, setSelectedEpisode] = useState<ScriptEpisode>();
   const [episodeLoading, setEpisodeLoading] = useState(false);
+  const [planQuestions, setPlanQuestions] = useState<ScriptPlanQuestion[]>([]);
+  const [planAnswers, setPlanAnswers] = useState<Record<string, ScriptPlanAnswer>>({});
   const episodeRequest = useRef<AbortController>();
 
   useEffect(() => {
@@ -435,6 +515,8 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
     setNotice('');
     setSelectedEpisode(undefined);
     setEpisodeLoading(false);
+    setPlanQuestions([]);
+    setPlanAnswers({});
     episodeRequest.current?.abort();
     void Promise.all([
       optional(client.script.plan.get(projectId, controller.signal)),
@@ -454,6 +536,105 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
       episodeRequest.current?.abort();
     };
   }, [client, onError, projectId, projectName]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const poll = async (): Promise<void> => {
+      try {
+        const [jobs, episodes] = await Promise.all([
+          client.script.jobs.list(projectId, controller.signal),
+          client.script.episodes.list(projectId, controller.signal),
+        ]);
+        if (!controller.signal.aborted) {
+          setData((current) => current ? { ...current, jobs, episodes } : current);
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) onError?.(error);
+      }
+    };
+    const timer = setInterval(poll, 2_000);
+    return () => {
+      controller.abort();
+      clearInterval(timer);
+    };
+  }, [client, onError, projectId]);
+
+  const applyPlanTurn = useCallback((
+    result: Awaited<ReturnType<ApiClient['script']['plan']['turn']>>,
+  ) => {
+    if (result.status === 'asking') {
+      setPlanQuestions(result.questions ?? []);
+      setPlanAnswers({});
+      setNotice(`策划 Agent 第 ${result.round} 轮需要确认 ${result.questions?.length ?? 0} 项`);
+      return;
+    }
+    if (result.plan) {
+      setData((current) => current ? { ...current, plan: result.plan! } : current);
+      setPlanQuestions([]);
+      setPlanAnswers({});
+      setNotice('Agent 已生成策划草稿，请检查后确认');
+    }
+  }, []);
+
+  const startPlanInterview = useCallback(async () => {
+    if (!data) return;
+    setBusy(true);
+    setNotice('');
+    try {
+      const seedPrompt = [data.plan.title, data.plan.logline, data.plan.coreRequirements]
+        .map((item) => item.trim()).filter(Boolean).join('\n');
+      applyPlanTurn(await client.script.plan.turn({
+        projectId,
+        seedPrompt,
+        answers: [],
+        reset: true,
+      }));
+    } catch (error) {
+      onError?.(error);
+    } finally {
+      setBusy(false);
+    }
+  }, [applyPlanTurn, client, data, onError, projectId]);
+
+  const submitPlanAnswers = useCallback(async () => {
+    const incomplete = planQuestions.some((question) => {
+      const answer = planAnswers[question.field];
+      const value = answer?.value;
+      return answer?.delegate !== true &&
+        (value === undefined || value === '' || (Array.isArray(value) && value.length === 0));
+    });
+    if (incomplete) {
+      setNotice('请回答本轮全部问题，或明确选择“交给 Agent”。');
+      return;
+    }
+    setBusy(true);
+    setNotice('');
+    try {
+      applyPlanTurn(await client.script.plan.turn({
+        projectId,
+        answers: planQuestions.map((question) => planAnswers[question.field]!),
+      }));
+    } catch (error) {
+      onError?.(error);
+    } finally {
+      setBusy(false);
+    }
+  }, [applyPlanTurn, client, onError, planAnswers, planQuestions, projectId]);
+
+  const approvePlan = useCallback(async () => {
+    if (!data) return;
+    setBusy(true);
+    setNotice('');
+    try {
+      const plan = await client.script.plan.approve(projectId, data.plan.revision);
+      setData((current) => current ? { ...current, plan } : current);
+      setNotice('策划已确认，可生成大纲、角色与世界设定');
+    } catch (error) {
+      onError?.(error);
+    } finally {
+      setBusy(false);
+    }
+  }, [client, data, onError, projectId]);
 
   const savePlan = useCallback(async () => {
     if (!data) return;
@@ -541,6 +722,27 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
     }
   }, [client, data, onError, projectId]);
 
+  const startMaterialJob = useCallback(async (
+    task: 'script_series_outline' | 'script_bible',
+    prompt?: string,
+  ) => {
+    setNotice('');
+    try {
+      const job = await client.script.jobs.create({
+        projectId,
+        task,
+        ...(prompt ? { prompt } : {}),
+      });
+      setData((current) => current ? {
+        ...current,
+        jobs: [job, ...current.jobs.filter((item) => item.id !== job.id)],
+      } : current);
+      setNotice('Agent 任务已提交，可切换项目后继续后台运行');
+    } catch (error) {
+      onError?.(error);
+    }
+  }, [client, onError, projectId]);
+
   const resumeJob = useCallback(async (jobId: string) => {
     setBusy(true);
     setNotice('');
@@ -618,16 +820,28 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
     }
   }, [client, onError, projectId, selectedEpisode]);
 
-  const exportScript = useCallback(async (format: 'txt' | 'md') => {
+  const exportScript = useCallback(async (
+    format: 'txt' | 'md' | 'docx' | 'fountain',
+    range?: ScriptExportRange,
+  ) => {
     setBusy(true);
     setNotice('');
     try {
-      const content = await client.script.export(projectId, format);
+      const sourceFormat = format === 'docx' ? 'txt' : format;
+      const content = range
+        ? await client.script.export(projectId, sourceFormat, range)
+        : await client.script.export(projectId, sourceFormat);
       if (typeof URL.createObjectURL === 'function') {
-        const url = URL.createObjectURL(new Blob([content], { type: format === 'md' ? 'text/markdown;charset=utf-8' : 'text/plain;charset=utf-8' }));
+        const title = projectName ?? data?.plan.title ?? '短剧';
+        const blob = format === 'docx'
+          ? buildProjectDocxBlob(title, [{ title: '短剧剧本', content, position: 0 }])
+          : new Blob([content], {
+              type: format === 'md' ? 'text/markdown;charset=utf-8' : 'text/plain;charset=utf-8',
+            });
+        const url = URL.createObjectURL(blob);
         const anchor = document.createElement('a');
         anchor.href = url;
-        anchor.download = `${(projectName ?? data?.plan.title ?? '短剧').replace(/[\\/:*?\"<>|]/g, '_')}.${format}`;
+        anchor.download = `${sanitizeDownloadName(title)}.${format}`;
         anchor.click();
         URL.revokeObjectURL(url);
       }
@@ -647,11 +861,11 @@ export function ScriptWorkspace({ projectId, projectName, onError, client = apiC
       </nav>
       {notice ? <div className="script-notice" role="status">{notice}</div> : null}
       {!data ? <div className="script-loading" role="status">正在加载短剧资料…</div> : null}
-      {data && stage === 'plan' ? <PlanEditor value={data.plan} busy={busy} onChange={(plan) => setData({ ...data, plan })} onSave={() => void savePlan()} /> : null}
-      {data && stage === 'outline' ? <OutlineEditor value={data.outline ?? emptyOutline(projectId)} busy={busy} onChange={(outline) => setData({ ...data, outline })} onSave={() => void saveOutline()} /> : null}
-      {data && stage === 'characters' ? <CharacterEditor projectId={projectId} value={data.characters} busy={busy} onChange={(characters) => setData({ ...data, characters })} onSave={() => void saveCharacters()} /> : null}
-      {data && stage === 'episodes' ? <EpisodeBatchPanel data={data} busy={busy} episode={selectedEpisode} episodeLoading={episodeLoading} onStart={(start, count) => void startEpisodeBatch(start, count)} onResume={(jobId) => void resumeJob(jobId)} onCancel={(jobId) => void cancelJob(jobId)} onOpenEpisode={(episodeNumber) => void openEpisode(episodeNumber)} onEpisodeChange={setSelectedEpisode} onSaveEpisode={() => void saveEpisode()} onExport={(format) => void exportScript(format)} /> : null}
-      {data && stage === 'world' ? <WorldEditor value={data.world ?? emptyWorld(projectId)} busy={busy} onChange={(world) => setData({ ...data, world })} onSave={() => void saveWorld()} /> : null}
+      {data && stage === 'plan' ? <PlanEditor value={data.plan} busy={busy} questions={planQuestions} answers={planAnswers} onChange={(plan) => setData({ ...data, plan })} onSave={() => void savePlan()} onAgentPlan={() => void startPlanInterview()} onAnswer={(field, value) => setPlanAnswers((current) => ({ ...current, [field]: { field, value } }))} onDelegate={(field) => setPlanAnswers((current) => ({ ...current, [field]: { field, delegate: true } }))} onSubmitAnswers={() => void submitPlanAnswers()} onApprove={() => void approvePlan()} /> : null}
+      {data && stage === 'outline' ? <OutlineEditor value={data.outline ?? emptyOutline(projectId)} busy={busy} onChange={(outline) => setData({ ...data, outline })} onSave={() => void saveOutline()} onGenerate={() => void startMaterialJob('script_series_outline')} /> : null}
+      {data && stage === 'characters' ? <CharacterEditor projectId={projectId} value={data.characters} busy={busy} onChange={(characters) => setData({ ...data, characters })} onSave={() => void saveCharacters()} onGenerate={() => void startMaterialJob('script_bible', '仅生成角色设定')} /> : null}
+      {data && stage === 'episodes' ? <EpisodeBatchPanel data={data} busy={busy} episode={selectedEpisode} episodeLoading={episodeLoading} onStart={(start, count) => void startEpisodeBatch(start, count)} onResume={(jobId) => void resumeJob(jobId)} onCancel={(jobId) => void cancelJob(jobId)} onOpenEpisode={(episodeNumber) => void openEpisode(episodeNumber)} onEpisodeChange={setSelectedEpisode} onSaveEpisode={() => void saveEpisode()} onExport={(format, range) => void exportScript(format, range)} /> : null}
+      {data && stage === 'world' ? <WorldEditor value={data.world ?? emptyWorld(projectId)} busy={busy} onChange={(world) => setData({ ...data, world })} onSave={() => void saveWorld()} onGenerate={() => void startMaterialJob('script_bible', '仅生成世界设定')} /> : null}
     </div>
   );
 }

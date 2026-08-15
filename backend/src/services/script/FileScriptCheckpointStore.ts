@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { mkdir, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 
 import { StoreError } from '../../store/StoreError.js';
 import { getCurrentClientId } from '../client/clientScope.js';
@@ -145,6 +145,26 @@ export class FileScriptCheckpointStore implements ScriptCheckpointStore {
         this.mutationQueues.delete(scopeKey);
       }
     }
+  }
+
+  async deleteProject(projectId: string): Promise<void> {
+    if (!SAFE_PROJECT_ID.test(projectId)) {
+      throw new StoreError(`短剧检查点项目标识格式无效: ${projectId}`);
+    }
+    const directory = resolve(this.rootDirectory, projectId);
+    const relativeDirectory = relative(this.rootDirectory, directory);
+    if (
+      !relativeDirectory ||
+      relativeDirectory.startsWith('..') ||
+      isAbsolute(relativeDirectory)
+    ) {
+      throw new StoreError(`短剧检查点删除路径越界: ${projectId}`);
+    }
+    const pending = [...this.mutationQueues.entries()]
+      .filter(([scopeKey]) => scopeKey.startsWith(`${projectId}\u0000`))
+      .map(([, operation]) => operation.catch(() => undefined));
+    await Promise.all(pending);
+    await rm(directory, { recursive: true, force: true });
   }
 
   private async saveAfterPrevious(checkpoint: ScriptPipelineCheckpoint): Promise<void> {

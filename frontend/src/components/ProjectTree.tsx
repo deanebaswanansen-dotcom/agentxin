@@ -11,6 +11,14 @@ import './components.css';
 
 type ProjectItem = Pick<Project, 'id' | 'name' | 'kind'>;
 
+const viteEnv = (import.meta as ImportMeta & {
+  env?: Record<string, string | undefined>;
+}).env;
+const scriptModeFlag = viteEnv?.VITE_SCRIPT_MODE_ENABLED;
+const SCRIPT_MODE_ENABLED = scriptModeFlag === undefined
+  ? viteEnv?.MODE !== 'production'
+  : scriptModeFlag === 'true';
+
 export interface ProjectTreeProps {
   selectedProjectId?: Id | null;
   selectedChapterId?: Id | null;
@@ -410,7 +418,7 @@ export function ProjectTree({
               onChange={(event) => setNewKind(event.target.value as Project['kind'])}
             >
               <option value="novel">小说</option>
-              <option value="short_drama">短剧</option>
+              {SCRIPT_MODE_ENABLED ? <option value="short_drama">短剧</option> : null}
             </select>
             <input
               className="nwa-input nwa-project-tree__new-input"
@@ -534,7 +542,7 @@ export function ProjectTree({
                 {isProjectSelected && !selectMode ? (
                   <ul className="nwa-project-tree__sublist">
                     {project.kind === 'short_drama' ? (
-                      <li className="nwa-project-tree__sub-empty">短剧制作台</li>
+                      <li className="nwa-project-tree__sub-empty">短剧专属工作区</li>
                     ) : chapters.length === 0 ? (
                       <li className="nwa-project-tree__sub-empty">暂无章节</li>
                     ) : (

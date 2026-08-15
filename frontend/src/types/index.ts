@@ -301,6 +301,13 @@ export interface AgentProgressEvent {
   current?: number;
   /** 总数（如总章节数）。 */
   total?: number;
+  /** Durable short-drama node checkpoint, when the running task is script based. */
+  scriptCheckpoint?: {
+    episodeNumber?: number;
+    node: string;
+    attempt: number;
+    artifactRevision: number;
+  };
 }
 
 // ---------------------------------------------------------------------------

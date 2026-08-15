@@ -99,6 +99,18 @@ import { FileScriptStore, createClientScopedScriptStore } from './services/scrip
 import type { ScriptStore } from './services/script/ScriptStore.js';
 import { ScriptService } from './services/script/ScriptService.js';
 import { registerScriptRoutes } from './routes/scriptRoutes.js';
+import {
+  FileScriptCheckpointStore,
+  createClientScopedScriptCheckpointStore,
+} from './services/script/FileScriptCheckpointStore.js';
+import {
+  InMemoryScriptCheckpointStore,
+  ScriptDirector,
+  type ScriptCheckpointStore,
+} from './services/script/agents/ScriptDirector.js';
+import { ProxyScriptModelAdapter } from './services/script/agents/ProxyScriptModelAdapter.js';
+import { ScriptPlanTurnService } from './services/script/agents/ScriptPlanTurnService.js';
+import { registerScriptPlanRoutes } from './routes/scriptPlanRoutes.js';
 
 /**
  * Build a fully wired Fastify application from an already-constructed
@@ -125,6 +137,7 @@ export function buildServer(
   planSessionStore?: PlanSessionStorePort,
   agentRunStore?: AgentRunStore,
   scriptStore?: ScriptStore,
+  scriptCheckpointStore?: ScriptCheckpointStore,
 ): FastifyInstance {
   const app = Fastify({ logger: false });
 
@@ -167,18 +180,39 @@ export function buildServer(
   const scriptService = scriptStore
     ? new ScriptService(scriptStore, { projectLookup: (id) => store.getProject(id) })
     : undefined;
+  const scriptCheckpoints = scriptStore
+    ? scriptCheckpointStore ?? new InMemoryScriptCheckpointStore()
+    : undefined;
+  let agentJobRunner: AgentJobRunner | undefined;
   const projectService = new ProjectService(store, {
     afterRemove: async (projectId) => {
+      const clientId = getCurrentClientId();
+      if (agentJobRunner) await agentJobRunner.cancelForProject(clientId, projectId);
       if (scriptStore) await scriptStore.deleteProject(projectId);
+      if (scriptCheckpoints) await scriptCheckpoints.deleteProject(projectId);
       await planSessions.clear(projectId);
       if (agentRunStore) {
-        await agentRunStore.deleteForProject(getCurrentClientId(), projectId);
+        await agentRunStore.deleteForProject(clientId, projectId);
       }
     },
   });
   const chapterService = new ChapterService(store);
   const settingService = new SettingService(store);
   const modelConfigService = new ModelConfigService(store, { allowStoredConfig: false });
+  const scriptDirector = scriptStore
+    ? new ScriptDirector({
+        model: new ProxyScriptModelAdapter(modelConfigService, proxy),
+        store: scriptStore,
+        checkpoints: scriptCheckpoints!,
+      })
+    : undefined;
+  const scriptPlanTurnService = scriptDirector && scriptCheckpoints
+    ? new ScriptPlanTurnService(
+        scriptDirector,
+        scriptCheckpoints,
+        (projectId) => store.getProject(projectId),
+      )
+    : undefined;
   const writingService = new WritingService(store, modelConfigService, proxy);
   const freeChatService = new FreeChatService(store, modelConfigService, proxy);
   const referenceService = new ReferenceAnalysisService(
@@ -209,7 +243,11 @@ export function buildServer(
     memory,
     referenceService,
     longNovelConfigs,
+    scriptDirector,
   );
+  agentJobRunner = agentRunStore
+    ? new AgentJobRunner(agentRunStore, agentService)
+    : undefined;
   const novelPlanService = new NovelPlanService(modelConfigService, proxy);
   const wordCountChecker = new WordCountChecker(store);
   const pacingChecker = new PacingChecker(store, modelConfigService, proxy);
@@ -233,13 +271,14 @@ export function buildServer(
   // Transport layer — register every route group against its service.
   registerProjectRoutes(app, projectService);
   if (scriptService) registerScriptRoutes(app, scriptService);
+  if (scriptPlanTurnService) registerScriptPlanRoutes(app, scriptPlanTurnService);
   registerChapterRoutes(app, chapterService);
   registerSettingRoutes(app, settingService);
   registerModelConfigRoutes(app, modelConfigService, proxy);
   registerWritingRoutes(app, writingService);
   registerAgentRoutes(app, agentService);
-  if (agentRunStore) {
-    registerAgentJobRoutes(app, agentRunStore, new AgentJobRunner(agentRunStore, agentService));
+  if (agentRunStore && agentJobRunner) {
+    registerAgentJobRoutes(app, agentRunStore, agentJobRunner);
   }
   registerPlanRoutes(app, novelPlanService, planSessions);
   registerFreeChatRoutes(app, freeChatService);
@@ -296,6 +335,11 @@ export async function start(): Promise<FastifyInstance> {
   const scriptStore = clientRoot
     ? createClientScopedScriptStore(join(clientRoot, 'scripts'))
     : await FileScriptStore.create(process.env.SCRIPT_DATA_DIR ?? join('data', 'scripts'));
+  const scriptCheckpointStore = clientRoot
+    ? createClientScopedScriptCheckpointStore(join(clientRoot, 'script-checkpoints'))
+    : await FileScriptCheckpointStore.create(
+        process.env.SCRIPT_CHECKPOINT_DIR ?? join('data', 'script-checkpoints'),
+      );
   const app = buildServer(
     store,
     undefined,
@@ -305,6 +349,7 @@ export async function start(): Promise<FastifyInstance> {
     planSessionStore,
     agentRunStore,
     scriptStore,
+    scriptCheckpointStore,
   );
 
   const port = Number(process.env.PORT ?? 3000);

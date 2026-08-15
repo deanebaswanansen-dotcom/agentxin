@@ -1,3 +1,7 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 
 import type {
@@ -10,7 +14,8 @@ import type {
   ScriptSeriesOutline,
   ScriptWorldBible,
 } from '../domain.js';
-import type { ScriptStore } from '../ScriptStore.js';
+import { FileScriptStore } from '../FileScriptStore.js';
+import { ScriptConflictError, type ScriptStore } from '../ScriptStore.js';
 import {
   InMemoryScriptCheckpointStore,
   ScriptDirector,
@@ -213,6 +218,64 @@ describe('ScriptDirector', () => {
       totalEpisodes: 10,
       projectId: 'project-1',
     });
+  });
+
+  it('does not overwrite a plan edited while the model is generating', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'script-director-conflict-'));
+    try {
+      const store = await FileScriptStore.create(root);
+      let releaseModel!: () => void;
+      let markModelStarted!: () => void;
+      const modelStarted = new Promise<void>((resolve) => {
+        markModelStarted = resolve;
+      });
+      const modelGate = new Promise<void>((resolve) => {
+        releaseModel = resolve;
+      });
+      const model: ScriptModelAdapter = {
+        async complete() {
+          markModelStarted();
+          await modelGate;
+          return JSON.stringify(approvedPlan());
+        },
+      };
+      const director = new ScriptDirector({
+        model,
+        store,
+        checkpoints: new InMemoryScriptCheckpointStore(),
+      });
+      const generation = director.run({
+        task: 'script_plan',
+        projectId: 'project-1',
+        planningSession: {
+          values: {
+            genres: ['校园青春'],
+            coreConflict: '新闻社主编与校园霸凌势力对抗',
+            audience: '18—30 岁女性',
+            totalEpisodes: 10,
+            episodeDurationSeconds: { min: 60, max: 90 },
+            targetCharsPerEpisode: 1_000,
+            maxScenesPerEpisode: 3,
+            dialogueDensityPercent: 60,
+            endingDirection: '真相公开',
+          },
+          delegatedFields: [],
+          askedFields: [],
+          questionCount: 0,
+        },
+      });
+
+      await modelStarted;
+      await store.savePlan({ ...approvedPlan(), title: '用户刚刚修改的标题' }, 0);
+      releaseModel();
+
+      await expect(generation).rejects.toBeInstanceOf(ScriptConflictError);
+      await expect(store.getProjectState('project-1')).resolves.toMatchObject({
+        plan: { title: '用户刚刚修改的标题', revision: 1 },
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it('generates the complete series outline in ten-episode chunks and preserves continuous numbering', async () => {
@@ -486,7 +549,9 @@ describe('ScriptDirector', () => {
       startEpisode: 1,
       episodeCount: 2,
       expectedPlanRevision: 1,
-      onProgress: (event) => progress.push(event.scriptCheckpoint.node),
+      onProgress: (event) => {
+        progress.push(event.scriptCheckpoint.node);
+      },
     });
 
     expect(result.kind).toBe('episode_batch');

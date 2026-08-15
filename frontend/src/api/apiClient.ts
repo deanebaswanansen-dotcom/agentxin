@@ -1339,7 +1339,7 @@ export interface ApiClient {
       resume(jobId: string, signal?: AbortSignal): Promise<ScriptAgentJobSnapshot>;
       cancel(jobId: string, signal?: AbortSignal): Promise<ScriptAgentJobSnapshot>;
     };
-    export(projectId: Id, format: 'txt' | 'md', range?: { startEpisode?: number; episodeCount?: number }, signal?: AbortSignal): Promise<string>;
+    export(projectId: Id, format: 'txt' | 'md' | 'fountain', range?: { startEpisode?: number; episodeCount?: number }, signal?: AbortSignal): Promise<string>;
   };
   chapters: {
     list(projectId: Id, signal?: AbortSignal): Promise<Chapter[]>;
@@ -1570,9 +1570,15 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
         create: (body, signal) =>
           request(b, 'POST', '/agent/jobs', body, { signal, includeModelConfig: true }),
         list: (projectId, signal) =>
-          request(b, 'GET', `/projects/${seg(projectId)}/agent-jobs`, undefined, { signal }),
+          request(b, 'GET', `/projects/${seg(projectId)}/agent-jobs`, undefined, {
+            signal,
+            includeModelConfig: true,
+          }),
         get: (jobId, signal) =>
-          request(b, 'GET', `/agent/jobs/${seg(jobId)}`, undefined, { signal }),
+          request(b, 'GET', `/agent/jobs/${seg(jobId)}`, undefined, {
+            signal,
+            includeModelConfig: true,
+          }),
         resume: (jobId, signal) =>
           request(b, 'POST', `/agent/jobs/${seg(jobId)}/resume`, {}, { signal, includeModelConfig: true }),
         cancel: (jobId, signal) =>

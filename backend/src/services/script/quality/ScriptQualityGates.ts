@@ -108,6 +108,18 @@ export function validateScriptEpisode(
     if (!['interior', 'exterior'].includes(scene.interiorExterior)) {
       addHard('MISSING_INTERIOR_EXTERIOR', '场景缺少内外景。', 'interiorExterior', scene.id);
     }
+    if (_options.registeredCharacterIds) {
+      for (const characterId of scene.characterIds) {
+        if (!_options.registeredCharacterIds.has(characterId)) {
+          addHard(
+            'UNKNOWN_CHARACTER_REFERENCE',
+            `场景引用了未登记人物 ID「${characterId}」。`,
+            'characterIds',
+            scene.id,
+          );
+        }
+      }
+    }
     for (const block of scene.blocks) {
       if (block.type !== 'dialogue') continue;
       const speaker = block.speaker.trim();

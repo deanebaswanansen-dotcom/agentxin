@@ -159,8 +159,8 @@ export function registerScriptRoutes(app: FastifyInstance, service: ScriptServic
   app.get<{ Params: ProjectParams; Querystring: ExportQuery }>('/api/projects/:id/script-export', async (request, reply) => {
     try {
       const format = request.query.format;
-      if (format !== 'txt' && format !== 'md') {
-        throw ScriptServiceError.validation('format必须是txt或md');
+      if (format !== 'txt' && format !== 'md' && format !== 'fountain') {
+        throw ScriptServiceError.validation('format必须是txt、md或fountain');
       }
       const result = await service.export(
         request.params.id,
