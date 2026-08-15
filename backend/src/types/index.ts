@@ -317,6 +317,15 @@ export interface AgentProgressEvent {
   };
 }
 
+/**
+ * Internal execution metadata supplied by the durable job runner. It is not
+ * parsed from an HTTP request and therefore cannot be spoofed by a client.
+ */
+export interface AgentRunExecutionContext {
+  /** The user explicitly resumed a job that had paused for candidate review. */
+  resumeRejectedCandidates?: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Novel planning / brainstorm mode (pre-generation interview)
 // ---------------------------------------------------------------------------

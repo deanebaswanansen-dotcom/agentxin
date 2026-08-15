@@ -1,5 +1,10 @@
 import type { ModelConfig } from '../../../types/index.js';
-import type { AgentProgressEvent, AgentRunRequest, AgentRunResult } from '../../../types/index.js';
+import type {
+  AgentProgressEvent,
+  AgentRunExecutionContext,
+  AgentRunRequest,
+  AgentRunResult,
+} from '../../../types/index.js';
 import { runWithClientId } from '../../client/clientScope.js';
 import { runWithRequestModelConfig } from '../../modelConfig/requestModelConfig.js';
 import type { AgentRunError, AgentRunStore, StoredAgentRun } from './AgentRunStore.js';
@@ -9,6 +14,7 @@ interface AgentExecutor {
     request: AgentRunRequest,
     signal: AbortSignal,
     onProgress?: (event: AgentProgressEvent) => void,
+    context?: AgentRunExecutionContext,
   ): Promise<AgentRunResult>;
 }
 
@@ -50,6 +56,13 @@ function isRecoverableNeedsReview(error: unknown): boolean {
   return candidate.recoverable === true &&
     typeof candidate.code === 'string' &&
     candidate.code.endsWith('_NEEDS_REVIEW');
+}
+
+function pausedForRejectedCandidate(run: StoredAgentRun): boolean {
+  const code = run.error?.code;
+  return run.status === 'waiting_user' &&
+    typeof code === 'string' &&
+    (code === 'SCRIPT_STRUCTURED_NEEDS_REVIEW' || code.endsWith('_NEEDS_REVIEW'));
 }
 
 function delay(milliseconds: number, signal: AbortSignal): Promise<void> {
@@ -102,7 +115,16 @@ export class AgentJobRunner {
       run.status === 'retrying' ||
       resumableScriptFailure
     ) {
-      this.launch(id, clientId, run.request, modelConfig);
+      if (!this.active.has(id)) {
+        const context = pausedForRejectedCandidate(run)
+          ? { resumeRejectedCandidates: true }
+          : undefined;
+        // Persist the hand-off before launching. The HTTP resume response must
+        // be pollable even though markRunning happens in the background task's
+        // next microtask.
+        await this.store.markQueued(id);
+        this.launch(id, clientId, run.request, modelConfig, context);
+      }
     }
     return this.store.getForClient(clientId, id);
   }
@@ -132,6 +154,7 @@ export class AgentJobRunner {
     clientId: string,
     request: AgentRunRequest,
     modelConfig: ModelConfig | undefined,
+    context?: AgentRunExecutionContext,
   ): void {
     if (this.active.has(id)) return;
     const controller = new AbortController();
@@ -148,7 +171,7 @@ export class AgentJobRunner {
                   progressWrites = progressWrites.then(async () => {
                     await this.store.appendEvent(id, event);
                   });
-                }),
+                }, context),
               ),
             );
             // Completion must never overtake a checkpoint/progress write. Apart

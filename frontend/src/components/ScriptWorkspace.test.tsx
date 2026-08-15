@@ -697,11 +697,10 @@ describe('ScriptWorkspace', () => {
       error: { code: 'SCRIPT_STRUCTURED_NEEDS_REVIEW', message: '正文结构需要确认' },
     };
     vi.mocked(client.script.jobs.list).mockResolvedValue([waitingJob]);
-    vi.mocked(client.script.jobs.resume).mockResolvedValue({
-      ...waitingJob,
-      status: 'running',
-      continuable: false,
-    });
+    // The real resume endpoint can return the pre-launch waiting_user snapshot
+    // before the background runner persists running. The UI must still begin
+    // polling instead of appearing permanently stuck.
+    vi.mocked(client.script.jobs.resume).mockResolvedValue(waitingJob);
     const intervalSpy = vi.spyOn(globalThis, 'setInterval');
 
     render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
@@ -713,6 +712,7 @@ describe('ScriptWorkspace', () => {
     fireEvent.click(screen.getByRole('button', { name: '继续第 2 集所在的 1–5 集任务' }));
 
     await waitFor(() => expect(client.script.jobs.resume).toHaveBeenCalledWith('job-waiting-review'));
+    await waitFor(() => expect(intervalSpy.mock.calls.some((call) => call[1] === 2000)).toBe(true));
     expect(client.script.jobs.create).not.toHaveBeenCalled();
   });
 

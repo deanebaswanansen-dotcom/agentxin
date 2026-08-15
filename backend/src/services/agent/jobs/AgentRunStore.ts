@@ -199,6 +199,13 @@ export class AgentRunStore {
     });
   }
 
+  async markQueued(id: string): Promise<StoredAgentRun> {
+    return this.update(id, (run) => {
+      run.status = 'queued';
+      delete run.error;
+    });
+  }
+
   async markRetrying(id: string, error: AgentRunError): Promise<StoredAgentRun> {
     return this.update(id, (run) => {
       run.status = 'retrying';
