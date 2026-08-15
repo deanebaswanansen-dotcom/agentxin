@@ -195,6 +195,13 @@
 .script-character-list { display: grid; gap: 1rem; }
 .script-character-card { padding: 1rem; border: 1px solid rgba(122,104,151,.15); border-radius: .65rem; background: rgba(255,255,255,.82); }
 .script-character-card > header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
+.script-character-errors { margin-bottom: 1rem; padding: .9rem 1rem; border: 1px solid rgba(190,58,73,.28); border-radius: .65rem; background: rgba(255,239,241,.9); color: #9c2635; }
+.script-character-errors ul { margin: .5rem 0 0; padding-left: 1.2rem; columns: 2; }
+.script-field [aria-invalid="true"] { border-color: #bd3b4c; box-shadow: 0 0 0 2px rgba(189,59,76,.1); }
+.script-character-relationships { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid rgba(122,104,151,.12); }
+.script-character-relationships > header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: .75rem; }
+.script-character-relationship { display: grid; grid-template-columns: minmax(10rem,1fr) minmax(10rem,1fr) minmax(12rem,1.5fr) auto; gap: .7rem; align-items: end; padding: .75rem; border-radius: .55rem; background: rgba(247,245,251,.8); }
+.script-character-relationship + .script-character-relationship { margin-top: .6rem; }
 .script-episode-editor { margin-top: 1.25rem; padding-top: 1.25rem; border-top: 1px solid rgba(122,104,151,.15); }
 .script-episode-editor > header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 1rem; }
 .script-episode-editor > header > div { display: flex; align-items: center; gap: .75rem; flex: 1; }
@@ -253,6 +260,8 @@
   .script-form-grid, .script-read-facts, .script-outline-arcs { grid-template-columns: 1fr; }
   .script-cover-brief { grid-template-columns: 8rem minmax(0,1fr); }
   .script-field--wide, .script-read-facts article.is-wide { grid-column: auto; }
+  .script-character-errors ul { columns: 1; }
+  .script-character-relationship { grid-template-columns: 1fr; }
   .script-production-grid { grid-template-columns: 1fr; }
   .script-job-panel { border-top: 1px solid rgba(122,104,151,.14); border-left: 0; }
   .script-outline-read-cards article { grid-template-columns: 4.5rem minmax(0,1fr); }

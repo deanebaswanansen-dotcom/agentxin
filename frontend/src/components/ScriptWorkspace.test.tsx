@@ -9,7 +9,13 @@ import type {
   ScriptWorkspaceSnapshot,
   ScriptWorldBible,
 } from '../types/index.js';
+import completeCharacterFixtureJson from '../test/fixtures/script-character.v1.json';
 import { ScriptWorkspace } from './ScriptWorkspace.js';
+
+const completeCharacterFixture: ScriptCharacter = {
+  ...completeCharacterFixtureJson,
+  role: completeCharacterFixtureJson.role as ScriptCharacter['role'],
+};
 
 function buildPlan(projectId = 'project-1'): ScriptPlan {
   return {
@@ -79,9 +85,8 @@ function buildOutline(synopsis = '服务器大纲'): ScriptSeriesOutline {
 
 function buildCharacter(name = '服务器角色'): ScriptCharacter {
   return {
-    id: 'character-1', projectId: 'project-1', name, aliases: [], role: 'lead', identity: '', biography: '',
-    motivation: '', goal: '', weakness: '', arc: '', appearance: '', hairstyle: '', physique: '', defaultOutfit: '',
-    personality: [], skills: [], speechStyle: '', catchphrases: [], relationships: [], revision: 2,
+    ...completeCharacterFixture,
+    id: 'character-1', projectId: 'project-1', name, revision: 2,
     updatedAt: '2026-08-15T00:00:00.000Z',
   };
 }
@@ -367,6 +372,9 @@ describe('ScriptWorkspace', () => {
     vi.mocked(client.script.plan.concepts).mockResolvedValue({
       proposals: [proposal, { ...proposal, title: '监控死角' }, { ...proposal, title: '凌晨账本' }],
     });
+    vi.mocked(client.script.jobs.create).mockResolvedValue({
+      id: 'outline-job', projectId: 'project-1', task: 'script_series_outline', status: 'queued', continuable: false,
+    });
     render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
 
     await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
@@ -379,6 +387,17 @@ describe('ScriptWorkspace', () => {
     expect(screen.getByLabelText('剧本名称')).toHaveValue('夜班真相');
     expect(client.script.plan.save).not.toHaveBeenCalled();
     expect(screen.getByText('已采用选题《夜班真相》，请检查后保存策划')).toBeInTheDocument();
+    expect((screen.getByLabelText('核心要求') as HTMLTextAreaElement).value).toContain('主线提示：从忍气吞声到公开证据完成反击');
+
+    fireEvent.click(screen.getByRole('button', { name: '保存策划' }));
+    await screen.findByText('策划已保存');
+    fireEvent.click(screen.getByRole('tab', { name: '剧本大纲' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Agent 生成大纲' }));
+    await waitFor(() => expect(client.script.jobs.create).toHaveBeenCalledWith({
+      projectId: 'project-1', task: 'script_series_outline',
+    }));
+    expect(screen.queryByText(/请先保存.*大纲/)).not.toBeInTheDocument();
+    expect(client.script.outline.save).not.toHaveBeenCalled();
   });
 
   it('runs a multi-turn planning interview and requires explicit approval', async () => {
@@ -579,6 +598,60 @@ describe('ScriptWorkspace', () => {
     expect(screen.getByText('运行中')).toBeInTheDocument();
   });
 
+  it('keeps a failed second episode inside its fixed 1–5 batch and resumes that job', async () => {
+    const client = createClient();
+    const episode1 = buildNumberedEpisode(1, '第一集已完成');
+    const episode2 = { ...buildNumberedEpisode(2, '第二集待修复'), status: 'failed' as const };
+    vi.mocked(client.script.episodes.list).mockResolvedValue([
+      summarizeEpisode(episode1),
+      { ...summarizeEpisode(episode2), status: 'failed' },
+    ]);
+    const failedJob = {
+      id: 'job-failed-episode-2', projectId: 'project-1', task: 'script_episode_batch' as const,
+      status: 'failed' as const, continuable: true,
+      scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 2 },
+      checkpoint: { episodeNumber: 2, node: 'review' as const, attempt: 2, artifactRevision: 1 },
+    };
+    vi.mocked(client.script.jobs.list).mockResolvedValue([failedJob]);
+    vi.mocked(client.script.jobs.resume).mockResolvedValue({ ...failedJob, status: 'running', continuable: false });
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
+
+    expect(screen.queryByRole('button', { name: '生成第 2–6 集' })).not.toBeInTheDocument();
+    const resume = screen.getByRole('button', { name: '继续第 2 集所在的 1–5 集任务' });
+    fireEvent.click(resume);
+    await waitFor(() => expect(client.script.jobs.resume).toHaveBeenCalledWith('job-failed-episode-2'));
+    expect(client.script.jobs.create).not.toHaveBeenCalled();
+  });
+
+  it('restarts a partial batch from its fixed boundary instead of generating episodes 2–6', async () => {
+    const client = createClient();
+    const episode1 = buildNumberedEpisode(1, '第一集已完成');
+    const episode2 = { ...buildNumberedEpisode(2, '第二集失败'), status: 'failed' as const };
+    vi.mocked(client.script.episodes.list).mockResolvedValue([
+      summarizeEpisode(episode1),
+      { ...summarizeEpisode(episode2), status: 'failed' },
+    ]);
+    vi.mocked(client.script.jobs.create).mockResolvedValue({
+      id: 'job-restart-1-5', projectId: 'project-1', task: 'script_episode_batch', status: 'queued', continuable: false,
+      scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 2 },
+    });
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
+    expect(screen.queryByRole('button', { name: '生成第 2–6 集' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '生成第 1–5 集' }));
+
+    await waitFor(() => expect(client.script.jobs.create).toHaveBeenCalledWith({
+      projectId: 'project-1',
+      task: 'script_episode_batch',
+      scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 2 },
+    }));
+  });
+
   it('edits and saves the versioned series outline', async () => {
     const client = createClient();
     const outline = {
@@ -608,7 +681,7 @@ describe('ScriptWorkspace', () => {
     ));
   });
 
-  it('adds a structured character including wardrobe and saves the bible', async () => {
+  it('locally rejects an incomplete character, then saves every canonical field from the editor', async () => {
     const client = createClient();
     vi.mocked(client.script.characters.save).mockImplementation((_projectId, items) => Promise.resolve(items));
     render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
@@ -616,14 +689,78 @@ describe('ScriptWorkspace', () => {
     await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
     fireEvent.click(screen.getByRole('tab', { name: '角色设定' }));
     fireEvent.click(screen.getByRole('button', { name: '添加角色' }));
-    fireEvent.change(screen.getByLabelText('角色姓名 1'), { target: { value: '沈清' } });
-    fireEvent.change(screen.getByLabelText('角色服装 1'), { target: { value: '白色衬衫与黑色西装裤' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存角色设定' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('角色 1 缺少人物身份');
+    expect(client.script.characters.save).not.toHaveBeenCalled();
+
+    const fields: Array<[string, string]> = [
+      ['角色姓名 1', completeCharacterFixture.name],
+      ['角色别名 1', `${completeCharacterFixture.aliases[0]}\n${completeCharacterFixture.aliases[0]}`],
+      ['角色身份 1', completeCharacterFixture.identity],
+      ['角色小传 1', completeCharacterFixture.biography],
+      ['角色动机 1', completeCharacterFixture.motivation],
+      ['角色目标 1', completeCharacterFixture.goal],
+      ['角色弱点 1', completeCharacterFixture.weakness],
+      ['角色弧光 1', completeCharacterFixture.arc],
+      ['角色外貌 1', completeCharacterFixture.appearance],
+      ['角色发型 1', completeCharacterFixture.hairstyle],
+      ['角色体格 1', completeCharacterFixture.physique],
+      ['角色服装 1', completeCharacterFixture.defaultOutfit],
+      ['角色性格 1', `${completeCharacterFixture.personality.join('\n')}\n冷静`],
+      ['角色技能 1', completeCharacterFixture.skills.join('\n')],
+      ['角色语言风格 1', completeCharacterFixture.speechStyle],
+      ['角色口头禅 1', completeCharacterFixture.catchphrases.join('\n')],
+    ];
+    fields.forEach(([label, value]) => fireEvent.change(screen.getByLabelText(label), { target: { value } }));
     fireEvent.click(screen.getByRole('button', { name: '保存角色设定' }));
 
     await waitFor(() => expect(client.script.characters.save).toHaveBeenCalledWith(
       'project-1',
-      expect.arrayContaining([expect.objectContaining({ name: '沈清', defaultOutfit: '白色衬衫与黑色西装裤' })]),
+      expect.arrayContaining([expect.objectContaining({
+        name: completeCharacterFixture.name,
+        identity: completeCharacterFixture.identity,
+        biography: completeCharacterFixture.biography,
+        motivation: completeCharacterFixture.motivation,
+        goal: completeCharacterFixture.goal,
+        weakness: completeCharacterFixture.weakness,
+        arc: completeCharacterFixture.arc,
+        appearance: completeCharacterFixture.appearance,
+        hairstyle: completeCharacterFixture.hairstyle,
+        physique: completeCharacterFixture.physique,
+        defaultOutfit: completeCharacterFixture.defaultOutfit,
+        personality: completeCharacterFixture.personality,
+        skills: completeCharacterFixture.skills,
+        speechStyle: completeCharacterFixture.speechStyle,
+        catchphrases: completeCharacterFixture.catchphrases,
+      })]),
       0,
+    ));
+  });
+
+  it('edits character relationships as target, label, and notes rows', async () => {
+    const client = createClient();
+    const shenQing = { ...completeCharacterFixture, id: 'character-1', revision: 2 };
+    const shenYizhou = { ...completeCharacterFixture, id: 'character-2', name: '沈亦舟', aliases: [], revision: 2 };
+    vi.mocked(client.script.characters.list).mockResolvedValue([shenQing, shenYizhou]);
+    vi.mocked(client.script.characters.save).mockImplementation((_projectId, items) => Promise.resolve(items));
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '角色设定' }));
+    fireEvent.click(screen.getByRole('button', { name: '编辑模式' }));
+    fireEvent.click(screen.getAllByRole('button', { name: '添加关系' })[0]!);
+    fireEvent.change(screen.getByLabelText('角色关系目标 1-1'), { target: { value: 'character-2' } });
+    fireEvent.change(screen.getByLabelText('角色关系标签 1-1'), { target: { value: '恋人' } });
+    fireEvent.change(screen.getByLabelText('角色关系备注 1-1'), { target: { value: '共同对抗旧规矩' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存角色设定' }));
+
+    await waitFor(() => expect(client.script.characters.save).toHaveBeenCalledWith(
+      'project-1',
+      expect.arrayContaining([expect.objectContaining({
+        id: 'character-1',
+        relationships: [{ characterId: 'character-2', label: '恋人', notes: '共同对抗旧规矩' }],
+      })]),
+      2,
     ));
   });
 
@@ -754,7 +891,7 @@ describe('ScriptWorkspace', () => {
     fireEvent.change(await screen.findByLabelText('第 5 集场景 1 块 1'), {
       target: { value: '第5集未保存的连续性修改' },
     });
-    fireEvent.click(screen.getByRole('button', { name: '生成第 6–10 集' }));
+    fireEvent.click(screen.getByText('6–10集剧本正文').closest('button')!);
 
     expect(client.script.jobs.create).not.toHaveBeenCalled();
     expect(screen.getByText('请先保存当前集')).toBeInTheDocument();
