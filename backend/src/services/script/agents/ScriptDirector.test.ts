@@ -1510,6 +1510,218 @@ describe('ScriptDirector', () => {
     expect(result.reports[0]?.report.hardFailed).toBe(false);
   });
 
+  it('repairs TOO_LONG through text-only reduction and commits once inside the target range', async () => {
+    const state = readySingleEpisodeState();
+    let reviewCalls = 0;
+    let revisionCalls = 0;
+    let revisionPrompt = '';
+    const store = new MemoryScriptStore(state);
+    const director = new ScriptDirector({
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+      model: {
+        async complete(request) {
+          if (request.node === 'draft') {
+            return JSON.stringify({
+              episodeNumber: 1,
+              title: '超长候选',
+              scenes: [{
+                ordinal: 1,
+                location: '校报社',
+                timeOfDay: 'day',
+                interiorExterior: 'interior',
+                characterIds: ['lead'],
+                blocks: [{ type: 'action', text: '超长'.repeat(180) }],
+              }],
+              summary: '', newFacts: [], openedThreads: [], closedThreads: [],
+            });
+          }
+          if (request.node === 'review') {
+            reviewCalls += 1;
+            return JSON.stringify({
+              issues: [], summary: '沈清精简证据说明。', newFacts: [],
+              openedThreads: [], closedThreads: [], wardrobe: [],
+            });
+          }
+          if (request.node === 'revision') {
+            revisionCalls += 1;
+            revisionPrompt = request.prompt;
+            const taskPrompt = request.prompt.split('\n结构契约：')[0] ?? request.prompt;
+            const current = JSON.parse(taskPrompt.split('当前候选：').at(-1) ?? '{}') as {
+              scenes: Array<{ id: string; blocks: Array<{ id: string }> }>;
+            };
+            return JSON.stringify({ operations: [{
+              op: 'replaceBlockText',
+              sceneId: current.scenes[0]!.id,
+              blockId: current.scenes[0]!.blocks[0]!.id,
+              text: '精简'.repeat(150),
+            }] });
+          }
+          throw new Error(`unexpected node: ${request.node}`);
+        },
+      },
+    });
+
+    const result = await director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+    });
+
+    expect(result.kind).toBe('episode_batch');
+    expect(reviewCalls).toBe(2);
+    expect(revisionCalls).toBe(1);
+    expect(revisionPrompt).toContain('修订后必须落在 255—345 个可见字符');
+    expect(revisionPrompt).not.toContain('恰好包含');
+    expect(store.state.episodes[0]?.scenes[0]?.blocks[0]?.text).toBe('精简'.repeat(150));
+    expect(store.atomicCommitCalls).toHaveLength(1);
+  });
+
+  it.each([
+    { label: 'still too long', replacement: '仍长'.repeat(175), expected: '变为 350 字' },
+    { label: 'over-reduced', replacement: '过短'.repeat(125), expected: '变为 250 字' },
+  ])('rejects a TOO_LONG patch that is $label', async ({ replacement, expected }) => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    const checkpoints = new InMemoryScriptCheckpointStore();
+    const director = new ScriptDirector({
+      store,
+      checkpoints,
+      model: {
+        async complete(request) {
+          if (request.node === 'draft') {
+            return JSON.stringify({
+              episodeNumber: 1, title: '超长候选',
+              scenes: [{
+                ordinal: 1, location: '校报社', timeOfDay: 'day',
+                interiorExterior: 'interior', characterIds: ['lead'],
+                blocks: [{ type: 'action', text: '超长'.repeat(180) }],
+              }],
+              summary: '', newFacts: [], openedThreads: [], closedThreads: [],
+            });
+          }
+          if (request.node === 'review') {
+            return JSON.stringify({
+              issues: [], summary: '沈清精简证据说明。', newFacts: [],
+              openedThreads: [], closedThreads: [], wardrobe: [],
+            });
+          }
+          if (request.node === 'revision') {
+            const taskPrompt = request.prompt.split('\n结构契约：')[0] ?? request.prompt;
+            const current = JSON.parse(taskPrompt.split('当前候选：').at(-1) ?? '{}') as {
+              scenes: Array<{ id: string; blocks: Array<{ id: string }> }>;
+            };
+            return JSON.stringify({ operations: [{
+              op: 'replaceBlockText',
+              sceneId: current.scenes[0]!.id,
+              blockId: current.scenes[0]!.blocks[0]!.id,
+              text: replacement,
+            }] });
+          }
+          throw new Error(`unexpected node: ${request.node}`);
+        },
+      },
+    });
+
+    await expect(director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+    })).rejects.toMatchObject({ code: 'SCRIPT_BATCH_NEEDS_REVIEW', recoverable: true });
+    expect(store.state.episodes).toEqual([]);
+    expect(store.atomicCommitCalls).toEqual([]);
+    const history = await checkpoints.list('project-1', 'script_episode_batch:1:1');
+    expect(history).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        node: 'revision', status: 'needs_review',
+        validationErrors: [expect.objectContaining({ message: expect.stringContaining(expected) })],
+      }),
+    ]));
+  });
+
+  it('regenerates a rejected TOO_LONG reduction on resume without rerunning draft or first review', async () => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    const checkpoints = new InMemoryScriptCheckpointStore();
+    let draftCalls = 0;
+    let reviewCalls = 0;
+    let revisionCalls = 0;
+    const director = new ScriptDirector({
+      store,
+      checkpoints,
+      model: {
+        async complete(request) {
+          if (request.node === 'draft') {
+            draftCalls += 1;
+            return JSON.stringify({
+              episodeNumber: 1, title: '超长候选',
+              scenes: [{
+                ordinal: 1, location: '校报社', timeOfDay: 'day',
+                interiorExterior: 'interior', characterIds: ['lead'],
+                blocks: [{ type: 'action', text: '超长'.repeat(180) }],
+              }],
+              summary: '', newFacts: [], openedThreads: [], closedThreads: [],
+            });
+          }
+          if (request.node === 'review') {
+            reviewCalls += 1;
+            return JSON.stringify({
+              issues: [], summary: '沈清精简证据说明。', newFacts: [],
+              openedThreads: [], closedThreads: [], wardrobe: [],
+            });
+          }
+          if (request.node === 'revision') {
+            revisionCalls += 1;
+            const taskPrompt = request.prompt.split('\n结构契约：')[0] ?? request.prompt;
+            const current = JSON.parse(taskPrompt.split('当前候选：').at(-1) ?? '{}') as {
+              scenes: Array<{ id: string; blocks: Array<{ id: string }> }>;
+            };
+            return JSON.stringify({ operations: [{
+              op: 'replaceBlockText',
+              sceneId: current.scenes[0]!.id,
+              blockId: current.scenes[0]!.blocks[0]!.id,
+              text: revisionCalls === 1 ? '未减'.repeat(180) : '精简'.repeat(150),
+            }] });
+          }
+          throw new Error(`unexpected node: ${request.node}`);
+        },
+      },
+    });
+    const request = {
+      task: 'script_episode_batch' as const,
+      projectId: 'project-1', startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+    };
+
+    await expect(director.run(request)).rejects.toMatchObject({
+      code: 'SCRIPT_BATCH_NEEDS_REVIEW', recoverable: true,
+    });
+    expect({ draftCalls, reviewCalls, revisionCalls }).toEqual({
+      draftCalls: 1, reviewCalls: 1, revisionCalls: 1,
+    });
+    expect(store.state.episodes).toEqual([]);
+    expect(store.atomicCommitCalls).toEqual([]);
+
+    await expect(director.run({
+      ...request,
+      resumeRejectedCandidates: true,
+    })).resolves.toMatchObject({ kind: 'episode_batch' });
+
+    expect({ draftCalls, reviewCalls, revisionCalls }).toEqual({
+      draftCalls: 1, reviewCalls: 2, revisionCalls: 2,
+    });
+    expect(store.state.episodes[0]?.scenes[0]?.blocks[0]?.text).toBe('精简'.repeat(150));
+    expect(store.atomicCommitCalls).toHaveLength(1);
+    const history = await checkpoints.list('project-1', 'script_episode_batch:1:1');
+    expect(history).toEqual(expect.arrayContaining([
+      expect.objectContaining({ node: 'revision', artifactRevision: 0, status: 'stale' }),
+      expect.objectContaining({ node: 'revision', artifactRevision: 1, status: 'succeeded' }),
+    ]));
+    const staleRevision = history.find((checkpoint) =>
+      checkpoint.node === 'revision' && checkpoint.artifactRevision === 0);
+    const succeededRevision = history.find((checkpoint) =>
+      checkpoint.node === 'revision' && checkpoint.artifactRevision === 1);
+    expect((staleRevision?.artifact as { candidateHash?: string } | undefined)?.candidateHash)
+      .not.toBe((succeededRevision?.artifact as { candidateHash?: string } | undefined)?.candidateHash);
+  });
+
   it('repairs a truncated review response through the bounded Fixup call', async () => {
     const state = readySingleEpisodeState();
     let reviewCalls = 0;

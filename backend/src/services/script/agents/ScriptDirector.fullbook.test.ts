@@ -313,6 +313,11 @@ describe('ScriptDirector offline ten-episode full-book diagnostic', () => {
     expect(episodeSixPrompt).toContain('causeEventIds');
     expect(episodeSixPrompt).toContain('props');
     expect(episodeSixPrompt).toContain('recentCommits');
+    const secondBatchOutlinePrompt = model.calls.find(
+      (call) => call.node === 'episode_outline' && call.prompt.includes('需要集号：6、7、8、9、10'),
+    )?.prompt;
+    expect(secondBatchOutlinePrompt).toContain('第 6—10 集');
+    expect(secondBatchOutlinePrompt).not.toContain('当前 1—5 集');
     expect(model.calls.filter((call) => call.node === 'revision')).toHaveLength(0);
     expect(model.calls).toHaveLength(32);
 
@@ -394,6 +399,7 @@ describe('ScriptDirector offline ten-episode full-book diagnostic', () => {
     expect(model.calls.filter(
       (call) => call.node === 'draft' && call.episodeNumber === 3,
     )).toHaveLength(1);
+    expect(model.calls.filter((call) => call.node === 'episode_outline')).toHaveLength(1);
 
     const resumed = await director.run({
       ...request,
@@ -409,6 +415,7 @@ describe('ScriptDirector offline ten-episode full-book diagnostic', () => {
     expect(model.calls.filter(
       (call) => call.node === 'review' && call.episodeNumber === 3,
     )).toHaveLength(2);
+    expect(model.calls.filter((call) => call.node === 'episode_outline')).toHaveLength(1);
 
     const finalState = await store.getProjectState(PROJECT_ID);
     expect(finalState?.episodes.map((episode) => episode.status)).toEqual(Array(5).fill('completed'));

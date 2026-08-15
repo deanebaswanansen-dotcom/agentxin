@@ -332,6 +332,22 @@ function scriptLengthInstruction(targetChars: number, currentChars?: number): st
   ].join('');
 }
 
+function scriptRevisionLengthInstruction(
+  targetChars: number,
+  currentChars: number,
+  reduceOnly: boolean,
+): string {
+  const minimum = Math.ceil(targetChars * 0.85);
+  const maximum = Math.floor(targetChars * 1.15);
+  const operationConstraint = reduceOnly
+    ? `本轮只能使用 replaceBlockText 精简现有正文块，至少净减少 ${Math.max(1, currentChars - maximum)} 个可见字符；不得插入、追加、改人物或改结构。`
+    : '只执行当前阻断项授权的 Patch 操作，不要为了初稿块数建议而重构未授权内容。';
+  return [
+    `当前正文有 ${currentChars} 个可见字符，修订后必须落在 ${minimum}—${maximum} 个可见字符。`,
+    operationConstraint,
+  ].join('');
+}
+
 function scriptVisibleChars(episode: ScriptEpisode): number {
   return episode.scenes
     .flatMap((scene) => scene.blocks)
@@ -1253,20 +1269,39 @@ export class ScriptDirector {
       const registeredCharacterIds = new Set(
         state.characters.map((character) => character.id),
       );
+      const batchOutlineIds = new Set(
+        state.episodeOutlines
+          .filter((outline) => range.includes(outline.episodeNumber))
+          .map((outline) => outline.id),
+      );
+      const batchEpisodeIds = new Set(
+        state.episodes
+          .filter((episode) => range.includes(episode.episodeNumber))
+          .map((episode) => episode.id),
+      );
+      // The five-episode outline is a batch-level upstream artifact. Episodes and
+      // detailed outlines written while consuming that artifact are downstream
+      // progress and must not invalidate it during resume.
       const episodeOutlineInputRevisionRefs = buildScriptInputRevisionRefs(
         state,
         request.startEpisode,
+      ).filter((reference) => !(
+        (reference.resource === 'outline' && batchOutlineIds.has(reference.id)) ||
+        (reference.resource === 'episode' && batchEpisodeIds.has(reference.id))
+      ));
+      const batchCards = seriesOutline.episodeCards.filter(
+        (card) => range.includes(card.episodeNumber),
       );
       const episodeOutlineUpstreamArtifactRefs = [buildScriptUpstreamArtifactRef(
         'episode_outline_range',
         request.startEpisode,
         {
-          missingOutlineNumbers,
-          cards: seriesOutline.episodeCards.filter((card) => range.includes(card.episodeNumber)),
+          episodeNumbers: range,
+          cards: batchCards,
           continuity: projectScriptContinuity(state, request.startEpisode),
         },
       )];
-      const episodeOutlinePromptVersion = 'episode-outline-batch-v2';
+      const episodeOutlinePromptVersion = 'episode-outline-batch-v3';
       const episodeOutlineInputFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'episode_outline',
         inputRevisionRefs: episodeOutlineInputRevisionRefs,
@@ -1275,16 +1310,19 @@ export class ScriptDirector {
         configRevision,
       });
       const prompt = [
-        '你是 EpisodeOutlineAgent。只展开当前 1—5 集详细大纲。',
+        `你是 EpisodeOutlineAgent。只展开当前固定批次第 ${range[0]}—${range[range.length - 1]} 集详细大纲。`,
         '只返回 JSON {"outlines":[...]} ，每集必须有冲突、节拍和结尾卡点。',
-        '每项严格模板：{"episodeNumber":1,"title":"字符串","goal":"字符串","conflict":"字符串","beats":["字符串"],"characterIds":["人物id"],"plannedScenes":[],"reveal":"可选字符串","reversal":"可选字符串","endingHook":"字符串","requiredFacts":["字符串"],"forbiddenFacts":["字符串"]}。plannedScenes 必须原样返回空数组 []，场景由下一节点规划；不得改名任何键。',
+        `必须且只能返回集号 ${range.join('、')}，即使其中部分集已完成也要保持整批结构完整。`,
+        '每项严格模板：{"episodeNumber":"对应上述集号的整数","title":"字符串","goal":"字符串","conflict":"字符串","beats":["字符串"],"characterIds":["人物id"],"plannedScenes":[],"reveal":"可选字符串","reversal":"可选字符串","endingHook":"字符串","requiredFacts":["字符串"],"forbiddenFacts":["字符串"]}。plannedScenes 必须原样返回空数组 []，场景由下一节点规划；不得改名任何键。',
         `characterIds 只能从以下人物 ID 白名单选择：${JSON.stringify([...registeredCharacterIds])}。`,
-        `需要集号：${missingOutlineNumbers.join('、')}`,
+        `需要集号：${range.join('、')}`,
         `策划：${JSON.stringify(plan)}`,
-        `分集卡：${JSON.stringify(seriesOutline.episodeCards.filter((card) => range.includes(card.episodeNumber)))}`,
+        `分集卡：${JSON.stringify(batchCards)}`,
         `当前连续性：${JSON.stringify({
           aggregate: projectScriptContinuity(state, request.startEpisode),
-          recentCommits: currentScriptContinuityCommits(state).slice(-2),
+          recentCommits: currentScriptContinuityCommits(state)
+            .filter((commit) => commit.episodeNumber < request.startEpisode)
+            .slice(-2),
         })}`,
       ].join('\n');
       const episodeOutlineContract = parserContract(
@@ -1308,11 +1346,13 @@ export class ScriptDirector {
           });
           parsed.sort((left, right) => left.episodeNumber - right.episodeNumber);
           if (
-            parsed.length !== missingOutlineNumbers.length ||
-            parsed.some((item, index) => item.episodeNumber !== missingOutlineNumbers[index])
+            parsed.length !== range.length ||
+            parsed.some((item, index) => item.episodeNumber !== range[index])
           ) {
+            const actualEpisodeNumbers = parsed.map((item) => item.episodeNumber);
             throw new ScriptModelOutputError(
-              `详细分集大纲必须唯一连续覆盖 ${missingOutlineNumbers.join('、')} 集。`,
+              `详细分集大纲需要且只能覆盖集号 ${range.join('、')}；` +
+              `实际集号为 ${actualEpisodeNumbers.length > 0 ? actualEpisodeNumbers.join('、') : '空'}。`,
             );
           }
           return parsed;
@@ -1863,9 +1903,10 @@ export class ScriptDirector {
         const expansionOnly =
           report.blockingIssues.length > 0 &&
           report.blockingIssues.every((issue) => issue.code === 'TOO_SHORT');
+        const hasTooLongIssue = report.blockingIssues.some((issue) => issue.code === 'TOO_LONG');
         const revisionInputRevisionRefs = buildScriptInputRevisionRefs(reviewState, episodeNumber);
         const revisionUpstreamArtifactRefs = [currentCandidateRef, currentReviewRef];
-        const revisionPromptVersion = 'script-revision-patch-v2';
+        const revisionPromptVersion = 'script-revision-patch-v3';
         const revisionInputFingerprint = computeScriptCheckpointInputFingerprint({
           node: 'revision',
           inputRevisionRefs: revisionInputRevisionRefs,
@@ -1984,7 +2025,11 @@ export class ScriptDirector {
               expansionOnly
                 ? '本轮只修复 TOO_SHORT：operations 只能使用 insertBlockAfter 或 appendBlock 增写可拍摄内容，严禁替换、删减或缩短既有正文。'
                 : '只对阻断项做最小改动；除 TOO_LONG 外，修订后正文不得比当前候选更短。',
-              scriptLengthInstruction(plan.targetCharsPerEpisode, report.visibleChars),
+              scriptRevisionLengthInstruction(
+                plan.targetCharsPerEpisode,
+                report.visibleChars,
+                hasTooLongIssue,
+              ),
               `当前可见字符 ${report.visibleChars}，目标 ${plan.targetCharsPerEpisode}，合格范围 ${Math.ceil(plan.targetCharsPerEpisode * 0.85)}—${Math.floor(plan.targetCharsPerEpisode * 1.15)}。`,
               `人物 ID 白名单：${JSON.stringify(state.characters.map((character) => character.id))}`,
               `场景与正文块 ID 白名单：${JSON.stringify(draft.scenes.map((scene) => ({ sceneId: scene.id, characterIds: scene.characterIds, blockIds: scene.blocks.map((block) => block.id) })))}`,
@@ -2013,9 +2058,24 @@ export class ScriptDirector {
               revisionPolicy,
             );
             const visibleCharsAfterPatch = scriptVisibleChars(applied.episode);
+            const minimumVisibleChars = Math.ceil(plan.targetCharsPerEpisode * 0.85);
+            const maximumVisibleChars = Math.floor(plan.targetCharsPerEpisode * 1.15);
+            if (
+              hasTooLongIssue &&
+              (
+                visibleCharsAfterPatch >= visibleCharsBeforePatch ||
+                visibleCharsAfterPatch < minimumVisibleChars ||
+                visibleCharsAfterPatch > maximumVisibleChars
+              )
+            ) {
+              throw new ScriptRevisionPatchError(
+                `TOO_LONG 修订必须缩短正文并一次落入 ${minimumVisibleChars}—${maximumVisibleChars} 字；` +
+                `当前由 ${visibleCharsBeforePatch} 字变为 ${visibleCharsAfterPatch} 字。`,
+              );
+            }
             if (
               visibleCharsAfterPatch < visibleCharsBeforePatch &&
-              !report.blockingIssues.some((issue) => issue.code === 'TOO_LONG')
+              !hasTooLongIssue
             ) {
               throw new ScriptRevisionPatchError('修订无权缩短未超长的候选正文。');
             }
@@ -2675,7 +2735,6 @@ export class ScriptDirector {
       const completedCandidateRejected = completed?.status === 'needs_review';
       if (!rejectedRevision && !completedCandidateRejected) continue;
 
-      if (completedCandidateRejected) await this.markCheckpointStale(completed);
       for (const revision of revisions) {
         if (
           revision.status === 'needs_review' ||
@@ -2684,6 +2743,10 @@ export class ScriptDirector {
           await this.markCheckpointStale(revision);
         }
       }
+      // Keep the durable completed=needs_review boundary until every rejected
+      // revision has been invalidated. A crash between writes will therefore
+      // retry the invalidation instead of reusing a rejected succeeded revision.
+      if (completedCandidateRejected) await this.markCheckpointStale(completed);
     }
   }
 

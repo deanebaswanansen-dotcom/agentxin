@@ -63,6 +63,11 @@ export type ScriptRevisionPatchPolicyRule =
       target: 'shortExpansion';
       sceneId: string;
       allowedAfterBlockIds: string[];
+    }
+  | {
+      issueCode: 'TOO_LONG';
+      target: 'longReduction';
+      allowedBlocks: Array<{ sceneId: string; blockId: string }>;
     };
 
 /**
@@ -165,6 +170,21 @@ export function buildScriptRevisionPatchPolicy(
         target: 'shortExpansion',
         sceneId: lastScene.id,
         allowedAfterBlockIds: lastBlock ? [lastBlock.id] : [],
+      });
+      continue;
+    }
+    if (issue.code === 'TOO_LONG') {
+      const allowedBlocks = base.scenes.flatMap((scene) => scene.blocks.map((block) => ({
+        sceneId: scene.id,
+        blockId: block.id,
+      })));
+      if (allowedBlocks.length === 0) {
+        cannotAutoRepair(issue, '正文没有可安全精简的正文块');
+      }
+      rules.push({
+        issueCode: 'TOO_LONG',
+        target: 'longReduction',
+        allowedBlocks,
       });
       continue;
     }
@@ -458,9 +478,11 @@ export function assertScriptRevisionPatchAllowed(
 
     const authorized = policy.rules.some((rule) => {
       if (operation.op === 'replaceBlockText') {
-        return rule.target === 'blockText' &&
+        return (rule.target === 'blockText' &&
           rule.sceneId === operation.sceneId &&
-          rule.blockId === operation.blockId;
+          rule.blockId === operation.blockId) ||
+          (rule.target === 'longReduction' && rule.allowedBlocks.some((target) =>
+            target.sceneId === operation.sceneId && target.blockId === operation.blockId));
       }
       if (operation.op === 'updateSceneCharacters') {
         return rule.target === 'sceneCharacters' && rule.sceneId === operation.sceneId;
@@ -477,6 +499,25 @@ export function assertScriptRevisionPatchAllowed(
       throw new ScriptRevisionPatchError(
         `操作 ${operationLabel(operation)} 未被当前阻断问题授权。`,
       );
+    }
+    if (operation.op === 'replaceBlockText') {
+      const exactBlockRule = policy.rules.some((rule) => rule.target === 'blockText' &&
+        rule.sceneId === operation.sceneId && rule.blockId === operation.blockId);
+      const longReductionRule = policy.rules.some((rule) => rule.target === 'longReduction' &&
+        rule.allowedBlocks.some((target) =>
+          target.sceneId === operation.sceneId && target.blockId === operation.blockId));
+      if (longReductionRule && !exactBlockRule) {
+        const original = base.scenes
+          .find((scene) => scene.id === operation.sceneId)
+          ?.blocks.find((block) => block.id === operation.blockId);
+        const before = original?.text.replace(/\s/gu, '').length ?? 0;
+        const after = operation.text.replace(/\s/gu, '').length;
+        if (after >= before) {
+          throw new ScriptRevisionPatchError(
+            `TOO_LONG 只能缩短现有正文块 ${operation.blockId}，不得等长或扩写。`,
+          );
+        }
+      }
     }
   }
 }
