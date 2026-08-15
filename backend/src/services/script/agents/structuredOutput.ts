@@ -10,6 +10,11 @@ export class ScriptModelOutputError extends Error {
   }
 }
 
+export interface StructuredModelParseResult {
+  value: Record<string, unknown>;
+  mode: 'direct' | 'local_repair';
+}
+
 function extractBalancedObject(text: string): string | undefined {
   const start = text.indexOf('{');
   if (start < 0) return undefined;
@@ -34,7 +39,7 @@ function extractBalancedObject(text: string): string | undefined {
   return undefined;
 }
 
-export function parseStructuredModelOutput(raw: string): Record<string, unknown> {
+export function parseStructuredModelOutputWithDiagnostics(raw: string): StructuredModelParseResult {
   const sanitized = stripReasoningArtifacts(raw)
     .replace(/^\s*```(?:json)?\s*$/gim, '')
     .trim();
@@ -44,11 +49,13 @@ export function parseStructuredModelOutput(raw: string): Record<string, unknown>
   }
 
   let parsed: unknown;
+  let mode: StructuredModelParseResult['mode'] = 'direct';
   try {
     parsed = JSON.parse(objectText);
   } catch {
     try {
       parsed = JSON.parse(repairLooseJson(objectText));
+      mode = 'local_repair';
     } catch {
       throw new ScriptModelOutputError('模型返回的 JSON 无法解析。');
     }
@@ -56,6 +63,10 @@ export function parseStructuredModelOutput(raw: string): Record<string, unknown>
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     throw new ScriptModelOutputError('模型返回的 JSON 顶层必须是对象。');
   }
-  return parsed as Record<string, unknown>;
+  return { value: parsed as Record<string, unknown>, mode };
+}
+
+export function parseStructuredModelOutput(raw: string): Record<string, unknown> {
+  return parseStructuredModelOutputWithDiagnostics(raw).value;
 }
 
