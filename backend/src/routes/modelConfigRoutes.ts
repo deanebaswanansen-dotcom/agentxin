@@ -34,6 +34,7 @@ interface SaveModelConfigBody {
   baseUrl?: unknown;
   apiKey?: unknown;
   modelName?: unknown;
+  structuredFallbackModelName?: unknown;
   temperature?: unknown;
   topP?: unknown;
 }
@@ -72,6 +73,10 @@ export function registerModelConfigRoutes(
         baseUrl: asString(body.baseUrl),
         apiKey: asString(body.apiKey),
         modelName: asString(body.modelName),
+        ...(typeof body.structuredFallbackModelName === 'string' &&
+        body.structuredFallbackModelName.trim().length > 0
+          ? { structuredFallbackModelName: body.structuredFallbackModelName }
+          : {}),
         temperature: asOptionalNumber(body.temperature),
         topP: asOptionalNumber(body.topP),
       };

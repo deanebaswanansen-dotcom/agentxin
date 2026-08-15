@@ -60,6 +60,8 @@ export interface ModelConfig {
   baseUrl: string;
   apiKey: string; // 仅服务端存储, 绝不返回前端原文
   modelName: string;
+  /** Optional same-provider model used only after structured-output Fixup fails. */
+  structuredFallbackModelName?: string;
   temperature?: number; // 0-2, defaults to 1
   topP?: number; // 0-1, defaults to 1
 }
@@ -68,6 +70,7 @@ export interface ModelConfig {
 export interface ModelConfigView {
   baseUrl: string;
   modelName: string;
+  structuredFallbackModelName?: string;
   apiKeyMasked: string; // 例如 "sk-****abcd"
   temperature: number;
   topP: number;

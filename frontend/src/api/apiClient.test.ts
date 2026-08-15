@@ -395,6 +395,7 @@ describe('apiClient request building', () => {
       baseUrl: 'https://api.example.com',
       apiKey: 'sk-secret-key',
       modelName: 'novel-model',
+      structuredFallbackModelName: 'novel-model-pro',
       temperature: 0.75,
       topP: 0.85,
     };
@@ -411,6 +412,7 @@ describe('apiClient request building', () => {
         return jsonResponse({
           baseUrl: config.baseUrl,
           modelName: config.modelName,
+          structuredFallbackModelName: config.structuredFallbackModelName,
           apiKeyMasked: '****-key',
           temperature: 0.75,
           topP: 0.85,
@@ -421,6 +423,7 @@ describe('apiClient request building', () => {
     await expect(api.modelConfig.save(config)).resolves.toEqual({
       baseUrl: 'https://api.example.com',
       modelName: 'novel-model',
+      structuredFallbackModelName: 'novel-model-pro',
       apiKeyMasked: '****-key',
       temperature: 0.75,
       topP: 0.85,
@@ -449,6 +452,7 @@ describe('apiClient request building', () => {
     await expect(api2.modelConfig.get()).resolves.toEqual({
       baseUrl: 'https://api.example.com',
       modelName: 'novel-model',
+      structuredFallbackModelName: 'novel-model-pro',
       apiKeyMasked: '****-key',
       temperature: 0.75,
       topP: 0.85,
