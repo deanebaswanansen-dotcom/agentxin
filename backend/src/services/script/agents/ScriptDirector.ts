@@ -34,7 +34,10 @@ import {
   validateScriptSeriesOutlineInput,
 } from '../ScriptCanonicalInput.js';
 import { ScriptServiceError } from '../ScriptServiceError.js';
-import type { ScriptStore } from '../ScriptStore.js';
+import {
+  computeScriptInputFingerprint,
+  type ScriptStore,
+} from '../ScriptStore.js';
 import {
   createScriptReviewIssues,
   isBlockingScriptReviewIssue,
@@ -321,18 +324,32 @@ function parserContract<T>(
   });
 }
 
-function scriptLengthInstruction(targetChars: number, currentChars?: number): string {
-  const blockCount = Math.max(12, Math.min(100, Math.round(targetChars / 18)));
+function scriptLengthInstruction(
+  targetChars: number,
+  sceneCount: number,
+  dialogueDensityPercent: number,
+  currentChars?: number,
+): string {
+  // Long episodes are more reliable when the model writes a moderate number
+  // of substantial blocks instead of dozens of tiny JSON objects. 1200 chars
+  // therefore maps to about 30 blocks rather than the previous 67.
+  const blockCount = Math.max(12, Math.min(48, Math.round(targetChars / 40)));
   const charsPerBlock = Math.round(targetChars / blockCount);
   const minimumPerBlock = Math.max(12, Math.floor(charsPerBlock * 0.9));
   const maximumPerBlock = Math.ceil(charsPerBlock * 1.1);
+  const safeSceneCount = Math.max(1, sceneCount);
+  const charsPerScene = Math.round(targetChars / safeSceneCount);
+  const minimumPerScene = Math.ceil(targetChars * 0.85 / safeSceneCount);
+  const maximumPerScene = Math.floor(targetChars * 1.15 / safeSceneCount);
   const current = currentChars === undefined
     ? ''
     : `当前正文只有 ${currentChars} 个可见字符，需增删约 ${Math.abs(targetChars - currentChars)} 个字符。`;
   return [
     current,
-    `请让全部场景合计恰好包含 ${blockCount} 个 caption/action/dialogue 正文块，`,
+    `请让全部场景合计约包含 ${blockCount} 个 caption/action/dialogue 正文块，`,
     `每个 blocks.text 约 ${minimumPerBlock}—${maximumPerBlock} 个可见字符；`,
+    `当前 ${safeSceneCount} 场平均每场约 ${charsPerScene} 字，可在 ${minimumPerScene}—${maximumPerScene} 字之间按戏剧任务自然分配；`,
+    `dialogue 类型 blocks.text 的可见字符合计目标约占正文 ${dialogueDensityPercent}%，其余用于可拍摄动作和必要字幕；`,
     '每个 text 至少写成一个完整句子，长度可参考“她攥紧彩票退到监控灯下，盯着老板把兑奖记录藏进抽屉”，不要用四五字短句凑块数；',
     `篇幅只能写进 blocks.text，summary、newFacts、openedThreads、closedThreads 不计入正文。`,
   ].join('');
@@ -363,11 +380,26 @@ function scriptVisibleChars(episode: ScriptEpisode): number {
     .length;
 }
 
+function gateDecodeIssues(
+  issues: readonly ScriptGateIssue[],
+): StructuredDecodeIssue[] {
+  return issues.map((issue) => ({
+    path: issue.path?.split('.').filter(Boolean) ?? [],
+    code: issue.code,
+    message: [
+      issue.sceneId ? `sceneId=${issue.sceneId}` : '',
+      issue.blockId ? `blockId=${issue.blockId}` : '',
+      issue.message,
+    ].filter(Boolean).join('；'),
+  }));
+}
+
 type RevisionSemanticIssueCode =
   | 'revision.policy'
   | 'revision.apply'
   | 'revision.length'
-  | 'revision.canonical';
+  | 'revision.canonical'
+  | 'revision.quality';
 
 class ScriptRevisionSemanticError extends ScriptRevisionPatchError {
   constructor(
@@ -1680,6 +1712,21 @@ export class ScriptDirector {
       }
 
       state = (await this.dependencies.store.getProjectState(request.projectId)) ?? state;
+      const deterministicEpisodeGate = (
+        candidate: ScriptEpisode,
+        reviewIssues?: readonly ScriptGateIssue[],
+      ): ScriptGateReport => validateScriptEpisode(candidate, plan, {
+        expectedEpisodeNumber: episodeNumber,
+        registeredCharacterIds: new Set(state.characters.map((character) => character.id)),
+        registeredCharacterNames: new Set(state.characters.map((character) => character.name)),
+        characterNamesById: new Map(state.characters.map((character) => [character.id, character.name])),
+        outline,
+        previousEpisode: state.episodes
+          .filter((item) => item.episodeNumber < episodeNumber)
+          .sort((left, right) => right.episodeNumber - left.episodeNumber)[0],
+        continuity: projectScriptContinuity(state, episodeNumber),
+        ...(reviewIssues ? { reviewIssues } : {}),
+      });
       // Canonicalize again after saveEpisodeOutline increments its revision.
       // Draft fingerprints must bind to this post-save artifact on both the
       // initial run and every resume.
@@ -1769,7 +1816,7 @@ export class ScriptDirector {
       );
       episodeUpstreamRefs.push(scenePlanRef);
       const draftInputRevisionRefs = buildScriptInputRevisionRefs(state, episodeNumber);
-      const draftPromptVersion = 'episode-draft-v2';
+      const draftPromptVersion = 'episode-draft-v3';
       const currentEpisodeRevision = state.episodes.find(
         (episode) => episode.episodeNumber === episodeNumber,
       )?.revision ?? 0;
@@ -1827,29 +1874,64 @@ export class ScriptDirector {
           '正文必须是可拍摄的竖屏短剧：前三个正文块内出现人物、处境与冲突；动作使用镜头可见行为，避免小说式心理概述；单句对白简洁、有对抗性，不写大段说教。',
           '首次出现的重要人物或地点可用 caption 交代身份；后续不得机械重复字幕。最后一至两个正文块必须兑现本集 endingHook，以反转、证据、人物闯入或未完成动作收尾。',
           '严格遵守大纲 requiredFacts 与 forbiddenFacts；继承上一集结尾状态、服装、道具、人物已知信息和未回收伏笔，禁止让角色无理由换装、瞬移或提前知道秘密。',
-          scriptLengthInstruction(plan.targetCharsPerEpisode),
+          scriptLengthInstruction(
+            plan.targetCharsPerEpisode,
+            outline.plannedScenes.length,
+            plan.dialogueDensityPercent,
+          ),
           `所有 blocks.text 去除空白后的总字符数以 ${plan.targetCharsPerEpisode} 为目标，必须在 ${Math.ceil(plan.targetCharsPerEpisode * 0.85)}—${Math.floor(plan.targetCharsPerEpisode * 1.15)} 之间；请在返回前逐块相加核对，优先贴近目标值。`,
           `对白只能使用这些已登记人物：${JSON.stringify(state.characters.map((character) => ({ id: character.id, name: character.name })))}`,
           this.assembleEpisodeContext(state, plan, outline, episodeNumber),
         ].join('\n');
         if (!draft) {
+          const draftContract = defineStructuredContract<ScriptEpisode>({
+            name: 'episode_draft',
+            version: 2,
+            instructions: [
+              '必须返回完整单集对象；scenes、每场 blocks 及所有正文块的类型必填字段不可省略。',
+              '完整候选还必须一次通过确定性质量门，包括目标字数、场景人物与对白人物一致性。失败时必须返回完整替代 Episode，不得返回 Patch。',
+            ].join('\n'),
+            decode: (value) => {
+              let candidate: ScriptEpisode;
+              try {
+                candidate = this.parseEpisode(
+                  recordField(value, 'episode_draft'),
+                  request.projectId,
+                  outline,
+                  plan,
+                  currentEpisode,
+                );
+              } catch (error) {
+                if (!(error instanceof ScriptModelOutputError)) throw error;
+                return {
+                  success: false,
+                  issues: [{
+                    path: issuePathFromMessage(error.message),
+                    code: /缺少|必须/u.test(error.message) ? 'field.required' : 'field.invalid',
+                    message: error.message,
+                  }],
+                };
+              }
+              const gate = deterministicEpisodeGate(candidate);
+              const draftGateIssues = [
+                ...gate.blockingIssues,
+                ...gate.issues.filter((issue) =>
+                  issue.code === 'DIALOGUE_DENSITY' &&
+                  !gate.blockingIssues.includes(issue)
+                ),
+              ];
+              return draftGateIssues.length > 0
+                ? { success: false, issues: gateDecodeIssues(draftGateIssues) }
+                : { success: true, value: candidate };
+            },
+          });
           draft = await this.generateNodeStructured({
             node: 'draft',
             projectId: request.projectId,
             episodeNumber,
             prompt,
             signal: request.signal,
-          }, parserContract(
-            'episode_draft',
-            '必须返回完整单集对象；scenes、每场 blocks 及所有正文块的类型必填字段不可省略。',
-            (value) => this.parseEpisode(
-              value,
-              request.projectId,
-              outline,
-              plan,
-              currentEpisode,
-            ),
-          ));
+          }, draftContract);
         }
       }
       draft = this.canonicalEpisodeCandidate(draft, plan, episodeNumber);
@@ -1885,6 +1967,7 @@ export class ScriptDirector {
         draftCheckpointRevision,
         draftArtifact,
       );
+      let currentCandidateInputRevisionRefs = structuredClone(draftArtifact.inputRevisionRefs);
       episodeUpstreamRefs.push(currentCandidateRef);
 
       if (!state) throw new ScriptModelOutputError('短剧项目状态丢失。');
@@ -2004,18 +2087,7 @@ export class ScriptDirector {
       const validateDraft = (
         candidate: ScriptEpisode,
         reviewIssues?: readonly ScriptGateIssue[],
-      ): ScriptGateReport => validateScriptEpisode(candidate, plan, {
-        expectedEpisodeNumber: episodeNumber,
-        registeredCharacterIds: new Set(reviewState.characters.map((character) => character.id)),
-        registeredCharacterNames: new Set(reviewState.characters.map((character) => character.name)),
-        characterNamesById: new Map(reviewState.characters.map((character) => [character.id, character.name])),
-        outline,
-        previousEpisode: reviewState.episodes
-          .filter((item) => item.episodeNumber < episodeNumber)
-          .sort((left, right) => right.episodeNumber - left.episodeNumber)[0],
-        continuity: projectScriptContinuity(reviewState, episodeNumber),
-        ...(reviewIssues ? { reviewIssues } : {}),
-      });
+      ): ScriptGateReport => deterministicEpisodeGate(candidate, reviewIssues);
       let deterministicReport = validateDraft(draft);
       let report = validateDraft(
         draft,
@@ -2237,8 +2309,9 @@ export class ScriptDirector {
               closedThreads: review.closedThreads,
               updatedAt,
             };
+            let canonicalCandidate: ScriptEpisode;
             try {
-              return this.canonicalEpisodeCandidate(candidate, plan, episodeNumber);
+              canonicalCandidate = this.canonicalEpisodeCandidate(candidate, plan, episodeNumber);
             } catch (error) {
               if (error instanceof ScriptModelOutputError) {
                 throw new ScriptRevisionSemanticError(
@@ -2248,6 +2321,18 @@ export class ScriptDirector {
               }
               throw error;
             }
+            const postPatchGate = deterministicEpisodeGate(canonicalCandidate);
+            if (postPatchGate.hardFailed) {
+              const summary = postPatchGate.blockingIssues
+                .slice(0, 4)
+                .map((issue) => `${issue.code}：${issue.message}`)
+                .join('；');
+              throw new ScriptRevisionSemanticError(
+                'revision.quality',
+                `修订后仍有确定性阻断问题：${summary || '未知硬性问题。'}`,
+              );
+            }
+            return canonicalCandidate;
           };
           const revisionContract = defineStructuredContract<ScriptRevisionPatch>({
             name: SCRIPT_REVISION_PATCH_CONTRACT.name,
@@ -2387,6 +2472,7 @@ export class ScriptDirector {
           revisionCheckpointRevision!,
           patchedArtifact!,
         );
+        currentCandidateInputRevisionRefs = structuredClone(patchedArtifact!.inputRevisionRefs);
         episodeUpstreamRefs.push(currentCandidateRef);
         reviewed = await reviewDraft(draft, revisionRound + 1, currentCandidateRef);
         review = reviewed.value;
@@ -2423,7 +2509,7 @@ export class ScriptDirector {
           projectId: request.projectId,
           episodeNumber,
           baseEpisodeRevision: currentEpisodeRevision,
-          inputRevisionRefs: buildScriptInputRevisionRefs(reviewState, episodeNumber),
+          inputRevisionRefs: currentCandidateInputRevisionRefs,
           upstreamArtifactRefs: [currentCandidateRef, currentReviewRef],
           promptVersion: 'quality-gate-needs-review-v1',
           configRevision,
@@ -2495,7 +2581,7 @@ export class ScriptDirector {
           projectId: request.projectId,
           episodeNumber,
           baseEpisodeRevision: currentEpisodeRevision,
-          inputRevisionRefs: buildScriptInputRevisionRefs(reviewState, episodeNumber),
+          inputRevisionRefs: currentCandidateInputRevisionRefs,
           upstreamArtifactRefs: [currentCandidateRef, currentReviewRef],
           promptVersion: 'quality-gate-needs-review-v1',
           configRevision,
@@ -2522,8 +2608,6 @@ export class ScriptDirector {
         reports.push({ episodeNumber, report });
         throw new ScriptBatchPausedError(episodeNumber, report);
       }
-      const commitState = (await this.dependencies.store.getProjectState(request.projectId))
-        ?? reviewState;
       draft = this.canonicalEpisodeCandidate(draft, plan, episodeNumber);
       const completedCheckpointRevision = await this.nextCheckpointArtifactRevision(
         request.projectId,
@@ -2534,7 +2618,7 @@ export class ScriptDirector {
         projectId: request.projectId,
         episodeNumber,
         baseEpisodeRevision: currentEpisodeRevision,
-        inputRevisionRefs: buildScriptInputRevisionRefs(commitState, episodeNumber),
+        inputRevisionRefs: currentCandidateInputRevisionRefs,
         upstreamArtifactRefs: [currentCandidateRef, currentReviewRef],
         promptVersion: 'quality-gate-final-v1',
         configRevision,
@@ -2546,12 +2630,23 @@ export class ScriptDirector {
         finalCandidateArtifact,
       );
       episodeUpstreamRefs.push(finalCandidateRef);
-      const continuity = buildScriptContinuityCandidate(commitState, draft, review.wardrobe);
-      const commitInput = buildScriptAtomicCommitInput(commitState, draft, continuity, {
+      // Continuity and generation refs must stay bound to the same snapshot
+      // that was actually prompted and gated. Only the review-ledger revision
+      // comes from this run's own persisted review write. The store compares
+      // these stable refs atomically against current canon and rejects any
+      // plan/outline/character/episode drift that landed while the model ran.
+      const continuity = buildScriptContinuityCandidate(reviewState, draft, review.wardrobe);
+      const commitInput = buildScriptAtomicCommitInput({
+        ...reviewState,
+        reviewRevision: persistedReview.revision,
+      }, draft, continuity, {
         upstreamArtifactRefs: episodeUpstreamRefs,
         promptVersion: 'short-drama-director-v2',
         modelConfigFingerprint: configRevision,
       });
+      commitInput.inputRevisionRefs = structuredClone(currentCandidateInputRevisionRefs);
+      commitInput.expectedReviewRevision = persistedReview.revision;
+      commitInput.inputFingerprint = computeScriptInputFingerprint(commitInput);
       const commitEpisodeWithContinuity = this.dependencies.store.commitEpisodeWithContinuity;
       if (!commitEpisodeWithContinuity) {
         throw new ScriptModelOutputError('正文存储未实现原子连续性提交。');
