@@ -279,6 +279,39 @@ describe('ScriptRevisionPatchPolicy', () => {
     }, () => 'safe-tail', policy)).not.toThrow();
   });
 
+  it('allows TOO_LONG to replace existing block text only', () => {
+    const base = twoSceneEpisode();
+    const policy = buildScriptRevisionPatchPolicy(base, [{
+      code: 'TOO_LONG',
+      severity: 'hard',
+      path: 'scenes',
+    }], { registeredCharacterIds: registeredCharacters });
+
+    expect(() => applyScriptRevisionPatch(base, {
+      operations: [{
+        op: 'replaceBlockText',
+        sceneId: 'scene-2',
+        blockId: 'action-2',
+        text: '沈清进院。',
+      }],
+    }, undefined, policy)).not.toThrow();
+    expect(() => applyScriptRevisionPatch(base, {
+      operations: [{
+        op: 'appendBlock',
+        sceneId: 'scene-2',
+        block: { type: 'action', text: '越权增写。' },
+      }],
+    }, undefined, policy)).toThrow(/未被当前阻断问题授权/u);
+    expect(() => applyScriptRevisionPatch(base, {
+      operations: [{
+        op: 'replaceBlockText',
+        sceneId: 'scene-2',
+        blockId: 'action-2',
+        text: '沈清慢慢走进后院并环顾四周。',
+      }],
+    }, undefined, policy)).toThrow(/不得等长或扩写/u);
+  });
+
   it('requires all scene and new-dialogue character IDs to be registered', () => {
     const base = twoSceneEpisode();
     const characterPolicy = buildScriptRevisionPatchPolicy(base, [{
@@ -318,7 +351,6 @@ describe('ScriptRevisionPatchPolicy', () => {
   });
 
   it.each([
-    { code: 'TOO_LONG', severity: 'hard' as const, path: 'scenes' },
     { code: 'MODEL_ARTIFACT', severity: 'hard' as const, path: 'scenes' },
     {
       code: 'MISSING_LOCATION',
