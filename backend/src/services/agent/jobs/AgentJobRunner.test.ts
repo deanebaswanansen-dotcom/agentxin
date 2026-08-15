@@ -116,6 +116,91 @@ describe('AgentJobRunner', () => {
     expect(store.getForClient(CLIENT_ID, created.id)?.status).toBe('completed');
   });
 
+  it('parks a structured needs-review error for the user and resumes the same request', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-needs-review-'));
+    const store = await AgentRunStore.create(join(directory, 'runs.json'));
+    let attempts = 0;
+    const run = vi.fn(async (request) => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw Object.assign(new Error('episode_draft 结构契约不匹配'), {
+          code: 'SCRIPT_STRUCTURED_NEEDS_REVIEW',
+          recoverable: true,
+          // Even if a nested provider error contributed this status, schema
+          // recovery belongs to the Director rather than the job retry loop.
+          status: 503,
+        });
+      }
+      return {
+        task: request.task,
+        mode: request.mode,
+        projectId: request.projectId ?? 'p1',
+        summary: '从原任务检查点恢复完成',
+        steps: [],
+        artifacts: [],
+      };
+    });
+    const runner = new AgentJobRunner(store, { run }, { maxAttempts: 3, retryDelayMs: 1 });
+    const request = {
+      task: 'script_episode_batch' as const,
+      mode: 'draft' as const,
+      prompt: '',
+      projectId: 'p1',
+      scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 1 },
+    };
+
+    const created = await runner.start(CLIENT_ID, request, undefined);
+    await runner.waitUntilIdle(created.id);
+
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0]?.[0]).toEqual(request);
+    expect(store.get(created.id)).toMatchObject({
+      status: 'waiting_user',
+      attempts: 1,
+      error: {
+        code: 'SCRIPT_STRUCTURED_NEEDS_REVIEW',
+        message: 'episode_draft 结构契约不匹配',
+      },
+    });
+
+    await runner.resume(CLIENT_ID, created.id, undefined);
+    await runner.waitUntilIdle(created.id);
+
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[1]?.[0]).toEqual(request);
+    expect(store.get(created.id)).toMatchObject({
+      status: 'completed',
+      attempts: 2,
+      result: { summary: '从原任务检查点恢复完成' },
+    });
+  });
+
+  it('marks an ordinary non-recoverable execution error as failed', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-non-recoverable-'));
+    const store = await AgentRunStore.create(join(directory, 'runs.json'));
+    const run = vi.fn(async () => {
+      throw Object.assign(new Error('结构节点实现错误'), {
+        code: 'SCRIPT_SCHEMA_MISMATCH',
+        recoverable: false,
+      });
+    });
+    const runner = new AgentJobRunner(store, { run }, { maxAttempts: 3, retryDelayMs: 1 });
+
+    const created = await runner.start(
+      CLIENT_ID,
+      { task: 'script_episode_batch', mode: 'draft', prompt: '', projectId: 'p1' },
+      undefined,
+    );
+    await runner.waitUntilIdle(created.id);
+
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(store.get(created.id)).toMatchObject({
+      status: 'failed',
+      attempts: 1,
+      error: { code: 'SCRIPT_SCHEMA_MISMATCH', message: '结构节点实现错误' },
+    });
+  });
+
   it('redacts API keys before persisting a failed job', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-redact-'));
     const file = join(directory, 'runs.json');
