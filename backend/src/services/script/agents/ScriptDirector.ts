@@ -60,6 +60,7 @@ import {
   type ScriptCheckpointNode,
   type ScriptCheckpointSelector,
   type ScriptCheckpointArtifactMeta,
+  type ScriptCheckpointValidationError,
   type ScriptEpisodeCandidateArtifact,
   type ScriptScenePlanArtifact,
   type ScriptCheckpointStore,
@@ -77,10 +78,13 @@ import {
   type StructuredModel,
 } from './generateStructured.js';
 import {
+  assertScriptRevisionPatchAllowed,
   applyScriptRevisionPatch,
   buildScriptRevisionPatchPolicy,
   SCRIPT_REVISION_PATCH_CONTRACT,
   ScriptRevisionPatchError,
+  type ScriptRevisionPatch,
+  type ScriptRevisionPatchPolicy,
 } from './ScriptRevisionPatch.js';
 import { ScriptModelOutputError } from './structuredOutput.js';
 
@@ -205,8 +209,10 @@ export class ScriptBatchPausedError extends Error {
     readonly episodeNumber: number,
     readonly report: ScriptGateReport,
   ) {
-    const hardIssueSummary = report.issues
-      .filter((issue) => issue.severity === 'hard')
+    const hardIssueSummary = [...report.blockingIssues]
+      .sort((left, right) =>
+        Number(right.code === 'REVISION_PATCH_REJECTED') -
+        Number(left.code === 'REVISION_PATCH_REJECTED'))
       .slice(0, 4)
       .map((issue) => `${issue.code}：${issue.message}`)
       .join('；');
@@ -355,6 +361,131 @@ function scriptVisibleChars(episode: ScriptEpisode): number {
     .join('')
     .replace(/\s/gu, '')
     .length;
+}
+
+type RevisionSemanticIssueCode =
+  | 'revision.policy'
+  | 'revision.apply'
+  | 'revision.length'
+  | 'revision.canonical';
+
+class ScriptRevisionSemanticError extends ScriptRevisionPatchError {
+  constructor(
+    readonly validationCode: RevisionSemanticIssueCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ScriptRevisionSemanticError';
+  }
+}
+
+function visibleTextChars(value: string): number {
+  return value.replace(/\s/gu, '').length;
+}
+
+function revisionPolicyPromptContext(
+  base: ScriptEpisode,
+  policy: ScriptRevisionPatchPolicy,
+  targetChars: number,
+): string[] {
+  const permissions = policy.rules.flatMap((rule) => {
+    if (rule.target === 'blockText') {
+      return [{ op: 'replaceBlockText', sceneId: rule.sceneId, blockId: rule.blockId }];
+    }
+    if (rule.target === 'longReduction') {
+      return rule.allowedBlocks.map((target) => ({ op: 'replaceBlockText', ...target }));
+    }
+    if (rule.target === 'sceneCharacters') {
+      return [{ op: 'updateSceneCharacters', sceneId: rule.sceneId }];
+    }
+    if (rule.target === 'sceneAppend') {
+      return [{ op: 'appendBlock', sceneId: rule.sceneId }];
+    }
+    if (rule.target !== 'shortExpansion') return [];
+    return [
+      { op: 'appendBlock', sceneId: rule.sceneId },
+      ...rule.allowedAfterBlockIds.map((afterBlockId) => ({
+        op: 'insertBlockAfter',
+        sceneId: rule.sceneId,
+        afterBlockId,
+      })),
+    ];
+  });
+  const uniquePermissions = [...new Map(
+    permissions.map((permission) => [JSON.stringify(permission), permission]),
+  ).values()];
+  const currentChars = scriptVisibleChars(base);
+  return [
+    `精确 revisionPolicy（唯一授权来源）：${JSON.stringify(policy)}`,
+    `唯一允许的操作与锚点（未列出的一律禁止）：${JSON.stringify(uniquePermissions)}`,
+    `每块当前可见字数：${JSON.stringify(base.scenes.map((scene) => ({
+      sceneId: scene.id,
+      blocks: scene.blocks.map((block) => ({
+        blockId: block.id,
+        type: block.type,
+        visibleChars: visibleTextChars(block.text),
+      })),
+    })))}`,
+    `目标总字数：${JSON.stringify({
+      current: currentChars,
+      target: targetChars,
+      minimum: Math.ceil(targetChars * 0.85),
+      maximum: Math.floor(targetChars * 1.15),
+      idealNetChange: targetChars - currentChars,
+    })}`,
+  ];
+}
+
+function deterministicRevisionValidationIdFactory(base: ScriptEpisode): () => string {
+  const existing = new Set(base.scenes.flatMap((scene) => [
+    scene.id,
+    ...scene.blocks.map((block) => block.id),
+  ]));
+  let sequence = 0;
+  return () => {
+    let candidate: string;
+    do {
+      sequence += 1;
+      candidate = `revision-validation-${sequence}`;
+    } while (existing.has(candidate));
+    existing.add(candidate);
+    return candidate;
+  };
+}
+
+function redactRevisionValidationMessage(code: string, message: string): string {
+  if (code === 'model.call_failed' || code === 'contract.decode_threw') {
+    return '修订模型调用或契约执行失败；提供方详情未写入检查点。';
+  }
+  return message
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/giu, '[REDACTED]')
+    .replace(/\b(?:authorization|bearer|api[_ -]?key)\b\s*[:=]?\s*\S+/giu, '[REDACTED]')
+    .slice(0, 500);
+}
+
+function sanitizedRevisionValidationErrors(
+  error: StructuredGenerationError,
+): ScriptCheckpointValidationError[] {
+  const sanitized = [
+    ...error.attempts.flatMap((attempt) => attempt.issues),
+    ...error.issues,
+  ].map((issue) => ({
+    ...(issue.path.length > 0
+      ? { path: issue.path.reduce<string>((path, segment) =>
+          typeof segment === 'number' ? `${path}[${segment}]` : `${path}.${segment}`, '$') }
+      : {}),
+    code: /^[A-Za-z0-9_.-]{1,80}$/u.test(issue.code) ? issue.code : 'revision.invalid',
+    message: redactRevisionValidationMessage(issue.code, issue.message),
+  }));
+  const unique = [...new Map(sanitized.map((issue) => [
+    JSON.stringify(issue),
+    issue,
+  ])).values()];
+  return unique
+    .sort((left, right) =>
+      Number(right.code.startsWith('revision.')) -
+      Number(left.code.startsWith('revision.')))
+    .slice(0, 8);
 }
 
 function checkpointArtifactMetadata(artifact: ScriptCheckpointArtifactMeta): Pick<
@@ -1903,10 +2034,11 @@ export class ScriptDirector {
         const expansionOnly =
           report.blockingIssues.length > 0 &&
           report.blockingIssues.every((issue) => issue.code === 'TOO_SHORT');
+        const hasTooShortIssue = report.blockingIssues.some((issue) => issue.code === 'TOO_SHORT');
         const hasTooLongIssue = report.blockingIssues.some((issue) => issue.code === 'TOO_LONG');
         const revisionInputRevisionRefs = buildScriptInputRevisionRefs(reviewState, episodeNumber);
         const revisionUpstreamArtifactRefs = [currentCandidateRef, currentReviewRef];
-        const revisionPromptVersion = 'script-revision-patch-v3';
+        const revisionPromptVersion = 'script-revision-patch-v4';
         const revisionInputFingerprint = computeScriptCheckpointInputFingerprint({
           node: 'revision',
           inputRevisionRefs: revisionInputRevisionRefs,
@@ -1927,13 +2059,18 @@ export class ScriptDirector {
         let revisionCheckpointRevision: number | undefined;
         const rejectRevisionPatch = async (
           error: ScriptRevisionPatchError,
+          structuredValidationErrors: readonly ScriptCheckpointValidationError[] = [],
         ): Promise<never> => {
+          const safeErrorMessage = redactRevisionValidationMessage(
+            'REVISION_PATCH_REJECTED',
+            error.message,
+          );
           const patchIssue: ScriptEvaluatedGateIssue = {
             code: 'REVISION_PATCH_REJECTED',
             severity: 'hard',
             source: 'deterministic',
             blocking: true,
-            message: error.message,
+            message: safeErrorMessage,
             path: 'revision.operations',
           };
           report = {
@@ -1950,11 +2087,13 @@ export class ScriptDirector {
             upstreamArtifactRefs: revisionUpstreamArtifactRefs,
             promptVersion: revisionPromptVersion,
             configRevision,
-            validationErrors: [{
-              path: 'revision.operations',
-              code: patchIssue.code,
-              message: patchIssue.message,
-            }],
+            validationErrors: structuredValidationErrors.length > 0
+              ? structuredValidationErrors
+              : [{
+                  path: 'revision.operations',
+                  code: patchIssue.code,
+                  message: patchIssue.message,
+                }],
             createdAt: this.now(),
           }, 'patched', draft!);
           const rejectedRevision = await this.nextCheckpointArtifactRevision(
@@ -2002,7 +2141,7 @@ export class ScriptDirector {
           }
         }
         if (!patchedArtifact) {
-          let revisionPolicy;
+          let revisionPolicy: ScriptRevisionPatchPolicy | undefined;
           try {
             revisionPolicy = buildScriptRevisionPatchPolicy(
               draft,
@@ -2013,53 +2152,59 @@ export class ScriptDirector {
             if (!(error instanceof ScriptRevisionPatchError)) throw error;
             await rejectRevisionPatch(error);
           }
-          const patch = await this.generateNodeStructured({
-            node: 'revision',
-            projectId: request.projectId,
-            episodeNumber,
-            prompt: [
-              '你是 ScriptRevisionAgent。只返回版本化 Patch JSON，不得返回完整 Episode。',
-              '顶层严格为 {"operations":[...]}。允许操作只有 replaceBlockText、insertBlockAfter、appendBlock、updateSceneCharacters。',
-              '禁止删除场景或正文块、重排场景、替换整集、修改集号/outlineId/既有 id，禁止触碰未被阻断错误定位的内容。',
-              'replaceBlockText 使用 {"op":"replaceBlockText","sceneId":"...","blockId":"...","text":"..."}；insertBlockAfter 使用 {"op":"insertBlockAfter","sceneId":"...","afterBlockId":"...","block":{"type":"action","text":"..."}}；appendBlock 与之类似；updateSceneCharacters 只更新 characterIds。',
-              expansionOnly
-                ? '本轮只修复 TOO_SHORT：operations 只能使用 insertBlockAfter 或 appendBlock 增写可拍摄内容，严禁替换、删减或缩短既有正文。'
-                : '只对阻断项做最小改动；除 TOO_LONG 外，修订后正文不得比当前候选更短。',
-              scriptRevisionLengthInstruction(
-                plan.targetCharsPerEpisode,
-                report.visibleChars,
-                hasTooLongIssue,
-              ),
-              `当前可见字符 ${report.visibleChars}，目标 ${plan.targetCharsPerEpisode}，合格范围 ${Math.ceil(plan.targetCharsPerEpisode * 0.85)}—${Math.floor(plan.targetCharsPerEpisode * 1.15)}。`,
-              `人物 ID 白名单：${JSON.stringify(state.characters.map((character) => character.id))}`,
-              `场景与正文块 ID 白名单：${JSON.stringify(draft.scenes.map((scene) => ({ sceneId: scene.id, characterIds: scene.characterIds, blockIds: scene.blocks.map((block) => block.id) })))}`,
-              `本集大纲：${JSON.stringify(outline)}`,
-              `阻断错误：${JSON.stringify(report.blockingIssues)}`,
-              rejectedRevisionFeedback.length > 0
-                ? `上次候选被系统拒绝：${JSON.stringify(rejectedRevisionFeedback)}。必须换一种满足白名单与长度保护的补丁，禁止重复该越界做法。`
-                : '',
-              `当前候选：${JSON.stringify(draft)}`,
-            ].filter(Boolean).join('\n'),
-            signal: request.signal,
-          }, SCRIPT_REVISION_PATCH_CONTRACT);
-          try {
+          if (!revisionPolicy) {
+            await rejectRevisionPatch(new ScriptRevisionPatchError('修订策略构造失败。'));
+          }
+          const exactRevisionPolicy = revisionPolicy as ScriptRevisionPatchPolicy;
+          const revisionBase = draft;
+          const minimumVisibleChars = Math.ceil(plan.targetCharsPerEpisode * 0.85);
+          const maximumVisibleChars = Math.floor(plan.targetCharsPerEpisode * 1.15);
+          const validateAndApplyRevisionPatch = (
+            patch: ScriptRevisionPatch,
+            createId: () => string,
+            updatedAt: string,
+          ): ScriptEpisode => {
             if (
               expansionOnly &&
               patch.operations.some((operation) =>
                 operation.op !== 'insertBlockAfter' && operation.op !== 'appendBlock')
             ) {
-              throw new ScriptRevisionPatchError('TOO_SHORT 修订只允许追加或插入正文块。');
+              throw new ScriptRevisionSemanticError(
+                'revision.policy',
+                'TOO_SHORT 修订只允许追加或插入正文块。',
+              );
             }
-            const visibleCharsBeforePatch = scriptVisibleChars(draft);
-            const applied = applyScriptRevisionPatch(
-              draft,
-              patch,
-              () => this.createId(),
-              revisionPolicy,
-            );
+            try {
+              assertScriptRevisionPatchAllowed(revisionBase, patch, exactRevisionPolicy);
+            } catch (error) {
+              if (!(error instanceof ScriptRevisionPatchError)) throw error;
+              throw new ScriptRevisionSemanticError('revision.policy', error.message);
+            }
+            let applied;
+            try {
+              // Policy is intentionally checked again by apply. The dynamic
+              // decoder is feedback, while this remains the mutation boundary.
+              applied = applyScriptRevisionPatch(revisionBase, patch, createId, exactRevisionPolicy);
+            } catch (error) {
+              if (!(error instanceof ScriptRevisionPatchError)) throw error;
+              throw new ScriptRevisionSemanticError('revision.apply', error.message);
+            }
+            const visibleCharsBeforePatch = scriptVisibleChars(revisionBase);
             const visibleCharsAfterPatch = scriptVisibleChars(applied.episode);
-            const minimumVisibleChars = Math.ceil(plan.targetCharsPerEpisode * 0.85);
-            const maximumVisibleChars = Math.floor(plan.targetCharsPerEpisode * 1.15);
+            if (
+              hasTooShortIssue &&
+              (
+                visibleCharsAfterPatch <= visibleCharsBeforePatch ||
+                visibleCharsAfterPatch < minimumVisibleChars ||
+                visibleCharsAfterPatch > maximumVisibleChars
+              )
+            ) {
+              throw new ScriptRevisionSemanticError(
+                'revision.length',
+                `TOO_SHORT 修订必须增加正文并一次落入 ${minimumVisibleChars}—${maximumVisibleChars} 字；` +
+                `当前由 ${visibleCharsBeforePatch} 字变为 ${visibleCharsAfterPatch} 字。`,
+              );
+            }
             if (
               hasTooLongIssue &&
               (
@@ -2068,33 +2213,125 @@ export class ScriptDirector {
                 visibleCharsAfterPatch > maximumVisibleChars
               )
             ) {
-              throw new ScriptRevisionPatchError(
+              throw new ScriptRevisionSemanticError(
+                'revision.length',
                 `TOO_LONG 修订必须缩短正文并一次落入 ${minimumVisibleChars}—${maximumVisibleChars} 字；` +
                 `当前由 ${visibleCharsBeforePatch} 字变为 ${visibleCharsAfterPatch} 字。`,
               );
             }
             if (
               visibleCharsAfterPatch < visibleCharsBeforePatch &&
-              !hasTooLongIssue
+              !hasTooLongIssue &&
+              !hasTooShortIssue
             ) {
-              throw new ScriptRevisionPatchError('修订无权缩短未超长的候选正文。');
+              throw new ScriptRevisionSemanticError(
+                'revision.length',
+                '修订无权缩短未超长的候选正文。',
+              );
             }
-            draft = {
+            const candidate = {
               ...applied.episode,
               summary: review.summary,
               newFacts: review.newFacts,
               openedThreads: review.openedThreads,
               closedThreads: review.closedThreads,
-              updatedAt: this.now(),
+              updatedAt,
             };
             try {
-              draft = this.canonicalEpisodeCandidate(draft, plan, episodeNumber);
+              return this.canonicalEpisodeCandidate(candidate, plan, episodeNumber);
             } catch (error) {
               if (error instanceof ScriptModelOutputError) {
-                throw new ScriptRevisionPatchError(`修订候选未通过统一输入校验：${error.message}`);
+                throw new ScriptRevisionSemanticError(
+                  'revision.canonical',
+                  `修订候选未通过统一输入校验：${error.message}`,
+                );
               }
               throw error;
             }
+          };
+          const revisionContract = defineStructuredContract<ScriptRevisionPatch>({
+            name: SCRIPT_REVISION_PATCH_CONTRACT.name,
+            version: 2,
+            instructions: [
+              SCRIPT_REVISION_PATCH_CONTRACT.instructions,
+              '本轮还必须通过精确 revisionPolicy、Patch 应用、总字数和 canonical Episode 校验；失败时必须按校验错误修正同一个完整 Patch。',
+            ].join('\n'),
+            decode(value) {
+              const decoded = SCRIPT_REVISION_PATCH_CONTRACT.decode(value);
+              if (!decoded.success) return decoded;
+              try {
+                validateAndApplyRevisionPatch(
+                  decoded.value,
+                  deterministicRevisionValidationIdFactory(revisionBase),
+                  revisionBase.updatedAt,
+                );
+                return decoded;
+              } catch (error) {
+                if (!(error instanceof ScriptRevisionSemanticError)) throw error;
+                return {
+                  success: false,
+                  issues: [{
+                    path: ['operations'],
+                    code: error.validationCode,
+                    message: error.message,
+                  }],
+                };
+              }
+            },
+          });
+          const revisionPrompt = [
+            '你是 ScriptRevisionAgent。只返回版本化 Patch JSON，不得返回完整 Episode。',
+            '顶层严格为 {"operations":[...]}。可用操作类型与锚点只认下方精确 revisionPolicy；未明确列出的操作一律禁止。',
+            '禁止删除场景或正文块、重排场景、替换整集、修改集号/outlineId/既有 id，禁止触碰未被阻断错误定位的内容。',
+            'replaceBlockText 使用 {"op":"replaceBlockText","sceneId":"...","blockId":"...","text":"..."}；insertBlockAfter 使用 {"op":"insertBlockAfter","sceneId":"...","afterBlockId":"...","block":{"type":"action","text":"..."}}；appendBlock 与之类似；updateSceneCharacters 只更新 characterIds。',
+            expansionOnly
+              ? '本轮只修复 TOO_SHORT：operations 只能使用精确策略授权的 insertBlockAfter 或 appendBlock 增写可拍摄内容，严禁替换、删减或缩短既有正文。'
+              : '只对阻断项做最小改动；除 TOO_LONG 外，修订后正文不得比当前候选更短。',
+            scriptRevisionLengthInstruction(
+              plan.targetCharsPerEpisode,
+              report.visibleChars,
+              hasTooLongIssue,
+            ),
+            ...revisionPolicyPromptContext(
+              revisionBase,
+              exactRevisionPolicy,
+              plan.targetCharsPerEpisode,
+            ),
+            `人物 ID 白名单：${JSON.stringify(state.characters.map((character) => character.id))}`,
+            `本集大纲：${JSON.stringify(outline)}`,
+            `阻断错误：${JSON.stringify(report.blockingIssues)}`,
+            rejectedRevisionFeedback.length > 0
+              ? `上次候选被系统拒绝：${JSON.stringify(rejectedRevisionFeedback)}。必须根据反馈换一种满足精确策略与长度保护的补丁，禁止重复该越界做法。`
+              : '',
+            `当前候选：${JSON.stringify(revisionBase)}`,
+          ].filter(Boolean).join('\n');
+          let patch!: ScriptRevisionPatch;
+          try {
+            patch = await this.generateNodeStructured({
+              node: 'revision',
+              projectId: request.projectId,
+              episodeNumber,
+              prompt: revisionPrompt,
+              signal: request.signal,
+            }, revisionContract);
+          } catch (error) {
+            if (!(error instanceof ScriptStructuredNeedsReviewError) || error.node !== 'revision') {
+              throw error;
+            }
+            const structuredValidationErrors = sanitizedRevisionValidationErrors(error.cause);
+            const firstValidationError = structuredValidationErrors[0];
+            const feedback = firstValidationError
+              ? `${firstValidationError.code}: ${firstValidationError.message}`
+              : '修订补丁未通过结构与权限校验。';
+            await rejectRevisionPatch(
+              new ScriptRevisionPatchError(`修订补丁在固定调用预算内仍不合格：${feedback}`),
+              structuredValidationErrors,
+            );
+          }
+          try {
+            // Run the same semantic boundary again with real IDs immediately
+            // before the candidate artifact can be persisted.
+            draft = validateAndApplyRevisionPatch(patch, () => this.createId(), this.now());
             patchedArtifact = buildScriptEpisodeCandidateArtifact({
               projectId: request.projectId,
               episodeNumber,
@@ -2112,7 +2349,19 @@ export class ScriptDirector {
             }, 'patched', draft);
           } catch (error) {
             if (!(error instanceof ScriptRevisionPatchError)) throw error;
-            await rejectRevisionPatch(error);
+            await rejectRevisionPatch(
+              error,
+              error instanceof ScriptRevisionSemanticError
+                ? [{
+                    path: '$.operations',
+                    code: error.validationCode,
+                    message: redactRevisionValidationMessage(
+                      error.validationCode,
+                      error.message,
+                    ),
+                  }]
+                : [],
+            );
           }
           revisionCheckpointRevision = await this.nextCheckpointArtifactRevision(
             request.projectId,

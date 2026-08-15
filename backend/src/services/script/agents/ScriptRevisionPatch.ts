@@ -316,7 +316,7 @@ export const SCRIPT_REVISION_PATCH_CONTRACT = defineStructuredContract<ScriptRev
   version: 1,
   instructions: [
     '顶层只包含 operations 数组，必须返回完整 Patch。',
-    '允许 op：replaceBlockText、insertBlockAfter、appendBlock、updateSceneCharacters。',
+    'Patch 结构支持 op：replaceBlockText、insertBlockAfter、appendBlock、updateSceneCharacters；实际授权仅以本轮精确 revisionPolicy 为准。',
     '禁止删除场景/正文块、替换整集、修改集号、outlineId 或重排场景。',
   ].join('\n'),
   decode(value) {
