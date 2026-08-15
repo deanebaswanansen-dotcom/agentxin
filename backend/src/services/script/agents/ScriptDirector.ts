@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import type {
   ScriptCharacter,
+  ScriptBlock,
   ScriptEpisode,
   ScriptEpisodeCard,
   ScriptEpisodeOutline,
@@ -380,6 +381,239 @@ function scriptVisibleChars(episode: ScriptEpisode): number {
     .length;
 }
 
+interface ScriptTextComposition {
+  visibleChars: number;
+  dialogueChars: number;
+  nonDialogueChars: number;
+  dialogueDensityPercent: number;
+}
+
+type ScriptDraftExpansionBlock =
+  | {
+      sceneOrdinal: number;
+      type: 'action';
+      text: string;
+    }
+  | {
+      sceneOrdinal: number;
+      type: 'dialogue';
+      characterId: string;
+      speaker: string;
+      delivery?: string;
+      mode?: 'normal' | 'os' | 'vo';
+      text: string;
+    };
+
+interface ScriptDraftExpansion {
+  blocks: ScriptDraftExpansionBlock[];
+}
+
+function scriptTextComposition(episode: ScriptEpisode): ScriptTextComposition {
+  const blocks = episode.scenes.flatMap((scene) => scene.blocks);
+  const visibleChars = blocks.reduce(
+    (total, block) => total + visibleTextChars(block.text),
+    0,
+  );
+  const dialogueChars = blocks.reduce(
+    (total, block) => total + (block.type === 'dialogue' ? visibleTextChars(block.text) : 0),
+    0,
+  );
+  return {
+    visibleChars,
+    dialogueChars,
+    nonDialogueChars: visibleChars - dialogueChars,
+    dialogueDensityPercent: visibleChars === 0
+      ? 0
+      : Math.round(dialogueChars / visibleChars * 100),
+  };
+}
+
+function draftExpansionBudget(
+  episode: ScriptEpisode,
+  targetChars: number,
+  dialogueDensityPercent: number,
+  canAddDialogue: boolean,
+): {
+  current: ScriptTextComposition;
+  finalVisibleChars: number;
+  requestedVisibleChars: number;
+  requestedDialogueChars: number;
+  requestedNonDialogueChars: number;
+  requestedBlocks: number;
+  requestedDialogueBlocks: number;
+  requestedNonDialogueBlocks: number;
+} | undefined {
+  const ratioBoundaryEpsilon = 1e-9;
+  const current = scriptTextComposition(episode);
+  const minimumVisibleChars = Math.ceil(targetChars * 0.85);
+  const maximumVisibleChars = Math.floor(targetChars * 1.15);
+  const targetDialogueRatio = dialogueDensityPercent / 100;
+  const lowDialogueRatio = Math.max(0, (dialogueDensityPercent - 15) / 100);
+  const highDialogueRatio = Math.min(1, (dialogueDensityPercent + 15) / 100);
+  const minimumLengthForExistingDialogue = current.dialogueChars === 0
+    ? 0
+    : highDialogueRatio === 0
+      ? Number.POSITIVE_INFINITY
+      : Math.ceil(current.dialogueChars / highDialogueRatio - ratioBoundaryEpsilon);
+  const minimumLengthForExistingNonDialogue = current.nonDialogueChars === 0
+    ? 0
+    : lowDialogueRatio === 1
+      ? Number.POSITIVE_INFINITY
+      : Math.ceil(current.nonDialogueChars / (1 - lowDialogueRatio) - ratioBoundaryEpsilon);
+  const finalVisibleChars = Math.max(
+    targetChars,
+    minimumVisibleChars,
+    minimumLengthForExistingDialogue,
+    minimumLengthForExistingNonDialogue,
+  );
+  if (!Number.isFinite(finalVisibleChars) || finalVisibleChars > maximumVisibleChars) {
+    return undefined;
+  }
+  const minimumFinalDialogueChars = Math.max(
+    current.dialogueChars,
+    Math.ceil(finalVisibleChars * lowDialogueRatio - ratioBoundaryEpsilon),
+  );
+  const maximumFinalDialogueChars = Math.min(
+    finalVisibleChars - current.nonDialogueChars,
+    Math.floor(finalVisibleChars * highDialogueRatio + ratioBoundaryEpsilon),
+  );
+  if (minimumFinalDialogueChars > maximumFinalDialogueChars) return undefined;
+  const desiredDialogueChars = Math.min(
+    maximumFinalDialogueChars,
+    Math.max(
+      minimumFinalDialogueChars,
+      Math.round(finalVisibleChars * targetDialogueRatio),
+    ),
+  );
+  const requestedVisibleChars = finalVisibleChars - current.visibleChars;
+  const requestedDialogueChars = desiredDialogueChars - current.dialogueChars;
+  if (requestedDialogueChars > 0 && !canAddDialogue) return undefined;
+  const requestedNonDialogueChars = requestedVisibleChars - requestedDialogueChars;
+  const requestedBlocks = Math.max(1, Math.round(requestedVisibleChars / 40));
+  const requestedDialogueBlocks = requestedVisibleChars === 0
+    ? 0
+    : Math.round(requestedBlocks * requestedDialogueChars / requestedVisibleChars);
+  return {
+    current,
+    finalVisibleChars,
+    requestedVisibleChars,
+    requestedDialogueChars,
+    requestedNonDialogueChars,
+    requestedBlocks,
+    requestedDialogueBlocks,
+    requestedNonDialogueBlocks: requestedBlocks - requestedDialogueBlocks,
+  };
+}
+
+function allocateEvenly(total: number, count: number): number[] {
+  if (count < 1) return [];
+  const quotient = Math.floor(total / count);
+  const remainder = total % count;
+  return Array.from(
+    { length: count },
+    (_, index) => quotient + (index < remainder ? 1 : 0),
+  );
+}
+
+function allocateWeighted(total: number, weights: readonly number[]): number[] {
+  if (weights.length === 0) return [];
+  if (total <= 0) return weights.map(() => 0);
+  const normalizedWeights = weights.map((weight) =>
+    Number.isFinite(weight) && weight > 0 ? weight : 0
+  );
+  const weightTotal = normalizedWeights.reduce((sum, weight) => sum + weight, 0);
+  if (weightTotal === 0) return allocateEvenly(total, weights.length);
+  const exact = normalizedWeights.map((weight) => total * weight / weightTotal);
+  const allocated = exact.map(Math.floor);
+  let remainder = total - allocated.reduce((sum, value) => sum + value, 0);
+  const priority = exact
+    .map((value, index) => ({ index, fraction: value - Math.floor(value) }))
+    .sort((left, right) => right.fraction - left.fraction || left.index - right.index);
+  for (const item of priority) {
+    if (remainder <= 0) break;
+    allocated[item.index] = (allocated[item.index] ?? 0) + 1;
+    remainder -= 1;
+  }
+  return allocated;
+}
+
+function normalizedExpansionDialogue(value: string): string {
+  return value.toLocaleLowerCase('zh-CN').replace(/[\s\p{P}\p{S}]/gu, '');
+}
+
+function expansionDialogueSimilarity(left: string, right: string): number {
+  if (left === right) return left.length === 0 ? 0 : 1;
+  if (left.length === 0 || right.length === 0) return 0;
+  let previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let row = 1; row <= left.length; row += 1) {
+    const current = [row];
+    for (let column = 1; column <= right.length; column += 1) {
+      const cost = left[row - 1] === right[column - 1] ? 0 : 1;
+      current[column] = Math.min(
+        (current[column - 1] ?? 0) + 1,
+        (previous[column] ?? 0) + 1,
+        (previous[column - 1] ?? 0) + cost,
+      );
+    }
+    previous = current;
+  }
+  const distance = previous[right.length] ?? Math.max(left.length, right.length);
+  return 1 - distance / Math.max(left.length, right.length);
+}
+
+function applyDraftExpansion(
+  base: ScriptEpisode,
+  expansion: ScriptDraftExpansion,
+  createId: () => string,
+): ScriptEpisode {
+  const episode = structuredClone(base);
+  const finalScene = episode.scenes.at(-1);
+  const insertionAnchorBySceneOrdinal = new Map(
+    episode.scenes.map((scene) => {
+      const protectedTailLength = scene === finalScene ? Math.min(2, scene.blocks.length) : 1;
+      return [
+        scene.ordinal,
+        protectedTailLength > 0 ? scene.blocks.at(-protectedTailLength)?.id : undefined,
+      ] as const;
+    }),
+  );
+  const existingIds = new Set(
+    episode.scenes.flatMap((scene) => scene.blocks.map((block) => block.id)),
+  );
+  for (const input of expansion.blocks) {
+    const scene = episode.scenes.find((candidate) => candidate.ordinal === input.sceneOrdinal);
+    if (!scene) {
+      throw new ScriptModelOutputError(`增量正文引用了不存在的场号 ${input.sceneOrdinal}。`);
+    }
+    const id = createId();
+    if (!id || existingIds.has(id)) {
+      throw new ScriptModelOutputError(`增量正文块 ID 冲突: ${id || '空 ID'}。`);
+    }
+    existingIds.add(id);
+    const block: ScriptBlock = input.type === 'dialogue'
+      ? {
+          id,
+          type: 'dialogue',
+          characterId: input.characterId,
+          speaker: input.speaker,
+          ...(input.delivery ? { delivery: input.delivery } : {}),
+          ...(input.mode ? { mode: input.mode } : {}),
+          text: input.text,
+        }
+      : { id, type: 'action', text: input.text };
+    const insertionAnchorId = insertionAnchorBySceneOrdinal.get(scene.ordinal);
+    if (insertionAnchorId) {
+      const insertionIndex = scene.blocks.findIndex((candidate) => candidate.id === insertionAnchorId);
+      if (insertionIndex >= 0) {
+        scene.blocks.splice(insertionIndex, 0, block);
+        continue;
+      }
+    }
+    scene.blocks.push(block);
+  }
+  return episode;
+}
+
 function gateDecodeIssues(
   issues: readonly ScriptGateIssue[],
 ): StructuredDecodeIssue[] {
@@ -485,9 +719,9 @@ function deterministicRevisionValidationIdFactory(base: ScriptEpisode): () => st
   };
 }
 
-function redactRevisionValidationMessage(code: string, message: string): string {
+function redactStructuredValidationMessage(code: string, message: string): string {
   if (code === 'model.call_failed' || code === 'contract.decode_threw') {
-    return '修订模型调用或契约执行失败；提供方详情未写入检查点。';
+    return '模型调用或结构契约执行失败；提供方详情未写入检查点。';
   }
   return message
     .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/giu, '[REDACTED]')
@@ -495,7 +729,11 @@ function redactRevisionValidationMessage(code: string, message: string): string 
     .slice(0, 500);
 }
 
-function sanitizedRevisionValidationErrors(
+function redactRevisionValidationMessage(code: string, message: string): string {
+  return redactStructuredValidationMessage(code, message);
+}
+
+function sanitizedStructuredValidationErrors(
   error: StructuredGenerationError,
 ): ScriptCheckpointValidationError[] {
   const sanitized = [
@@ -506,8 +744,8 @@ function sanitizedRevisionValidationErrors(
       ? { path: issue.path.reduce<string>((path, segment) =>
           typeof segment === 'number' ? `${path}[${segment}]` : `${path}.${segment}`, '$') }
       : {}),
-    code: /^[A-Za-z0-9_.-]{1,80}$/u.test(issue.code) ? issue.code : 'revision.invalid',
-    message: redactRevisionValidationMessage(issue.code, issue.message),
+    code: /^[A-Za-z0-9_.-]{1,80}$/u.test(issue.code) ? issue.code : 'structured.invalid',
+    message: redactStructuredValidationMessage(issue.code, issue.message),
   }));
   const unique = [...new Map(sanitized.map((issue) => [
     JSON.stringify(issue),
@@ -1816,7 +2054,7 @@ export class ScriptDirector {
       );
       episodeUpstreamRefs.push(scenePlanRef);
       const draftInputRevisionRefs = buildScriptInputRevisionRefs(state, episodeNumber);
-      const draftPromptVersion = 'episode-draft-v3';
+      const draftPromptVersion = 'episode-draft-v4';
       const currentEpisodeRevision = state.episodes.find(
         (episode) => episode.episodeNumber === episodeNumber,
       )?.revision ?? 0;
@@ -1829,9 +2067,14 @@ export class ScriptDirector {
       });
       let draftArtifact: ScriptEpisodeCandidateArtifact | undefined;
       let draftCheckpointRevision: number | undefined;
+      let rejectedDraftFeedback: readonly ScriptCheckpointValidationError[] = [];
+      let resumedRejectedDraftCheckpoint: ScriptPipelineCheckpoint | undefined;
+      let sourceDraftCheckpoint: ScriptPipelineCheckpoint | undefined;
+      let expansionBaseCheckpoint: ScriptPipelineCheckpoint | undefined;
       let draft = state.episodes.find(
         (episode) => episode.episodeNumber === episodeNumber && episode.status === 'reviewing',
       );
+      const preflightFreshDraft = !draft;
       if (!draft) {
         const currentEpisode = state.episodes.find((item) => item.episodeNumber === episodeNumber);
         const storedDraft = await this.latestCheckpoint(
@@ -1841,7 +2084,11 @@ export class ScriptDirector {
         );
         if (storedDraft) {
           const decision = decideScriptCheckpointResume(storedDraft, draftInputFingerprint);
-          if (decision.disposition === 'reuse' && storedDraft.artifact !== undefined) {
+          const reusableArtifact = decision.disposition === 'reuse' || (
+            decision.disposition === 'resume' &&
+            (storedDraft.status === 'needs_review' || storedDraft.status === 'running')
+          );
+          if (reusableArtifact && storedDraft.artifact !== undefined) {
             try {
               draftArtifact = decodeScriptEpisodeCandidateArtifact(storedDraft.artifact, {
                 projectId: request.projectId,
@@ -1854,7 +2101,13 @@ export class ScriptDirector {
                 plan,
                 episodeNumber,
               );
-              draftCheckpointRevision = storedDraft.artifactRevision;
+              sourceDraftCheckpoint = storedDraft;
+              if (decision.disposition === 'reuse') {
+                draftCheckpointRevision = storedDraft.artifactRevision;
+              } else if (storedDraft.status === 'needs_review') {
+                rejectedDraftFeedback = storedDraft.validationErrors;
+                resumedRejectedDraftCheckpoint = storedDraft;
+              }
             } catch {
               await this.markCheckpointStale(storedDraft);
               draftArtifact = undefined;
@@ -1889,7 +2142,7 @@ export class ScriptDirector {
             version: 2,
             instructions: [
               '必须返回完整单集对象；scenes、每场 blocks 及所有正文块的类型必填字段不可省略。',
-              '完整候选还必须一次通过确定性质量门，包括目标字数、场景人物与对白人物一致性。失败时必须返回完整替代 Episode，不得返回 Patch。',
+              '完整候选必须通过字段、场景人物与对白人物一致性等确定性结构门。若仅正文偏短，系统会保留结构基稿并另行增量扩写，不要求整集重写。',
             ].join('\n'),
             decode: (value) => {
               let candidate: ScriptEpisode;
@@ -1913,9 +2166,21 @@ export class ScriptDirector {
                 };
               }
               const gate = deterministicEpisodeGate(candidate);
+              const hasTooShortIssue = gate.blockingIssues.some(
+                (issue) => issue.code === 'TOO_SHORT',
+              );
+              const canIncrementallyExpand = hasTooShortIssue && draftExpansionBudget(
+                candidate,
+                plan.targetCharsPerEpisode,
+                plan.dialogueDensityPercent,
+                candidate.scenes.some((scene) => scene.characterIds.length > 0),
+              ) !== undefined;
               const draftGateIssues = [
-                ...gate.blockingIssues,
+                ...gate.blockingIssues.filter((issue) =>
+                  issue.code !== 'TOO_SHORT' || !canIncrementallyExpand
+                ),
                 ...gate.issues.filter((issue) =>
+                  !canIncrementallyExpand &&
                   issue.code === 'DIALOGUE_DENSITY' &&
                   !gate.blockingIssues.includes(issue)
                 ),
@@ -1935,6 +2200,423 @@ export class ScriptDirector {
         }
       }
       draft = this.canonicalEpisodeCandidate(draft, plan, episodeNumber);
+      const draftPreflightReport = deterministicEpisodeGate(draft);
+      const draftPreflightExpansionBudget = draftExpansionBudget(
+        draft,
+        plan.targetCharsPerEpisode,
+        plan.dialogueDensityPercent,
+        draft.scenes.some((scene) => scene.characterIds.length > 0),
+      );
+      if (
+        preflightFreshDraft &&
+        draftPreflightReport.blockingIssues.some((issue) => issue.code === 'TOO_SHORT') &&
+        draftPreflightExpansionBudget
+      ) {
+        const expansionBase = draft;
+        const expansionBudget = draftPreflightExpansionBudget;
+        expansionBaseCheckpoint = sourceDraftCheckpoint;
+        if (!expansionBaseCheckpoint) {
+          const baseValidationErrors = draftPreflightReport.issues
+            .filter((issue) => issue.code === 'TOO_SHORT' || issue.code === 'DIALOGUE_DENSITY')
+            .map((issue) => ({
+              ...(issue.path ? { path: issue.path } : {}),
+              code: issue.code,
+              message: issue.message,
+            }));
+          const baseArtifact = buildScriptEpisodeCandidateArtifact({
+            projectId: request.projectId,
+            episodeNumber,
+            baseEpisodeRevision: currentEpisodeRevision,
+            inputRevisionRefs: draftInputRevisionRefs,
+            upstreamArtifactRefs: [scenePlanRef],
+            promptVersion: draftPromptVersion,
+            configRevision,
+            validationErrors: baseValidationErrors,
+            createdAt: this.now(),
+          }, 'draft', expansionBase);
+          const baseRevision = await this.nextCheckpointArtifactRevision(
+            request.projectId,
+            runKey,
+            { node: 'draft', episodeNumber },
+          );
+          await this.saveCheckpoint(request, {
+            projectId: request.projectId,
+            runKey,
+            node: 'draft',
+            status: 'running',
+            attempt: 1,
+            artifactRevision: baseRevision,
+            episodeNumber,
+            artifact: baseArtifact,
+            ...checkpointArtifactMetadata(baseArtifact),
+            updatedAt: this.now(),
+          }, `第 ${episodeNumber} 集结构基稿已写入检查点，开始增量扩写。`);
+          expansionBaseCheckpoint = await this.latestCheckpoint(
+            request.projectId,
+            runKey,
+            { node: 'draft', episodeNumber },
+          );
+          if (expansionBaseCheckpoint?.artifactRevision !== baseRevision) {
+            throw new ScriptModelOutputError('结构基稿检查点写入后无法读取。');
+          }
+          draftArtifact = baseArtifact;
+          draftCheckpointRevision = baseRevision;
+          request.signal?.throwIfAborted();
+        }
+        const dialogueCharactersByScene = expansionBase.scenes.map((scene) =>
+          scene.characterIds.flatMap((characterId) => {
+            const character = state.characters.find((item) => item.id === characterId);
+            return character ? [{ id: character.id, name: character.name }] : [];
+          })
+        );
+        const dialogueSceneIndexes = dialogueCharactersByScene
+          .map((characters, index) => characters.length > 0 ? index : -1)
+          .filter((index) => index >= 0);
+        const sceneCompositions = expansionBase.scenes.map((scene) => {
+          const visibleChars = scene.blocks.reduce(
+            (total, block) => total + visibleTextChars(block.text),
+            0,
+          );
+          const dialogueChars = scene.blocks.reduce(
+            (total, block) => total + (block.type === 'dialogue'
+              ? visibleTextChars(block.text)
+              : 0),
+            0,
+          );
+          return { visibleChars, dialogueChars, nonDialogueChars: visibleChars - dialogueChars };
+        });
+        // Give every planned scene a comparable final footprint, then allocate
+        // only the missing dialogue/action. This lets a thin scene catch up
+        // instead of preserving and amplifying a lopsided base draft.
+        const finalVisibleByScene = allocateEvenly(
+          expansionBudget.finalVisibleChars,
+          sceneCompositions.length,
+        );
+        const targetDialogueRatio = plan.dialogueDensityPercent / 100;
+        const dialogueGaps = dialogueSceneIndexes.map((sceneIndex) => Math.max(
+          0,
+          Math.round((finalVisibleByScene[sceneIndex] ?? 0) * targetDialogueRatio) -
+            (sceneCompositions[sceneIndex]?.dialogueChars ?? 0),
+        ));
+        const dialogueWeights = dialogueGaps.some((gap) => gap > 0)
+          ? dialogueGaps
+          : dialogueSceneIndexes.map((sceneIndex) =>
+              Math.max(1, sceneCompositions[sceneIndex]?.visibleChars ?? 0)
+            );
+        const dialogueAllocations = allocateWeighted(
+          expansionBudget.requestedDialogueChars,
+          dialogueWeights,
+        );
+        const dialogueByScene = Array.from(
+          { length: expansionBase.scenes.length },
+          () => 0,
+        );
+        dialogueSceneIndexes.forEach((sceneIndex, allocationIndex) => {
+          dialogueByScene[sceneIndex] = dialogueAllocations[allocationIndex] ?? 0;
+        });
+        const nonDialogueGaps = sceneCompositions.map((composition, index) => {
+          const eligibleForDialogue = dialogueCharactersByScene[index]?.length;
+          const targetDialogueChars = eligibleForDialogue
+            ? Math.round((finalVisibleByScene[index] ?? 0) * targetDialogueRatio)
+            : 0;
+          const targetNonDialogueChars = (finalVisibleByScene[index] ?? 0) - targetDialogueChars;
+          return Math.max(0, targetNonDialogueChars - composition.nonDialogueChars);
+        });
+        const nonDialogueWeights = nonDialogueGaps.some((gap) => gap > 0)
+          ? nonDialogueGaps
+          : sceneCompositions.map((composition) => Math.max(1, composition.visibleChars));
+        const nonDialogueByScene = allocateWeighted(
+          expansionBudget.requestedNonDialogueChars,
+          nonDialogueWeights,
+        );
+        const sceneBudgets = expansionBase.scenes.map((scene, index) => ({
+          sceneOrdinal: scene.ordinal,
+          dialogueChars: dialogueByScene[index] ?? 0,
+          nonDialogueChars: nonDialogueByScene[index] ?? 0,
+          visibleChars: (dialogueByScene[index] ?? 0) + (nonDialogueByScene[index] ?? 0),
+          approximatelyBlocks: (dialogueByScene[index] ?? 0) + (nonDialogueByScene[index] ?? 0) === 0
+            ? 0
+            : Math.max(
+                1,
+                Math.round(((dialogueByScene[index] ?? 0) + (nonDialogueByScene[index] ?? 0)) / 40),
+              ),
+          allowedDialogueCharacters: dialogueCharactersByScene[index] ?? [],
+        }));
+        const baseCombinedText = expansionBase.scenes
+          .flatMap((scene) => scene.blocks)
+          .map((block) => block.text)
+          .join('\n');
+        const missingRequiredFacts = outline.requiredFacts
+          .map((fact) => fact.trim())
+          .filter((fact) => fact && !baseCombinedText.includes(fact));
+        const expansionPrompt = [
+          '你是 ScriptDraftExpansionAgent。保留现有结构基稿，只返回分场增量 blocks；不得重写或复述完整 Episode。',
+          '严格顶层模板：{"blocks":[...]}。每项只允许 action 或 dialogue，并必须包含 sceneOrdinal、type、text；dialogue 还必须包含本场已登记人物的 characterId、speaker，可选 delivery、mode(normal|os|vo)。',
+          'blocks.text 只写新增正文内容：action 不带“△”；dialogue 不重复说话人或冒号。每个 text 写成约 30—50 个可见字符的完整可拍摄动作或有对抗性的对白。',
+          '新增内容必须推进本集既有冲突和节拍，不得引入大纲外事实；仅正增量预算的场必须获得 blocks。系统会把增量插在每场原场尾块之前，最后一场则插在原末两个卡点块之前，原转场与卡点顺序不得改变。',
+          `当前基稿共 ${expansionBudget.current.visibleChars} 字：对白 ${expansionBudget.current.dialogueChars} 字（${expansionBudget.current.dialogueDensityPercent}%），非对白 ${expansionBudget.current.nonDialogueChars} 字。`,
+          `精确扩写目标：新增共 ${expansionBudget.requestedVisibleChars} 字，其中对白 ${expansionBudget.requestedDialogueChars} 字、非对白 ${expansionBudget.requestedNonDialogueChars} 字；约 ${expansionBudget.requestedBlocks} 个块（对白约 ${expansionBudget.requestedDialogueBlocks} 块、动作约 ${expansionBudget.requestedNonDialogueBlocks} 块）。`,
+          `扩写后总正文以 ${expansionBudget.finalVisibleChars} 字、对白 ${plan.dialogueDensityPercent}% 为目标，并必须通过 ${Math.ceil(plan.targetCharsPerEpisode * 0.85)}—${Math.floor(plan.targetCharsPerEpisode * 1.15)} 字硬范围。`,
+          `各场精确分配与对白白名单：${JSON.stringify(sceneBudgets)}`,
+          rejectedDraftFeedback.length > 0
+            ? `上次增量候选被系统拒绝：${JSON.stringify(rejectedDraftFeedback)}。必须依据实际差额调整新增 blocks，禁止再次返回同样不足的结果。`
+            : '',
+          `本集大纲：${JSON.stringify(outline)}`,
+          `基稿尚未命中的 requiredFacts（必须由增量正文明确补齐）：${JSON.stringify(missingRequiredFacts)}`,
+          `压缩创作上下文（人物身份/口吻、世界规则/地点/禁忌、上集与连续性）：\n${this.assembleEpisodeContext(state, plan, outline, episodeNumber)}`,
+          `不可改写的结构基稿：${JSON.stringify(expansionBase)}`,
+        ].filter(Boolean).join('\n');
+
+        const parseExpansion = (value: unknown): ScriptDraftExpansion => {
+          const root = recordField(value, 'episode_draft_expansion');
+          if (!Array.isArray(root.blocks) || root.blocks.length === 0) {
+            throw new ScriptModelOutputError('增量正文 blocks 必须是非空数组。');
+          }
+          const blocks = root.blocks.map((candidate, index): ScriptDraftExpansionBlock => {
+            const block = recordField(candidate, `blocks.${index}`);
+            const sceneOrdinal = numberField(block.sceneOrdinal, `blocks.${index}.sceneOrdinal`);
+            if (!Number.isInteger(sceneOrdinal) || sceneOrdinal < 1) {
+              throw new ScriptModelOutputError(`增量正文字段 blocks.${index}.sceneOrdinal 必须是正整数。`);
+            }
+            const type = enumField(block.type, `blocks.${index}.type`, ['action', 'dialogue'] as const);
+            const text = stringField(block.text, `blocks.${index}.text`);
+            if (type === 'action') return { sceneOrdinal, type, text };
+            return {
+              sceneOrdinal,
+              type,
+              characterId: stringField(block.characterId, `blocks.${index}.characterId`),
+              speaker: stringField(block.speaker, `blocks.${index}.speaker`),
+              ...(optionalStringField(block.delivery)
+                ? { delivery: optionalStringField(block.delivery) }
+                : {}),
+              ...(block.mode === undefined
+                ? {}
+                : { mode: enumField(block.mode, `blocks.${index}.mode`, ['normal', 'os', 'vo'] as const) }),
+              text,
+            };
+          });
+          return { blocks };
+        };
+
+        const assessExpansion = (
+          expansion: ScriptDraftExpansion,
+          createId: () => string,
+          updatedAt: string,
+        ): {
+          candidate: ScriptEpisode;
+          issues: StructuredDecodeIssue[];
+        } => {
+          const missingScene = sceneBudgets.find((budget) =>
+            budget.visibleChars > 0 &&
+            !expansion.blocks.some((block) => block.sceneOrdinal === budget.sceneOrdinal)
+          );
+          if (missingScene) {
+            return {
+              candidate: expansionBase,
+              issues: [{
+                path: ['blocks'],
+                code: 'EXPANSION_SCENE_MISSING',
+                message: `第 ${missingScene.sceneOrdinal} 场有正增量预算但没有获得正文。`,
+              }],
+            };
+          }
+          const knownDialogue = expansionBase.scenes
+            .flatMap((scene) => scene.blocks)
+            .filter((block) => block.type === 'dialogue')
+            .map((block) => normalizedExpansionDialogue(block.text))
+            .filter(Boolean);
+          const duplicateDialogue = expansion.blocks.find((block) => {
+            if (block.type !== 'dialogue') return false;
+            const normalized = normalizedExpansionDialogue(block.text);
+            if (!normalized) return false;
+            const duplicate = knownDialogue.some((existing) =>
+              expansionDialogueSimilarity(existing, normalized) > 0.92
+            );
+            knownDialogue.push(normalized);
+            return duplicate;
+          });
+          if (duplicateDialogue) {
+            return {
+              candidate: expansionBase,
+              issues: [{
+                path: ['blocks'],
+                code: 'EXPANSION_DUPLICATE_DIALOGUE',
+                message: '增量对白与基稿或另一条增量对白在规范化后重复。',
+              }],
+            };
+          }
+          let candidate: ScriptEpisode;
+          try {
+            candidate = this.canonicalEpisodeCandidate({
+              ...applyDraftExpansion(expansionBase, expansion, createId),
+              updatedAt,
+            }, plan, episodeNumber);
+          } catch (error) {
+            if (!(error instanceof ScriptModelOutputError)) throw error;
+            return {
+              candidate: expansionBase,
+              issues: [{
+                path: issuePathFromMessage(error.message),
+                code: 'EXPANSION_INVALID',
+                message: error.message,
+              }],
+            };
+          }
+          const composition = scriptTextComposition(candidate);
+          const actualDialogueChars = composition.dialogueChars - expansionBudget.current.dialogueChars;
+          const actualNonDialogueChars = composition.nonDialogueChars - expansionBudget.current.nonDialogueChars;
+          const actualVisibleChars = composition.visibleChars - expansionBudget.current.visibleChars;
+          const distributionIssues: StructuredDecodeIssue[] = sceneBudgets.flatMap((budget) => {
+            const blocks = expansion.blocks.filter(
+              (block) => block.sceneOrdinal === budget.sceneOrdinal,
+            );
+            const dialogueChars = blocks.reduce(
+              (total, block) => total + (block.type === 'dialogue'
+                ? visibleTextChars(block.text)
+                : 0),
+              0,
+            );
+            const nonDialogueChars = blocks.reduce(
+              (total, block) => total + (block.type === 'action'
+                ? visibleTextChars(block.text)
+                : 0),
+              0,
+            );
+            const misses = (
+              actual: number,
+              expected: number,
+            ): boolean => Math.abs(actual - expected) > Math.max(20, Math.round(expected * 0.2));
+            if (
+              !misses(dialogueChars, budget.dialogueChars) &&
+              !misses(nonDialogueChars, budget.nonDialogueChars)
+            ) return [];
+            return [{
+              path: ['blocks'],
+              code: 'EXPANSION_SCENE_BUDGET_MISS',
+              message: `第 ${budget.sceneOrdinal} 场要求对白/非对白 ${budget.dialogueChars}/${budget.nonDialogueChars} 字，实际 ${dialogueChars}/${nonDialogueChars} 字。`,
+            }];
+          });
+          const gate = deterministicEpisodeGate(candidate);
+          const gateIssues = [
+            ...gate.blockingIssues,
+            ...gate.issues.filter((issue) =>
+              issue.code === 'DIALOGUE_DENSITY' && !gate.blockingIssues.includes(issue)
+            ),
+          ];
+          if (gateIssues.length === 0 && distributionIssues.length === 0) {
+            return { candidate, issues: [] };
+          }
+          return {
+            candidate,
+            issues: [{
+              path: ['blocks'],
+              code: 'EXPANSION_BUDGET_MISS',
+              message: [
+                `要求新增总/对白/非对白 ${expansionBudget.requestedVisibleChars}/${expansionBudget.requestedDialogueChars}/${expansionBudget.requestedNonDialogueChars} 字`,
+                `实际新增 ${actualVisibleChars}/${actualDialogueChars}/${actualNonDialogueChars} 字`,
+                `扩写后共 ${composition.visibleChars} 字、对白 ${composition.dialogueDensityPercent}%`,
+              ].join('；'),
+            }, ...distributionIssues, ...gateDecodeIssues(gateIssues)],
+          };
+        };
+
+        const expansionContract = defineStructuredContract<ScriptDraftExpansion>({
+          name: 'episode_draft_expansion',
+          version: 1,
+          instructions: [
+            '只返回新增 blocks，不得返回完整 Episode 或修改既有块。',
+            '增量应用后必须同时通过总字数、对白密度、人物白名单及全部确定性硬门；失败时仍返回完整替代 blocks 数组。',
+          ].join('\n'),
+          decode: (value) => {
+            let expansion: ScriptDraftExpansion;
+            try {
+              expansion = parseExpansion(value);
+            } catch (error) {
+              if (!(error instanceof ScriptModelOutputError)) throw error;
+              return {
+                success: false,
+                issues: [{
+                  path: issuePathFromMessage(error.message),
+                  code: /缺少|必须/u.test(error.message) ? 'field.required' : 'field.invalid',
+                  message: error.message,
+                }],
+              };
+            }
+            const assessed = assessExpansion(
+              expansion,
+              deterministicRevisionValidationIdFactory(expansionBase),
+              expansionBase.updatedAt,
+            );
+            return assessed.issues.length > 0
+              ? { success: false, issues: assessed.issues }
+              : { success: true, value: expansion };
+          },
+        });
+
+        let expansion: ScriptDraftExpansion;
+        try {
+          expansion = await this.generateNodeStructured({
+            node: 'draft',
+            projectId: request.projectId,
+            episodeNumber,
+            prompt: expansionPrompt,
+            signal: request.signal,
+          }, expansionContract);
+        } catch (error) {
+          if (!(error instanceof ScriptStructuredNeedsReviewError) || error.node !== 'draft') {
+            throw error;
+          }
+          const validationErrors = [
+            ...draftPreflightReport.blockingIssues.map((issue) => ({
+              ...(issue.path ? { path: issue.path } : {}),
+              code: issue.code,
+              message: issue.message,
+            })),
+            ...sanitizedStructuredValidationErrors(error.cause),
+          ];
+          const rejectedArtifact = buildScriptEpisodeCandidateArtifact({
+            projectId: request.projectId,
+            episodeNumber,
+            baseEpisodeRevision: currentEpisodeRevision,
+            inputRevisionRefs: draftInputRevisionRefs,
+            upstreamArtifactRefs: [scenePlanRef],
+            promptVersion: draftPromptVersion,
+            configRevision,
+            validationErrors,
+            createdAt: this.now(),
+          }, 'draft', expansionBase);
+          const rejectedRevision = await this.nextCheckpointArtifactRevision(
+            request.projectId,
+            runKey,
+            { node: 'draft', episodeNumber },
+          );
+          await this.saveCheckpoint(request, {
+            projectId: request.projectId,
+            runKey,
+            node: 'draft',
+            status: 'needs_review',
+            attempt: (resumedRejectedDraftCheckpoint?.attempt ?? 0) + 1,
+            artifactRevision: rejectedRevision,
+            episodeNumber,
+            artifact: rejectedArtifact,
+            ...checkpointArtifactMetadata(rejectedArtifact),
+            updatedAt: this.now(),
+          }, `第 ${episodeNumber} 集增量扩写未达到篇幅与对白目标，已保留结构基稿。`);
+          if (expansionBaseCheckpoint) {
+            await this.markCheckpointStale(expansionBaseCheckpoint);
+          }
+          throw error;
+        }
+        const assessedExpansion = assessExpansion(expansion, () => this.createId(), this.now());
+        if (assessedExpansion.issues.length > 0) {
+          throw new ScriptModelOutputError('增量正文通过契约后在正式应用时失效。');
+        }
+        draft = assessedExpansion.candidate;
+        // A resumed needs-review artifact is the immutable base, not the final
+        // succeeded draft. The expanded candidate receives a new revision.
+        draftArtifact = undefined;
+        draftCheckpointRevision = undefined;
+      }
       draftArtifact ??= buildScriptEpisodeCandidateArtifact({
         projectId: request.projectId,
         episodeNumber,
@@ -1962,6 +2644,9 @@ export class ScriptDirector {
         ...checkpointArtifactMetadata(draftArtifact),
         updatedAt: this.now(),
       }, `第 ${episodeNumber} 集初稿候选已写入检查点，进入审查。`);
+      if (expansionBaseCheckpoint) {
+        await this.markCheckpointStale(expansionBaseCheckpoint);
+      }
       let currentCandidateRef = buildScriptUpstreamArtifactRef(
         'draft',
         draftCheckpointRevision,
@@ -2403,7 +3088,7 @@ export class ScriptDirector {
             if (!(error instanceof ScriptStructuredNeedsReviewError) || error.node !== 'revision') {
               throw error;
             }
-            const structuredValidationErrors = sanitizedRevisionValidationErrors(error.cause);
+            const structuredValidationErrors = sanitizedStructuredValidationErrors(error.cause);
             const firstValidationError = structuredValidationErrors[0];
             const feedback = firstValidationError
               ? `${firstValidationError.code}: ${firstValidationError.message}`
