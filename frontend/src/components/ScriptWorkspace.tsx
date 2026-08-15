@@ -325,6 +325,27 @@ const BLOCKING_JOB_STATUSES = new Set<ScriptAgentJobSnapshot['status']>([
   'waiting_user',
 ]);
 
+function summarizeEpisode(episode: ScriptEpisode): ScriptEpisodeSummary {
+  const visibleChars = episode.scenes.reduce(
+    (total, scene) => total + scene.blocks.reduce(
+      (sceneTotal, block) => sceneTotal + block.text.replace(/\s/gu, '').length,
+      0,
+    ),
+    0,
+  );
+  return {
+    id: episode.id,
+    episodeNumber: episode.episodeNumber,
+    title: episode.title,
+    status: episode.status,
+    targetChars: episode.targetChars,
+    visibleChars,
+    sceneCount: episode.scenes.length,
+    revision: episode.revision,
+    updatedAt: episode.updatedAt,
+  };
+}
+
 function jobResourceSignature(jobs: ScriptAgentJobSnapshot[]): string {
   return jobs
     .map((job) => [
@@ -1597,24 +1618,7 @@ export function ScriptWorkspace({
     setNotice('');
     try {
       const saved = await client.script.episodes.save(projectId, selectedEpisode.episodeNumber, selectedEpisode, selectedEpisode.revision);
-      const visibleChars = saved.scenes.reduce(
-        (total, scene) => total + scene.blocks.reduce(
-          (sceneTotal, block) => sceneTotal + block.text.replace(/\s/gu, '').length,
-          0,
-        ),
-        0,
-      );
-      const summary: ScriptEpisodeSummary = {
-        id: saved.id,
-        episodeNumber: saved.episodeNumber,
-        title: saved.title,
-        status: saved.status,
-        targetChars: saved.targetChars,
-        visibleChars,
-        sceneCount: saved.scenes.length,
-        revision: saved.revision,
-        updatedAt: saved.updatedAt,
-      };
+      const summary = summarizeEpisode(saved);
       const sameEpisodeStillSelected = selectedEpisodeRef.current?.episodeNumber === saved.episodeNumber;
       const unchangedWhileSaving = selectedEpisodeEditVersion.current === editVersion;
       const editorEpisode = sameEpisodeStillSelected && !unchangedWhileSaving
@@ -1661,6 +1665,10 @@ export function ScriptWorkspace({
     setNotice('');
     try {
       const result = await client.script.episodes.review(projectId, episodeNumber, data.reviewRevision);
+      const reviewedEpisode = result.report.hardFailed
+        ? undefined
+        : await client.script.episodes.get(projectId, episodeNumber);
+      const reviewedSummary = reviewedEpisode ? summarizeEpisode(reviewedEpisode) : undefined;
       setData((current) => current ? {
         ...current,
         reviewRevision: result.revision,
@@ -1668,8 +1676,26 @@ export function ScriptWorkspace({
           ...current.reviewIssues.filter((item) => item.episodeNumber !== episodeNumber),
           ...result.items,
         ],
+        episodes: reviewedSummary
+          ? current.episodes.some((item) => item.episodeNumber === episodeNumber)
+            ? current.episodes.map((item) => item.episodeNumber === episodeNumber ? reviewedSummary : item)
+            : [...current.episodes, reviewedSummary].sort((left, right) => left.episodeNumber - right.episodeNumber)
+          : current.episodes,
       } : current);
-      const hardCount = result.items.filter((item) => item.status === 'open' && item.severity === 'hard').length;
+      if (reviewedEpisode) {
+        setBatchEpisodes((current) => current.some((item) => item.episodeNumber === episodeNumber)
+          ? current.map((item) => item.episodeNumber === episodeNumber ? reviewedEpisode : item)
+          : current);
+        if (
+          selectedEpisodeRef.current?.episodeNumber === episodeNumber &&
+          !selectedEpisodeDirty.current
+        ) {
+          selectedEpisodeRef.current = reviewedEpisode;
+          selectedEpisodeEditVersion.current = 0;
+          setSelectedEpisode(reviewedEpisode);
+        }
+      }
+      const hardCount = result.items.filter(isBlockingReviewIssue).length;
       setNotice(hardCount > 0
         ? `第 ${episodeNumber} 集校稿完成：发现 ${hardCount} 个必须修复的硬性问题`
         : `第 ${episodeNumber} 集校稿完成：未发现阻断完成的硬性问题`);

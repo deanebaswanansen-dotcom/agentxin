@@ -242,6 +242,62 @@ describe('ScriptWorkspace', () => {
     expect(await screen.findByText('已修复')).toBeInTheDocument();
   });
 
+  it('refreshes a proofreading-reactivated episode and its completed status', async () => {
+    const client = createClient();
+    const reviewingEpisode = { ...buildEpisode('待复检正文', 2), status: 'reviewing' as const };
+    const completedEpisode = {
+      ...reviewingEpisode,
+      status: 'completed' as const,
+      revision: 3,
+      updatedAt: '2026-08-15T01:00:00.000Z',
+    };
+    Object.assign(client.script, {
+      workspace: {
+        get: vi.fn().mockResolvedValue(buildWorkspaceSnapshot({
+          episodeSummaries: [summarizeEpisode(reviewingEpisode)],
+          batchSummaries: [{
+            startEpisode: 1,
+            endEpisode: 5,
+            status: 'proofreading',
+            completedEpisodes: 0,
+            visibleChars: 5,
+            unresolvedHardIssues: 0,
+            unresolvedSoftIssues: 0,
+          }],
+        })),
+      },
+      reviews: { list: vi.fn(), save: vi.fn(), updateStatus: vi.fn() },
+    });
+    Object.assign(client.script.episodes, {
+      get: vi.fn().mockResolvedValue(completedEpisode),
+      review: vi.fn().mockResolvedValue({
+        revision: 1,
+        items: [],
+        report: {
+          hardFailed: false,
+          issues: [],
+          visibleChars: 5,
+          dialogueDensityPercent: 0,
+        },
+      }),
+    });
+
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
+    fireEvent.click(await screen.findByRole('button', { name: '校稿第 1 集' }));
+
+    await waitFor(() => expect(client.script.episodes.review).toHaveBeenCalledWith(
+      'project-1',
+      1,
+      0,
+    ));
+    await waitFor(() => expect(client.script.episodes.get).toHaveBeenCalledWith('project-1', 1));
+    expect(await screen.findByText(/已完成 · 5 字/)).toBeInTheDocument();
+    expect(screen.getByText('第 1 集校稿完成：未发现阻断完成的硬性问题')).toBeInTheDocument();
+  });
+
   it('loads jobs before the aggregate snapshot so a completed job cannot strand stale workspace data', async () => {
     const client = createClient();
     let resolveJobs!: (jobs: Awaited<ReturnType<typeof client.script.jobs.list>>) => void;
