@@ -12,8 +12,12 @@ import { getCurrentClientId } from '../client/clientScope.js';
 import { StoreError } from '../../store/StoreError.js';
 import type {
   ScriptCharacter,
+  ScriptCommitEpisodeWithContinuityInput,
+  ScriptCommitEpisodeWithContinuityResult,
   ScriptContinuityState,
   ScriptEpisode,
+  ScriptEpisodeContinuityCommit,
+  ScriptEpisodeContinuityCommitInput,
   ScriptEpisodeOutline,
   ScriptPlan,
   ScriptProjectState,
@@ -25,6 +29,9 @@ import type {
 } from './domain.js';
 import {
   assertExpectedRevision,
+  computeScriptEpisodeCandidateHash,
+  computeScriptInputFingerprint,
+  ScriptCommitConflictError,
   type ScriptStore,
 } from './ScriptStore.js';
 
@@ -42,6 +49,7 @@ function emptyState(projectId: string): ScriptProjectState {
     characters: [],
     episodeOutlines: [],
     episodes: [],
+    continuityCommits: [],
     continuity: {
       currentState: [],
       openThreads: [],
@@ -65,6 +73,12 @@ function normalizeState(value: unknown, projectId: string): ScriptProjectState {
     throw new StoreError(`短剧项目标识与文件名不一致: ${projectId}`);
   }
   const continuity = input.continuity;
+  const episodes = Array.isArray(input.episodes) ? clone(input.episodes) : [];
+  const continuityCommits = normalizeContinuityCommits(
+    input.continuityCommits,
+    projectId,
+    episodes,
+  );
   return {
     schemaVersion: 1,
     projectId,
@@ -75,7 +89,8 @@ function normalizeState(value: unknown, projectId: string): ScriptProjectState {
     episodeOutlines: Array.isArray(input.episodeOutlines)
       ? clone(input.episodeOutlines)
       : [],
-    episodes: Array.isArray(input.episodes) ? clone(input.episodes) : [],
+    episodes,
+    continuityCommits,
     continuity: {
       currentState: Array.isArray(continuity?.currentState)
         ? clone(continuity.currentState)
@@ -99,6 +114,214 @@ function normalizeState(value: unknown, projectId: string): ScriptProjectState {
         ? input.updatedAt
         : new Date(0).toISOString(),
   };
+}
+
+function normalizeContinuityCommits(
+  value: unknown,
+  projectId: string,
+  episodes: ScriptEpisode[],
+): ScriptEpisodeContinuityCommit[] {
+  if (!Array.isArray(value)) return [];
+  const episodeByNumber = new Map(episodes.map((episode) => [episode.episodeNumber, episode]));
+  const commits = clone(value) as ScriptEpisodeContinuityCommit[];
+  for (const commit of commits) {
+    if (commit.schemaVersion !== 1) {
+      throw new StoreError(
+        `不支持的短剧连续性存储版本: ${String(commit.schemaVersion)}`,
+      );
+    }
+    commit.projectId = projectId;
+    const episode = episodeByNumber.get(commit.episodeNumber);
+    if (
+      commit.status === 'current' &&
+      (episode?.status !== 'completed' || episode.revision !== commit.episodeRevision)
+    ) {
+      commit.status = 'stale';
+    }
+  }
+  const currentByEpisode = new Map<number, ScriptEpisodeContinuityCommit>();
+  for (const commit of commits) {
+    if (commit.status !== 'current') continue;
+    const previous = currentByEpisode.get(commit.episodeNumber);
+    if (!previous || commit.revision > previous.revision) {
+      if (previous) previous.status = 'stale';
+      currentByEpisode.set(commit.episodeNumber, commit);
+    } else {
+      commit.status = 'stale';
+    }
+  }
+  return commits.sort((left, right) =>
+    left.revision - right.revision || left.episodeNumber - right.episodeNumber,
+  );
+}
+
+function resourceRevision(
+  state: ScriptProjectState,
+  resource: ScriptCommitEpisodeWithContinuityInput['inputRevisionRefs'][number]['resource'],
+  id: string,
+): number {
+  switch (resource) {
+    case 'plan':
+      return state.plan?.id === id ? state.plan.revision : 0;
+    case 'outline': {
+      const episodeOutline = state.episodeOutlines.find((item) => item.id === id);
+      if (episodeOutline) return episodeOutline.revision;
+      return state.seriesOutline?.projectId === id ? state.seriesOutline.revision : 0;
+    }
+    case 'characters': {
+      const character = state.characters.find((item) => item.id === id);
+      if (character) return character.revision;
+      return id === state.projectId
+        ? Math.max(0, ...state.characters.map((item) => item.revision))
+        : 0;
+    }
+    case 'world':
+      return state.worldBible?.projectId === id ? state.worldBible.revision : 0;
+    case 'episode':
+      return state.episodes.find((item) => item.id === id)?.revision ?? 0;
+    case 'continuity':
+      return state.continuityCommits?.find((item) => item.id === id)?.revision ?? 0;
+  }
+}
+
+function staleCurrentContinuityCommit(
+  state: ScriptProjectState,
+  episodeNumber: number,
+  updatedAt: string,
+): void {
+  for (const commit of state.continuityCommits ?? []) {
+    if (commit.episodeNumber === episodeNumber && commit.status === 'current') {
+      commit.status = 'stale';
+      commit.updatedAt = updatedAt;
+    }
+  }
+}
+
+function previousEpisodeContinuityCommit(
+  state: ScriptProjectState,
+  episodeNumber: number,
+): ScriptEpisodeContinuityCommit | undefined {
+  if (episodeNumber <= 1) return undefined;
+  const previousEpisode = state.episodes.find(
+    (episode) => episode.episodeNumber === episodeNumber - 1,
+  );
+  if (!previousEpisode || previousEpisode.status !== 'completed') {
+    throw new ScriptCommitConflictError(
+      `第 ${episodeNumber} 集提交前，第 ${episodeNumber - 1} 集必须处于已完成状态。`,
+    );
+  }
+  const matches = (state.continuityCommits ?? []).filter(
+    (commit) =>
+      commit.episodeNumber === previousEpisode.episodeNumber &&
+      commit.episodeRevision === previousEpisode.revision &&
+      commit.status === 'current',
+  );
+  if (matches.length !== 1) {
+    throw new ScriptCommitConflictError(
+      `第 ${episodeNumber - 1} 集缺少与最新正文版本匹配的连续性提交。`,
+    );
+  }
+  return matches[0];
+}
+
+function assertUniqueContinuityIds<T>(
+  items: readonly T[],
+  idOf: (item: T) => string,
+  label: string,
+): void {
+  const ids = new Set<string>();
+  for (const item of items) {
+    const id = idOf(item).trim();
+    if (!id) {
+      throw new ScriptCommitConflictError(`${label} ID 不能为空。`);
+    }
+    if (ids.has(id)) {
+      throw new ScriptCommitConflictError(`${label} ID 在同一连续性提交中必须唯一: ${id}`);
+    }
+    ids.add(id);
+  }
+}
+
+function validateContinuityCandidate(
+  state: ScriptProjectState,
+  episode: ScriptEpisode,
+  continuity: ScriptEpisodeContinuityCommitInput,
+): void {
+  const blockIds = new Set(
+    episode.scenes.flatMap((scene) => scene.blocks.map((block) => block.id)),
+  );
+  const registeredCharacterIds = new Set(state.characters.map((character) => character.id));
+
+  for (const update of continuity.characterUpdates) {
+    if (!registeredCharacterIds.has(update.characterId)) {
+      throw new ScriptCommitConflictError(
+        `连续性人物更新引用了未登记人物: ${update.characterId}`,
+      );
+    }
+  }
+  for (const prop of continuity.props) {
+    if (
+      prop.holderCharacterId !== undefined &&
+      !registeredCharacterIds.has(prop.holderCharacterId)
+    ) {
+      throw new ScriptCommitConflictError(
+        `连续性道具持有人未登记: ${prop.holderCharacterId}`,
+      );
+    }
+  }
+
+  assertUniqueContinuityIds(continuity.factsAdded, (fact) => fact.factId, '事实');
+  assertUniqueContinuityIds(continuity.props, (prop) => prop.propId, '道具');
+  assertUniqueContinuityIds(continuity.threads, (thread) => thread.threadId, '伏笔');
+  assertUniqueContinuityIds(continuity.timelineEvents, (event) => event.eventId, '时间事件');
+
+  const evidenceOwners = [
+    ...continuity.factsAdded.map((item) => ({
+      label: `事实 ${item.factId}`,
+      evidenceBlockIds: item.evidenceBlockIds,
+    })),
+    ...continuity.props.map((item) => ({
+      label: `道具 ${item.propId}`,
+      evidenceBlockIds: item.evidenceBlockIds,
+    })),
+    ...continuity.threads.map((item) => ({
+      label: `伏笔 ${item.threadId}`,
+      evidenceBlockIds: item.evidenceBlockIds,
+    })),
+    ...continuity.timelineEvents.map((item) => ({
+      label: `时间事件 ${item.eventId}`,
+      evidenceBlockIds: item.evidenceBlockIds,
+    })),
+  ];
+  for (const owner of evidenceOwners) {
+    for (const blockId of owner.evidenceBlockIds) {
+      if (!blockIds.has(blockId)) {
+        throw new ScriptCommitConflictError(
+          `${owner.label} 引用了不属于候选正文的证据块: ${blockId}`,
+        );
+      }
+    }
+  }
+
+  const resolvableEventIds = new Set(
+    (state.continuityCommits ?? [])
+      .filter(
+        (commit) =>
+          commit.status === 'current' &&
+          commit.episodeNumber < episode.episodeNumber,
+      )
+      .flatMap((commit) => commit.timelineEvents.map((event) => event.eventId)),
+  );
+  for (const event of continuity.timelineEvents) resolvableEventIds.add(event.eventId);
+  for (const event of continuity.timelineEvents) {
+    for (const causeEventId of event.causeEventIds) {
+      if (!resolvableEventIds.has(causeEventId)) {
+        throw new ScriptCommitConflictError(
+          `时间事件 ${event.eventId} 引用了无法解析的原因事件: ${causeEventId}`,
+        );
+      }
+    }
+  }
 }
 
 function isErrno(error: unknown): error is NodeJS.ErrnoException {
@@ -316,16 +539,109 @@ export class FileScriptStore implements ScriptStore {
       const current = index >= 0 ? state.episodes[index] : undefined;
       const currentRevision = current?.revision ?? 0;
       assertExpectedRevision(expectedRevision, currentRevision);
+      const updatedAt = new Date().toISOString();
+      const editedCompletedEpisode = current?.status === 'completed';
       const saved: ScriptEpisode = {
         ...clone(value),
+        // A completed Episode and its continuity commit are one canonical
+        // boundary. Any later edit must be reviewed and recommitted together.
+        status: editedCompletedEpisode ? 'reviewing' : value.status,
         revision: currentRevision + 1,
         createdAt: current?.createdAt ?? value.createdAt,
-        updatedAt: new Date().toISOString(),
+        updatedAt,
       };
+      if (editedCompletedEpisode) {
+        staleCurrentContinuityCommit(state, value.episodeNumber, updatedAt);
+      }
       if (index >= 0) state.episodes[index] = saved;
       else state.episodes.push(saved);
       state.episodes.sort((a, b) => a.episodeNumber - b.episodeNumber);
       return saved;
+    });
+  }
+
+  commitEpisodeWithContinuity(
+    input: ScriptCommitEpisodeWithContinuityInput,
+  ): Promise<ScriptCommitEpisodeWithContinuityResult> {
+    const projectId = input.episode.projectId;
+    return this.mutate(projectId, (state) => {
+      const episodeIndex = state.episodes.findIndex(
+        (item) => item.episodeNumber === input.episode.episodeNumber,
+      );
+      const currentEpisode = episodeIndex >= 0 ? state.episodes[episodeIndex] : undefined;
+      const currentEpisodeRevision = currentEpisode?.revision ?? 0;
+      assertExpectedRevision(input.expectedEpisodeRevision, currentEpisodeRevision);
+
+      if (input.episode.projectId !== state.projectId) {
+        throw new ScriptCommitConflictError('候选正文与短剧项目不一致。');
+      }
+      const previous = previousEpisodeContinuityCommit(
+        state,
+        input.episode.episodeNumber,
+      );
+      for (const reference of input.inputRevisionRefs) {
+        assertExpectedRevision(
+          reference.revision,
+          resourceRevision(state, reference.resource, reference.id),
+        );
+      }
+
+      const candidateHash = computeScriptEpisodeCandidateHash(input.episode);
+      if (candidateHash !== input.candidateHash) {
+        throw new ScriptCommitConflictError(
+          '候选正文哈希不匹配，拒绝提交可能已被替换的正文。',
+        );
+      }
+      const inputFingerprint = computeScriptInputFingerprint(input);
+      if (inputFingerprint !== input.inputFingerprint) {
+        throw new ScriptCommitConflictError('候选输入指纹不匹配，拒绝提交过期正文。');
+      }
+      validateContinuityCandidate(state, input.episode, input.continuity);
+
+      const updatedAt = new Date().toISOString();
+      const episode: ScriptEpisode = {
+        ...clone(input.episode),
+        projectId,
+        status: 'completed',
+        revision: currentEpisodeRevision + 1,
+        createdAt: currentEpisode?.createdAt ?? input.episode.createdAt,
+        updatedAt,
+      };
+
+      staleCurrentContinuityCommit(state, episode.episodeNumber, updatedAt);
+      const continuityCommits = state.continuityCommits ??= [];
+      const revision = Math.max(
+        0,
+        ...continuityCommits.map((commit) => commit.revision),
+      ) + 1;
+      const continuity: ScriptEpisodeContinuityCommit = {
+        ...clone(input.continuity),
+        id: randomUUID(),
+        schemaVersion: 1,
+        projectId,
+        episodeNumber: episode.episodeNumber,
+        episodeRevision: episode.revision,
+        revision,
+        status: 'current',
+        inputFingerprint,
+        ...(previous
+          ? {
+              previousContinuityCommitId: previous.id,
+              previousContinuityRevision: previous.revision,
+            }
+          : {}),
+        createdAt: updatedAt,
+        updatedAt,
+      };
+
+      if (episodeIndex >= 0) state.episodes[episodeIndex] = episode;
+      else state.episodes.push(episode);
+      state.episodes.sort((left, right) => left.episodeNumber - right.episodeNumber);
+      continuityCommits.push(continuity);
+      continuityCommits.sort((left, right) =>
+        left.revision - right.revision || left.episodeNumber - right.episodeNumber,
+      );
+      return { episode, continuity };
     });
   }
 

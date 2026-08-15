@@ -219,6 +219,116 @@ export interface ScriptContinuityState {
   }>;
 }
 
+/** A persisted input revision used to reject work produced from stale canon. */
+export interface ScriptInputRevisionRef {
+  resource:
+    | 'plan'
+    | 'outline'
+    | 'characters'
+    | 'world'
+    | 'episode'
+    | 'continuity';
+  id: ScriptId;
+  revision: number;
+}
+
+/** An immutable checkpoint artifact that contributed to a generated candidate. */
+export interface ScriptUpstreamArtifactRef {
+  node: string;
+  artifactRevision: number;
+  artifactHash: string;
+}
+
+export interface ScriptContinuityCharacterUpdate {
+  characterId: ScriptId;
+  location?: string;
+  emotionalState?: string;
+  knownFactsAdded: string[];
+  relationshipChanges: string[];
+  outfit?: string;
+}
+
+export interface ScriptContinuityFact {
+  /** Stable across later commits that refer to the same fact. */
+  factId: ScriptId;
+  text: string;
+  evidenceBlockIds: ScriptId[];
+}
+
+export interface ScriptContinuityProp {
+  /** Stable across transfers and state changes of the same prop. */
+  propId: ScriptId;
+  name: string;
+  holderCharacterId?: ScriptId;
+  state: string;
+  evidenceBlockIds: ScriptId[];
+}
+
+export interface ScriptContinuityThread {
+  /** Stable from opening through advancing and closing the same thread. */
+  threadId: ScriptId;
+  action: 'opened' | 'advanced' | 'closed';
+  description: string;
+  evidenceBlockIds: ScriptId[];
+}
+
+export interface ScriptContinuityTimelineEvent {
+  /** Stable when another event cites this event as a cause. */
+  eventId: ScriptId;
+  timeLabel: string;
+  summary: string;
+  causeEventIds: ScriptId[];
+  evidenceBlockIds: ScriptId[];
+}
+
+export interface ScriptEpisodeContinuityCommitInput {
+  characterUpdates: ScriptContinuityCharacterUpdate[];
+  factsAdded: ScriptContinuityFact[];
+  props: ScriptContinuityProp[];
+  threads: ScriptContinuityThread[];
+  timelineEvents: ScriptContinuityTimelineEvent[];
+  nextEpisodeMustInherit: string[];
+}
+
+/**
+ * Versioned continuity delta bound to one exact, atomically committed Episode
+ * revision. Historical entries remain inspectable but cannot be used as canon
+ * after they become stale.
+ */
+export interface ScriptEpisodeContinuityCommit
+  extends ScriptEpisodeContinuityCommitInput {
+  id: ScriptId;
+  schemaVersion: 1;
+  projectId: ScriptId;
+  episodeNumber: number;
+  episodeRevision: number;
+  /** Monotonic project-wide continuity commit revision. */
+  revision: number;
+  status: 'current' | 'stale';
+  inputFingerprint: string;
+  previousContinuityCommitId?: ScriptId;
+  previousContinuityRevision?: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ScriptCommitEpisodeWithContinuityInput {
+  episode: ScriptEpisode;
+  expectedEpisodeRevision: number;
+  continuity: ScriptEpisodeContinuityCommitInput;
+  inputRevisionRefs: ScriptInputRevisionRef[];
+  upstreamArtifactRefs: ScriptUpstreamArtifactRef[];
+  promptVersion: string;
+  modelConfigFingerprint: string;
+  inputFingerprint: string;
+  candidateHash: string;
+}
+
+export interface ScriptCommitEpisodeWithContinuityResult {
+  episode: ScriptEpisode;
+  continuity: ScriptEpisodeContinuityCommit;
+}
+
 export type ScriptReviewSeverity = 'hard' | 'soft' | 'suggestion';
 export type ScriptReviewStatus = 'open' | 'fixed' | 'ignored';
 export type ScriptReviewSource = 'deterministic' | 'ai' | 'user';
@@ -275,6 +385,9 @@ export interface ScriptProjectState {
   seriesOutline?: ScriptSeriesOutline;
   episodeOutlines: ScriptEpisodeOutline[];
   episodes: ScriptEpisode[];
+  /** Detailed continuity source of truth; missing in legacy v1 files. */
+  continuityCommits?: ScriptEpisodeContinuityCommit[];
+  /** Legacy aggregate retained while readers migrate to continuityCommits. */
   continuity: ScriptContinuityState;
   /** Aggregate compare-and-save revision for the review issue collection. */
   reviewRevision: number;
