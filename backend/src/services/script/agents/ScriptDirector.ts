@@ -162,6 +162,8 @@ export type ScriptDirectorRequest =
       task: 'script_bible';
       projectId: string;
       signal?: AbortSignal;
+      /** Regenerate the candidate that caused a durable needs-review pause. */
+      resumeRejectedCandidates?: boolean;
     }
   | {
       task: 'script_episode_batch';
@@ -170,6 +172,8 @@ export type ScriptDirectorRequest =
       episodeCount: number;
       expectedPlanRevision: number;
       signal?: AbortSignal;
+      /** Regenerate the candidate that caused a durable needs-review pause. */
+      resumeRejectedCandidates?: boolean;
       onProgress?: (event: ScriptProgressEvent) => void | Promise<void>;
     };
 
@@ -368,7 +372,11 @@ export class ScriptDirector {
       return this.generateSeriesOutline(request.projectId, request.signal);
     }
     if (request.task === 'script_bible') {
-      return this.generateBible(request.projectId, request.signal);
+      return this.generateBible(
+        request.projectId,
+        request.signal,
+        request.resumeRejectedCandidates === true,
+      );
     }
     if (request.task === 'script_episode_batch') {
       return this.generateEpisodeBatch(request);
@@ -682,7 +690,11 @@ export class ScriptDirector {
     return { kind: 'series_outline', outline: saved };
   }
 
-  private async generateBible(projectId: string, signal?: AbortSignal): Promise<ScriptDirectorResult> {
+  private async generateBible(
+    projectId: string,
+    signal?: AbortSignal,
+    resumeRejectedCandidates = false,
+  ): Promise<ScriptDirectorResult> {
     const state = await this.dependencies.store.getProjectState(projectId);
     if (!state?.plan || !state.seriesOutline) {
       throw new ScriptModelOutputError('生成剧本圣经前必须先完成策划和全剧大纲。');
@@ -690,6 +702,30 @@ export class ScriptDirector {
     const now = this.dependencies.now?.() ?? new Date().toISOString();
     const plan = state.plan;
     const outline = state.seriesOutline;
+    const characterInputRevisionRefs = [
+      { resource: 'plan' as const, id: plan.id, revision: plan.revision },
+      {
+        resource: 'outline' as const,
+        id: outline.projectId,
+        revision: outline.revision,
+      },
+    ];
+    const characterPromptVersion = 'character-bible-v3';
+    const characterConfigRevision = await this.modelConfigFingerprint();
+    const characterInputFingerprint = computeScriptCheckpointInputFingerprint({
+      node: 'character_bible',
+      inputRevisionRefs: characterInputRevisionRefs,
+      promptVersion: characterPromptVersion,
+      configRevision: characterConfigRevision,
+    });
+    const rejectedCharacters = await this.latestCheckpoint(
+      projectId,
+      'script_bible',
+      { node: 'character_bible' },
+    );
+    if (rejectedCharacters?.status === 'needs_review') {
+      await this.markCheckpointStale(rejectedCharacters);
+    }
     const generateCharacters = async (): Promise<ScriptCharacter[]> => {
       if (state.characters.length > 0) return state.characters;
       let preservedCharacters: Array<{ index: number; character: ScriptCharacter }> = [];
@@ -701,9 +737,13 @@ export class ScriptDirector {
           '只返回 JSON 对象 {"characters": [...]} ，不输出思考过程。',
           '每个人物严格包含：id, name, aliases, role, age(可选), occupation(可选), identity, biography, motivation, goal, weakness, arc, appearance, hairstyle, physique, defaultOutfit, personality, skills, speechStyle, catchphrases, relationships。',
           'role 只能是 lead/supporting/antagonist/minor；aliases/personality/skills/catchphrases/relationships 必须是数组；relationship 使用 {"characterId":"已存在人物id","label":"关系","notes":"可选说明"}。不得改名任何键。',
+          `当前策划允许最多 ${plan.maxPrimaryCharacters} 个非 minor 主要人物；请以当前数字为准，不沿用旧候选约束。`,
+          resumeRejectedCandidates
+            ? '这是用户显式恢复后的新候选生成；必须重新依据下方最新策划与大纲作答。'
+            : '',
           `策划：${JSON.stringify(plan)}`,
           `大纲：${JSON.stringify(outline)}`,
-        ].join('\n');
+        ].filter(Boolean).join('\n');
         const characterContract = defineStructuredContract<ScriptCharacter[]>({
           name: 'character_bible',
           version: 2,
@@ -867,6 +907,12 @@ export class ScriptDirector {
           attempt: 1,
           artifactRevision,
           artifact: saved,
+          inputRevisionRefs: characterInputRevisionRefs,
+          upstreamArtifactRefs: [],
+          promptVersion: characterPromptVersion,
+          configRevision: characterConfigRevision,
+          inputFingerprint: characterInputFingerprint,
+          validationErrors: [],
           updatedAt: now,
         });
         return saved;
@@ -884,6 +930,11 @@ export class ScriptDirector {
             validCharacters: preservedCharacters.map((item) => item.character),
             failedCharacterIndexes: failedIndexes,
           },
+          inputRevisionRefs: characterInputRevisionRefs,
+          upstreamArtifactRefs: [],
+          promptVersion: characterPromptVersion,
+          configRevision: characterConfigRevision,
+          inputFingerprint: characterInputFingerprint,
           validationErrors: [{ code: 'CHARACTER_BIBLE_FAILED', message: error instanceof Error ? error.message : String(error) }],
           updatedAt: now,
         });
@@ -1113,6 +1164,7 @@ export class ScriptDirector {
     const runKey = `script_episode_batch:${request.startEpisode}:${request.episodeCount}`;
     const existingCheckpoints = await this.dependencies.checkpoints.list(request.projectId, runKey);
     const configRevision = await this.modelConfigFingerprint();
+    await this.invalidateRejectedEpisodeCandidates(existingCheckpoints, range);
     let plan: ScriptPlan = state.plan ?? validatedPlan;
     if (plan.status === 'approved') {
       const requestedPlanRevision = request.expectedPlanRevision;
@@ -1826,6 +1878,10 @@ export class ScriptDirector {
           runKey,
           { node: 'revision', episodeNumber, chunkStart: revisionRound },
         );
+        const rejectedRevisionFeedback = storedRevision &&
+          (storedRevision.status === 'needs_review' || storedRevision.status === 'stale')
+          ? storedRevision.validationErrors
+          : [];
         let patchedArtifact: ScriptEpisodeCandidateArtifact | undefined;
         let revisionCheckpointRevision: number | undefined;
         const rejectRevisionPatch = async (
@@ -1934,8 +1990,11 @@ export class ScriptDirector {
               `场景与正文块 ID 白名单：${JSON.stringify(draft.scenes.map((scene) => ({ sceneId: scene.id, characterIds: scene.characterIds, blockIds: scene.blocks.map((block) => block.id) })))}`,
               `本集大纲：${JSON.stringify(outline)}`,
               `阻断错误：${JSON.stringify(report.blockingIssues)}`,
+              rejectedRevisionFeedback.length > 0
+                ? `上次候选被系统拒绝：${JSON.stringify(rejectedRevisionFeedback)}。必须换一种满足白名单与长度保护的补丁，禁止重复该越界做法。`
+                : '',
               `当前候选：${JSON.stringify(draft)}`,
-            ].join('\n'),
+            ].filter(Boolean).join('\n'),
             signal: request.signal,
           }, SCRIPT_REVISION_PATCH_CONTRACT);
           try {
@@ -2586,6 +2645,46 @@ export class ScriptDirector {
       status: 'stale',
       updatedAt: this.now(),
     });
+  }
+
+  /**
+   * A durable needs-review boundary requests a new candidate, not another
+   * evaluation of the exact candidate that paused the job. This state-based
+   * check also covers a process crash between checkpoint persistence and the
+   * job runner recording its waiting status. Preserve the expensive draft and
+   * first review, but invalidate the rejected revision boundary so its
+   * downstream review fingerprint is forced to change as well.
+   */
+  private async invalidateRejectedEpisodeCandidates(
+    checkpoints: readonly ScriptPipelineCheckpoint[],
+    episodeNumbers: readonly number[],
+  ): Promise<void> {
+    for (const episodeNumber of episodeNumbers) {
+      const completed = latestScriptCheckpoint(checkpoints, {
+        node: 'completed',
+        episodeNumber,
+      });
+      const revisions = [1, 2]
+        .map((revisionRound) => latestScriptCheckpoint(checkpoints, {
+          node: 'revision',
+          episodeNumber,
+          chunkStart: revisionRound,
+        }))
+        .filter((checkpoint): checkpoint is ScriptPipelineCheckpoint => checkpoint !== undefined);
+      const rejectedRevision = revisions.find((checkpoint) => checkpoint.status === 'needs_review');
+      const completedCandidateRejected = completed?.status === 'needs_review';
+      if (!rejectedRevision && !completedCandidateRejected) continue;
+
+      if (completedCandidateRejected) await this.markCheckpointStale(completed);
+      for (const revision of revisions) {
+        if (
+          revision.status === 'needs_review' ||
+          (completedCandidateRejected && revision.status === 'succeeded')
+        ) {
+          await this.markCheckpointStale(revision);
+        }
+      }
+    }
   }
 
   private now(): string {

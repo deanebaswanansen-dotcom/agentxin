@@ -1,6 +1,11 @@
 import type { ModelProxy } from '../../proxy/ModelProxy.js';
 import type { DataStore } from '../../store/DataStore.js';
-import type { AgentProgressEvent, AgentRunRequest, AgentRunResult } from '../../types/index.js';
+import type {
+  AgentProgressEvent,
+  AgentRunExecutionContext,
+  AgentRunRequest,
+  AgentRunResult,
+} from '../../types/index.js';
 import type { BlueprintService } from '../blueprint/BlueprintService.js';
 import type { ChapterWriter } from '../blueprint/ChapterWriter.js';
 import type { ModelConfigService } from '../modelConfig/ModelConfigService.js';
@@ -74,9 +79,10 @@ export class AgentService {
     request: AgentRunRequest,
     signal: AbortSignal,
     onProgress?: (event: AgentProgressEvent) => void,
+    context?: AgentRunExecutionContext,
   ): Promise<AgentRunResult> {
     if (isScriptTask(request.task)) {
-      return this.runScript({ ...request, task: request.task }, signal, onProgress);
+      return this.runScript({ ...request, task: request.task }, signal, onProgress, context);
     }
     return this.orchestrator.run(request, signal, onProgress);
   }
@@ -85,6 +91,7 @@ export class AgentService {
     request: AgentRunRequest & { task: ScriptTask },
     signal: AbortSignal,
     onProgress?: (event: AgentProgressEvent) => void,
+    context?: AgentRunExecutionContext,
   ): Promise<AgentRunResult> {
     if (!this.scriptDirector) {
       throw ServiceError.validation('短剧 Agent 尚未接入当前运行环境。');
@@ -115,7 +122,12 @@ export class AgentService {
     } else if (request.task === 'script_series_outline') {
       result = await this.scriptDirector.run({ task: request.task, projectId, signal });
     } else if (request.task === 'script_bible') {
-      result = await this.scriptDirector.run({ task: request.task, projectId, signal });
+      result = await this.scriptDirector.run({
+        task: request.task,
+        projectId,
+        signal,
+        ...(context?.resumeRejectedCandidates ? { resumeRejectedCandidates: true } : {}),
+      });
     } else {
       const options = request.scriptBatchOptions;
       if (!options) {
@@ -126,6 +138,7 @@ export class AgentService {
         projectId,
         ...options,
         signal,
+        ...(context?.resumeRejectedCandidates ? { resumeRejectedCandidates: true } : {}),
         onProgress: (event) => {
           onProgress?.(event);
         },

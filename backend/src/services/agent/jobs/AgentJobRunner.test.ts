@@ -120,9 +120,10 @@ describe('AgentJobRunner', () => {
     const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-needs-review-'));
     const store = await AgentRunStore.create(join(directory, 'runs.json'));
     let attempts = 0;
-    const run = vi.fn(async (request) => {
+    const run = vi.fn(async (request, _signal, _onProgress, context) => {
       attempts += 1;
       if (attempts === 1) {
+        expect(context).toBeUndefined();
         throw Object.assign(new Error('episode_draft 结构契约不匹配'), {
           code: 'SCRIPT_STRUCTURED_NEEDS_REVIEW',
           recoverable: true,
@@ -131,6 +132,7 @@ describe('AgentJobRunner', () => {
           status: 503,
         });
       }
+      expect(context).toEqual({ resumeRejectedCandidates: true });
       return {
         task: request.task,
         mode: request.mode,
@@ -163,7 +165,9 @@ describe('AgentJobRunner', () => {
       },
     });
 
-    await runner.resume(CLIENT_ID, created.id, undefined);
+    await expect(runner.resume(CLIENT_ID, created.id, undefined)).resolves.toMatchObject({
+      status: 'queued',
+    });
     await runner.waitUntilIdle(created.id);
 
     expect(run).toHaveBeenCalledTimes(2);
@@ -173,6 +177,43 @@ describe('AgentJobRunner', () => {
       attempts: 2,
       result: { summary: '从原任务检查点恢复完成' },
     });
+  });
+
+  it('does not invalidate exact checkpoints when resuming an interrupted process', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-interrupted-'));
+    const store = await AgentRunStore.create(join(directory, 'runs.json'));
+    const request = {
+      task: 'script_episode_batch' as const,
+      mode: 'draft' as const,
+      prompt: '',
+      projectId: 'p1',
+      scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 1 },
+    };
+    const stored = await store.create(CLIENT_ID, request);
+    await store.markWaiting(stored.id, {
+      code: 'RUN_INTERRUPTED',
+      message: '后台进程重启，等待继续。',
+    });
+    const run = vi.fn(async (received, _signal, _onProgress, context) => {
+      expect(context).toBeUndefined();
+      return {
+        task: received.task,
+        mode: received.mode,
+        projectId: received.projectId ?? 'p1',
+        summary: '从精确检查点恢复完成',
+        steps: [],
+        artifacts: [],
+      };
+    });
+    const runner = new AgentJobRunner(store, { run });
+
+    await expect(runner.resume(CLIENT_ID, stored.id, undefined)).resolves.toMatchObject({
+      status: 'queued',
+    });
+    await runner.waitUntilIdle(stored.id);
+
+    expect(run).toHaveBeenCalledOnce();
+    expect(store.get(stored.id)?.status).toBe('completed');
   });
 
   it('marks an ordinary non-recoverable execution error as failed', async () => {

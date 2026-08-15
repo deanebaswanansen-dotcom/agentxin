@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -9,6 +9,7 @@ import { FileScriptStore } from '../FileScriptStore.js';
 import { currentScriptContinuityCommits } from '../ScriptContinuityCommit.js';
 import type {
   ScriptCharacter,
+  ScriptEpisode,
   ScriptPlan,
   ScriptSeriesOutline,
   ScriptWorldBible,
@@ -412,5 +413,145 @@ describe('ScriptDirector offline ten-episode full-book diagnostic', () => {
     const finalState = await store.getProjectState(PROJECT_ID);
     expect(finalState?.episodes.map((episode) => episode.status)).toEqual(Array(5).fill('completed'));
     expect(currentScriptContinuityCommits(finalState!)).toHaveLength(5);
+  });
+
+  it('rebuilds a mixed legacy 1-5 batch instead of reusing v1 empty-fingerprint candidates', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-fullbook-legacy-resume-'));
+    directories.push(directory);
+    const projectRoot = join(directory, 'projects');
+    const checkpointRoot = join(directory, 'checkpoints');
+    const store = await FileScriptStore.create(projectRoot);
+    const savedPlan = await seedProject(store);
+    const legacyEpisode = (episodeNumber: number, status: ScriptEpisode['status']): ScriptEpisode => ({
+      id: `legacy-episode-${episodeNumber}`,
+      projectId: PROJECT_ID,
+      episodeNumber,
+      title: `旧版第${episodeNumber}集候选`,
+      outlineId: `legacy-outline-${episodeNumber}`,
+      status,
+      targetChars: 300,
+      scenes: [{
+        id: `legacy-scene-${episodeNumber}`,
+        ordinal: 1,
+        location: '旧版资料室',
+        timeOfDay: 'day',
+        interiorExterior: 'interior',
+        characterIds: ['lead'],
+        blocks: [{
+          id: `legacy-block-${episodeNumber}`,
+          type: 'action',
+          text: '这份旧候选来自无法验证输入的 v1 检查点，不得进入正式正文。',
+        }],
+      }],
+      summary: '旧版候选摘要',
+      newFacts: ['旧版候选事实'],
+      openedThreads: ['旧版候选伏笔'],
+      closedThreads: [],
+      revision: 0,
+      createdAt: NOW,
+      updatedAt: NOW,
+    });
+
+    const legacyDraftOne = await store.saveEpisode(legacyEpisode(1, 'reviewing'), 0);
+    const legacyCompletedOne = await store.saveEpisode({
+      ...legacyDraftOne,
+      status: 'completed',
+    }, legacyDraftOne.revision);
+    const legacyFailedTwo = await store.saveEpisode(legacyEpisode(2, 'failed'), 0);
+    expect((await store.getProjectState(PROJECT_ID))?.continuityCommits).toEqual([]);
+
+    const runKey = 'script_episode_batch:1:5';
+    const encodedRunKey = Buffer.from(runKey, 'utf8').toString('base64url');
+    await mkdir(join(checkpointRoot, PROJECT_ID), { recursive: true });
+    await writeFile(join(checkpointRoot, PROJECT_ID, `${encodedRunKey}.json`), JSON.stringify({
+      schemaVersion: 1,
+      projectId: PROJECT_ID,
+      runKey,
+      checkpoints: [
+        {
+          projectId: PROJECT_ID,
+          runKey,
+          node: 'draft',
+          status: 'completed',
+          attempt: 1,
+          artifactRevision: 1,
+          episodeNumber: 1,
+          inputFingerprint: '',
+          artifact: { stage: 'draft', episode: legacyCompletedOne },
+          updatedAt: NOW,
+        },
+        {
+          projectId: PROJECT_ID,
+          runKey,
+          node: 'draft',
+          status: 'running',
+          attempt: 1,
+          artifactRevision: 1,
+          episodeNumber: 2,
+          inputFingerprint: '',
+          artifact: { stage: 'draft', episode: legacyFailedTwo },
+          updatedAt: NOW,
+        },
+      ],
+    }), 'utf8');
+    const checkpoints = await FileScriptCheckpointStore.create(checkpointRoot);
+    expect((await checkpoints.list(PROJECT_ID, runKey)).map((checkpoint) => ({
+      episodeNumber: checkpoint.episodeNumber,
+      status: checkpoint.status,
+      inputFingerprint: checkpoint.inputFingerprint,
+    }))).toEqual([
+      { episodeNumber: 1, status: 'succeeded', inputFingerprint: '' },
+      { episodeNumber: 2, status: 'pending', inputFingerprint: '' },
+    ]);
+
+    const model = new DeterministicFullBookModel();
+    let nextId = 0;
+    const director = new ScriptDirector({
+      model,
+      store,
+      checkpoints,
+      now: () => NOW,
+      id: () => `legacy-resume-id-${++nextId}`,
+    });
+    const resumed = await director.run({
+      task: 'script_episode_batch',
+      projectId: PROJECT_ID,
+      startEpisode: 1,
+      episodeCount: 5,
+      expectedPlanRevision: savedPlan.revision,
+    });
+
+    expect(resumed.kind).toBe('episode_batch');
+    if (resumed.kind !== 'episode_batch') throw new Error('预期 episode_batch');
+    expect(resumed.episodes.map((episode) => episode.episodeNumber)).toEqual([1, 2, 3, 4, 5]);
+    expect(resumed.skippedEpisodeNumbers).toEqual([]);
+    expect(model.calls.filter((call) => call.node === 'draft').map(
+      (call) => call.episodeNumber,
+    )).toEqual([1, 2, 3, 4, 5]);
+    expect(resumed.episodes.every((episode) => !episode.title.startsWith('旧版'))).toBe(true);
+
+    const finalState = await store.getProjectState(PROJECT_ID);
+    expect(finalState?.episodes.map((episode) => episode.status)).toEqual(Array(5).fill('completed'));
+    const currentCommits = currentScriptContinuityCommits(finalState!);
+    expect(currentCommits).toHaveLength(5);
+    for (const episode of finalState!.episodes) {
+      expect(currentCommits.filter((commit) =>
+        commit.episodeNumber === episode.episodeNumber &&
+        commit.episodeRevision === episode.revision
+      ), `第 ${episode.episodeNumber} 集 continuity 必须绑定正式正文 revision`).toHaveLength(1);
+    }
+    expect(finalState!.episodes.find((episode) => episode.episodeNumber === 1)!.revision)
+      .toBeGreaterThan(legacyCompletedOne.revision);
+    expect(finalState!.episodes.find((episode) => episode.episodeNumber === 2)!.revision)
+      .toBeGreaterThan(legacyFailedTwo.revision);
+
+    const persistedCheckpoints = await checkpoints.list(PROJECT_ID, runKey);
+    const legacyDrafts = persistedCheckpoints.filter((checkpoint) =>
+      checkpoint.node === 'draft' && checkpoint.artifactRevision === 1 &&
+      (checkpoint.episodeNumber === 1 || checkpoint.episodeNumber === 2)
+    );
+    expect(legacyDrafts).toHaveLength(2);
+    expect(legacyDrafts.every((checkpoint) => checkpoint.status === 'stale')).toBe(true);
+    expect(legacyDrafts.every((checkpoint) => checkpoint.inputFingerprint === '')).toBe(true);
   });
 });

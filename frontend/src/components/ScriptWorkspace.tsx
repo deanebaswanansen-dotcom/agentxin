@@ -1514,7 +1514,20 @@ export function ScriptWorkspace({
     setNotice('');
     try {
       const job = await client.script.jobs.resume(jobId);
-      setData((current) => current ? { ...current, jobs: current.jobs.map((item) => item.id === job.id ? job : item) } : current);
+      // The resume endpoint launches the background runner asynchronously. On
+      // a very fast response the persisted job can still be waiting/failed for
+      // one event-loop turn, which would otherwise leave this page with no
+      // polling job and make a successful resume look stuck forever. Treat a
+      // resumable response as queued until the next authoritative jobs poll.
+      const resumedJob: ScriptAgentJobSnapshot = (
+        job.status === 'waiting_user' || job.status === 'failed' || job.status === 'cancelled'
+      )
+        ? { ...job, status: 'queued', continuable: false }
+        : job;
+      setData((current) => current ? {
+        ...current,
+        jobs: current.jobs.map((item) => item.id === resumedJob.id ? resumedJob : item),
+      } : current);
       setNotice('任务已从检查点继续');
     } catch (error) {
       onError?.(error);
