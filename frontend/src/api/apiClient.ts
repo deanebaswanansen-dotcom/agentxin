@@ -63,6 +63,7 @@ import type {
   ScriptCharacter,
   ScriptConceptResult,
   ScriptEpisode,
+  ScriptEpisodeContinuityCommit,
   ScriptEpisodeOutline,
   ScriptEpisodeReviewResult,
   ScriptEpisodeSummary,
@@ -321,6 +322,8 @@ export interface ScriptProjectStateResponse {
       outfit: string;
     }>;
   };
+  /** Versioned continuity source of truth. Optional while older servers roll forward. */
+  continuityCommits?: ScriptEpisodeContinuityCommit[];
   reviewRevision: number;
   reviewIssues: ScriptReviewIssue[];
   updatedAt: string;

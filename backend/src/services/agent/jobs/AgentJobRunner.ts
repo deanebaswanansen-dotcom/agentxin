@@ -164,6 +164,15 @@ export class AgentJobRunner {
             } catch (progressError) {
               effectiveError = progressError;
             }
+            // Cancellation wins over every recoverable/error classification.
+            // Otherwise a late structured-output error can resurrect a job
+            // that the user already cancelled as `waiting_user`.
+            if (
+              controller.signal.aborted ||
+              this.store.get(id)?.status === 'cancelled'
+            ) {
+              throw effectiveError;
+            }
             // A structured-contract mismatch is a resumable workflow state,
             // not a provider failure. Persist the checkpoint-facing pause and
             // let a later resume run the same request; the Director owns which

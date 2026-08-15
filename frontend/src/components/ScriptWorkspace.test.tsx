@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ApiClient } from '../api/apiClient.js';
 import type {
+  ScriptAgentJobSnapshot,
   ScriptCharacter,
   ScriptEpisode,
   ScriptPlan,
@@ -9,7 +10,7 @@ import type {
   ScriptWorkspaceSnapshot,
   ScriptWorldBible,
 } from '../types/index.js';
-import completeCharacterFixtureJson from '../test/fixtures/script-character.v1.json';
+import completeCharacterFixtureJson from '../../../spec/fixtures/script-character.v1.json';
 import { ScriptWorkspace } from './ScriptWorkspace.js';
 
 const completeCharacterFixture: ScriptCharacter = {
@@ -276,6 +277,8 @@ describe('ScriptWorkspace', () => {
         report: {
           hardFailed: false,
           issues: [],
+          blockingIssues: [],
+          advisoryIssues: [],
           visibleChars: 5,
           dialogueDensityPercent: 0,
         },
@@ -328,6 +331,10 @@ describe('ScriptWorkspace', () => {
       status: 'open' as const, source: 'ai' as const,
       createdAt: '2026-08-15T00:00:00.000Z', updatedAt: '2026-08-15T00:00:00.000Z',
     };
+    const updateStatus = vi.fn().mockResolvedValue({
+      revision: 1,
+      item: { ...aiIssue, status: 'ignored' as const },
+    });
     Object.assign(client.script, {
       workspace: {
         get: vi.fn().mockResolvedValue(buildWorkspaceSnapshot({
@@ -335,7 +342,7 @@ describe('ScriptWorkspace', () => {
           reviewIssues: [aiIssue],
         })),
       },
-      reviews: { list: vi.fn(), save: vi.fn(), updateStatus: vi.fn() },
+      reviews: { list: vi.fn(), save: vi.fn(), updateStatus },
     });
 
     render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
@@ -345,6 +352,16 @@ describe('ScriptWorkspace', () => {
     expect(await screen.findByText('第 1 集 · AI 重点建议')).toBeInTheDocument();
     expect(screen.getByText('0 个硬性')).toBeInTheDocument();
     expect(screen.getByText('1 个待优化')).toBeInTheDocument();
+    const firstBatchTab = screen.getByRole('tab', { name: /^1–5集剧本正文/ });
+    expect(firstBatchTab).toHaveTextContent('待校稿');
+    expect(firstBatchTab).not.toHaveTextContent('失败');
+    fireEvent.click(screen.getByRole('button', { name: '忽略' }));
+    await waitFor(() => expect(updateStatus).toHaveBeenCalledWith(
+      'project-1',
+      'ai-hard-1',
+      'ignored',
+      0,
+    ));
   });
 
   it('does not offer a later fixed batch until every preceding episode is completed', async () => {
@@ -699,6 +716,28 @@ describe('ScriptWorkspace', () => {
     expect(client.script.jobs.create).not.toHaveBeenCalled();
   });
 
+  it('renders every checkpoint-v2 material label without a fake episode number', async () => {
+    const client = createClient();
+    const jobs: ScriptAgentJobSnapshot[] = [
+      { id: 'checkpoint-plan', projectId: 'project-1', task: 'script_episode_batch', status: 'waiting_user', continuable: true, scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 2 }, checkpoint: { node: 'plan', attempt: 1, artifactRevision: 2 } },
+      { id: 'checkpoint-outline', projectId: 'project-1', task: 'script_series_outline', status: 'waiting_user', continuable: true, checkpoint: { node: 'series_outline', attempt: 1, artifactRevision: 1 } },
+      { id: 'checkpoint-character', projectId: 'project-1', task: 'script_bible', status: 'waiting_user', continuable: true, checkpoint: { node: 'character_bible', attempt: 1, artifactRevision: 1 } },
+      { id: 'checkpoint-world', projectId: 'project-1', task: 'script_bible', status: 'waiting_user', continuable: true, checkpoint: { node: 'world_bible', attempt: 1, artifactRevision: 1 } },
+      { id: 'checkpoint-revision', projectId: 'project-1', task: 'script_episode_batch', status: 'waiting_user', continuable: true, scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 2 }, checkpoint: { episodeNumber: 2, node: 'revision', attempt: 2, artifactRevision: 3 } },
+    ];
+    vi.mocked(client.script.jobs.list).mockResolvedValue(jobs);
+
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
+    for (const label of ['策划锁定', '全剧大纲', '人物圣经', '世界圣经']) {
+      expect(screen.getByText(label)).toBeInTheDocument();
+    }
+    expect(screen.getByText('第 2 集 · 定向修订')).toBeInTheDocument();
+    expect(screen.queryByText(/第 undefined 集/)).not.toBeInTheDocument();
+  });
+
   it('treats waiting-user material and episode jobs as duplicate blockers', async () => {
     const client = createClient();
     vi.mocked(client.script.jobs.list).mockResolvedValue([{
@@ -913,6 +952,53 @@ describe('ScriptWorkspace', () => {
       })]),
       2,
     ));
+  });
+
+  it('keeps newly added character ids unique after deleting a middle character', async () => {
+    const client = createClient();
+    const characters = [1, 2, 3].map((index) => ({
+      ...completeCharacterFixture,
+      id: `character-${index}`,
+      name: `人物${index}`,
+      revision: 2,
+    }));
+    vi.mocked(client.script.characters.list).mockResolvedValue(characters);
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '角色设定' }));
+    fireEvent.click(screen.getByRole('button', { name: '编辑模式' }));
+    fireEvent.click(screen.getAllByRole('button', { name: '删除' })[1]!);
+    fireEvent.click(screen.getByRole('button', { name: '添加角色' }));
+    fireEvent.click(screen.getAllByRole('button', { name: '添加关系' })[0]!);
+
+    const target = screen.getByLabelText('角色关系目标 1-1') as HTMLSelectElement;
+    const candidateIds = Array.from(target.options).map((option) => option.value).filter(Boolean);
+    expect(candidateIds).toHaveLength(2);
+    expect(new Set(candidateIds).size).toBe(candidateIds.length);
+  });
+
+  it('rejects self-referential and dangling character relationships before saving', async () => {
+    const client = createClient();
+    vi.mocked(client.script.characters.list).mockResolvedValue([{
+      ...completeCharacterFixture,
+      id: 'character-1',
+      relationships: [
+        { characterId: 'character-1', label: '自己' },
+        { characterId: 'missing-character', label: '失联' },
+      ],
+      revision: 2,
+    }]);
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '角色设定' }));
+    fireEvent.click(screen.getByRole('button', { name: '编辑模式' }));
+    fireEvent.click(screen.getByRole('button', { name: '保存角色设定' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('不能指向自己');
+    expect(screen.getByRole('alert')).toHaveTextContent('指向不存在的人物');
+    expect(client.script.characters.save).not.toHaveBeenCalled();
   });
 
   it('edits and saves the world bible as structured lists', async () => {

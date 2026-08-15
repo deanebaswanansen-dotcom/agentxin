@@ -183,6 +183,7 @@ function commitInput(
   const partial = {
     episode: value,
     expectedEpisodeRevision: value.revision,
+    expectedReviewRevision: 0,
     continuity: continuity(),
     inputRevisionRefs: [{ resource: 'plan' as const, id: 'plan-1', revision: 1 }],
     upstreamArtifactRefs: [{ node: 'review', artifactRevision: 1, artifactHash: 'review-hash' }],
@@ -603,6 +604,30 @@ describe('FileScriptStore', () => {
     expect(state?.continuityCommits?.filter((item) => item.status === 'current')).toHaveLength(1);
   });
 
+  it('rejects a late review-ledger change and an open hard issue inside the atomic mutation', async () => {
+    const store = await FileScriptStore.create(root);
+    await store.savePlan(plan(), 0);
+    await registerCharacters(store);
+    const draft = await store.saveEpisode(episode(), 0);
+    const reviewedInput = commitInput(draft);
+
+    await store.saveReviewIssues('project-1', [reviewIssue({
+      severity: 'hard',
+      source: 'user',
+      code: 'USER_HARD_STOP',
+    })], 0);
+
+    await expect(store.commitEpisodeWithContinuity(reviewedInput))
+      .rejects.toBeInstanceOf(ScriptConflictError);
+    await expect(store.commitEpisodeWithContinuity(commitInput(draft, {
+      expectedReviewRevision: 1,
+    }))).rejects.toThrow('仍有未解决的硬性校稿问题');
+
+    const state = await store.getProjectState('project-1');
+    expect(state?.episodes).toEqual([draft]);
+    expect(state?.continuityCommits).toEqual([]);
+  });
+
   it('idempotently defaults review state when loading a legacy schemaVersion 1 file', async () => {
     await writeFile(
       join(root, 'project-1.json'),
@@ -675,5 +700,29 @@ describe('FileScriptStore', () => {
 
     expect(replaced.items.map((item) => item.id).sort()).toEqual(['issue-1', 'issue-2']);
     expect(new Set(replaced.items.map((item) => item.id)).size).toBe(2);
+  });
+
+  it('preserves an ignored AI hard advisory when the same finding is reviewed again', async () => {
+    const store = await FileScriptStore.create(root);
+    const advisory = reviewIssue({
+      id: 'ai-advisory-1',
+      code: 'HOOK_STRENGTH',
+      severity: 'hard',
+      source: 'ai',
+      status: 'ignored',
+    });
+    await store.saveReviewIssues('project-1', [advisory], 0);
+
+    const replaced = await store.replaceEpisodeReviewIssues(
+      'project-1',
+      1,
+      ['ai'],
+      [{ ...advisory, id: 'generated-id', status: 'open' }],
+      1,
+    );
+
+    expect(replaced.items).toEqual([
+      expect.objectContaining({ id: 'ai-advisory-1', source: 'ai', status: 'ignored' }),
+    ]);
   });
 });

@@ -124,7 +124,7 @@ function normalizeIssues(issues: readonly StructuredDecodeIssue[]): readonly Str
 function parseIssue(error: ScriptModelOutputError): StructuredDecodeIssue {
   return {
     path: [],
-    code: 'json.parse_failed',
+    code: `json.${error.failureKind}`,
     message: error.message,
   };
 }
@@ -261,6 +261,12 @@ export async function generateStructured<T>(
         ...(options.signal ? { signal: options.signal } : {}),
       });
     } catch (error) {
+      if (
+        options.signal?.aborted ||
+        (error instanceof Error && error.name === 'AbortError')
+      ) {
+        throw error;
+      }
       latestIssues = [modelIssue(error)];
       attempts.push({
         attempt,

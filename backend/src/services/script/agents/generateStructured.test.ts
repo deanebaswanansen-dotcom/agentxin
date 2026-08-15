@@ -189,6 +189,21 @@ describe('generateStructured', () => {
     });
   });
 
+  it('propagates cancellation instead of converting it into needs_review', async () => {
+    const controller = new AbortController();
+    const abortError = Object.assign(new Error('cancelled'), { name: 'AbortError' });
+    const primary = new QueueModel([abortError]);
+    controller.abort();
+
+    await expect(generateStructured({
+      contract: characterContract,
+      prompt: '生成人物卡',
+      primary,
+      signal: controller.signal,
+    })).rejects.toBe(abortError);
+    expect(primary.requests).toHaveLength(1);
+  });
+
   it('returns needs_review with all three diagnostics when fallback also fails', async () => {
     const primary = new QueueModel(['{}', '{"name":"林晓"}']);
     const fallback = new QueueModel(['not json']);
@@ -208,8 +223,28 @@ describe('generateStructured', () => {
       stage: 'fallback',
       model: 'fallback',
       outcome: 'parse_failed',
-      issues: [expect.objectContaining({ path: [], code: 'json.parse_failed' })],
+      issues: [expect.objectContaining({ path: [], code: 'json.invalid_json' })],
     });
-    expect(result.error.issues[0]?.code).toBe('json.parse_failed');
+    expect(result.error.issues[0]?.code).toBe('json.invalid_json');
+  });
+
+  it('does not fabricate a value when truncated primary output and its fixup both fail', async () => {
+    const primary = new QueueModel(['{"name":"林晓"', '{}']);
+
+    const result = await generateStructured({
+      contract: characterContract,
+      prompt: '生成人物卡',
+      primary,
+    });
+
+    expect(result.status).toBe('needs_review');
+    if (result.status !== 'needs_review') throw new Error('预期 needs_review');
+    expect(result.callsUsed).toBe(2);
+    expect(result.attempts[0]).toMatchObject({
+      outcome: 'parse_failed',
+      issues: [expect.objectContaining({ code: 'json.truncated_output' })],
+    });
+    expect(result.attempts[1]).toMatchObject({ outcome: 'decode_failed' });
+    expect('value' in result).toBe(false);
   });
 });

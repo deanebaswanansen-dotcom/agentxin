@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import type { ScriptBlock, ScriptEpisode } from '../domain.js';
+import type { ScriptGateIssue } from '../quality/ScriptQualityGates.js';
 import {
   defineStructuredContract,
   type StructuredDecodeIssue,
@@ -40,6 +41,42 @@ export interface AppliedScriptRevisionPatch {
   insertedBlockIds: string[];
 }
 
+export interface ScriptRevisionPatchPolicyOptions {
+  /** The canonical character registry for this run. Empty is valid; missing is not. */
+  registeredCharacterIds: Iterable<string>;
+}
+
+export type ScriptRevisionPatchPolicyRule =
+  | {
+      issueCode: string;
+      target: 'blockText';
+      sceneId: string;
+      blockId: string;
+    }
+  | {
+      issueCode: string;
+      target: 'sceneAppend' | 'sceneCharacters';
+      sceneId: string;
+    }
+  | {
+      issueCode: 'TOO_SHORT';
+      target: 'shortExpansion';
+      sceneId: string;
+      allowedAfterBlockIds: string[];
+    };
+
+/**
+ * A capability tied to one exact episode revision. It deliberately contains
+ * only targets justified by the blocking gate report, never a broad scene list.
+ */
+export interface ScriptRevisionPatchPolicy {
+  episodeId: string;
+  episodeRevision: number;
+  outlineId: string;
+  registeredCharacterIds: string[];
+  rules: ScriptRevisionPatchPolicyRule[];
+}
+
 export class ScriptRevisionPatchError extends Error {
   readonly code = 'INVALID_SCRIPT_REVISION_PATCH';
 
@@ -47,6 +84,146 @@ export class ScriptRevisionPatchError extends Error {
     super(message);
     this.name = 'ScriptRevisionPatchError';
   }
+}
+
+const BLOCK_TEXT_CODES = new Set([
+  'EMPTY_BLOCK_TEXT',
+  'CAPTION_STRUCTURE_POLLUTION',
+  'ACTION_STRUCTURE_POLLUTION',
+  'DIALOGUE_STRUCTURE_POLLUTION',
+]);
+
+const SCENE_CHARACTER_CODES = new Set([
+  'DUPLICATE_SCENE_CHARACTER',
+  'UNKNOWN_CHARACTER_REFERENCE',
+  'SPEAKER_NOT_IN_SCENE',
+]);
+
+function normalizedPath(value: string | undefined): string {
+  return (value ?? '')
+    .trim()
+    .replace(/\[\d+\]/gu, '')
+    .replace(/^episode\./u, '')
+    .replace(/^scenes\./u, '');
+}
+
+function cannotAutoRepair(issue: Pick<ScriptGateIssue, 'code' | 'path' | 'sceneId' | 'blockId'>, reason: string): never {
+  const location = [
+    issue.sceneId ? `sceneId=${issue.sceneId}` : '',
+    issue.blockId ? `blockId=${issue.blockId}` : '',
+    issue.path ? `path=${issue.path}` : '',
+  ].filter(Boolean).join(', ');
+  throw new ScriptRevisionPatchError(
+    `阻断问题 ${issue.code}${location ? `（${location}）` : ''} 无法安全自动修复：${reason}`,
+  );
+}
+
+function uniquePolicyRules(rules: readonly ScriptRevisionPatchPolicyRule[]): ScriptRevisionPatchPolicyRule[] {
+  const seen = new Set<string>();
+  return rules.filter((rule) => {
+    const key = JSON.stringify(rule);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+/**
+ * Converts a blocking report into a narrow, revision-bound write capability.
+ * Throws instead of guessing when an issue has no target expressible by the
+ * supported Patch operations.
+ */
+export function buildScriptRevisionPatchPolicy(
+  base: ScriptEpisode,
+  blockingIssues: readonly Pick<
+    ScriptGateIssue,
+    'code' | 'severity' | 'path' | 'sceneId' | 'blockId'
+  >[],
+  options: ScriptRevisionPatchPolicyOptions,
+): ScriptRevisionPatchPolicy {
+  if (blockingIssues.length === 0) {
+    throw new ScriptRevisionPatchError('没有阻断问题，拒绝授予自动修订权限。');
+  }
+  if (!options || options.registeredCharacterIds === undefined) {
+    throw new ScriptRevisionPatchError('构造修订策略必须提供已登记人物 ID 白名单。');
+  }
+  const registeredCharacterIds = [...new Set(
+    [...options.registeredCharacterIds].map((id) => id.trim()).filter(Boolean),
+  )];
+  const rules: ScriptRevisionPatchPolicyRule[] = [];
+
+  for (const issue of blockingIssues) {
+    if (issue.severity !== 'hard') {
+      cannotAutoRepair(issue, '只有 hard 阻断问题可以授权自动修订');
+    }
+    if (issue.code === 'TOO_SHORT') {
+      const lastScene = base.scenes.at(-1);
+      if (!lastScene) cannotAutoRepair(issue, '正文没有可安全扩写的末场');
+      const lastBlock = lastScene.blocks.at(-1);
+      rules.push({
+        issueCode: 'TOO_SHORT',
+        target: 'shortExpansion',
+        sceneId: lastScene.id,
+        allowedAfterBlockIds: lastBlock ? [lastBlock.id] : [],
+      });
+      continue;
+    }
+
+    const path = normalizedPath(issue.path);
+    if (
+      issue.sceneId &&
+      (SCENE_CHARACTER_CODES.has(issue.code) || /(?:^|\.)characterIds$/u.test(path))
+    ) {
+      const scene = base.scenes.find((candidate) => candidate.id === issue.sceneId);
+      if (!scene) cannotAutoRepair(issue, '定位的场景已不存在');
+      rules.push({
+        issueCode: issue.code,
+        target: 'sceneCharacters',
+        sceneId: scene.id,
+      });
+      continue;
+    }
+    if (issue.blockId) {
+      if (!issue.sceneId) cannotAutoRepair(issue, '正文块问题缺少 sceneId');
+      const scene = base.scenes.find((candidate) => candidate.id === issue.sceneId);
+      const block = scene?.blocks.find((candidate) => candidate.id === issue.blockId);
+      if (!scene || !block) cannotAutoRepair(issue, '定位的场景或正文块已不存在');
+      if (!BLOCK_TEXT_CODES.has(issue.code) && !/(?:^|\.)blocks\.text$|^text$/u.test(path)) {
+        cannotAutoRepair(issue, '该块级问题不能仅通过替换正文文本修复');
+      }
+      rules.push({
+        issueCode: issue.code,
+        target: 'blockText',
+        sceneId: scene.id,
+        blockId: block.id,
+      });
+      continue;
+    }
+
+    if (issue.sceneId) {
+      const scene = base.scenes.find((candidate) => candidate.id === issue.sceneId);
+      if (!scene) cannotAutoRepair(issue, '定位的场景已不存在');
+      if (issue.code === 'EMPTY_SCENE' || /(?:^|\.)blocks$/u.test(path)) {
+        rules.push({
+          issueCode: issue.code,
+          target: 'sceneAppend',
+          sceneId: scene.id,
+        });
+        continue;
+      }
+      cannotAutoRepair(issue, '该场景字段不在 Patch 允许修改的 characterIds/blocks 范围内');
+    }
+
+    cannotAutoRepair(issue, '问题没有精确场景/正文块定位，且不属于安全扩写');
+  }
+
+  return {
+    episodeId: base.id,
+    episodeRevision: base.revision,
+    outlineId: base.outlineId,
+    registeredCharacterIds,
+    rules: uniquePolicyRules(rules),
+  };
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -235,6 +412,75 @@ function canonical(value: unknown): string {
   return JSON.stringify(value);
 }
 
+function operationLabel(operation: ScriptRevisionOperation): string {
+  if (operation.op === 'replaceBlockText') return `${operation.op}:${operation.sceneId}/${operation.blockId}`;
+  if (operation.op === 'insertBlockAfter') {
+    return `${operation.op}:${operation.sceneId}/${operation.afterBlockId}`;
+  }
+  return `${operation.op}:${operation.sceneId}`;
+}
+
+/** Validates the complete Patch before any ID is allocated or candidate is mutated. */
+export function assertScriptRevisionPatchAllowed(
+  base: ScriptEpisode,
+  patch: ScriptRevisionPatch,
+  policy: ScriptRevisionPatchPolicy,
+): void {
+  if (
+    policy.episodeId !== base.id ||
+    policy.episodeRevision !== base.revision ||
+    policy.outlineId !== base.outlineId
+  ) {
+    throw new ScriptRevisionPatchError('修订策略与当前 Episode 版本不匹配，拒绝应用陈旧 Patch。');
+  }
+  if (policy.rules.length === 0) {
+    throw new ScriptRevisionPatchError('修订策略没有授权任何操作。');
+  }
+  const registeredCharacterIds = new Set(policy.registeredCharacterIds);
+
+  for (const operation of patch.operations) {
+    if (operation.op === 'updateSceneCharacters') {
+      const unknownId = operation.characterIds.find((id) => !registeredCharacterIds.has(id));
+      if (unknownId) {
+        throw new ScriptRevisionPatchError(`场景人物更新引用了未登记人物 ID：${unknownId}。`);
+      }
+    }
+    if (
+      (operation.op === 'insertBlockAfter' || operation.op === 'appendBlock') &&
+      operation.block.type === 'dialogue' &&
+      operation.block.characterId &&
+      !registeredCharacterIds.has(operation.block.characterId)
+    ) {
+      throw new ScriptRevisionPatchError(
+        `新增对白引用了未登记人物 ID：${operation.block.characterId}。`,
+      );
+    }
+
+    const authorized = policy.rules.some((rule) => {
+      if (operation.op === 'replaceBlockText') {
+        return rule.target === 'blockText' &&
+          rule.sceneId === operation.sceneId &&
+          rule.blockId === operation.blockId;
+      }
+      if (operation.op === 'updateSceneCharacters') {
+        return rule.target === 'sceneCharacters' && rule.sceneId === operation.sceneId;
+      }
+      if (operation.op === 'appendBlock') {
+        return (rule.target === 'sceneAppend' || rule.target === 'shortExpansion') &&
+          rule.sceneId === operation.sceneId;
+      }
+      return rule.target === 'shortExpansion' &&
+        rule.sceneId === operation.sceneId &&
+        rule.allowedAfterBlockIds.includes(operation.afterBlockId);
+    });
+    if (!authorized) {
+      throw new ScriptRevisionPatchError(
+        `操作 ${operationLabel(operation)} 未被当前阻断问题授权。`,
+      );
+    }
+  }
+}
+
 /** Proves that every non-targeted original block remains byte-for-byte and order stable. */
 export function assertUntouchedScriptBlocks(
   base: ScriptEpisode,
@@ -257,10 +503,12 @@ export function applyScriptRevisionPatch(
   base: ScriptEpisode,
   patch: ScriptRevisionPatch,
   createId: () => string = randomUUID,
+  policy?: ScriptRevisionPatchPolicy,
 ): AppliedScriptRevisionPatch {
   if (patch.operations.length === 0 || patch.operations.length > 32) {
     throw new ScriptRevisionPatchError('修订操作数量必须为 1 到 32。');
   }
+  if (policy) assertScriptRevisionPatchAllowed(base, patch, policy);
   const episode = structuredClone(base);
   const existingIds = new Set(episode.scenes.flatMap((scene) => scene.blocks.map((block) => block.id)));
   const touchedSceneIds = new Set<string>();

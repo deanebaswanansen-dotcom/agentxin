@@ -290,4 +290,30 @@ describe('AgentJobRunner', () => {
     expect(store.get(created.id)?.status).toBe('cancelled');
     expect(store.get(created.id)?.result).toBeUndefined();
   });
+
+  it('does not resurrect a cancelled structured job as waiting_user', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-cancel-structured-'));
+    const store = await AgentRunStore.create(join(directory, 'runs.json'));
+    let rejectRun!: (error: unknown) => void;
+    const runner = new AgentJobRunner(store, {
+      run: () => new Promise((_resolve, reject) => {
+        rejectRun = reject;
+      }),
+    });
+
+    const created = await runner.start(
+      CLIENT_ID,
+      { task: 'script_episode_batch', mode: 'draft', prompt: '', projectId: 'p1' },
+      undefined,
+    );
+    await vi.waitFor(() => expect(store.get(created.id)?.status).toBe('running'));
+    await runner.cancel(CLIENT_ID, created.id);
+    rejectRun(Object.assign(new Error('候选等待人工检查'), {
+      code: 'SCRIPT_STRUCTURED_NEEDS_REVIEW',
+      recoverable: true,
+    }));
+    await runner.waitUntilIdle(created.id);
+
+    expect(store.get(created.id)?.status).toBe('cancelled');
+  });
 });

@@ -34,6 +34,8 @@ import {
   ScriptCommitConflictError,
   type ScriptStore,
 } from './ScriptStore.js';
+import { currentScriptContinuityCommits } from './ScriptContinuityCommit.js';
+import { isBlockingScriptReviewIssue } from './quality/ScriptQualityGates.js';
 
 const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const RENAME_DELAYS_MS = [5, 15, 35, 75, 150, 300] as const;
@@ -210,18 +212,15 @@ function previousEpisodeContinuityCommit(
       `第 ${episodeNumber} 集提交前，第 ${episodeNumber - 1} 集必须处于已完成状态。`,
     );
   }
-  const matches = (state.continuityCommits ?? []).filter(
-    (commit) =>
-      commit.episodeNumber === previousEpisode.episodeNumber &&
-      commit.episodeRevision === previousEpisode.revision &&
-      commit.status === 'current',
+  const previous = currentScriptContinuityCommits(state).find(
+    (commit) => commit.episodeNumber === previousEpisode.episodeNumber,
   );
-  if (matches.length !== 1) {
+  if (!previous) {
     throw new ScriptCommitConflictError(
-      `第 ${episodeNumber - 1} 集缺少与最新正文版本匹配的连续性提交。`,
+      `第 ${episodeNumber - 1} 集缺少与最新正文版本匹配的连续性提交（完整链）。`,
     );
   }
-  return matches[0];
+  return previous;
 }
 
 function assertUniqueContinuityIds<T>(
@@ -304,12 +303,8 @@ function validateContinuityCandidate(
   }
 
   const resolvableEventIds = new Set(
-    (state.continuityCommits ?? [])
-      .filter(
-        (commit) =>
-          commit.status === 'current' &&
-          commit.episodeNumber < episode.episodeNumber,
-      )
+    currentScriptContinuityCommits(state)
+      .filter((commit) => commit.episodeNumber < episode.episodeNumber)
       .flatMap((commit) => commit.timelineEvents.map((event) => event.eventId)),
   );
   for (const event of continuity.timelineEvents) resolvableEventIds.add(event.eventId);
@@ -571,6 +566,14 @@ export class FileScriptStore implements ScriptStore {
       const currentEpisode = episodeIndex >= 0 ? state.episodes[episodeIndex] : undefined;
       const currentEpisodeRevision = currentEpisode?.revision ?? 0;
       assertExpectedRevision(input.expectedEpisodeRevision, currentEpisodeRevision);
+      assertExpectedRevision(input.expectedReviewRevision, state.reviewRevision);
+      if (state.reviewIssues.some((issue) =>
+        issue.episodeNumber === input.episode.episodeNumber && isBlockingScriptReviewIssue(issue)
+      )) {
+        throw new ScriptCommitConflictError(
+          `第 ${input.episode.episodeNumber} 集仍有未解决的硬性校稿问题。`,
+        );
+      }
 
       if (input.episode.projectId !== state.projectId) {
         throw new ScriptCommitConflictError('候选正文与短剧项目不一致。');
@@ -708,7 +711,7 @@ export class FileScriptStore implements ScriptStore {
           ...item,
           id,
           projectId,
-          status: previous?.status === 'ignored' && item.severity !== 'hard'
+          status: previous?.status === 'ignored' && !isBlockingScriptReviewIssue(item)
             ? 'ignored' as const
             : item.status,
           createdAt: previous?.createdAt ?? item.createdAt,

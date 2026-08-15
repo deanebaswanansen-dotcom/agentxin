@@ -1,10 +1,19 @@
 import { repairLooseJson } from '../../blueprint/blueprintParser.js';
 import { stripReasoningArtifacts } from '../../text/reasoningSanitizer.js';
 
+export type ScriptModelOutputFailureKind =
+  | 'empty_output'
+  | 'truncated_output'
+  | 'invalid_json'
+  | 'invalid_shape';
+
 export class ScriptModelOutputError extends Error {
   readonly code = 'SCRIPT_MODEL_OUTPUT_INVALID';
 
-  constructor(message: string) {
+  constructor(
+    message: string,
+    readonly failureKind: ScriptModelOutputFailureKind = 'invalid_shape',
+  ) {
     super(message);
     this.name = 'ScriptModelOutputError';
   }
@@ -43,9 +52,17 @@ export function parseStructuredModelOutputWithDiagnostics(raw: string): Structur
   const sanitized = stripReasoningArtifacts(raw)
     .replace(/^\s*```(?:json)?\s*$/gim, '')
     .trim();
+  if (!sanitized) {
+    throw new ScriptModelOutputError('模型未返回 JSON 内容。', 'empty_output');
+  }
   const objectText = extractBalancedObject(sanitized);
   if (!objectText) {
-    throw new ScriptModelOutputError('模型未返回完整的 JSON 对象。');
+    throw new ScriptModelOutputError(
+      sanitized.includes('{')
+        ? '模型返回的 JSON 对象被截断。'
+        : '模型未返回 JSON 对象。',
+      sanitized.includes('{') ? 'truncated_output' : 'invalid_json',
+    );
   }
 
   let parsed: unknown;
@@ -57,11 +74,11 @@ export function parseStructuredModelOutputWithDiagnostics(raw: string): Structur
       parsed = JSON.parse(repairLooseJson(objectText));
       mode = 'local_repair';
     } catch {
-      throw new ScriptModelOutputError('模型返回的 JSON 无法解析。');
+      throw new ScriptModelOutputError('模型返回的 JSON 无法解析。', 'invalid_json');
     }
   }
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw new ScriptModelOutputError('模型返回的 JSON 顶层必须是对象。');
+    throw new ScriptModelOutputError('模型返回的 JSON 顶层必须是对象。', 'invalid_shape');
   }
   return { value: parsed as Record<string, unknown>, mode };
 }

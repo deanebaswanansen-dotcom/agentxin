@@ -10,6 +10,9 @@ import {
   decodeScriptEpisodeCandidateArtifact,
   decodeScriptScenePlanArtifact,
   decideScriptCheckpointResume,
+  InMemoryScriptCheckpointStore,
+  latestScriptCheckpoint,
+  nextScriptCheckpointArtifactRevision,
   type ScriptCheckpointArtifactBuildContext,
   type ScriptCheckpointArtifactExpectation,
   type ScriptPipelineCheckpoint,
@@ -119,6 +122,86 @@ function expectation(artifact: {
 }
 
 describe('script checkpoint v2 recovery', () => {
+  it('selects the highest artifact revision independent of list and timestamp order', () => {
+    const latest = checkpoint({
+      artifactRevision: 6,
+      updatedAt: '2026-08-14T00:00:00.000Z',
+      artifact: { title: '第六版' },
+    });
+    const older = checkpoint({
+      artifactRevision: 5,
+      updatedAt: '2099-08-14T00:00:00.000Z',
+      artifact: { title: '第五版' },
+    });
+
+    expect(latestScriptCheckpoint([older, latest], {
+      node: 'draft',
+      episodeNumber: 2,
+    })).toEqual(latest);
+    expect(nextScriptCheckpointArtifactRevision([latest, older], {
+      node: 'draft',
+      episodeNumber: 2,
+    })).toBe(7);
+  });
+
+  it('keeps immutable revisions in memory and permits status-only updates', async () => {
+    const store = new InMemoryScriptCheckpointStore();
+    const running = checkpoint({ status: 'running', artifactRevision: 4 });
+    const succeeded = checkpoint({
+      status: 'succeeded',
+      attempt: 2,
+      artifactRevision: 4,
+      updatedAt: '2026-08-15T00:01:00.000Z',
+    });
+    const revisionFive = checkpoint({
+      artifactRevision: 5,
+      artifact: { title: '第五版' },
+      updatedAt: '2026-08-15T00:02:00.000Z',
+    });
+
+    await store.save(running);
+    await store.save(succeeded);
+    await store.save(revisionFive);
+    await expect(store.save(checkpoint({
+      artifactRevision: 5,
+      artifact: { title: '原地篡改' },
+    }))).rejects.toThrow(/不可原地改写/);
+
+    const history = await store.list(running.projectId, running.runKey);
+    expect(history).toEqual([succeeded, revisionFive]);
+    expect(latestScriptCheckpoint(history, {
+      node: 'draft',
+      episodeNumber: 2,
+    })).toEqual(revisionFive);
+  });
+
+  it('materializes an empty revision without allowing its provenance to change', async () => {
+    const store = new InMemoryScriptCheckpointStore();
+    const running = checkpoint({
+      status: 'running',
+      artifactRevision: 7,
+      artifact: undefined,
+    });
+    await store.save(running);
+
+    await expect(store.save(checkpoint({
+      status: 'succeeded',
+      artifactRevision: 7,
+      artifact: { title: '候选' },
+      inputFingerprint: 'b'.repeat(64),
+    }))).rejects.toThrow(/不可原地改写 provenance/);
+
+    const materialized = checkpoint({
+      status: 'succeeded',
+      attempt: 2,
+      artifactRevision: 7,
+      artifact: { title: '候选' },
+      updatedAt: '2026-08-15T00:03:00.000Z',
+    });
+    await store.save(materialized);
+    expect(await store.list(running.projectId, running.runKey)).toEqual([materialized]);
+  });
+
   it('computes the same fingerprint regardless of revision-ref input order', () => {
     const left = computeScriptCheckpointInputFingerprint({
       node: 'draft',

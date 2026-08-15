@@ -72,6 +72,11 @@ npx vitest run src/services/script/agents/structuredOutputEval.test.ts --pool=th
 本地 repair 能安全处理尾逗号和字符串内裸控制字符，不尝试猜测缺失引号、缺括号或被
 截断的内容。这些不可确定修复进入显式 Fixup，符合“本地只做保守修复”的边界。
 
+解析失败同时保留机器可读分类：`empty_output`、`truncated_output`、`invalid_json`
+和 `invalid_shape`。代码围栏与合法 JSON 走 `direct`，尾逗号等保守修复走
+`local_repair`；缺闭合括号和真实中途截断不会被补成空对象，而是以
+`truncated_output` 进入一次 Fixup，Fixup 仍不完整时进入 `needs_review`。
+
 ## 已发现边界
 
 - 顶层数组夹具会被当前“提取第一个平衡对象”逻辑提取出内部对象并通过契约。对于只需

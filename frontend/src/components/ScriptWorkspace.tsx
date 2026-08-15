@@ -395,9 +395,28 @@ function OutlineEditor({
   );
 }
 
-function emptyCharacter(projectId: Id, index: number): ScriptCharacter {
+let fallbackCharacterId = 0;
+
+function createCharacterId(projectId: Id, characters: readonly ScriptCharacter[]): Id {
+  const existingIds = new Set(characters.map((character) => character.id));
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const randomId = globalThis.crypto?.randomUUID?.();
+    if (randomId) {
+      const candidate = `${projectId}-character-${randomId}`;
+      if (!existingIds.has(candidate)) return candidate;
+    }
+  }
+  let candidate: string;
+  do {
+    fallbackCharacterId += 1;
+    candidate = `${projectId}-character-local-${fallbackCharacterId}`;
+  } while (existingIds.has(candidate));
+  return candidate;
+}
+
+function emptyCharacter(projectId: Id, characters: readonly ScriptCharacter[]): ScriptCharacter {
   return {
-    id: `${projectId}-character-${index}`,
+    id: createCharacterId(projectId, characters),
     projectId,
     name: '',
     aliases: [],
@@ -501,6 +520,7 @@ const REQUIRED_CHARACTER_TEXT_FIELDS: Array<{
 
 function validateCharacters(value: ScriptCharacter[]): CharacterValidationError[] {
   const errors: CharacterValidationError[] = [];
+  const characterIds = new Set(value.map((character) => character.id));
   value.forEach((character, characterIndex) => {
     REQUIRED_CHARACTER_TEXT_FIELDS.forEach(({ field, label }) => {
       if (!character[field].trim()) {
@@ -516,6 +536,18 @@ function validateCharacters(value: ScriptCharacter[]): CharacterValidationError[
           characterIndex,
           field: `relationships.${relationshipIndex}.characterId`,
           message: `角色 ${characterIndex + 1} 的关系 ${relationshipIndex + 1} 缺少目标人物`,
+        });
+      } else if (relationship.characterId === character.id) {
+        errors.push({
+          characterIndex,
+          field: `relationships.${relationshipIndex}.characterId`,
+          message: `角色 ${characterIndex + 1} 的关系 ${relationshipIndex + 1} 不能指向自己`,
+        });
+      } else if (!characterIds.has(relationship.characterId)) {
+        errors.push({
+          characterIndex,
+          field: `relationships.${relationshipIndex}.characterId`,
+          message: `角色 ${characterIndex + 1} 的关系 ${relationshipIndex + 1} 指向不存在的人物`,
         });
       }
       if (!relationship.label.trim()) {
@@ -561,7 +593,7 @@ function CharacterEditor({
   };
   return (
     <section className="script-stage-panel" aria-labelledby="script-characters-heading">
-      <header className="script-stage-heading"><div><span>第三阶段</span><h2 id="script-characters-heading">角色设定</h2></div><div className="script-stage-heading__actions"><div className="script-view-switch" role="group" aria-label="角色查看模式"><button type="button" aria-pressed={mode === 'read'} onClick={() => setMode('read')}>人物卡</button><button type="button" aria-pressed={mode === 'edit'} onClick={() => setMode('edit')}>编辑模式</button></div><button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={onGenerate}>Agent 补全人物与世界</button><button type="button" className="nwa-button nwa-button--ghost" onClick={() => { setValidationErrors([]); onChange([...value, emptyCharacter(projectId, value.length + 1)]); }}>添加角色</button></div></header>
+      <header className="script-stage-heading"><div><span>第三阶段</span><h2 id="script-characters-heading">角色设定</h2></div><div className="script-stage-heading__actions"><div className="script-view-switch" role="group" aria-label="角色查看模式"><button type="button" aria-pressed={mode === 'read'} onClick={() => setMode('read')}>人物卡</button><button type="button" aria-pressed={mode === 'edit'} onClick={() => setMode('edit')}>编辑模式</button></div><button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={onGenerate}>Agent 补全人物与世界</button><button type="button" className="nwa-button nwa-button--ghost" onClick={() => { setValidationErrors([]); onChange([...value, emptyCharacter(projectId, value)]); }}>添加角色</button></div></header>
       {mode === 'read' ? <ScriptCharactersReadView value={value} /> : <>
       {validationErrors.length > 0 ? <div className="script-character-errors" role="alert"><strong>请补全人物卡后再保存</strong><ul>{validationErrors.map((error) => <li key={`${error.characterIndex}-${error.field}`}>{error.message}</li>)}</ul></div> : null}
       {value.length === 0 ? <p className="script-muted">尚无角色。可手动添加，或让 Agent 根据策划和总纲补全人物与世界圣经。</p> : <div className="script-character-list">{value.map((character, index) => (
@@ -659,10 +691,15 @@ const JOB_STATUS_LABEL: Record<ScriptAgentJobSnapshot['status'], string> = {
 };
 
 const CHECKPOINT_LABEL: Record<NonNullable<ScriptAgentJobSnapshot['checkpoint']>['node'], string> = {
+  plan: '策划锁定',
+  series_outline: '全剧大纲',
+  character_bible: '人物圣经',
+  world_bible: '世界圣经',
   episode_outline: '详细大纲',
   scene_plan: '场景计划',
   draft: '正文初稿',
   review: '连续性审查',
+  revision: '定向修订',
   completed: '本集完成',
   batch_report: '批次报告',
 };
@@ -805,7 +842,9 @@ function EpisodeBatchPanel({
           {visibleJobs.length === 0 ? <p className="script-muted">当前批次暂无后台任务。</p> : visibleJobs.map((job) => (
             <article className="script-job-card" key={job.id}>
               <div className="script-job-card__status"><strong>{JOB_STATUS_LABEL[job.status]}</strong><span>{job.task === 'script_episode_batch' ? '分批正文' : '资料生成'}</span></div>
-              {job.checkpoint ? <p>第 {job.checkpoint.episodeNumber} 集 · {CHECKPOINT_LABEL[job.checkpoint.node]}</p> : <p>等待首个检查点</p>}
+              {job.checkpoint ? <p>{job.checkpoint.episodeNumber === undefined
+                ? CHECKPOINT_LABEL[job.checkpoint.node]
+                : `第 ${job.checkpoint.episodeNumber} 集 · ${CHECKPOINT_LABEL[job.checkpoint.node]}`}</p> : <p>等待首个检查点</p>}
               {job.error ? <p className="script-job-error">{job.error.message}</p> : null}
               {job.continuable ? <button type="button" className="nwa-button nwa-button--sm" disabled={busy} onClick={() => onResume(job.id)}>从检查点继续</button> : null}
               {job.status === 'queued' || job.status === 'running' || job.status === 'retrying' ? <button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={busy} onClick={() => onCancel(job.id)}>取消任务</button> : null}
@@ -847,7 +886,7 @@ function EpisodeBatchPanel({
                 <footer>
                   {issue.status === 'open' ? <>
                     <button type="button" className="nwa-button nwa-button--sm" disabled={busy} onClick={() => onReviewStatus(issue.id, 'fixed')}>标记已修复</button>
-                    {issue.severity !== 'hard'
+                    {!isBlockingReviewIssue(issue)
                       ? <button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={busy} onClick={() => onReviewStatus(issue.id, 'ignored')}>忽略</button>
                       : <span className="script-proofread-required">硬性问题不可忽略</span>}
                   </> : <button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={busy} onClick={() => onReviewStatus(issue.id, 'open')}>重新打开</button>}
@@ -1812,7 +1851,7 @@ export function ScriptWorkspace({
           item.episodeNumber >= batch.startEpisode &&
           item.episodeNumber <= batch.endEpisode
         ));
-        const hasHardIssue = openIssues.some((item) => item.severity === 'hard');
+        const hasHardIssue = openIssues.some(isBlockingReviewIssue);
         const status = batch.status === 'generating'
           ? batch.status
           : hasHardIssue

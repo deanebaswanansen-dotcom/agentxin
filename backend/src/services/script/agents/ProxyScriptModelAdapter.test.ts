@@ -102,4 +102,39 @@ describe('ProxyScriptModelAdapter', () => {
     expect(received[0]?.baseUrl).toBe(config.baseUrl);
     expect(received[0]?.apiKey).toBe(config.apiKey);
   });
+
+  it('fingerprints only canonical non-secret model routing fields', async () => {
+    const first = new ProxyScriptModelAdapter(
+      { getInternalConfig: vi.fn().mockResolvedValue({
+        ...config,
+        apiKey: 'secret-a',
+        baseUrl: 'https://example.test/v1/',
+        structuredFallbackModelName: 'repair-model',
+      }) },
+      { streamCompletion: vi.fn() } as unknown as ModelProxy,
+    );
+    const rotatedKey = new ProxyScriptModelAdapter(
+      { getInternalConfig: vi.fn().mockResolvedValue({
+        ...config,
+        apiKey: 'secret-b',
+        structuredFallbackModelName: 'repair-model',
+      }) },
+      { streamCompletion: vi.fn() } as unknown as ModelProxy,
+    );
+    const changedModel = new ProxyScriptModelAdapter(
+      { getInternalConfig: vi.fn().mockResolvedValue({
+        ...config,
+        apiKey: 'secret-a',
+        modelName: 'another-model',
+        structuredFallbackModelName: 'repair-model',
+      }) },
+      { streamCompletion: vi.fn() } as unknown as ModelProxy,
+    );
+
+    const fingerprint = await first.getModelConfigFingerprint();
+    expect(fingerprint).toMatch(/^[a-f0-9]{64}$/);
+    await expect(rotatedKey.getModelConfigFingerprint()).resolves.toBe(fingerprint);
+    await expect(changedModel.getModelConfigFingerprint()).resolves.not.toBe(fingerprint);
+    expect(fingerprint).not.toContain('secret-a');
+  });
 });

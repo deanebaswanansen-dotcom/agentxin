@@ -136,7 +136,14 @@ describe('apiClient request building', () => {
         return jsonResponse({
           revision: 3,
           items: [issue],
-          report: { hardFailed: false, issues: [], visibleChars: 1200, dialogueDensityPercent: 60 },
+          report: {
+            hardFailed: false,
+            issues: [],
+            blockingIssues: [],
+            advisoryIssues: [],
+            visibleChars: 1200,
+            dialogueDensityPercent: 60,
+          },
         });
       }
       if (url.endsWith('/script-review-issues/issue-1')) {

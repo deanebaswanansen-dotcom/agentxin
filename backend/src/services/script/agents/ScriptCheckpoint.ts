@@ -660,7 +660,13 @@ export class InMemoryScriptCheckpointStore implements ScriptCheckpointStore {
   async save(checkpoint: ScriptPipelineCheckpointWrite): Promise<void> {
     const normalized = normalizeScriptCheckpointWrite(checkpoint);
     const key = checkpointIdentity(normalized);
-    this.items.set(key, structuredClone(normalized));
+    const current = this.items.get(key);
+    this.items.set(
+      key,
+      current
+        ? mergeScriptCheckpointRevision(current, normalized)
+        : structuredClone(normalized),
+    );
   }
 
   async deleteProject(projectId: string): Promise<void> {
@@ -672,15 +678,123 @@ export class InMemoryScriptCheckpointStore implements ScriptCheckpointStore {
 
 export function checkpointIdentity(checkpoint: Pick<
   ScriptPipelineCheckpoint,
-  'projectId' | 'runKey' | 'node' | 'episodeNumber' | 'chunkStart'
+  | 'projectId'
+  | 'runKey'
+  | 'node'
+  | 'episodeNumber'
+  | 'chunkStart'
+  | 'artifactRevision'
 >): string {
-  return [
+  return JSON.stringify([
     checkpoint.projectId,
     checkpoint.runKey,
     checkpoint.node,
-    checkpoint.episodeNumber ?? '',
-    checkpoint.chunkStart ?? '',
-  ].join(':');
+    checkpoint.episodeNumber ?? null,
+    checkpoint.chunkStart ?? null,
+    checkpoint.artifactRevision,
+  ]);
+}
+
+export interface ScriptCheckpointSelector {
+  node: ScriptCheckpointNode;
+  episodeNumber?: number;
+  chunkStart?: number;
+}
+
+/**
+ * Select the newest immutable artifact revision for one logical node scope.
+ * Store iteration order is deliberately not part of recovery semantics.
+ */
+export function latestScriptCheckpoint(
+  checkpoints: readonly ScriptPipelineCheckpoint[],
+  selector: ScriptCheckpointSelector,
+): ScriptPipelineCheckpoint | undefined {
+  return checkpoints
+    .filter((checkpoint) =>
+      checkpoint.node === selector.node &&
+      (selector.episodeNumber === undefined ||
+        checkpoint.episodeNumber === selector.episodeNumber) &&
+      (selector.chunkStart === undefined || checkpoint.chunkStart === selector.chunkStart),
+    )
+    .reduce<ScriptPipelineCheckpoint | undefined>((latest, checkpoint) => {
+      if (!latest || compareScriptCheckpointRecency(checkpoint, latest) > 0) {
+        return checkpoint;
+      }
+      return latest;
+    }, undefined);
+}
+
+/** Return the next artifact revision for one logical node scope. */
+export function nextScriptCheckpointArtifactRevision(
+  checkpoints: readonly ScriptPipelineCheckpoint[],
+  selector: ScriptCheckpointSelector,
+): number {
+  const latest = latestScriptCheckpoint(checkpoints, selector);
+  return latest ? latest.artifactRevision + 1 : 0;
+}
+
+/**
+ * Merge an operational status update for one immutable artifact revision.
+ * A running record may materialize its artifact once; after that, changing the
+ * artifact or any of its provenance fields requires a new artifactRevision.
+ */
+export function mergeScriptCheckpointRevision(
+  current: ScriptPipelineCheckpoint,
+  incoming: ScriptPipelineCheckpoint,
+): ScriptPipelineCheckpoint {
+  if (checkpointIdentity(current) !== checkpointIdentity(incoming)) {
+    throw new TypeError('只能合并同一短剧检查点 artifact revision');
+  }
+
+  if (current.artifact === undefined) {
+    const immutableCurrent = checkpointImmutablePayload(current, undefined);
+    const immutableIncoming = checkpointImmutablePayload(incoming, undefined);
+    if (canonicalHash(immutableCurrent) !== canonicalHash(immutableIncoming)) {
+      throw new TypeError(
+        '短剧检查点 artifact revision 不可原地改写 provenance；请增加 artifactRevision',
+      );
+    }
+    return structuredClone(incoming);
+  }
+
+  const incomingArtifact = incoming.artifact === undefined
+    ? current.artifact
+    : incoming.artifact;
+  const immutableCurrent = checkpointImmutablePayload(current, current.artifact);
+  const immutableIncoming = checkpointImmutablePayload(incoming, incomingArtifact);
+  if (canonicalHash(immutableCurrent) !== canonicalHash(immutableIncoming)) {
+    throw new TypeError(
+      '短剧检查点 artifact revision 不可原地改写；请增加 artifactRevision',
+    );
+  }
+
+  return structuredClone({
+    ...incoming,
+    artifact: incomingArtifact,
+  });
+}
+
+function checkpointImmutablePayload(
+  checkpoint: ScriptPipelineCheckpoint,
+  artifact: unknown,
+): unknown {
+  return {
+    inputRevisionRefs: checkpoint.inputRevisionRefs,
+    upstreamArtifactRefs: checkpoint.upstreamArtifactRefs,
+    promptVersion: checkpoint.promptVersion,
+    configRevision: checkpoint.configRevision,
+    inputFingerprint: checkpoint.inputFingerprint,
+    artifact,
+  };
+}
+
+function compareScriptCheckpointRecency(
+  left: ScriptPipelineCheckpoint,
+  right: ScriptPipelineCheckpoint,
+): number {
+  return left.artifactRevision - right.artifactRevision ||
+    left.attempt - right.attempt ||
+    left.updatedAt.localeCompare(right.updatedAt);
 }
 
 /** Expand a legacy call-site write to a non-reusable, complete v2 record. */

@@ -5,7 +5,9 @@ import { isAbsolute, join, relative, resolve } from 'node:path';
 import { StoreError } from '../../store/StoreError.js';
 import { getCurrentClientId } from '../client/clientScope.js';
 import {
+  checkpointIdentity,
   decodeScriptCheckpointV2,
+  mergeScriptCheckpointRevision,
   migrateScriptCheckpointV1,
   normalizeScriptCheckpointWrite,
   type ScriptCheckpointStore,
@@ -95,7 +97,21 @@ export function normalizeScriptCheckpointFile(
     if (checkpoints.some((item) => item.projectId !== projectId || item.runKey !== runKey)) {
       throw new StoreError(`短剧检查点记录与当前运行不匹配: ${projectId}/${runKey}`);
     }
-    return { schemaVersion: 2, projectId, runKey, checkpoints };
+    const history = new Map<string, ScriptPipelineCheckpoint>();
+    for (const checkpoint of checkpoints) {
+      const identity = checkpointIdentity(checkpoint);
+      const current = history.get(identity);
+      history.set(
+        identity,
+        current ? mergeScriptCheckpointRevision(current, checkpoint) : checkpoint,
+      );
+    }
+    return {
+      schemaVersion: 2,
+      projectId,
+      runKey,
+      checkpoints: [...history.values()],
+    };
   } catch (error) {
     if (error instanceof StoreError) throw error;
     throw new StoreError(`短剧检查点记录格式无效: ${projectId}/${runKey}`, {
@@ -204,13 +220,16 @@ export class FileScriptCheckpointStore implements ScriptCheckpointStore {
   private async saveAfterPrevious(checkpoint: ScriptPipelineCheckpointWrite): Promise<void> {
     const normalized = normalizeScriptCheckpointWrite(checkpoint);
     const file = await this.read(normalized.projectId, normalized.runKey);
+    const identity = checkpointIdentity(normalized);
     const index = file.checkpoints.findIndex(
-      (current) =>
-        current.node === normalized.node &&
-        current.episodeNumber === normalized.episodeNumber &&
-        current.chunkStart === normalized.chunkStart,
+      (current) => checkpointIdentity(current) === identity,
     );
-    if (index >= 0) file.checkpoints[index] = clone(normalized);
+    if (index >= 0) {
+      file.checkpoints[index] = mergeScriptCheckpointRevision(
+        file.checkpoints[index]!,
+        normalized,
+      );
+    }
     else file.checkpoints.push(clone(normalized));
     await this.persist(file);
   }

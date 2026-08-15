@@ -315,6 +315,8 @@ export interface ScriptEpisodeContinuityCommit
 export interface ScriptCommitEpisodeWithContinuityInput {
   episode: ScriptEpisode;
   expectedEpisodeRevision: number;
+  /** Review ledger revision observed after the last quality-gate write. */
+  expectedReviewRevision: number;
   continuity: ScriptEpisodeContinuityCommitInput;
   inputRevisionRefs: ScriptInputRevisionRef[];
   upstreamArtifactRefs: ScriptUpstreamArtifactRef[];

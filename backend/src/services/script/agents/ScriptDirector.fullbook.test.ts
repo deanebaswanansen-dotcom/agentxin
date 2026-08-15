@@ -92,7 +92,7 @@ class DeterministicFullBookModel implements ScriptModelAdapter {
           timeOfDay: 'day',
           interiorExterior: 'interior',
           characterIds: ['lead'],
-          blocks: [{ type: 'action', text: '沈清核验证据推进调查'.repeat(20) }],
+        blocks: [{ type: 'action', text: '沈清握紧录音笔核验证据推进调查'.repeat(20) }],
         }],
         summary: '',
         newFacts: [],
@@ -138,7 +138,7 @@ function plan(): ScriptPlan {
     highlights: ['逐集证据升级', '连续性追踪'],
     totalEpisodes: 10,
     episodeDurationSeconds: { min: 60, max: 90 },
-    targetCharsPerEpisode: 200,
+    targetCharsPerEpisode: 300,
     maxPrimaryCharacters: 6,
     maxScenesPerEpisode: 3,
     dialogueDensityPercent: 0,
@@ -307,6 +307,10 @@ describe('ScriptDirector offline ten-episode full-book diagnostic', () => {
       (call) => call.node === 'draft' && call.episodeNumber === 6,
     )?.prompt;
     expect(episodeSixPrompt).toContain('第5集证据已登记');
+    expect(episodeSixPrompt).toContain('第5集待解线索');
+    expect(episodeSixPrompt).toContain('录音笔');
+    expect(episodeSixPrompt).toContain('causeEventIds');
+    expect(episodeSixPrompt).toContain('props');
     expect(episodeSixPrompt).toContain('recentCommits');
     expect(model.calls.filter((call) => call.node === 'revision')).toHaveLength(0);
     expect(model.calls).toHaveLength(32);
