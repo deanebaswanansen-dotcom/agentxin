@@ -83,6 +83,119 @@ const client = () => createApiClient('/api');
 // ---------------------------------------------------------------------------
 
 describe('apiClient request building', () => {
+  it('loads the aggregate short-drama state in one request', async () => {
+    const state = {
+      schemaVersion: 1 as const,
+      projectId: 'project-1',
+      characters: [],
+      episodeOutlines: [],
+      episodes: [],
+      continuity: { currentState: [], openThreads: [], wardrobeLedger: [] },
+      reviewRevision: 0,
+      reviewIssues: [],
+      updatedAt: '2026-08-15T00:00:00.000Z',
+    };
+    const mock = installFetch((url, init) => {
+      expect(url).toBe('/api/projects/project-1/script-state');
+      expect(init?.method).toBe('GET');
+      return jsonResponse(state);
+    });
+
+    await expect(client().script.state.get('project-1')).resolves.toEqual(state);
+    expect(mock).toHaveBeenCalledTimes(1);
+  });
+
+  it('loads the product workspace and completes a proofreading issue workflow', async () => {
+    const issue = {
+      id: 'issue-1',
+      projectId: 'project-1',
+      episodeNumber: 1,
+      code: 'MISSING_HOOK',
+      severity: 'soft' as const,
+      category: 'hook' as const,
+      message: '结尾缺少卡点。',
+      status: 'open' as const,
+      source: 'deterministic' as const,
+      createdAt: '2026-08-15T00:00:00.000Z',
+      updatedAt: '2026-08-15T00:00:00.000Z',
+    };
+    const workspace = {
+      schemaVersion: 1 as const,
+      projectId: 'project-1',
+      characters: [],
+      episodeSummaries: [],
+      batchSummaries: [],
+      reviewRevision: 2,
+      reviewIssues: [issue],
+      updatedAt: '2026-08-15T00:00:00.000Z',
+    };
+    const mock = installFetch((url, init) => {
+      if (url.endsWith('/script-workspace')) return jsonResponse(workspace);
+      if (url.endsWith('/script-episodes/1/review')) {
+        expect(JSON.parse(String(init?.body))).toEqual({ expectedRevision: 2 });
+        return jsonResponse({
+          revision: 3,
+          items: [issue],
+          report: { hardFailed: false, issues: [], visibleChars: 1200, dialogueDensityPercent: 60 },
+        });
+      }
+      if (url.endsWith('/script-review-issues/issue-1')) {
+        expect(JSON.parse(String(init?.body))).toEqual({ expectedRevision: 3, status: 'fixed' });
+        return jsonResponse({ revision: 4, item: { ...issue, status: 'fixed' } });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+
+    await expect(client().script.workspace.get('project-1')).resolves.toEqual(workspace);
+    await expect(client().script.episodes.review('project-1', 1, 2)).resolves.toMatchObject({ revision: 3 });
+    await expect(client().script.reviews.updateStatus('project-1', 'issue-1', 'fixed', 3))
+      .resolves.toMatchObject({ revision: 4, item: { status: 'fixed' } });
+    expect(mock.mock.calls.map((call) => [call[0], call[1]?.method])).toEqual([
+      ['/api/projects/project-1/script-workspace', 'GET'],
+      ['/api/projects/project-1/script-episodes/1/review', 'POST'],
+      ['/api/projects/project-1/script-review-issues/issue-1', 'PATCH'],
+    ]);
+  });
+
+  it('downloads script exports as blobs and keeps the UTF-8 server filename', async () => {
+    const mock = installFetch((url, init) => {
+      expect(url).toBe('/api/projects/project-1/script-export?format=md&startEpisode=6&episodeCount=5');
+      expect(init?.method).toBe('GET');
+      return new Response('# 第六集', {
+        headers: {
+          'Content-Type': 'text/markdown; charset=utf-8',
+          'Content-Disposition': "attachment; filename*=UTF-8''%E5%A4%9C%E7%8F%AD%E7%9C%9F%E7%9B%B8-6-10.md",
+        },
+      });
+    });
+
+    const file = await client().script.exportFile('project-1', 'md', {
+      startEpisode: 6,
+      episodeCount: 5,
+    });
+    expect(file.filename).toBe('夜班真相-6-10.md');
+    expect(file.contentType).toBe('text/markdown; charset=utf-8');
+    expect(file.blob.size).toBeGreaterThan(0);
+    expect(file.blob.type.replace(/;\s*/g, ';')).toBe('text/markdown;charset=utf-8');
+    expect(mock).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses a safe fallback export filename when Content-Disposition is unavailable', async () => {
+    installFetch(() => new Response('正文', { headers: { 'Content-Type': 'text/plain; charset=utf-8' } }));
+
+    const file = await client().script.exportFile('project/unsafe', 'fountain');
+    expect(file.filename).toBe('short-drama-project_unsafe.fountain');
+  });
+
+  it('rejects an HTML SPA fallback instead of downloading it as a script', async () => {
+    installFetch(() => htmlResponse());
+
+    await expect(client().script.exportFile('project-1', 'txt')).rejects.toMatchObject({
+      code: 'STORE_ERROR',
+      message: expect.stringContaining('网页内容'),
+    });
+  });
+
   it('loads and saves the versioned short-drama plan through the script namespace', async () => {
     const plan = {
       id: 'plan-1',
@@ -121,6 +234,22 @@ describe('apiClient request building', () => {
     await expect(client().script.plan.get('project-1')).resolves.toEqual(plan);
     await expect(client().script.plan.save('project-1', plan, 2)).resolves.toMatchObject({ revision: 3 });
     expect(JSON.parse(String(mock.mock.calls[1]?.[1]?.body))).toEqual({ expectedRevision: 2, value: plan });
+  });
+
+  it('requests AI short-drama concepts with the current model configuration', async () => {
+    const proposals = [{ title: '选题一' }, { title: '选题二' }, { title: '选题三' }];
+    const mock = installFetch((url) => {
+      expect(url).toBe('/api/plan/script/concepts');
+      return jsonResponse({ proposals });
+    });
+
+    await expect(client().script.plan.concepts('project-1', '家庭情绪勒索'))
+      .resolves.toEqual({ proposals });
+    const request = mock.mock.calls[0]?.[1];
+    expect(request?.method).toBe('POST');
+    expect(JSON.parse(String(request?.body))).toEqual({
+      projectId: 'project-1', seedPrompt: '家庭情绪勒索',
+    });
   });
 
   it('starts and resumes a five-episode script job with checkpoint-safe options', async () => {

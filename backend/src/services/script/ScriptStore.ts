@@ -5,6 +5,9 @@ import type {
   ScriptEpisodeOutline,
   ScriptPlan,
   ScriptProjectState,
+  ScriptReviewIssue,
+  ScriptReviewIssueCollection,
+  ScriptReviewSource,
   ScriptSeriesOutline,
   ScriptWorldBible,
 } from './domain.js';
@@ -37,6 +40,18 @@ export interface ScriptStore {
     projectId: string,
     value: ScriptContinuityState,
   ): Promise<ScriptContinuityState>;
+  saveReviewIssues(
+    projectId: string,
+    items: ScriptReviewIssue[],
+    expectedRevision?: number,
+  ): Promise<ScriptReviewIssueCollection>;
+  replaceEpisodeReviewIssues(
+    projectId: string,
+    episodeNumber: number,
+    sources: readonly ScriptReviewSource[],
+    items: ScriptReviewIssue[],
+    expectedRevision?: number,
+  ): Promise<ScriptReviewIssueCollection>;
   deleteProject(projectId: string): Promise<void>;
 }
 

@@ -44,6 +44,14 @@ describe('serializeChineseShortDrama', () => {
               mode: 'os',
               text: '这规矩，该改改了。',
             },
+            {
+              id: 'b-5',
+              type: 'dialogue',
+              characterId: 'c-1',
+              speaker: '沈清',
+              mode: 'normal',
+              text: '饭凉了，我去热。',
+            },
           ],
         },
       ],
@@ -56,7 +64,8 @@ describe('serializeChineseShortDrama', () => {
       updatedAt: '2026-08-14T00:00:00.000Z',
     } satisfies ScriptEpisode;
 
-    expect(serializeChineseShortDrama([episode], characters)).toBe(
+    const serialized = serializeChineseShortDrama([episode], characters);
+    expect(serialized).toBe(
       [
         '第一集',
         '',
@@ -66,7 +75,10 @@ describe('serializeChineseShortDrama', () => {
         '△沈清跨过门槛。',
         '周慧兰（嗓子哑）：恭请太奶奶出房用膳——！',
         '沈清（os）：这规矩，该改改了。',
+        '沈清：饭凉了，我去热。',
       ].join('\n'),
     );
+    expect(serialized).not.toContain('△△');
+    expect(serialized).not.toMatch(/(?:沈清|周慧兰)(?:（[^）]+）)?：(?:沈清|周慧兰)(?:（[^）]+）)?：/u);
   });
 });

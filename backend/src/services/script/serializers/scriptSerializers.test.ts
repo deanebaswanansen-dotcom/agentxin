@@ -25,6 +25,7 @@ const episode = {
         { id: 'caption', type: 'caption', text: '深夜' },
         { id: 'action', type: 'action', text: '沈清俯身查看门缝。' },
         { id: 'line', type: 'dialogue', characterId: 'lead', speaker: '沈清', mode: 'vo', text: '果然有问题。' },
+        { id: 'normal-line', type: 'dialogue', characterId: 'lead', speaker: '沈清', mode: 'normal', text: '我知道了。' },
       ],
     },
   ],
@@ -50,6 +51,8 @@ describe('script exchange serializers', () => {
     expect(value).toContain('# 第2集 门缝的秘密');
     expect(value).toContain('## 2-1 太奶奶房门口 夜/内');
     expect(value).toContain('**沈清（vo）：**果然有问题。');
+    expect(value).toContain('**沈清：**我知道了。');
+    expect(value).not.toContain('沈清（normal）');
     expect(value).not.toContain('```json');
   });
 

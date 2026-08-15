@@ -6,6 +6,7 @@ import type {
   ScriptPlanTurnAnswer,
   ScriptPlanTurnService,
 } from '../services/script/agents/ScriptPlanTurnService.js';
+import type { ScriptConceptService } from '../services/script/agents/ScriptConceptService.js';
 import { toErrorResponse } from './errorMapping.js';
 
 interface ScriptPlanTurnBody {
@@ -13,6 +14,11 @@ interface ScriptPlanTurnBody {
   seedPrompt?: unknown;
   answers?: unknown;
   reset?: unknown;
+}
+
+interface ScriptConceptBody {
+  projectId?: unknown;
+  seedPrompt?: unknown;
 }
 function answerValue(value: unknown, index: number): ScriptPlanAnswerValue | undefined {
   if (value === undefined) return undefined;
@@ -66,6 +72,7 @@ function parseBody(body: ScriptPlanTurnBody) {
 export function registerScriptPlanRoutes(
   app: FastifyInstance,
   service: ScriptPlanTurnService,
+  concepts?: ScriptConceptService,
 ): void {
   app.post<{ Body: ScriptPlanTurnBody }>('/api/plan/script/turn', async (request, reply) => {
     const controller = new AbortController();
@@ -82,4 +89,34 @@ export function registerScriptPlanRoutes(
       reply.raw.removeListener('close', onClose);
     }
   });
+  if (concepts) {
+    app.post<{ Body: ScriptConceptBody }>('/api/plan/script/concepts', async (request, reply) => {
+      const body = request.body ?? {};
+      if (typeof body.projectId !== 'string' || !body.projectId.trim()) {
+        const mapped = toErrorResponse(ServiceError.validation('projectId 不能为空。'));
+        return reply.code(mapped.status).send(mapped.body);
+      }
+      if (body.seedPrompt !== undefined && typeof body.seedPrompt !== 'string') {
+        const mapped = toErrorResponse(ServiceError.validation('seedPrompt 必须是文本。'));
+        return reply.code(mapped.status).send(mapped.body);
+      }
+      const controller = new AbortController();
+      const onClose = (): void => {
+        if (!reply.raw.writableEnded) controller.abort();
+      };
+      reply.raw.on('close', onClose);
+      try {
+        return reply.code(200).send(await concepts.generate(
+          body.projectId.trim(),
+          typeof body.seedPrompt === 'string' ? body.seedPrompt : '',
+          controller.signal,
+        ));
+      } catch (error) {
+        const mapped = toErrorResponse(error);
+        return reply.code(mapped.status).send(mapped.body);
+      } finally {
+        reply.raw.removeListener('close', onClose);
+      }
+    });
+  }
 }

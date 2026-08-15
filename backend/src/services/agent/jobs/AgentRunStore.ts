@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
+import { ServiceError } from '../../ServiceError.js';
 import type { AgentProgressEvent, AgentRunRequest, AgentRunResult } from '../../../types/index.js';
 
 export type AgentRunStatus =
@@ -37,6 +38,56 @@ interface AgentRunFile {
 }
 
 const INTERRUPTED_MESSAGE = '服务已重启，请重新连接以继续任务。';
+const DEDUPLICATED_SCRIPT_TASKS = new Set<AgentRunRequest['task']>([
+  'script_series_outline',
+  'script_bible',
+  'script_episode_batch',
+]);
+const ACTIVE_STATUSES = new Set<AgentRunStatus>([
+  'queued',
+  'running',
+  'retrying',
+  'waiting_user',
+]);
+
+export class AgentRunConflictError extends ServiceError {
+  constructor(
+    readonly existingJobId: string,
+    message: string,
+  ) {
+    super('CONFLICT', message);
+    this.name = 'AgentRunConflictError';
+    Object.setPrototypeOf(this, AgentRunConflictError.prototype);
+  }
+}
+
+function batchRange(request: AgentRunRequest): { start: number; end: number } | undefined {
+  const options = request.scriptBatchOptions;
+  if (request.task !== 'script_episode_batch' || !options) return undefined;
+  return {
+    start: options.startEpisode,
+    end: options.startEpisode + options.episodeCount - 1,
+  };
+}
+
+function requestsConflict(existing: AgentRunRequest, candidate: AgentRunRequest): boolean {
+  if (
+    !DEDUPLICATED_SCRIPT_TASKS.has(candidate.task) ||
+    existing.task !== candidate.task ||
+    existing.projectId !== candidate.projectId
+  ) {
+    return false;
+  }
+  if (candidate.task !== 'script_episode_batch') return true;
+  const existingRange = batchRange(existing);
+  const candidateRange = batchRange(candidate);
+  return Boolean(
+    existingRange &&
+    candidateRange &&
+    existingRange.start <= candidateRange.end &&
+    candidateRange.start <= existingRange.end,
+  );
+}
 
 function clone<T>(value: T): T {
   return structuredClone(value);
@@ -78,6 +129,20 @@ export class AgentRunStore {
   }
 
   async create(clientId: string, request: AgentRunRequest): Promise<StoredAgentRun> {
+    const conflict = Object.values(this.data.runs).find((run) =>
+      run.clientId === clientId &&
+      ACTIVE_STATUSES.has(run.status) &&
+      requestsConflict(run.request, request),
+    );
+    if (conflict) {
+      throw new AgentRunConflictError(
+        conflict.id,
+        request.task === 'script_episode_batch'
+          ? '同一项目已有集数范围重叠的短剧批次正在执行或等待恢复。'
+          : '同一项目已有相同短剧任务正在执行或等待恢复。',
+      );
+    }
+
     const now = new Date().toISOString();
     const run: StoredAgentRun = {
       id: randomUUID(),

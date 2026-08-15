@@ -129,4 +129,48 @@ describe('agent job routes', () => {
     expect(response.json()).toEqual({ error: { code: 'STORE_ERROR', message: '服务器内部错误。' } });
     await app.close();
   });
+
+  it('returns 409 and the existing job id for an active duplicate script job', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-job-route-conflict-'));
+    const store = await AgentRunStore.create(join(directory, 'runs.json'));
+    const existing = await store.create(CLIENT_A, {
+      task: 'script_series_outline',
+      mode: 'draft',
+      prompt: '',
+      projectId: 'project-a',
+    });
+    await store.markWaiting(existing.id, { code: 'RUN_INTERRUPTED', message: '等待恢复' });
+    const runner = new AgentJobRunner(store, {
+      run: vi.fn(async (request) => ({
+        task: request.task,
+        mode: request.mode,
+        projectId: request.projectId,
+        summary: '完成',
+        steps: [],
+        artifacts: [],
+      })),
+    });
+    const app = Fastify();
+    registerClientScope(app);
+    registerRequestModelConfig(app);
+    registerAgentJobRoutes(app, store, runner);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/agent/jobs',
+      headers: { 'x-agentxin-client-id': CLIENT_A },
+      payload: { task: 'script_series_outline', projectId: 'project-a' },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({
+      error: {
+        code: 'CONFLICT',
+        message: expect.stringContaining('相同短剧任务'),
+        existingJobId: existing.id,
+      },
+    });
+    expect(store.listForClient(CLIENT_A, 'project-a')).toHaveLength(1);
+    await app.close();
+  });
 });

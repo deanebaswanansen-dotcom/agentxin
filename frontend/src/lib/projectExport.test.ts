@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildProjectDocxBlob,
   buildProjectTextExport,
+  downloadBlobFile,
   sanitizeDownloadName,
 } from './projectExport.js';
 
@@ -43,6 +44,29 @@ describe('project export helpers', () => {
   it('sanitizes Windows-hostile download names', () => {
     expect(sanitizeDownloadName('  a:b/c*d?e"f<g>h|  ')).toBe('a_b_c_d_e_f_g_h_');
     expect(sanitizeDownloadName('   ')).toBe('novel');
+    expect(sanitizeDownloadName('CON.txt')).toBe('_CON.txt');
+    expect(sanitizeDownloadName('剧本.md. ')).toBe('剧本.md');
+  });
+
+  it('keeps the object URL alive while the browser acquires a download', () => {
+    vi.useFakeTimers();
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    const createObjectURL = vi.fn(() => 'blob:script-export');
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal('URL', { createObjectURL, revokeObjectURL });
+
+    downloadBlobFile(new Blob(['正文']), '夜班:真相.md', 5_000);
+
+    expect(click).toHaveBeenCalledTimes(1);
+    expect(document.querySelector('a')?.download).toBe('夜班_真相.md');
+    expect(revokeObjectURL).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(0);
+    expect(document.querySelector('a')).toBeNull();
+    expect(revokeObjectURL).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(5_000);
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:script-export');
+
+    vi.useRealTimers();
   });
 
   it('builds a valid DOCX package with document XML', async () => {

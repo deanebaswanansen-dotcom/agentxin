@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
 import type { ScriptEpisode, ScriptEpisodeOutline, ScriptPlan } from '../domain.js';
-import { validateScriptEpisode } from './ScriptQualityGates.js';
+import {
+  createScriptReviewIssues,
+  validateScriptEpisode,
+} from './ScriptQualityGates.js';
 
 const plan = {
   targetCharsPerEpisode: 100,
@@ -140,5 +143,243 @@ describe('validateScriptEpisode', () => {
     expect(report.issues.map((issue) => issue.code)).toEqual(
       expect.arrayContaining(['DUPLICATE_DIALOGUE', 'DIALOGUE_DENSITY', 'WARDROBE_JUMP']),
     );
+  });
+
+  it('localizes scene, block and speaker format failures for proofreading', () => {
+    const scene = {
+      ...validScene(2),
+      characterIds: [],
+      blocks: [
+        {
+          id: 'duplicate-block',
+          type: 'dialogue' as const,
+          characterId: 'character-1',
+          speaker: '错误名字',
+          text: '剧情'.repeat(45),
+        },
+        { id: 'duplicate-block', type: 'action' as const, text: '补充动作' },
+      ],
+    };
+    const outline = {
+      id: 'outline-1',
+      conflict: '正面冲突',
+      endingHook: '新证人出现',
+      requiredFacts: ['必须出现的证据'],
+      forbiddenFacts: ['补充动作'],
+    } as unknown as ScriptEpisodeOutline;
+    const report = validateScriptEpisode(episode({ scenes: [scene] }), plan, {
+      outline,
+      registeredCharacterIds: new Set(['character-1']),
+      registeredCharacterNames: new Set(['沈清']),
+      characterNamesById: new Map([['character-1', '沈清']]),
+    });
+
+    expect(report.issues.map((issue) => issue.code)).toEqual(expect.arrayContaining([
+      'NON_CONTIGUOUS_SCENE_ORDINAL',
+      'DUPLICATE_BLOCK_ID',
+      'SPEAKER_NOT_IN_SCENE',
+      'SPEAKER_CHARACTER_MISMATCH',
+      'MISSING_REQUIRED_FACT',
+      'FORBIDDEN_FACT',
+    ]));
+    expect(report.issues.find((issue) => issue.code === 'DUPLICATE_BLOCK_ID')).toMatchObject({
+      sceneId: 'scene-2',
+      blockId: 'duplicate-block',
+    });
+  });
+
+  it('reports structured continuity ledger conflicts without hard-failing the episode', () => {
+    const report = validateScriptEpisode(
+      episode({
+        scenes: [validScene()],
+        summary: '本集摘要',
+        newFacts: ['旧事实'],
+        openedThreads: ['即开即收'],
+        closedThreads: ['即开即收', '不存在的旧伏笔'],
+      }),
+      plan,
+      {
+        continuity: {
+          currentState: ['旧事实'],
+          openThreads: [],
+          wardrobeLedger: [],
+        },
+      },
+    );
+
+    expect(report.hardFailed).toBe(false);
+    expect(report.issues.map((issue) => issue.code)).toEqual(expect.arrayContaining([
+      'UNKNOWN_CLOSED_THREAD',
+      'THREAD_OPENED_AND_CLOSED',
+      'DUPLICATE_CONTINUITY_FACT',
+    ]));
+  });
+
+  it('converts gate issues into persisted review issues with source and location', () => {
+    const items = createScriptReviewIssues('project-1', 3, 'deterministic', [{
+      code: 'EMPTY_BLOCK_TEXT',
+      severity: 'hard',
+      message: '正文块内容为空。',
+      sceneId: 'scene-1',
+      blockId: 'block-1',
+      path: 'blocks.text',
+    }], '2026-08-15T00:00:00.000Z');
+
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      projectId: 'project-1',
+      episodeNumber: 3,
+      source: 'deterministic',
+      status: 'open',
+      category: 'format',
+      sceneId: 'scene-1',
+      blockId: 'block-1',
+    });
+  });
+
+  it.each([
+    '△沈清推门而入。',
+    '【字幕：三天后】',
+    '沈清（冷静）：证据在这里。',
+  ])('hard-fails caption blocks polluted by action/dialogue structure: %s', (caption) => {
+    const scene = {
+      ...validScene(),
+      characterIds: ['character-1'],
+      blocks: [
+        { id: 'action', type: 'action' as const, text: '剧情'.repeat(40) },
+        { id: 'caption', type: 'caption' as const, text: caption },
+      ],
+    };
+    const report = validateScriptEpisode(episode({ scenes: [scene], summary: '摘要' }), plan, {
+      registeredCharacterNames: new Set(['沈清']),
+    });
+
+    expect(report.hardFailed).toBe(true);
+    expect(report.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'CAPTION_STRUCTURE_POLLUTION',
+        sceneId: 'scene-1',
+        blockId: 'caption',
+      }),
+    ]));
+  });
+
+  it.each([
+    '△沈清推门而入。',
+    '【字幕：三天后】',
+    '沈清（冷静）：证据在这里。',
+  ])('hard-fails action blocks polluted by serialized structure: %s', (action) => {
+    const scene = {
+      ...validScene(),
+      characterIds: ['character-1'],
+      blocks: [
+        { id: 'filler', type: 'action' as const, text: '剧情'.repeat(40) },
+        { id: 'polluted-action', type: 'action' as const, text: action },
+      ],
+    };
+    const report = validateScriptEpisode(episode({ scenes: [scene], summary: '摘要' }), plan, {
+      registeredCharacterNames: new Set(['沈清']),
+    });
+
+    expect(report.hardFailed).toBe(true);
+    expect(report.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'ACTION_STRUCTURE_POLLUTION',
+        severity: 'hard',
+        sceneId: 'scene-1',
+        blockId: 'polluted-action',
+        path: 'blocks.text',
+      }),
+    ]));
+  });
+
+  it.each([
+    '△沈清转身离开。',
+    '【字幕：三天后】',
+    '沈清：证据在这里。',
+    '沈清（冷静）：证据在这里。',
+  ])('hard-fails dialogue text polluted by serialized structure: %s', (dialogue) => {
+    const scene = {
+      ...validScene(),
+      characterIds: ['character-1'],
+      blocks: [
+        { id: 'filler', type: 'action' as const, text: '剧情'.repeat(40) },
+        {
+          id: 'polluted-dialogue',
+          type: 'dialogue' as const,
+          characterId: 'character-1',
+          speaker: '沈清',
+          text: dialogue,
+        },
+      ],
+    };
+    const report = validateScriptEpisode(episode({ scenes: [scene], summary: '摘要' }), plan, {
+      registeredCharacterIds: new Set(['character-1']),
+      registeredCharacterNames: new Set(['沈清']),
+      characterNamesById: new Map([['character-1', '沈清']]),
+    });
+
+    expect(report.hardFailed).toBe(true);
+    expect(report.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'DIALOGUE_STRUCTURE_POLLUTION',
+        severity: 'hard',
+        sceneId: 'scene-1',
+        blockId: 'polluted-dialogue',
+        path: 'blocks.text',
+      }),
+    ]));
+  });
+
+  it('reports an outline forbidden fact once with the specific stable code', () => {
+    const outline = {
+      id: 'outline-1',
+      conflict: '正面冲突',
+      endingHook: '新证人出现',
+      requiredFacts: [],
+      forbiddenFacts: ['校园剧'],
+    } as unknown as ScriptEpisodeOutline;
+    const scene = {
+      ...validScene(),
+      blocks: [{ id: 'action', type: 'action' as const, text: `校园剧${'剧情'.repeat(42)}` }],
+    };
+    const overlappingPlan = { ...plan, forbiddenElements: ['校园剧'] };
+    const report = validateScriptEpisode(
+      episode({ scenes: [scene], summary: '摘要' }),
+      overlappingPlan,
+      { outline },
+    );
+
+    expect(report.issues.filter((issue) => issue.code.includes('FORBIDDEN')).map((issue) => issue.code))
+      .toEqual(['FORBIDDEN_FACT']);
+  });
+
+  it('reports a localized soft LONG_DIALOGUE finding above 80 visible characters', () => {
+    const scene = {
+      ...validScene(),
+      characterIds: ['character-1'],
+      blocks: [{
+        id: 'long-dialogue',
+        type: 'dialogue' as const,
+        characterId: 'character-1',
+        speaker: '沈清',
+        text: '证据'.repeat(45),
+      }],
+    };
+    const report = validateScriptEpisode(episode({ scenes: [scene], summary: '摘要' }), plan, {
+      registeredCharacterIds: new Set(['character-1']),
+      registeredCharacterNames: new Set(['沈清']),
+      characterNamesById: new Map([['character-1', '沈清']]),
+    });
+
+    expect(report.hardFailed).toBe(false);
+    expect(report.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'LONG_DIALOGUE',
+        severity: 'soft',
+        sceneId: 'scene-1',
+        blockId: 'long-dialogue',
+      }),
+    ]));
   });
 });

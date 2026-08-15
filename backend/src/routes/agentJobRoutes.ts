@@ -1,7 +1,11 @@
 import type { FastifyInstance } from 'fastify';
 
 import { AgentJobRunner } from '../services/agent/jobs/AgentJobRunner.js';
-import type { AgentRunStore, StoredAgentRun } from '../services/agent/jobs/AgentRunStore.js';
+import {
+  AgentRunConflictError,
+  type AgentRunStore,
+  type StoredAgentRun,
+} from '../services/agent/jobs/AgentRunStore.js';
 import { getCurrentClientId } from '../services/client/clientScope.js';
 import { getRequestModelConfig } from '../services/modelConfig/requestModelConfig.js';
 import { parseAgentBody } from './agentRoutes.js';
@@ -57,6 +61,15 @@ export function registerAgentJobRoutes(
       );
       return reply.code(202).send(toClientRun(run));
     } catch (error) {
+      if (error instanceof AgentRunConflictError) {
+        return reply.code(409).send({
+          error: {
+            code: 'CONFLICT',
+            message: error.message,
+            existingJobId: error.existingJobId,
+          },
+        });
+      }
       const { status, body } = toErrorResponse(error);
       return reply.code(status).send(body);
     }

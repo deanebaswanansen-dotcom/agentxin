@@ -17,6 +17,9 @@ import type {
   ScriptEpisodeOutline,
   ScriptPlan,
   ScriptProjectState,
+  ScriptReviewIssue,
+  ScriptReviewIssueCollection,
+  ScriptReviewSource,
   ScriptSeriesOutline,
   ScriptWorldBible,
 } from './domain.js';
@@ -44,6 +47,8 @@ function emptyState(projectId: string): ScriptProjectState {
       openThreads: [],
       wardrobeLedger: [],
     },
+    reviewRevision: 0,
+    reviewIssues: [],
     updatedAt: new Date().toISOString(),
   };
 }
@@ -82,6 +87,13 @@ function normalizeState(value: unknown, projectId: string): ScriptProjectState {
         ? clone(continuity.wardrobeLedger)
         : [],
     },
+    reviewRevision:
+      Number.isInteger(input.reviewRevision) && (input.reviewRevision as number) >= 0
+        ? (input.reviewRevision as number)
+        : 0,
+    reviewIssues: Array.isArray(input.reviewIssues)
+      ? clone(input.reviewIssues).map((item) => ({ ...item, projectId }))
+      : [],
     updatedAt:
       typeof input.updatedAt === 'string'
         ? input.updatedAt
@@ -325,6 +337,74 @@ export class FileScriptStore implements ScriptStore {
       const saved = clone(value);
       state.continuity = saved;
       return saved;
+    });
+  }
+
+  saveReviewIssues(
+    projectId: string,
+    items: ScriptReviewIssue[],
+    expectedRevision?: number,
+  ): Promise<ScriptReviewIssueCollection> {
+    return this.mutate(projectId, (state) => {
+      assertExpectedRevision(expectedRevision, state.reviewRevision);
+      const revision = state.reviewRevision + 1;
+      const saved = clone(items)
+        .map((item) => ({ ...item, projectId }))
+        .sort((left, right) =>
+          left.episodeNumber - right.episodeNumber || left.createdAt.localeCompare(right.createdAt),
+        );
+      state.reviewRevision = revision;
+      state.reviewIssues = saved;
+      return { revision, items: saved };
+    });
+  }
+
+  replaceEpisodeReviewIssues(
+    projectId: string,
+    episodeNumber: number,
+    sources: readonly ScriptReviewSource[],
+    items: ScriptReviewIssue[],
+    expectedRevision?: number,
+  ): Promise<ScriptReviewIssueCollection> {
+    return this.mutate(projectId, (state) => {
+      assertExpectedRevision(expectedRevision, state.reviewRevision);
+      const replacedSources = new Set(sources);
+      const retained = state.reviewIssues.filter(
+        (item) => item.episodeNumber !== episodeNumber || !replacedSources.has(item.source),
+      );
+      const existing = state.reviewIssues.filter(
+        (item) => item.episodeNumber === episodeNumber && replacedSources.has(item.source),
+      );
+      const fingerprint = (item: ScriptReviewIssue): string =>
+        [item.source, item.code, item.sceneId ?? '', item.blockId ?? '', item.path ?? ''].join('\u0000');
+      const existingByFingerprint = new Map<string, ScriptReviewIssue[]>();
+      for (const item of existing) {
+        const key = fingerprint(item);
+        existingByFingerprint.set(key, [...(existingByFingerprint.get(key) ?? []), item]);
+      }
+      const usedIds = new Set(retained.map((item) => item.id));
+      const replacements = clone(items).map((item) => {
+        const previous = existingByFingerprint.get(fingerprint(item))?.shift();
+        let id = previous?.id ?? item.id;
+        if (usedIds.has(id)) id = randomUUID();
+        usedIds.add(id);
+        return {
+          ...item,
+          id,
+          projectId,
+          status: previous?.status === 'ignored' && item.severity !== 'hard'
+            ? 'ignored' as const
+            : item.status,
+          createdAt: previous?.createdAt ?? item.createdAt,
+        };
+      });
+      const saved = [...retained, ...replacements].sort((left, right) =>
+        left.episodeNumber - right.episodeNumber || left.createdAt.localeCompare(right.createdAt),
+      );
+      const revision = state.reviewRevision + 1;
+      state.reviewRevision = revision;
+      state.reviewIssues = saved;
+      return { revision, items: saved };
     });
   }
 

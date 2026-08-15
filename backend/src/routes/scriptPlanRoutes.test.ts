@@ -99,4 +99,36 @@ describe('script plan routes', () => {
     expect(wrongKind.statusCode).toBe(400);
     await app.close();
   });
+
+  it('returns three AI concept proposals through the synchronous planning route', async () => {
+    const director = { run: vi.fn() } as never;
+    const checkpoints = new InMemoryScriptCheckpointStore();
+    const service = new ScriptPlanTurnService(
+      director,
+      checkpoints,
+      async (id) => ({
+        id, name: '短剧', kind: 'short_drama',
+        createdAt: '2026-08-15T00:00:00.000Z', updatedAt: '2026-08-15T00:00:00.000Z',
+      }),
+    );
+    const generate = vi.fn().mockResolvedValue({
+      proposals: [{ title: '选题一' }, { title: '选题二' }, { title: '选题三' }],
+    });
+    const app = Fastify();
+    registerScriptPlanRoutes(app, service, { generate } as never);
+
+    const response = await app.inject({
+      method: 'POST', url: '/api/plan/script/concepts',
+      payload: { projectId: 'project-1', seedPrompt: '家庭情绪勒索' },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.proposals).toHaveLength(3);
+    expect(body.proposals[0]).toMatchObject({ title: '选题一' });
+    expect(generate).toHaveBeenCalledWith(
+      'project-1', '家庭情绪勒索', expect.any(AbortSignal),
+    );
+    await app.close();
+  });
 });

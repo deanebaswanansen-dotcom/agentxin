@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { runWithClientId } from '../client/clientScope.js';
-import type { ScriptPlan } from './domain.js';
+import type { ScriptPlan, ScriptReviewIssue } from './domain.js';
 import {
   FileScriptStore,
   createClientScopedScriptStore,
@@ -40,6 +40,23 @@ function plan(projectId = 'project-1'): ScriptPlan {
     endingDirection: '和解',
     createdAt: '2026-08-14T00:00:00.000Z',
     updatedAt: '2026-08-14T00:00:00.000Z',
+  };
+}
+
+function reviewIssue(overrides: Partial<ScriptReviewIssue> = {}): ScriptReviewIssue {
+  return {
+    id: 'issue-1',
+    projectId: 'project-1',
+    episodeNumber: 1,
+    code: 'MISSING_SUMMARY',
+    severity: 'soft',
+    category: 'continuity',
+    message: '本集摘要为空。',
+    status: 'open',
+    source: 'deterministic',
+    createdAt: '2026-08-14T00:00:00.000Z',
+    updatedAt: '2026-08-14T00:00:00.000Z',
+    ...overrides,
   };
 }
 
@@ -158,5 +175,75 @@ describe('FileScriptStore', () => {
     expect(JSON.parse(await readFile(join(root, 'project-1.json'), 'utf8'))).toMatchObject({
       schemaVersion: 99,
     });
+  });
+
+  it('idempotently defaults review state when loading a legacy schemaVersion 1 file', async () => {
+    await writeFile(
+      join(root, 'project-1.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        projectId: 'project-1',
+        characters: [],
+        episodeOutlines: [],
+        episodes: [],
+        continuity: { currentState: [], openThreads: [], wardrobeLedger: [] },
+        updatedAt: '2026-08-14T00:00:00.000Z',
+      }),
+      'utf8',
+    );
+
+    const store = await FileScriptStore.create(root);
+    const first = await store.getProjectState('project-1');
+    const second = await store.getProjectState('project-1');
+
+    expect(first).toMatchObject({ reviewRevision: 0, reviewIssues: [] });
+    expect(second).toEqual(first);
+  });
+
+  it('persists review issues with collection conflicts and safely replaces one episode source', async () => {
+    const store = await FileScriptStore.create(root);
+    const userIssue = reviewIssue({ id: 'user-1', source: 'user', code: 'USER_NOTE' });
+    const deterministic = reviewIssue();
+    const first = await store.saveReviewIssues('project-1', [userIssue, deterministic], 0);
+    expect(first.revision).toBe(1);
+
+    await expect(
+      store.saveReviewIssues('project-1', [], 0),
+    ).rejects.toBeInstanceOf(ScriptConflictError);
+
+    const replaced = await store.replaceEpisodeReviewIssues(
+      'project-1',
+      1,
+      ['deterministic'],
+      [reviewIssue({ id: 'new-id', message: '摘要仍为空。' })],
+      1,
+    );
+    expect(replaced.revision).toBe(2);
+    expect(replaced.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'user-1', source: 'user' }),
+      expect.objectContaining({ id: 'issue-1', source: 'deterministic', message: '摘要仍为空。' }),
+    ]));
+  });
+
+  it('reuses review ids one-to-one when multiple findings share the same fingerprint', async () => {
+    const store = await FileScriptStore.create(root);
+    await store.saveReviewIssues('project-1', [
+      reviewIssue({ id: 'issue-1', message: '第一处问题' }),
+      reviewIssue({ id: 'issue-2', message: '第二处问题' }),
+    ], 0);
+
+    const replaced = await store.replaceEpisodeReviewIssues(
+      'project-1',
+      1,
+      ['deterministic'],
+      [
+        reviewIssue({ id: 'generated-1', message: '第一处问题已重新定位' }),
+        reviewIssue({ id: 'generated-2', message: '第二处问题已重新定位' }),
+      ],
+      1,
+    );
+
+    expect(replaced.items.map((item) => item.id).sort()).toEqual(['issue-1', 'issue-2']);
+    expect(new Set(replaced.items.map((item) => item.id)).size).toBe(2);
   });
 });
