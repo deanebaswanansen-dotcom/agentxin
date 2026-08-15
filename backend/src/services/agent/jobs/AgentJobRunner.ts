@@ -43,6 +43,15 @@ function isRetryable(error: unknown): boolean {
   return candidate.code === 'PROVIDER_ERROR';
 }
 
+function isRecoverableNeedsReview(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as { code?: unknown; recoverable?: unknown };
+  if (candidate.code === 'SCRIPT_STRUCTURED_NEEDS_REVIEW') return true;
+  return candidate.recoverable === true &&
+    typeof candidate.code === 'string' &&
+    candidate.code.endsWith('_NEEDS_REVIEW');
+}
+
 function delay(milliseconds: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -154,6 +163,23 @@ export class AgentJobRunner {
               await progressWrites;
             } catch (progressError) {
               effectiveError = progressError;
+            }
+            // Cancellation wins over every recoverable/error classification.
+            // Otherwise a late structured-output error can resurrect a job
+            // that the user already cancelled as `waiting_user`.
+            if (
+              controller.signal.aborted ||
+              this.store.get(id)?.status === 'cancelled'
+            ) {
+              throw effectiveError;
+            }
+            // A structured-contract mismatch is a resumable workflow state,
+            // not a provider failure. Persist the checkpoint-facing pause and
+            // let a later resume run the same request; the Director owns which
+            // node can be reused or must be regenerated.
+            if (isRecoverableNeedsReview(effectiveError)) {
+              await this.store.markWaiting(id, safeError(effectiveError));
+              return;
             }
             if (
               controller.signal.aborted ||

@@ -1,0 +1,2 @@
+<think>先判断人物定位，再生成字段。这段推理不能进入正式产物。</think>
+{"name":"沈清","hairstyle":"高马尾","role":"lead","aliases":["清清"]}

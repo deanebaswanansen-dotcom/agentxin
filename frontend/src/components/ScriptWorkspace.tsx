@@ -314,11 +314,37 @@ function mergeWorkspaceSnapshot(
   };
 }
 
-const ACTIVE_JOB_STATUSES = new Set<ScriptAgentJobSnapshot['status']>([
+const POLLING_JOB_STATUSES = new Set<ScriptAgentJobSnapshot['status']>([
   'queued',
   'running',
   'retrying',
 ]);
+
+const BLOCKING_JOB_STATUSES = new Set<ScriptAgentJobSnapshot['status']>([
+  ...POLLING_JOB_STATUSES,
+  'waiting_user',
+]);
+
+function summarizeEpisode(episode: ScriptEpisode): ScriptEpisodeSummary {
+  const visibleChars = episode.scenes.reduce(
+    (total, scene) => total + scene.blocks.reduce(
+      (sceneTotal, block) => sceneTotal + block.text.replace(/\s/gu, '').length,
+      0,
+    ),
+    0,
+  );
+  return {
+    id: episode.id,
+    episodeNumber: episode.episodeNumber,
+    title: episode.title,
+    status: episode.status,
+    targetChars: episode.targetChars,
+    visibleChars,
+    sceneCount: episode.scenes.length,
+    revision: episode.revision,
+    updatedAt: episode.updatedAt,
+  };
+}
 
 function jobResourceSignature(jobs: ScriptAgentJobSnapshot[]): string {
   return jobs
@@ -369,9 +395,28 @@ function OutlineEditor({
   );
 }
 
-function emptyCharacter(projectId: Id, index: number): ScriptCharacter {
+let fallbackCharacterId = 0;
+
+function createCharacterId(projectId: Id, characters: readonly ScriptCharacter[]): Id {
+  const existingIds = new Set(characters.map((character) => character.id));
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const randomId = globalThis.crypto?.randomUUID?.();
+    if (randomId) {
+      const candidate = `${projectId}-character-${randomId}`;
+      if (!existingIds.has(candidate)) return candidate;
+    }
+  }
+  let candidate: string;
+  do {
+    fallbackCharacterId += 1;
+    candidate = `${projectId}-character-local-${fallbackCharacterId}`;
+  } while (existingIds.has(candidate));
+  return candidate;
+}
+
+function emptyCharacter(projectId: Id, characters: readonly ScriptCharacter[]): ScriptCharacter {
   return {
-    id: `${projectId}-character-${index}`,
+    id: createCharacterId(projectId, characters),
     projectId,
     name: '',
     aliases: [],
@@ -396,6 +441,127 @@ function emptyCharacter(projectId: Id, index: number): ScriptCharacter {
   };
 }
 
+function uniqueLines(value: string): string[] {
+  return [...new Set(value.split('\n').map((item) => item.trim()).filter(Boolean))];
+}
+
+function CharacterLinesField({
+  label,
+  ariaLabel,
+  value,
+  wide = false,
+  invalid = false,
+  onChange,
+}: {
+  label: string;
+  ariaLabel: string;
+  value: string[];
+  wide?: boolean;
+  invalid?: boolean;
+  onChange: (value: string[]) => void;
+}): JSX.Element {
+  const [draft, setDraft] = useState(() => value.join('\n'));
+  useEffect(() => {
+    const normalizedDraft = uniqueLines(draft).join('\n');
+    const normalizedValue = value.join('\n');
+    if (normalizedDraft !== normalizedValue) setDraft(normalizedValue);
+  }, [draft, value]);
+  return (
+    <label className={`script-field${wide ? ' script-field--wide' : ''}`}>{label}<textarea
+      aria-label={ariaLabel}
+      aria-invalid={invalid}
+      value={draft}
+      onBlur={() => setDraft(value.join('\n'))}
+      onChange={(event) => {
+        setDraft(event.target.value);
+        onChange(uniqueLines(event.target.value));
+      }}
+    /></label>
+  );
+}
+
+interface CharacterValidationError {
+  characterIndex: number;
+  field: string;
+  message: string;
+}
+
+const REQUIRED_CHARACTER_TEXT_FIELDS: Array<{
+  field: keyof Pick<
+    ScriptCharacter,
+    | 'name'
+    | 'identity'
+    | 'biography'
+    | 'motivation'
+    | 'goal'
+    | 'weakness'
+    | 'arc'
+    | 'appearance'
+    | 'hairstyle'
+    | 'physique'
+    | 'defaultOutfit'
+    | 'speechStyle'
+  >;
+  label: string;
+}> = [
+  { field: 'name', label: '姓名' },
+  { field: 'identity', label: '人物身份' },
+  { field: 'biography', label: '人物小传' },
+  { field: 'motivation', label: '动机' },
+  { field: 'goal', label: '目标' },
+  { field: 'weakness', label: '弱点' },
+  { field: 'arc', label: '人物弧光' },
+  { field: 'appearance', label: '外貌' },
+  { field: 'hairstyle', label: '发型' },
+  { field: 'physique', label: '体格' },
+  { field: 'defaultOutfit', label: '默认服装' },
+  { field: 'speechStyle', label: '语言风格' },
+];
+
+function validateCharacters(value: ScriptCharacter[]): CharacterValidationError[] {
+  const errors: CharacterValidationError[] = [];
+  const characterIds = new Set(value.map((character) => character.id));
+  value.forEach((character, characterIndex) => {
+    REQUIRED_CHARACTER_TEXT_FIELDS.forEach(({ field, label }) => {
+      if (!character[field].trim()) {
+        errors.push({ characterIndex, field, message: `角色 ${characterIndex + 1} 缺少${label}` });
+      }
+    });
+    if (character.personality.length === 0) {
+      errors.push({ characterIndex, field: 'personality', message: `角色 ${characterIndex + 1} 至少需要一项性格` });
+    }
+    character.relationships.forEach((relationship, relationshipIndex) => {
+      if (!relationship.characterId.trim()) {
+        errors.push({
+          characterIndex,
+          field: `relationships.${relationshipIndex}.characterId`,
+          message: `角色 ${characterIndex + 1} 的关系 ${relationshipIndex + 1} 缺少目标人物`,
+        });
+      } else if (relationship.characterId === character.id) {
+        errors.push({
+          characterIndex,
+          field: `relationships.${relationshipIndex}.characterId`,
+          message: `角色 ${characterIndex + 1} 的关系 ${relationshipIndex + 1} 不能指向自己`,
+        });
+      } else if (!characterIds.has(relationship.characterId)) {
+        errors.push({
+          characterIndex,
+          field: `relationships.${relationshipIndex}.characterId`,
+          message: `角色 ${characterIndex + 1} 的关系 ${relationshipIndex + 1} 指向不存在的人物`,
+        });
+      }
+      if (!relationship.label.trim()) {
+        errors.push({
+          characterIndex,
+          field: `relationships.${relationshipIndex}.label`,
+          message: `角色 ${characterIndex + 1} 的关系 ${relationshipIndex + 1} 缺少关系标签`,
+        });
+      }
+    });
+  });
+  return errors;
+}
+
 function CharacterEditor({
   projectId,
   value,
@@ -412,32 +578,66 @@ function CharacterEditor({
   onGenerate: () => void;
 }): JSX.Element {
   const [mode, setMode] = useState<'read' | 'edit'>(() => value.length > 0 ? 'read' : 'edit');
-  const update = (index: number, fields: Partial<ScriptCharacter>) =>
+  const [validationErrors, setValidationErrors] = useState<CharacterValidationError[]>([]);
+  const update = (index: number, fields: Partial<ScriptCharacter>) => {
+    setValidationErrors([]);
     onChange(value.map((item, itemIndex) => itemIndex === index ? { ...item, ...fields } : item));
+  };
+  const hasError = (characterIndex: number, field: string) => validationErrors.some((error) => (
+    error.characterIndex === characterIndex && error.field === field
+  ));
+  const save = () => {
+    const errors = validateCharacters(value);
+    setValidationErrors(errors);
+    if (errors.length === 0) onSave();
+  };
   return (
     <section className="script-stage-panel" aria-labelledby="script-characters-heading">
-      <header className="script-stage-heading"><div><span>第三阶段</span><h2 id="script-characters-heading">角色设定</h2></div><div className="script-stage-heading__actions"><div className="script-view-switch" role="group" aria-label="角色查看模式"><button type="button" aria-pressed={mode === 'read'} onClick={() => setMode('read')}>人物卡</button><button type="button" aria-pressed={mode === 'edit'} onClick={() => setMode('edit')}>编辑模式</button></div><button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={onGenerate}>Agent 补全人物与世界</button><button type="button" className="nwa-button nwa-button--ghost" onClick={() => onChange([...value, emptyCharacter(projectId, value.length + 1)])}>添加角色</button></div></header>
+      <header className="script-stage-heading"><div><span>第三阶段</span><h2 id="script-characters-heading">角色设定</h2></div><div className="script-stage-heading__actions"><div className="script-view-switch" role="group" aria-label="角色查看模式"><button type="button" aria-pressed={mode === 'read'} onClick={() => setMode('read')}>人物卡</button><button type="button" aria-pressed={mode === 'edit'} onClick={() => setMode('edit')}>编辑模式</button></div><button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={onGenerate}>Agent 补全人物与世界</button><button type="button" className="nwa-button nwa-button--ghost" onClick={() => { setValidationErrors([]); onChange([...value, emptyCharacter(projectId, value)]); }}>添加角色</button></div></header>
       {mode === 'read' ? <ScriptCharactersReadView value={value} /> : <>
+      {validationErrors.length > 0 ? <div className="script-character-errors" role="alert"><strong>请补全人物卡后再保存</strong><ul>{validationErrors.map((error) => <li key={`${error.characterIndex}-${error.field}`}>{error.message}</li>)}</ul></div> : null}
       {value.length === 0 ? <p className="script-muted">尚无角色。可手动添加，或让 Agent 根据策划和总纲补全人物与世界圣经。</p> : <div className="script-character-list">{value.map((character, index) => (
         <article key={character.id} className="script-character-card">
-          <header><strong>{character.name || `角色 ${index + 1}`}</strong><button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" onClick={() => onChange(value.filter((_, itemIndex) => itemIndex !== index))}>删除</button></header>
+          <header><strong>{character.name || `角色 ${index + 1}`}</strong><button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" onClick={() => { setValidationErrors([]); onChange(value.filter((_, itemIndex) => itemIndex !== index)); }}>删除</button></header>
           <div className="script-form-grid">
-            <label className="script-field">姓名<input aria-label={`角色姓名 ${index + 1}`} value={character.name} onChange={(e) => update(index, { name: e.target.value })} /></label>
+            <label className="script-field">姓名<input aria-label={`角色姓名 ${index + 1}`} aria-invalid={hasError(index, 'name')} value={character.name} onChange={(e) => update(index, { name: e.target.value })} /></label>
             <label className="script-field">定位<select value={character.role} onChange={(e) => update(index, { role: e.target.value as ScriptCharacter['role'] })}><option value="lead">主角</option><option value="supporting">配角</option><option value="antagonist">反派</option><option value="minor">次要角色</option></select></label>
-            <label className="script-field">年龄<input type="number" min={0} max={120} value={character.age ?? ''} onChange={(e) => update(index, { age: e.target.value ? Number(e.target.value) : undefined })} /></label>
+            <label className="script-field">年龄<input type="number" min={0} max={150} value={character.age ?? ''} onChange={(e) => update(index, { age: e.target.value ? Number(e.target.value) : undefined })} /></label>
             <label className="script-field">职业<input value={character.occupation ?? ''} onChange={(e) => update(index, { occupation: e.target.value })} /></label>
-            <label className="script-field script-field--wide">身份与经历<textarea value={character.biography} onChange={(e) => update(index, { biography: e.target.value })} /></label>
-            <label className="script-field">目标<textarea value={character.goal} onChange={(e) => update(index, { goal: e.target.value })} /></label>
-            <label className="script-field">弱点<textarea value={character.weakness} onChange={(e) => update(index, { weakness: e.target.value })} /></label>
-            <label className="script-field script-field--wide">默认服装<textarea aria-label={`角色服装 ${index + 1}`} value={character.defaultOutfit} onChange={(e) => update(index, { defaultOutfit: e.target.value })} /></label>
-            <label className="script-field">外貌<textarea value={character.appearance} onChange={(e) => update(index, { appearance: e.target.value })} /></label>
-            <label className="script-field">发型与体格<textarea value={[character.hairstyle, character.physique].filter(Boolean).join('；')} onChange={(e) => update(index, { hairstyle: e.target.value })} /></label>
-            <label className="script-field script-field--wide">语言风格与口头禅<textarea value={[character.speechStyle, ...character.catchphrases].filter(Boolean).join('\n')} onChange={(e) => update(index, { speechStyle: e.target.value })} /></label>
+            <CharacterLinesField label="别名（每行一项）" ariaLabel={`角色别名 ${index + 1}`} value={character.aliases} wide onChange={(aliases) => update(index, { aliases })} />
+            <label className="script-field">人物身份<textarea aria-label={`角色身份 ${index + 1}`} aria-invalid={hasError(index, 'identity')} value={character.identity} onChange={(e) => update(index, { identity: e.target.value })} /></label>
+            <label className="script-field">人物小传<textarea aria-label={`角色小传 ${index + 1}`} aria-invalid={hasError(index, 'biography')} value={character.biography} onChange={(e) => update(index, { biography: e.target.value })} /></label>
+            <label className="script-field">动机<textarea aria-label={`角色动机 ${index + 1}`} aria-invalid={hasError(index, 'motivation')} value={character.motivation} onChange={(e) => update(index, { motivation: e.target.value })} /></label>
+            <label className="script-field">目标<textarea aria-label={`角色目标 ${index + 1}`} aria-invalid={hasError(index, 'goal')} value={character.goal} onChange={(e) => update(index, { goal: e.target.value })} /></label>
+            <label className="script-field">弱点<textarea aria-label={`角色弱点 ${index + 1}`} aria-invalid={hasError(index, 'weakness')} value={character.weakness} onChange={(e) => update(index, { weakness: e.target.value })} /></label>
+            <label className="script-field">人物弧光<textarea aria-label={`角色弧光 ${index + 1}`} aria-invalid={hasError(index, 'arc')} value={character.arc} onChange={(e) => update(index, { arc: e.target.value })} /></label>
+            <label className="script-field">外貌<textarea aria-label={`角色外貌 ${index + 1}`} aria-invalid={hasError(index, 'appearance')} value={character.appearance} onChange={(e) => update(index, { appearance: e.target.value })} /></label>
+            <label className="script-field">发型<textarea aria-label={`角色发型 ${index + 1}`} aria-invalid={hasError(index, 'hairstyle')} value={character.hairstyle} onChange={(e) => update(index, { hairstyle: e.target.value })} /></label>
+            <label className="script-field">体格<textarea aria-label={`角色体格 ${index + 1}`} aria-invalid={hasError(index, 'physique')} value={character.physique} onChange={(e) => update(index, { physique: e.target.value })} /></label>
+            <label className="script-field">默认服装<textarea aria-label={`角色服装 ${index + 1}`} aria-invalid={hasError(index, 'defaultOutfit')} value={character.defaultOutfit} onChange={(e) => update(index, { defaultOutfit: e.target.value })} /></label>
+            <CharacterLinesField label="性格（每行一项）" ariaLabel={`角色性格 ${index + 1}`} value={character.personality} invalid={hasError(index, 'personality')} onChange={(personality) => update(index, { personality })} />
+            <CharacterLinesField label="技能（每行一项）" ariaLabel={`角色技能 ${index + 1}`} value={character.skills} onChange={(skills) => update(index, { skills })} />
+            <label className="script-field">语言风格<textarea aria-label={`角色语言风格 ${index + 1}`} aria-invalid={hasError(index, 'speechStyle')} value={character.speechStyle} onChange={(e) => update(index, { speechStyle: e.target.value })} /></label>
+            <CharacterLinesField label="口头禅（每行一项）" ariaLabel={`角色口头禅 ${index + 1}`} value={character.catchphrases} onChange={(catchphrases) => update(index, { catchphrases })} />
           </div>
+          <section className="script-character-relationships" aria-label={`角色关系 ${index + 1}`}>
+            <header><strong>人物关系</strong><button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" onClick={() => update(index, { relationships: [...character.relationships, { characterId: '', label: '' }] })}>添加关系</button></header>
+            {character.relationships.length === 0 ? <p className="script-muted">暂无人物关系。</p> : character.relationships.map((relationship, relationshipIndex) => {
+              const knownTarget = value.some((candidate) => candidate.id === relationship.characterId && candidate.id !== character.id);
+              return (
+                <div className="script-character-relationship" key={`${relationship.characterId}-${relationshipIndex}`}>
+                  <label className="script-field">目标人物<select aria-label={`角色关系目标 ${index + 1}-${relationshipIndex + 1}`} aria-invalid={hasError(index, `relationships.${relationshipIndex}.characterId`)} value={relationship.characterId} onChange={(event) => update(index, { relationships: character.relationships.map((item, itemIndex) => itemIndex === relationshipIndex ? { ...item, characterId: event.target.value } : item) })}><option value="">请选择人物</option>{!knownTarget && relationship.characterId ? <option value={relationship.characterId}>{relationship.characterId}</option> : null}{value.filter((candidate) => candidate.id !== character.id).map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.name || candidate.id}</option>)}</select></label>
+                  <label className="script-field">关系标签<input aria-label={`角色关系标签 ${index + 1}-${relationshipIndex + 1}`} aria-invalid={hasError(index, `relationships.${relationshipIndex}.label`)} value={relationship.label} onChange={(event) => update(index, { relationships: character.relationships.map((item, itemIndex) => itemIndex === relationshipIndex ? { ...item, label: event.target.value } : item) })} /></label>
+                  <label className="script-field">备注<input aria-label={`角色关系备注 ${index + 1}-${relationshipIndex + 1}`} value={relationship.notes ?? ''} onChange={(event) => update(index, { relationships: character.relationships.map((item, itemIndex) => itemIndex === relationshipIndex ? { ...item, notes: event.target.value } : item) })} /></label>
+                  <button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" onClick={() => update(index, { relationships: character.relationships.filter((_, itemIndex) => itemIndex !== relationshipIndex) })}>删除关系</button>
+                </div>
+              );
+            })}
+          </section>
         </article>
       ))}</div>}
       </>}
-      <footer className="script-stage-actions"><button type="button" className="nwa-button" disabled={busy} onClick={onSave}>{busy ? '保存中…' : '保存角色设定'}</button></footer>
+      <footer className="script-stage-actions"><button type="button" className="nwa-button" disabled={busy} onClick={save}>{busy ? '保存中…' : '保存角色设定'}</button></footer>
     </section>
   );
 }
@@ -491,10 +691,15 @@ const JOB_STATUS_LABEL: Record<ScriptAgentJobSnapshot['status'], string> = {
 };
 
 const CHECKPOINT_LABEL: Record<NonNullable<ScriptAgentJobSnapshot['checkpoint']>['node'], string> = {
+  plan: '策划锁定',
+  series_outline: '全剧大纲',
+  character_bible: '人物圣经',
+  world_bible: '世界圣经',
   episode_outline: '详细大纲',
   scene_plan: '场景计划',
   draft: '正文初稿',
   review: '连续性审查',
+  revision: '定向修订',
   completed: '本集完成',
   batch_report: '批次报告',
 };
@@ -511,14 +716,24 @@ const REVIEW_STATUS_LABEL: Record<ScriptReviewIssue['status'], string> = {
   ignored: '已忽略',
 };
 
-function nextBatchStart(episodes: ScriptEpisodeSummary[], totalEpisodes: number): number {
-  const completed = new Set(
-    episodes.filter((item) => item.status === 'completed').map((item) => item.episodeNumber),
-  );
-  for (let episode = 1; episode <= totalEpisodes; episode += 1) {
-    if (!completed.has(episode)) return episode;
-  }
-  return totalEpisodes + 1;
+function isBlockingReviewIssue(issue: ScriptReviewIssue): boolean {
+  return issue.status === 'open' && issue.severity === 'hard' && issue.source !== 'ai';
+}
+
+function reviewSeverityLabel(issue: ScriptReviewIssue): string {
+  return issue.source === 'ai' && issue.severity === 'hard'
+    ? 'AI 重点建议'
+    : REVIEW_SEVERITY_LABEL[issue.severity];
+}
+
+function fixedBatchStartForEpisode(episodeNumber: number): number {
+  return Math.floor((Math.max(1, episodeNumber) - 1) / 5) * 5 + 1;
+}
+
+function jobBatchStart(job: ScriptAgentJobSnapshot): number | undefined {
+  if (job.task !== 'script_episode_batch') return undefined;
+  const episodeNumber = job.scriptBatchOptions?.startEpisode ?? job.checkpoint?.episodeNumber;
+  return typeof episodeNumber === 'number' ? fixedBatchStartForEpisode(episodeNumber) : undefined;
 }
 
 function EpisodeBatchPanel({
@@ -559,13 +774,28 @@ function EpisodeBatchPanel({
   const [exportScope, setExportScope] = useState<'all' | 'batch'>('all');
   const [contentMode, setContentMode] = useState<'read' | 'edit'>('read');
   const [fullscreen, setFullscreen] = useState(false);
-  const start = nextBatchStart(data.episodes, data.plan.totalEpisodes);
-  const count = Math.min(5, Math.max(0, data.plan.totalEpisodes - start + 1));
-  const end = start + count - 1;
-  const batchEnd = Math.min(batchStart + 4, data.plan.totalEpisodes);
-  const batchSummaries = data.episodes.filter((item) => item.episodeNumber >= batchStart && item.episodeNumber <= batchEnd);
+  const fixedBatchStart = fixedBatchStartForEpisode(batchStart);
+  const batchEnd = Math.min(fixedBatchStart + 4, data.plan.totalEpisodes);
+  const batchCount = Math.max(0, batchEnd - fixedBatchStart + 1);
+  const batchSummaries = data.episodes.filter((item) => item.episodeNumber >= fixedBatchStart && item.episodeNumber <= batchEnd);
+  const completedBatchEpisodes = new Set(batchSummaries.filter((item) => item.status === 'completed').map((item) => item.episodeNumber));
+  const batchCompleted = batchCount > 0 && Array.from({ length: batchCount }, (_, index) => fixedBatchStart + index)
+    .every((episodeNumber) => completedBatchEpisodes.has(episodeNumber));
+  const allCompletedEpisodes = new Set(
+    data.episodes.filter((item) => item.status === 'completed').map((item) => item.episodeNumber),
+  );
+  const precedingEpisodesCompleted = fixedBatchStart === 1 || Array.from(
+    { length: fixedBatchStart - 1 },
+    (_, index) => index + 1,
+  ).every((episodeNumber) => allCompletedEpisodes.has(episodeNumber));
+  const continuableBatchJob = data.jobs.find((job) => (
+    job.task === 'script_episode_batch' && job.continuable && jobBatchStart(job) === fixedBatchStart
+  ));
+  const visibleJobs = data.jobs.filter((job) => (
+    job.task !== 'script_episode_batch' || jobBatchStart(job) === undefined || jobBatchStart(job) === fixedBatchStart
+  ));
   const batchIssues = data.reviewIssues
-    .filter((item) => item.episodeNumber >= batchStart && item.episodeNumber <= batchEnd)
+    .filter((item) => item.episodeNumber >= fixedBatchStart && item.episodeNumber <= batchEnd)
     .sort((left, right) => {
       if (left.status === 'open' && right.status !== 'open') return -1;
       if (left.status !== 'open' && right.status === 'open') return 1;
@@ -573,7 +803,7 @@ function EpisodeBatchPanel({
       return left.createdAt.localeCompare(right.createdAt);
     });
   const unresolvedIssues = batchIssues.filter((item) => item.status === 'open');
-  const unresolvedHardIssues = unresolvedIssues.filter((item) => item.severity === 'hard').length;
+  const unresolvedHardIssues = unresolvedIssues.filter(isBlockingReviewIssue).length;
   const referenceEpisode = episode?.episodeNumber ?? batchStart;
   const exportBatchStart = Math.floor((referenceEpisode - 1) / 5) * 5 + 1;
   const exportRange = exportScope === 'batch'
@@ -582,7 +812,7 @@ function EpisodeBatchPanel({
   return (
     <section className={`script-stage-panel script-episodes-panel${fullscreen ? ' is-fullscreen' : ''}`} aria-labelledby="script-episodes-heading">
       <header className="script-stage-heading">
-        <div><span>第五阶段 · 五集一批</span><h2 id="script-episodes-heading">{batchStart}–{batchEnd}集剧本正文</h2></div>
+        <div><span>第五阶段 · 五集一批</span><h2 id="script-episodes-heading">{fixedBatchStart}–{batchEnd}集剧本正文</h2></div>
         <div className="script-stage-heading__actions">
           <div className="script-view-switch" role="group" aria-label="正文查看模式"><button type="button" aria-pressed={contentMode === 'read'} onClick={() => setContentMode('read')}>成品阅读</button><button type="button" aria-pressed={contentMode === 'edit'} onClick={() => setContentMode('edit')}>编辑模式</button></div>
           <button type="button" className="nwa-button nwa-button--ghost" onClick={() => setFullscreen((value) => !value)}>{fullscreen ? '退出全屏' : '全屏阅读'}</button>
@@ -591,7 +821,11 @@ function EpisodeBatchPanel({
           <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => onExport('md', exportRange)}>导出 MD</button>
           <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => onExport('docx', exportRange)}>导出 DOCX</button>
           <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => onExport('fountain', exportRange)}>导出 Fountain</button>
-          {count > 0 ? <button type="button" className="nwa-button" disabled={busy} onClick={() => onStart(start, count)}>生成第 {start}–{end} 集</button> : <span className="script-status-chip">全剧已完成</span>}
+          {continuableBatchJob ? <button type="button" className="nwa-button" disabled={busy} onClick={() => onResume(continuableBatchJob.id)}>继续第 {continuableBatchJob.checkpoint?.episodeNumber ?? fixedBatchStart} 集所在的 {fixedBatchStart}–{batchEnd} 集任务</button>
+            : batchCompleted ? <span className="script-status-chip">本批已完成</span>
+              : !precedingEpisodesCompleted ? <span className="script-status-chip">请先完成第 1–{fixedBatchStart - 1} 集</span>
+              : batchCount > 0 ? <button type="button" className="nwa-button" disabled={busy} onClick={() => onStart(fixedBatchStart, batchCount)}>生成第 {fixedBatchStart}–{batchEnd} 集</button>
+                : <span className="script-status-chip">全剧已完成</span>}
         </div>
       </header>
       <div className="script-production-grid">
@@ -605,10 +839,12 @@ function EpisodeBatchPanel({
         </div>
         <aside className="script-job-panel" aria-label="生成任务">
           <h3>任务与检查点</h3>
-          {data.jobs.length === 0 ? <p className="script-muted">暂无后台任务。</p> : data.jobs.map((job) => (
+          {visibleJobs.length === 0 ? <p className="script-muted">当前批次暂无后台任务。</p> : visibleJobs.map((job) => (
             <article className="script-job-card" key={job.id}>
               <div className="script-job-card__status"><strong>{JOB_STATUS_LABEL[job.status]}</strong><span>{job.task === 'script_episode_batch' ? '分批正文' : '资料生成'}</span></div>
-              {job.checkpoint ? <p>第 {job.checkpoint.episodeNumber} 集 · {CHECKPOINT_LABEL[job.checkpoint.node]}</p> : <p>等待首个检查点</p>}
+              {job.checkpoint ? <p>{job.checkpoint.episodeNumber === undefined
+                ? CHECKPOINT_LABEL[job.checkpoint.node]
+                : `第 ${job.checkpoint.episodeNumber} 集 · ${CHECKPOINT_LABEL[job.checkpoint.node]}`}</p> : <p>等待首个检查点</p>}
               {job.error ? <p className="script-job-error">{job.error.message}</p> : null}
               {job.continuable ? <button type="button" className="nwa-button nwa-button--sm" disabled={busy} onClick={() => onResume(job.id)}>从检查点继续</button> : null}
               {job.status === 'queued' || job.status === 'running' || job.status === 'retrying' ? <button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={busy} onClick={() => onCancel(job.id)}>取消任务</button> : null}
@@ -621,7 +857,7 @@ function EpisodeBatchPanel({
           <div>
             <span>质量门</span>
             <h3 id="script-proofread-heading">校稿与连续性检查</h3>
-            <p>AI也可能会走神，请注意校稿。硬性问题会阻止本集进入完成状态。</p>
+            <p>AI也可能会走神，请注意校稿。规则检查或人工标注的硬性问题会阻止完成；AI 判断默认作为建议展示。</p>
           </div>
           <div className="script-proofread-summary" aria-label="校稿问题统计">
             <span className={unresolvedHardIssues > 0 ? 'is-danger' : ''}>{unresolvedHardIssues} 个硬性</span>
@@ -640,9 +876,9 @@ function EpisodeBatchPanel({
         {batchIssues.length > 0 ? (
           <div className="script-proofread-list">
             {batchIssues.map((issue) => (
-              <article key={issue.id} className={`script-proofread-issue is-${issue.severity} is-${issue.status}`}>
+              <article key={issue.id} className={`script-proofread-issue is-${issue.source === 'ai' && issue.severity === 'hard' ? 'suggestion' : issue.severity} is-${issue.status}`}>
                 <header>
-                  <div><strong>第 {issue.episodeNumber} 集 · {REVIEW_SEVERITY_LABEL[issue.severity]}</strong><span>{issue.category} · {issue.source === 'deterministic' ? '规则检查' : issue.source === 'ai' ? 'AI 审读' : '人工标注'}</span></div>
+                  <div><strong>第 {issue.episodeNumber} 集 · {reviewSeverityLabel(issue)}</strong><span>{issue.category} · {issue.source === 'deterministic' ? '规则检查' : issue.source === 'ai' ? 'AI 审读' : '人工标注'}</span></div>
                   <span>{REVIEW_STATUS_LABEL[issue.status]}</span>
                 </header>
                 <p>{issue.message}</p>
@@ -650,7 +886,7 @@ function EpisodeBatchPanel({
                 <footer>
                   {issue.status === 'open' ? <>
                     <button type="button" className="nwa-button nwa-button--sm" disabled={busy} onClick={() => onReviewStatus(issue.id, 'fixed')}>标记已修复</button>
-                    {issue.severity !== 'hard'
+                    {!isBlockingReviewIssue(issue)
                       ? <button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={busy} onClick={() => onReviewStatus(issue.id, 'ignored')}>忽略</button>
                       : <span className="script-proofread-required">硬性问题不可忽略</span>}
                   </> : <button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={busy} onClick={() => onReviewStatus(issue.id, 'open')}>重新打开</button>}
@@ -661,7 +897,7 @@ function EpisodeBatchPanel({
         ) : <div className="script-proofread-empty">当前批次暂无校稿问题。建议在正文修改后重新运行单集校稿。</div>}
       </section>
       {episodeLoading ? <div className="script-loading script-loading--compact" role="status">正在加载单集正文…</div> : null}
-      {contentMode === 'read' ? <ScriptEpisodeReader episodes={batchEpisodes} summaries={data.episodes} characters={data.characters} batchStart={batchStart} batchEnd={batchEnd} loading={batchLoading} onEditEpisode={(episodeNumber) => { setContentMode('edit'); onOpenEpisode(episodeNumber); }} /> : null}
+      {contentMode === 'read' ? <ScriptEpisodeReader episodes={batchEpisodes} summaries={data.episodes} characters={data.characters} batchStart={fixedBatchStart} batchEnd={batchEnd} loading={batchLoading} onEditEpisode={(episodeNumber) => { setContentMode('edit'); onOpenEpisode(episodeNumber); }} /> : null}
       {contentMode === 'edit' && !episode ? <div className="script-editor-empty"><strong>请选择要编辑的单集</strong><span>从上方分集进度中打开一集，或切回“成品阅读”连续查看本批正文。</span></div> : null}
       {contentMode === 'edit' && episode ? (
         <section className="script-episode-editor" aria-label={`第 ${episode.episodeNumber} 集编辑器`}>
@@ -816,10 +1052,10 @@ export function ScriptWorkspace({
     };
   }, [client, onError, projectId, projectName]);
 
-  const hasActiveJobs = data?.jobs.some((job) => ACTIVE_JOB_STATUSES.has(job.status)) ?? false;
+  const hasPollingJobs = data?.jobs.some((job) => POLLING_JOB_STATUSES.has(job.status)) ?? false;
 
   useEffect(() => {
-    if (!hasActiveJobs) return undefined;
+    if (!hasPollingJobs) return undefined;
     const controller = new AbortController();
     let inFlight = false;
     const poll = async (): Promise<void> => {
@@ -904,7 +1140,7 @@ export function ScriptWorkspace({
       pollErrorId.current = undefined;
       pollErrorReported.current = false;
     };
-  }, [client, hasActiveJobs, onError, onErrorClear, projectId, projectName]);
+  }, [client, hasPollingJobs, onError, onErrorClear, projectId, projectName]);
 
   const markResourceDirty = useCallback((resource: EditableScriptResource) => {
     dirtyResources.current[resource] = true;
@@ -968,8 +1204,12 @@ export function ScriptWorkspace({
     markResourceDirty('plan');
     setData((current) => {
       if (!current) return current;
-      const seedsOutline = !current.outline || current.outline.revision === 0;
-      if (seedsOutline) markResourceDirty('outline');
+      const mainArcHint = `主线提示：${concept.mainArc}`;
+      const existingRequirements = current.plan.coreRequirements
+        .split('\n')
+        .map((item) => item.trim())
+        .filter((item) => item && !item.startsWith('主线提示：'));
+      const coreRequirements = [...existingRequirements, mainArcHint].join('\n');
       return {
         ...current,
         plan: {
@@ -986,14 +1226,12 @@ export function ScriptWorkspace({
           endingDirection: concept.endingDirection,
           coverPrompt: concept.coverPrompt,
           totalEpisodes: concept.totalEpisodes,
+          coreRequirements,
         },
-        outline: seedsOutline
-          ? { ...(current.outline ?? emptyOutline(projectId)), mainArc: [concept.mainArc] }
-          : current.outline,
       };
     });
     setNotice(`已采用选题《${concept.title}》，请检查后保存策划`);
-  }, [markResourceDirty, projectId]);
+  }, [markResourceDirty]);
 
   const startPlanInterview = useCallback(async () => {
     if (!data) return;
@@ -1175,6 +1413,12 @@ export function ScriptWorkspace({
 
   const startEpisodeBatch = useCallback(async (startEpisode: number, episodeCount: number) => {
     if (!data) return;
+    const fixedBatchStart = fixedBatchStartForEpisode(startEpisode);
+    const fixedBatchCount = Math.min(5, Math.max(0, data.plan.totalEpisodes - fixedBatchStart + 1));
+    if (startEpisode !== fixedBatchStart || episodeCount !== fixedBatchCount) {
+      setNotice(`正文只能按固定批次生成：第 ${fixedBatchStart}–${fixedBatchStart + fixedBatchCount - 1} 集`);
+      return;
+    }
     const unsavedResources = (Object.keys(dirtyResources.current) as EditableScriptResource[])
       .filter((resource) => dirtyResources.current[resource]);
     if (unsavedResources.length > 0) {
@@ -1187,7 +1431,7 @@ export function ScriptWorkspace({
     }
     const endEpisode = startEpisode + episodeCount - 1;
     const hasOverlappingBatch = data.jobs.some((job) => {
-      if (job.task !== 'script_episode_batch' || !ACTIVE_JOB_STATUSES.has(job.status)) return false;
+      if (job.task !== 'script_episode_batch' || !BLOCKING_JOB_STATUSES.has(job.status)) return false;
       const options = job.scriptBatchOptions;
       if (!options) return false;
       const jobEnd = options.startEpisode + options.episodeCount - 1;
@@ -1228,7 +1472,7 @@ export function ScriptWorkspace({
       setNotice(`请先保存${unsavedResources.map((resource) => SCRIPT_RESOURCE_LABEL[resource]).join('、')}，再启动 Agent`);
       return;
     }
-    if (data?.jobs.some((job) => job.task === task && ACTIVE_JOB_STATUSES.has(job.status))) {
+    if (data?.jobs.some((job) => job.task === task && BLOCKING_JOB_STATUSES.has(job.status))) {
       setNotice(task === 'script_bible'
         ? '人物与世界补全任务正在运行，请勿重复提交'
         : '大纲生成任务正在运行，请勿重复提交');
@@ -1413,24 +1657,7 @@ export function ScriptWorkspace({
     setNotice('');
     try {
       const saved = await client.script.episodes.save(projectId, selectedEpisode.episodeNumber, selectedEpisode, selectedEpisode.revision);
-      const visibleChars = saved.scenes.reduce(
-        (total, scene) => total + scene.blocks.reduce(
-          (sceneTotal, block) => sceneTotal + block.text.replace(/\s/gu, '').length,
-          0,
-        ),
-        0,
-      );
-      const summary: ScriptEpisodeSummary = {
-        id: saved.id,
-        episodeNumber: saved.episodeNumber,
-        title: saved.title,
-        status: saved.status,
-        targetChars: saved.targetChars,
-        visibleChars,
-        sceneCount: saved.scenes.length,
-        revision: saved.revision,
-        updatedAt: saved.updatedAt,
-      };
+      const summary = summarizeEpisode(saved);
       const sameEpisodeStillSelected = selectedEpisodeRef.current?.episodeNumber === saved.episodeNumber;
       const unchangedWhileSaving = selectedEpisodeEditVersion.current === editVersion;
       const editorEpisode = sameEpisodeStillSelected && !unchangedWhileSaving
@@ -1477,6 +1704,10 @@ export function ScriptWorkspace({
     setNotice('');
     try {
       const result = await client.script.episodes.review(projectId, episodeNumber, data.reviewRevision);
+      const reviewedEpisode = result.report.hardFailed
+        ? undefined
+        : await client.script.episodes.get(projectId, episodeNumber);
+      const reviewedSummary = reviewedEpisode ? summarizeEpisode(reviewedEpisode) : undefined;
       setData((current) => current ? {
         ...current,
         reviewRevision: result.revision,
@@ -1484,8 +1715,26 @@ export function ScriptWorkspace({
           ...current.reviewIssues.filter((item) => item.episodeNumber !== episodeNumber),
           ...result.items,
         ],
+        episodes: reviewedSummary
+          ? current.episodes.some((item) => item.episodeNumber === episodeNumber)
+            ? current.episodes.map((item) => item.episodeNumber === episodeNumber ? reviewedSummary : item)
+            : [...current.episodes, reviewedSummary].sort((left, right) => left.episodeNumber - right.episodeNumber)
+          : current.episodes,
       } : current);
-      const hardCount = result.items.filter((item) => item.status === 'open' && item.severity === 'hard').length;
+      if (reviewedEpisode) {
+        setBatchEpisodes((current) => current.some((item) => item.episodeNumber === episodeNumber)
+          ? current.map((item) => item.episodeNumber === episodeNumber ? reviewedEpisode : item)
+          : current);
+        if (
+          selectedEpisodeRef.current?.episodeNumber === episodeNumber &&
+          !selectedEpisodeDirty.current
+        ) {
+          selectedEpisodeRef.current = reviewedEpisode;
+          selectedEpisodeEditVersion.current = 0;
+          setSelectedEpisode(reviewedEpisode);
+        }
+      }
+      const hardCount = result.items.filter(isBlockingReviewIssue).length;
       setNotice(hardCount > 0
         ? `第 ${episodeNumber} 集校稿完成：发现 ${hardCount} 个必须修复的硬性问题`
         : `第 ${episodeNumber} 集校稿完成：未发现阻断完成的硬性问题`);
@@ -1602,7 +1851,7 @@ export function ScriptWorkspace({
           item.episodeNumber >= batch.startEpisode &&
           item.episodeNumber <= batch.endEpisode
         ));
-        const hasHardIssue = openIssues.some((item) => item.severity === 'hard');
+        const hasHardIssue = openIssues.some(isBlockingReviewIssue);
         const status = batch.status === 'generating'
           ? batch.status
           : hasHardIssue

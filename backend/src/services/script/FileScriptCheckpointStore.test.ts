@@ -1,14 +1,18 @@
-import { mkdtemp, readdir, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { runWithClientId } from '../client/clientScope.js';
-import type { ScriptPipelineCheckpoint } from './agents/ScriptDirector.js';
+import type {
+  ScriptPipelineCheckpoint,
+  ScriptPipelineCheckpointWrite,
+} from './agents/ScriptCheckpoint.js';
 import {
   FileScriptCheckpointStore,
   createClientScopedScriptCheckpointStore,
+  type ScriptCheckpointFileV2,
 } from './FileScriptCheckpointStore.js';
 
 function checkpoint(
@@ -18,10 +22,17 @@ function checkpoint(
     projectId: 'project-1',
     runKey: 'script_episode_batch:1-5',
     node: 'draft',
-    status: 'completed',
+    schemaVersion: 2,
+    status: 'succeeded',
     attempt: 1,
     artifactRevision: 1,
     episodeNumber: 1,
+    inputRevisionRefs: [{ resource: 'plan', id: 'plan-1', revision: 3 }],
+    upstreamArtifactRefs: [],
+    promptVersion: 'draft-v1',
+    configRevision: 'model-config-v1',
+    inputFingerprint: 'a'.repeat(64),
+    validationErrors: [],
     artifact: { title: '第一集' },
     updatedAt: '2026-08-14T00:00:00.000Z',
     ...overrides,
@@ -50,23 +61,215 @@ describe('FileScriptCheckpointStore', () => {
     expect(await restarted.list(saved.projectId, saved.runKey)).toEqual([saved]);
   });
 
-  it('upserts the same node, episode, and chunk checkpoint', async () => {
+  it('preserves older artifact revisions for the same node, episode, and chunk', async () => {
     const store = await FileScriptCheckpointStore.create(root);
-    await store.save(
-      checkpoint({ chunkStart: 1, status: 'running', artifactRevision: 0 }),
-    );
-    const completed = checkpoint({
+    const original = checkpoint({
       chunkStart: 1,
-      status: 'completed',
+      artifactRevision: 1,
+      artifact: { title: '第一版第一集' },
+    });
+    await store.save(original);
+    const revised = checkpoint({
+      chunkStart: 1,
+      status: 'succeeded',
       attempt: 2,
       artifactRevision: 2,
       artifact: { title: '修订后的第一集' },
       updatedAt: '2026-08-14T00:01:00.000Z',
     });
 
-    await store.save(completed);
+    await store.save(revised);
 
-    expect(await store.list(completed.projectId, completed.runKey)).toEqual([completed]);
+    expect(await store.list(revised.projectId, revised.runKey)).toEqual([original, revised]);
+    const restarted = await FileScriptCheckpointStore.create(root);
+    expect(await restarted.list(revised.projectId, revised.runKey)).toEqual([original, revised]);
+  });
+
+  it('updates running to succeeded within one revision without duplicating history', async () => {
+    const store = await FileScriptCheckpointStore.create(root);
+    const running = checkpoint({
+      status: 'running',
+      artifact: undefined,
+      artifactRevision: 3,
+    });
+    const succeeded = checkpoint({
+      status: 'succeeded',
+      attempt: 2,
+      artifactRevision: 3,
+      artifact: { title: '一次性写入的候选' },
+      updatedAt: '2026-08-14T00:01:00.000Z',
+    });
+
+    await store.save(running);
+    await store.save(succeeded);
+    await store.save(succeeded);
+
+    expect(await store.list(succeeded.projectId, succeeded.runKey)).toEqual([succeeded]);
+  });
+
+  it('rejects an in-place artifact rewrite and leaves the stored file unchanged', async () => {
+    const store = await FileScriptCheckpointStore.create(root);
+    const saved = checkpoint({ artifactRevision: 3, artifact: { title: '不可变候选' } });
+    await store.save(saved);
+    const encodedRunKey = Buffer.from(saved.runKey, 'utf8').toString('base64url');
+    const filePath = join(root, saved.projectId, `${encodedRunKey}.json`);
+    const before = await readFile(filePath, 'utf8');
+
+    await expect(store.save(checkpoint({
+      artifactRevision: 3,
+      artifact: { title: '偷偷替换的候选' },
+      updatedAt: '2026-08-14T00:01:00.000Z',
+    }))).rejects.toThrow(/不可原地改写.*artifactRevision/);
+
+    expect(await readFile(filePath, 'utf8')).toBe(before);
+    expect(await store.list(saved.projectId, saved.runKey)).toEqual([saved]);
+  });
+
+  it('normalizes an unversioned legacy call-site write to a non-reusable v2 record', async () => {
+    const store = await FileScriptCheckpointStore.create(root);
+    const legacyWrite: ScriptPipelineCheckpointWrite = {
+      projectId: 'project-1',
+      runKey: 'legacy-write',
+      node: 'draft',
+      status: 'completed',
+      attempt: 1,
+      artifactRevision: 1,
+      episodeNumber: 1,
+      artifact: { title: '旧调用方候选' },
+      updatedAt: '2026-08-14T00:00:00.000Z',
+    };
+
+    await store.save(legacyWrite);
+
+    await expect(store.list(legacyWrite.projectId, legacyWrite.runKey)).resolves.toEqual([
+      expect.objectContaining({
+        schemaVersion: 2,
+        status: 'succeeded',
+        inputRevisionRefs: [],
+        upstreamArtifactRefs: [],
+        promptVersion: 'legacy-unversioned',
+        configRevision: 'legacy-unversioned',
+        inputFingerprint: '',
+        validationErrors: [],
+      }),
+    ]);
+  });
+
+  it('migrates a v1 file in memory and persists v2 idempotently on the next save', async () => {
+    const projectId = 'project-1';
+    const runKey = 'legacy-run';
+    const encodedRunKey = Buffer.from(runKey, 'utf8').toString('base64url');
+    const filePath = join(root, projectId, `${encodedRunKey}.json`);
+    const v1 = {
+      schemaVersion: 1,
+      projectId,
+      runKey,
+      checkpoints: [
+        {
+          projectId,
+          runKey,
+          node: 'draft',
+          status: 'completed',
+          attempt: 1,
+          artifactRevision: 1,
+          episodeNumber: 1,
+          artifact: { title: '旧候选' },
+          updatedAt: '2026-08-14T00:00:00.000Z',
+        },
+        {
+          projectId,
+          runKey,
+          node: 'review',
+          status: 'running',
+          attempt: 2,
+          artifactRevision: 1,
+          episodeNumber: 1,
+          updatedAt: '2026-08-14T00:01:00.000Z',
+        },
+      ],
+    };
+    await mkdir(join(root, projectId), { recursive: true });
+    await writeFile(filePath, JSON.stringify(v1), 'utf8');
+    const store = await FileScriptCheckpointStore.create(root);
+
+    const firstRead = await store.list(projectId, runKey);
+    expect(firstRead.map((item) => item.status)).toEqual(['succeeded', 'pending']);
+    expect(firstRead.every((item) => item.schemaVersion === 2)).toBe(true);
+    expect(JSON.parse(await readFile(filePath, 'utf8')).schemaVersion).toBe(1);
+
+    await store.save(firstRead[0]!);
+    const persisted = JSON.parse(await readFile(filePath, 'utf8')) as {
+      schemaVersion: number;
+      checkpoints: ScriptPipelineCheckpoint[];
+    };
+    expect(persisted.schemaVersion).toBe(2);
+    expect(persisted.checkpoints).toEqual(firstRead);
+
+    const restarted = await FileScriptCheckpointStore.create(root);
+    expect(await restarted.list(projectId, runKey)).toEqual(firstRead);
+  });
+
+  it('preserves v1 artifact history across migration and repeated v2 persistence', async () => {
+    const projectId = 'project-1';
+    const runKey = 'legacy-history';
+    const encodedRunKey = Buffer.from(runKey, 'utf8').toString('base64url');
+    const filePath = join(root, projectId, `${encodedRunKey}.json`);
+    const first = checkpoint({
+      runKey,
+      schemaVersion: 2,
+      artifactRevision: 1,
+      artifact: { title: '旧第一版' },
+    });
+    const second = checkpoint({
+      runKey,
+      schemaVersion: 2,
+      artifactRevision: 2,
+      artifact: { title: '旧第二版' },
+      updatedAt: '2026-08-14T00:01:00.000Z',
+    });
+    const legacyRecord = (value: ScriptPipelineCheckpoint) => {
+      const { schemaVersion: _schemaVersion, ...record } = value;
+      return { ...record, status: 'completed' };
+    };
+    await mkdir(join(root, projectId), { recursive: true });
+    await writeFile(filePath, JSON.stringify({
+      schemaVersion: 1,
+      projectId,
+      runKey,
+      checkpoints: [legacyRecord(first), legacyRecord(second)],
+    }), 'utf8');
+    const store = await FileScriptCheckpointStore.create(root);
+
+    const migrated = await store.list(projectId, runKey);
+    expect(migrated.map((item) => item.artifactRevision)).toEqual([1, 2]);
+    await store.save(migrated[1]!);
+    await store.save(migrated[1]!);
+
+    const restarted = await FileScriptCheckpointStore.create(root);
+    expect(await restarted.list(projectId, runKey)).toEqual(migrated);
+    const persisted = JSON.parse(await readFile(filePath, 'utf8')) as ScriptCheckpointFileV2;
+    expect(persisted.schemaVersion).toBe(2);
+    expect(persisted.checkpoints).toHaveLength(2);
+  });
+
+  it('rejects an unknown outer schema without overwriting the file', async () => {
+    const projectId = 'project-1';
+    const runKey = 'future-run';
+    const encodedRunKey = Buffer.from(runKey, 'utf8').toString('base64url');
+    const filePath = join(root, projectId, `${encodedRunKey}.json`);
+    const futureFile = JSON.stringify({
+      schemaVersion: 99,
+      projectId,
+      runKey,
+      checkpoints: [],
+    });
+    await mkdir(join(root, projectId), { recursive: true });
+    await writeFile(filePath, futureFile, 'utf8');
+    const store = await FileScriptCheckpointStore.create(root);
+
+    await expect(store.list(projectId, runKey)).rejects.toThrow(/不支持.*版本 99/);
+    await expect(store.save(checkpoint({ runKey }))).rejects.toThrow(/不支持.*版本 99/);
+    expect(await readFile(filePath, 'utf8')).toBe(futureFile);
   });
 
   it('isolates checkpoints by project and run key', async () => {

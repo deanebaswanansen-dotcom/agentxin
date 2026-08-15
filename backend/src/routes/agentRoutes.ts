@@ -159,6 +159,9 @@ function parseScriptBatchOptions(raw: unknown): AgentRunRequest['scriptBatchOpti
   if (episodeCount > 5) {
     throw ServiceError.validation('短剧每批最多生成 5 集。');
   }
+  if ((startEpisode - 1) % 5 !== 0) {
+    throw ServiceError.validation('短剧正文批次必须从第 1、6、11……集开始。');
+  }
   return { startEpisode, episodeCount, expectedPlanRevision };
 }
 

@@ -5,8 +5,12 @@ import { ServiceError } from '../../ServiceError.js';
 import type {
   ScriptCheckpointStore,
   ScriptDirector,
-  ScriptPipelineCheckpoint,
+  ScriptPipelineCheckpointWrite,
 } from './ScriptDirector.js';
+import {
+  latestScriptCheckpoint,
+  nextScriptCheckpointArtifactRevision,
+} from './ScriptCheckpoint.js';
 import type {
   ScriptPlanningField,
   ScriptPlanningQuestion,
@@ -223,7 +227,7 @@ export class ScriptPlanTurnService {
       session.askedFields = result.askedFields;
       session.questionCount = result.questionCount;
       session.activeQuestions = result.questions;
-      await this.save(session, 'running', session.questionCount);
+      await this.save(session, 'running');
       return {
         status: 'asking',
         session: session.id,
@@ -235,7 +239,7 @@ export class ScriptPlanTurnService {
       if (session.activeQuestions.length === 0) {
         throw ServiceError.validation(`短剧策划仍缺少：${result.missingFields.join('、')}`);
       }
-      await this.save(session, 'running', session.questionCount);
+      await this.save(session, 'running');
       return {
         status: 'asking',
         session: session.id,
@@ -247,7 +251,7 @@ export class ScriptPlanTurnService {
       throw ServiceError.validation('短剧策划任务返回了不匹配的结果。');
     }
     session.activeQuestions = [];
-    await this.save(session, 'completed', result.plan.revision);
+    await this.save(session, 'completed');
     return {
       status: 'ready',
       session: session.id,
@@ -258,18 +262,17 @@ export class ScriptPlanTurnService {
 
   private async load(projectId: string): Promise<StoredScriptPlanSession | undefined> {
     const checkpoints = await this.checkpoints.list(projectId, SESSION_RUN_KEY);
-    const latest = checkpoints
-      .filter((item) => item.node === 'plan')
-      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
+    const latest = latestScriptCheckpoint(checkpoints, { node: 'plan' });
     return storedSession(latest?.artifact);
   }
 
-  private save(
+  private async save(
     session: StoredScriptPlanSession,
-    status: ScriptPipelineCheckpoint['status'],
-    artifactRevision: number,
+    status: ScriptPipelineCheckpointWrite['status'],
   ): Promise<void> {
-    return this.checkpoints.save({
+    const checkpoints = await this.checkpoints.list(session.projectId, SESSION_RUN_KEY);
+    const artifactRevision = nextScriptCheckpointArtifactRevision(checkpoints, { node: 'plan' });
+    await this.checkpoints.save({
       projectId: session.projectId,
       runKey: SESSION_RUN_KEY,
       node: 'plan',

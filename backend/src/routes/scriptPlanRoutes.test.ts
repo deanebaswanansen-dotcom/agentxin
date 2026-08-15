@@ -69,7 +69,10 @@ describe('script plan routes', () => {
     expect(second.statusCode).toBe(200);
     expect(second.json()).toMatchObject({ status: 'ready', round: 2, plan: { title: '她不再道歉' } });
     expect(run.mock.calls[1]?.[0].planningSession.values.endingDirection).toBe('痛快翻盘');
-    expect(await checkpoints.list('project-1', 'script_plan_session')).toHaveLength(1);
+    const history = await checkpoints.list('project-1', 'script_plan_session');
+    expect(history).toHaveLength(2);
+    expect(history.map((item) => item.artifactRevision)).toEqual([0, 1]);
+    expect(history.map((item) => item.status)).toEqual(['running', 'succeeded']);
     await app.close();
   });
 

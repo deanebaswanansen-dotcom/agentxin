@@ -63,7 +63,7 @@ describe('agent job routes', () => {
     await app.close();
   });
 
-  it('automatically resumes an interrupted project job when polling supplies model config', async () => {
+  it('keeps an interrupted project job paused until the user explicitly resumes it', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'agentxin-job-route-restart-'));
     const file = join(directory, 'runs.json');
     const beforeRestart = await AgentRunStore.create(file);
@@ -98,6 +98,24 @@ describe('agent job routes', () => {
       headers: { 'x-agentxin-client-id': CLIENT_A, 'x-agentxin-model-config': MODEL },
     });
     expect(listed.statusCode).toBe(200);
+    expect(listed.json()).toEqual([
+      expect.objectContaining({ id: interrupted.id, status: 'waiting_user', continuable: true }),
+    ]);
+    const polled = await app.inject({
+      method: 'GET',
+      url: `/api/agent/jobs/${interrupted.id}`,
+      headers: { 'x-agentxin-client-id': CLIENT_A, 'x-agentxin-model-config': MODEL },
+    });
+    expect(polled.statusCode).toBe(200);
+    expect(polled.json()).toMatchObject({ id: interrupted.id, status: 'waiting_user' });
+    expect(run).not.toHaveBeenCalled();
+
+    const resumed = await app.inject({
+      method: 'POST',
+      url: `/api/agent/jobs/${interrupted.id}/resume`,
+      headers: { 'x-agentxin-client-id': CLIENT_A, 'x-agentxin-model-config': MODEL },
+    });
+    expect(resumed.statusCode).toBe(200);
     await vi.waitFor(() => expect(run).toHaveBeenCalledOnce());
     await runner.waitUntilIdle(interrupted.id);
     expect(store.get(interrupted.id)).toMatchObject({

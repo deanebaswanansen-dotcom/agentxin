@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -18,6 +19,15 @@ import type {
 import { registerScriptRoutes } from './scriptRoutes.js';
 
 const projectId = 'project-1';
+
+const completeCharacterFixture = JSON.parse(readFileSync(
+  new URL('../../../spec/fixtures/script-character.v1.json', import.meta.url),
+  'utf8',
+)) as ScriptCharacterInput & {
+  projectId: string;
+  revision: number;
+  updatedAt: string;
+};
 
 function planInput(): ScriptPlanInput {
   return {
@@ -46,31 +56,11 @@ function planInput(): ScriptPlanInput {
 }
 
 function charactersInput(): ScriptCharacterInput[] {
-  return [
-    {
-      id: 'character-1',
-      name: '沈清',
-      aliases: [],
-      role: 'lead',
-      age: 25,
-      occupation: '美食工作室老板',
-      identity: '现代独立女性',
-      biography: '白手起家',
-      motivation: '保护家人',
-      goal: '打破绑架规矩',
-      weakness: '不愿求助',
-      arc: '学会接纳家庭',
-      appearance: '利落',
-      hairstyle: '高马尾',
-      physique: '高挑',
-      defaultOutfit: '白衬衫黑西装裤',
-      personality: ['冷静'],
-      skills: ['烹饪'],
-      speechStyle: '简短有力',
-      catchphrases: [],
-      relationships: [],
-    },
-  ];
+  const value = structuredClone(completeCharacterFixture) as Record<string, unknown>;
+  delete value.projectId;
+  delete value.revision;
+  delete value.updatedAt;
+  return [value as unknown as ScriptCharacterInput];
 }
 
 function worldInput(): ScriptWorldBibleInput {
@@ -170,10 +160,11 @@ function episodeInput(number = 1): ScriptEpisodeInput {
 describe('scriptRoutes', () => {
   let root: string;
   let app: FastifyInstance;
+  let store: FileScriptStore;
 
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), 'script-routes-'));
-    const store = await FileScriptStore.create(root);
+    store = await FileScriptStore.create(root);
     app = Fastify({ logger: false });
     registerScriptRoutes(app, new ScriptService(store));
     await app.ready();
@@ -266,6 +257,29 @@ describe('scriptRoutes', () => {
     }
   });
 
+  it('accepts the repository-level canonical character fixture', async () => {
+    const [expectedCharacter] = charactersInput();
+    const saved = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-characters`,
+      payload: { expectedRevision: 0, items: [expectedCharacter] },
+    });
+
+    expect(saved.statusCode).toBe(200);
+    expect(saved.json()).toEqual([
+      expect.objectContaining(expectedCharacter),
+    ]);
+
+    const loaded = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${projectId}/script-characters`,
+    });
+    expect(loaded.statusCode).toBe(200);
+    expect(loaded.json()).toEqual([
+      expect.objectContaining(expectedCharacter),
+    ]);
+  });
+
   it('rejects a body whose episode number differs from the route', async () => {
     const response = await app.inject({
       method: 'PUT',
@@ -337,6 +351,27 @@ describe('scriptRoutes', () => {
     expect(fountain.body).toContain('沈清');
   });
 
+  it('rejects self-referential and dangling character relationships', async () => {
+    const base = charactersInput()[0]!;
+    for (const relationship of [
+      { characterId: base.id!, label: '自己' },
+      { characterId: 'missing-character', label: '陌生人' },
+    ]) {
+      const response = await app.inject({
+        method: 'PUT',
+        url: `/api/projects/${projectId}/script-characters`,
+        payload: {
+          expectedRevision: 0,
+          items: [{ ...base, relationships: [relationship] }],
+        },
+      });
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toMatchObject({
+        error: { code: 'VALIDATION_ERROR' },
+      });
+    }
+  });
+
   it('rejects marking an episode completed when it fails the hard quality gate', async () => {
     await app.inject({
       method: 'PUT',
@@ -369,7 +404,7 @@ describe('scriptRoutes', () => {
     });
   });
 
-  it('rejects completed status while the episode has a persisted open hard review issue', async () => {
+  it('rejects completed status while the episode has a persisted user hard review issue', async () => {
     await app.inject({
       method: 'PUT',
       url: `/api/projects/${projectId}/script-plan`,
@@ -390,14 +425,14 @@ describe('scriptRoutes', () => {
       payload: {
         expectedRevision: 0,
         items: [{
-          id: 'ai-hard-1',
+          id: 'user-hard-1',
           episodeNumber: 1,
           code: 'AI_LOGIC_CONFLICT',
           severity: 'hard',
           category: 'logic',
           message: '人物动机与前集冲突。',
           status: 'open',
-          source: 'ai',
+          source: 'user',
         }],
       },
     });
@@ -437,14 +472,14 @@ describe('scriptRoutes', () => {
         code: 'VALIDATION_ERROR',
         message: expect.stringContaining('未解决的硬性校稿问题'),
         details: {
-          issues: [expect.objectContaining({ id: 'ai-hard-1', status: 'open' })],
+          issues: [expect.objectContaining({ id: 'user-hard-1', status: 'open' })],
         },
       },
     });
 
     const fixed = await app.inject({
       method: 'PATCH',
-      url: `/api/projects/${projectId}/script-review-issues/ai-hard-1`,
+      url: `/api/projects/${projectId}/script-review-issues/user-hard-1`,
       payload: { expectedRevision: 1, status: 'fixed' },
     });
     expect(fixed.statusCode).toBe(200);
@@ -470,6 +505,86 @@ describe('scriptRoutes', () => {
     expect(missing.statusCode).toBe(404);
     expect(missing.json().error.code).toBe('NOT_FOUND');
     expect(list.json()).toEqual([]);
+  });
+
+  it('stales continuity after editing a completed episode and atomically reactivates it after proofreading', async () => {
+    await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-plan`,
+      payload: { expectedRevision: 0, value: { ...planInput(), targetCharsPerEpisode: 300 } },
+    });
+    await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-characters`,
+      payload: { expectedRevision: 0, items: charactersInput() },
+    });
+    const outlineResponse = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/episode-outlines/1`,
+      payload: { expectedRevision: 0, value: episodeOutlineInput(1) },
+    });
+    const outlineId = outlineResponse.json().id as string;
+    const completedValue = {
+      ...episodeInput(1),
+      outlineId,
+      targetChars: 300,
+      scenes: [{
+        ...episodeInput(1).scenes[0],
+        characterIds: ['character-1'],
+        blocks: [{ id: 'block-long', type: 'action' as const, text: '剧情'.repeat(135) }],
+      }],
+      summary: '沈清进入老宅并决定打破旧规。',
+      newFacts: ['沈清拒绝跪请'],
+      openedThreads: ['太奶奶会如何反击'],
+    };
+    const completed = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-episodes/1`,
+      payload: { expectedRevision: 0, value: completedValue },
+    });
+    expect(completed.statusCode).toBe(200);
+    expect(completed.json()).toMatchObject({ status: 'completed', revision: 1 });
+
+    const edited = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-episodes/1`,
+      payload: {
+        expectedRevision: 1,
+        value: {
+          ...completed.json(),
+          // The editor submits the resource as it was loaded. The backend,
+          // not the browser, owns the completed -> reviewing transition.
+          status: 'completed',
+          scenes: [{
+            ...completed.json().scenes[0],
+            blocks: [{
+              ...completed.json().scenes[0].blocks[0],
+              text: '修订剧情'.repeat(70),
+            }],
+          }],
+          summary: '沈清修订了进入老宅后的应对方式。',
+        },
+      },
+    });
+    expect(edited.statusCode).toBe(200);
+    expect(edited.json()).toMatchObject({ status: 'reviewing', revision: 2 });
+    expect((await store.getProjectState(projectId))?.continuityCommits).toEqual([
+      expect.objectContaining({ episodeNumber: 1, status: 'stale', episodeRevision: 1 }),
+    ]);
+
+    const reviewed = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${projectId}/script-episodes/1/review`,
+      payload: { expectedRevision: 0 },
+    });
+    expect(reviewed.statusCode).toBe(200);
+    expect(reviewed.json()).toMatchObject({ report: { hardFailed: false } });
+    const reactivatedState = await store.getProjectState(projectId);
+    expect(reactivatedState?.episodes[0]).toMatchObject({ status: 'completed', revision: 3 });
+    expect(reactivatedState?.continuityCommits).toEqual([
+      expect.objectContaining({ status: 'stale', episodeRevision: 1 }),
+      expect.objectContaining({ status: 'current', episodeRevision: 3 }),
+    ]);
   });
 
   it('returns a compact five-episode workspace and persists proofreading issue status', async () => {
@@ -588,6 +703,38 @@ describe('scriptRoutes', () => {
     expect(ignoreHard.statusCode).toBe(400);
     expect(ignoreHard.json()).toMatchObject({
       error: { code: 'VALIDATION_ERROR', message: expect.stringContaining('不能忽略') },
+    });
+
+    const savedAiHard = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-review-issues`,
+      payload: {
+        expectedRevision: 3,
+        items: [
+          ...reviewed.json().items,
+          {
+            id: 'ai-hard-advisory',
+            episodeNumber: 1,
+            code: 'AI_TENSION',
+            severity: 'hard',
+            category: 'hook',
+            message: 'AI认为张力还可加强。',
+            status: 'open',
+            source: 'ai',
+          },
+        ],
+      },
+    });
+    expect(savedAiHard.statusCode).toBe(200);
+    const ignoredAiHard = await app.inject({
+      method: 'PATCH',
+      url: `/api/projects/${projectId}/script-review-issues/ai-hard-advisory`,
+      payload: { expectedRevision: 4, status: 'ignored' },
+    });
+    expect(ignoredAiHard.statusCode).toBe(200);
+    expect(ignoredAiHard.json()).toMatchObject({
+      revision: 5,
+      item: { id: 'ai-hard-advisory', status: 'ignored', source: 'ai' },
     });
   });
 });

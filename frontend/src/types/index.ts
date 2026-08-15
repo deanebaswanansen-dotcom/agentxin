@@ -60,6 +60,8 @@ export interface ModelConfig {
   baseUrl: string;
   apiKey: string; // 仅服务端存储, 绝不返回前端原文
   modelName: string;
+  /** Optional same-provider model used only after structured-output Fixup fails. */
+  structuredFallbackModelName?: string;
   temperature?: number; // 0-2, defaults to 1
   topP?: number; // 0-1, defaults to 1
 }
@@ -68,6 +70,7 @@ export interface ModelConfig {
 export interface ModelConfigView {
   baseUrl: string;
   modelName: string;
+  structuredFallbackModelName?: string;
   apiKeyMasked: string; // 例如 "sk-****abcd"
   temperature: number;
   topP: number;
@@ -1276,6 +1279,80 @@ export interface ScriptEpisodeSummary {
   updatedAt: string;
 }
 
+export interface ScriptInputRevisionRef {
+  resource: 'plan' | 'outline' | 'characters' | 'world' | 'episode' | 'continuity';
+  id: Id;
+  revision: number;
+}
+
+export interface ScriptUpstreamArtifactRef {
+  node: string;
+  artifactRevision: number;
+  artifactHash: string;
+}
+
+export interface ScriptContinuityCharacterUpdate {
+  characterId: Id;
+  location?: string;
+  emotionalState?: string;
+  knownFactsAdded: string[];
+  relationshipChanges: string[];
+  outfit?: string;
+}
+
+export interface ScriptContinuityFact {
+  factId: Id;
+  text: string;
+  evidenceBlockIds: Id[];
+}
+
+export interface ScriptContinuityProp {
+  propId: Id;
+  name: string;
+  holderCharacterId?: Id;
+  state: string;
+  evidenceBlockIds: Id[];
+}
+
+export interface ScriptContinuityThread {
+  threadId: Id;
+  action: 'opened' | 'advanced' | 'closed';
+  description: string;
+  evidenceBlockIds: Id[];
+}
+
+export interface ScriptContinuityTimelineEvent {
+  eventId: Id;
+  timeLabel: string;
+  summary: string;
+  causeEventIds: Id[];
+  evidenceBlockIds: Id[];
+}
+
+export interface ScriptEpisodeContinuityCommitInput {
+  characterUpdates: ScriptContinuityCharacterUpdate[];
+  factsAdded: ScriptContinuityFact[];
+  props: ScriptContinuityProp[];
+  threads: ScriptContinuityThread[];
+  timelineEvents: ScriptContinuityTimelineEvent[];
+  nextEpisodeMustInherit: string[];
+}
+
+export interface ScriptEpisodeContinuityCommit extends ScriptEpisodeContinuityCommitInput {
+  id: Id;
+  schemaVersion: 1;
+  projectId: Id;
+  episodeNumber: number;
+  episodeRevision: number;
+  revision: number;
+  status: 'current' | 'stale';
+  inputFingerprint: string;
+  previousContinuityCommitId?: Id;
+  previousContinuityRevision?: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export type ScriptReviewSeverity = 'hard' | 'soft' | 'suggestion';
 export type ScriptReviewStatus = 'open' | 'fixed' | 'ignored';
 export type ScriptReviewSource = 'deterministic' | 'ai' | 'user';
@@ -1356,6 +1433,28 @@ export interface ScriptEpisodeReviewResult extends ScriptReviewIssueCollection {
     issues: Array<{
       code: string;
       severity: 'hard' | 'soft';
+      source: ScriptReviewSource;
+      blocking: boolean;
+      message: string;
+      sceneId?: Id;
+      blockId?: Id;
+      path?: string;
+    }>;
+    blockingIssues: Array<{
+      code: string;
+      severity: 'hard' | 'soft';
+      source: ScriptReviewSource;
+      blocking: boolean;
+      message: string;
+      sceneId?: Id;
+      blockId?: Id;
+      path?: string;
+    }>;
+    advisoryIssues: Array<{
+      code: string;
+      severity: 'hard' | 'soft';
+      source: ScriptReviewSource;
+      blocking: boolean;
       message: string;
       sceneId?: Id;
       blockId?: Id;
@@ -1379,15 +1478,20 @@ export type ScriptAgentTask =
   | 'script_episode_batch';
 
 export type ScriptCheckpointNode =
+  | 'plan'
+  | 'series_outline'
+  | 'character_bible'
+  | 'world_bible'
   | 'episode_outline'
   | 'scene_plan'
   | 'draft'
   | 'review'
+  | 'revision'
   | 'completed'
   | 'batch_report';
 
 export interface ScriptAgentJobCheckpoint {
-  episodeNumber: number;
+  episodeNumber?: number;
   node: ScriptCheckpointNode;
   attempt: number;
   artifactRevision: number;

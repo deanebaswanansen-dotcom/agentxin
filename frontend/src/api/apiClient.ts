@@ -63,6 +63,7 @@ import type {
   ScriptCharacter,
   ScriptConceptResult,
   ScriptEpisode,
+  ScriptEpisodeContinuityCommit,
   ScriptEpisodeOutline,
   ScriptEpisodeReviewResult,
   ScriptEpisodeSummary,
@@ -167,6 +168,10 @@ function loadStoredModelConfig(): ModelConfig | null {
       baseUrl: parsed.baseUrl,
       apiKey: parsed.apiKey,
       modelName: parsed.modelName,
+      ...(typeof parsed.structuredFallbackModelName === 'string' &&
+      parsed.structuredFallbackModelName.trim().length > 0
+        ? { structuredFallbackModelName: parsed.structuredFallbackModelName }
+        : {}),
       temperature: typeof parsed.temperature === 'number' ? parsed.temperature : undefined,
       topP: typeof parsed.topP === 'number' ? parsed.topP : undefined,
     });
@@ -207,6 +212,9 @@ function toModelConfigView(config: ModelConfig | null): ModelConfigView {
   return {
     baseUrl: config.baseUrl,
     modelName: config.modelName,
+    ...(config.structuredFallbackModelName?.trim()
+      ? { structuredFallbackModelName: config.structuredFallbackModelName }
+      : {}),
     apiKeyMasked: maskApiKey(config.apiKey),
     temperature: config.temperature ?? 1,
     topP: config.topP ?? 1,
@@ -314,6 +322,8 @@ export interface ScriptProjectStateResponse {
       outfit: string;
     }>;
   };
+  /** Versioned continuity source of truth. Optional while older servers roll forward. */
+  continuityCommits?: ScriptEpisodeContinuityCommit[];
   reviewRevision: number;
   reviewIssues: ScriptReviewIssue[];
   updatedAt: string;

@@ -96,6 +96,7 @@ export function SettingsPanel({
 }: SettingsPanelProps): JSX.Element {
   const [baseUrl, setBaseUrl] = useState('');
   const [modelName, setModelName] = useState('');
+  const [structuredFallbackModelName, setStructuredFallbackModelName] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [apiKeyMasked, setApiKeyMasked] = useState('');
   const [presetId, setPresetId] = useState(PROVIDER_PRESETS[0].id);
@@ -125,10 +126,12 @@ export function SettingsPanel({
           const defaultPreset = PROVIDER_PRESETS[0];
           setBaseUrl(defaultPreset.baseUrl);
           setModelName(defaultPreset.modelName);
+          setStructuredFallbackModelName('');
           setPresetId(defaultPreset.id);
         } else {
           setBaseUrl(view.baseUrl);
           setModelName(view.modelName);
+          setStructuredFallbackModelName(view.structuredFallbackModelName ?? '');
           const detected = resolvePresetId(view.baseUrl, view.modelName);
           setPresetId(detected);
         }
@@ -219,6 +222,9 @@ export function SettingsPanel({
       baseUrl: baseUrl.trim(),
       apiKey: isMockPreset ? resolvedKey || 'mock-key-for-demo' : resolvedKey,
       modelName: modelName.trim(),
+      ...(structuredFallbackModelName.trim()
+        ? { structuredFallbackModelName: structuredFallbackModelName.trim() }
+        : {}),
       temperature,
       topP,
     };
@@ -226,6 +232,7 @@ export function SettingsPanel({
       const view = await client.modelConfig.save(config);
       setBaseUrl(view.baseUrl);
       setModelName(view.modelName);
+      setStructuredFallbackModelName(view.structuredFallbackModelName ?? '');
       setTemperature(view.temperature ?? DEFAULT_TEMPERATURE);
       setTopP(view.topP ?? DEFAULT_TOP_P);
       setApiKeyMasked(view.apiKeyMasked);
@@ -240,7 +247,7 @@ export function SettingsPanel({
     } finally {
       setBusy(false);
     }
-  }, [busy, canSave, baseUrl, apiKey, isMockPreset, modelName, temperature, topP, client, onSaved, handleError]);
+  }, [busy, canSave, baseUrl, apiKey, isMockPreset, modelName, structuredFallbackModelName, temperature, topP, client, onSaved, handleError]);
 
   const handlePresetChange = useCallback(
     (nextId: string) => {
@@ -249,6 +256,7 @@ export function SettingsPanel({
       setPresetId(nextId);
       setBaseUrl(preset.baseUrl);
       setModelName(preset.modelName);
+      setStructuredFallbackModelName('');
       // For mock demo, auto-provide a dummy key so save succeeds without user input.
       if (nextId === 'mock') {
         setApiKey('mock-key-for-demo');
@@ -422,6 +430,25 @@ export function SettingsPanel({
             />
             <span className="nwa-field__hint nwa-muted">
               可选官方模型：deepseek-v4-pro、deepseek-v4-flash；旧 deepseek-chat / reasoner 会自动迁移。
+            </span>
+          </label>
+
+          <label className="nwa-field">
+            <span className="nwa-field__label">结构输出备用模型（可选）</span>
+            <input
+              className="nwa-input"
+              type="text"
+              placeholder="例如 deepseek-v4-pro"
+              aria-label="结构输出备用模型"
+              value={structuredFallbackModelName}
+              disabled={busy}
+              onChange={(event) => {
+                setStructuredFallbackModelName(event.target.value);
+                setSaved(false);
+              }}
+            />
+            <span className="nwa-field__hint nwa-muted">
+              仅当主模型的结构修复仍失败时调用；留空则暂停等待人工处理，不会偷偷切换模型。
             </span>
           </label>
 

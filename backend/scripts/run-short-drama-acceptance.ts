@@ -12,7 +12,7 @@ import { FileScriptCheckpointStore } from '../src/services/script/FileScriptChec
 import { FileScriptStore } from '../src/services/script/FileScriptStore.js';
 
 const CLIENT_ID = 'e'.repeat(64);
-const TERMINAL_JOB_STATES = new Set(['completed', 'failed', 'cancelled']);
+const TERMINAL_JOB_STATES = new Set(['completed', 'failed', 'cancelled', 'waiting_user']);
 
 interface JobSnapshot {
   id: string;
@@ -102,7 +102,10 @@ async function run(): Promise<void> {
       }
       timings[label] = Date.now() - stageStartedAt;
       if (created.status !== 'completed') {
-        throw new Error(`${label} ended as ${created.status}: ${created.error?.code ?? 'RUN_FAILED'} ${created.error?.message ?? ''}`);
+        const nextAction = created.status === 'waiting_user'
+          ? ' Update the model/fallback configuration or source material, then explicitly resume this job.'
+          : '';
+        throw new Error(`${label} ended as ${created.status}: ${created.error?.code ?? 'RUN_FAILED'} ${created.error?.message ?? ''}.${nextAction}`);
       }
       return created;
     };

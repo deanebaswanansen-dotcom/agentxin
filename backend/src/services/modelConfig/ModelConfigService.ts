@@ -140,6 +140,9 @@ function toView(config: ModelConfig): ModelConfigView {
   return {
     baseUrl: config.baseUrl,
     modelName: config.modelName,
+    ...(config.structuredFallbackModelName?.trim()
+      ? { structuredFallbackModelName: config.structuredFallbackModelName }
+      : {}),
     apiKeyMasked: maskApiKey(config.apiKey),
     temperature: config.temperature ?? DEFAULT_TEMPERATURE,
     topP: config.topP ?? DEFAULT_TOP_P,

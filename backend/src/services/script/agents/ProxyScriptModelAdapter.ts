@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import type { ChatMessage, ModelConfig } from '../../../types/index.js';
 import type { ModelProxy, StreamCompletionOptions } from '../../../proxy/ModelProxy.js';
 import { ServiceError } from '../../ServiceError.js';
@@ -31,6 +33,26 @@ export class ProxyScriptModelAdapter implements ScriptModelAdapter {
     private readonly proxy: ModelProxy,
   ) {}
 
+  async getStructuredFallbackModelName(): Promise<string | undefined> {
+    const config = await this.modelConfig.getInternalConfig();
+    return config?.structuredFallbackModelName?.trim() || undefined;
+  }
+
+  async getModelConfigFingerprint(): Promise<string> {
+    const config = await this.modelConfig.getInternalConfig();
+    if (!config) {
+      throw ServiceError.modelNotConfigured('尚未配置模型，请先在模型设置中保存 API 配置。');
+    }
+    const safeConfig = {
+      baseUrl: config.baseUrl.trim().replace(/\/+$/u, ''),
+      modelName: config.modelName.trim(),
+      structuredFallbackModelName: config.structuredFallbackModelName?.trim() || '',
+    };
+    return createHash('sha256')
+      .update(JSON.stringify(safeConfig), 'utf8')
+      .digest('hex');
+  }
+
   async complete(request: ScriptModelRequest): Promise<string> {
     const config = await this.modelConfig.getInternalConfig();
     if (!config) {
@@ -51,7 +73,10 @@ export class ProxyScriptModelAdapter implements ScriptModelAdapter {
     };
     const chunks: string[] = [];
     const signal = request.signal ?? new AbortController().signal;
-    for await (const delta of this.proxy.streamCompletion(config, messages, signal, options)) {
+    const effectiveConfig = request.modelNameOverride
+      ? { ...config, modelName: request.modelNameOverride }
+      : config;
+    for await (const delta of this.proxy.streamCompletion(effectiveConfig, messages, signal, options)) {
       if (delta.kind === 'content' && delta.text) chunks.push(delta.text);
     }
     const content = chunks.join('').trim();

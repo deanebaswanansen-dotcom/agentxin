@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { parseStructuredModelOutput, ScriptModelOutputError } from './structuredOutput.js';
+import {
+  parseStructuredModelOutput,
+  parseStructuredModelOutputWithDiagnostics,
+  ScriptModelOutputError,
+} from './structuredOutput.js';
 
 describe('parseStructuredModelOutput', () => {
   it('removes hidden reasoning and Markdown fences before parsing the first JSON object', () => {
@@ -25,4 +29,21 @@ describe('parseStructuredModelOutput', () => {
       expect(() => parseStructuredModelOutput(raw)).toThrow(ScriptModelOutputError);
     },
   );
+
+  it.each([
+    ['', 'empty_output'],
+    ['<think>只有思考</think>', 'empty_output'],
+    ['完全不是 JSON', 'invalid_json'],
+    ['{"title":"缺右括号"', 'truncated_output'],
+    ['{"items":[{"name":"响应中途', 'truncated_output'],
+    ['{"title": unquoted}', 'invalid_json'],
+  ] as const)('classifies malformed output %j as %s', (raw, failureKind) => {
+    try {
+      parseStructuredModelOutputWithDiagnostics(raw);
+      throw new Error('预期解析失败');
+    } catch (error) {
+      expect(error).toBeInstanceOf(ScriptModelOutputError);
+      expect((error as ScriptModelOutputError).failureKind).toBe(failureKind);
+    }
+  });
 });

@@ -154,6 +154,7 @@ describe('SettingsPanel', () => {
       apiKeyMasked: 'sk-****wxyz',
       temperature: 1.25,
       topP: 0.85,
+      structuredFallbackModelName: 'deepseek-v4-flash',
     });
     const client = makeClient({ save });
     const onSaved = vi.fn();
@@ -165,6 +166,9 @@ describe('SettingsPanel', () => {
     fireEvent.click(screen.getByRole('button', { name: /DeepSeek V4 Pro/ }));
     fireEvent.change(screen.getByLabelText('温度'), { target: { value: '1.25' } });
     fireEvent.change(screen.getByLabelText('Top-P'), { target: { value: '0.85' } });
+    fireEvent.change(screen.getByLabelText('结构输出备用模型'), {
+      target: { value: 'deepseek-v4-flash' },
+    });
     fireEvent.change(screen.getByLabelText('API Key'), { target: { value: 'sk-secret-key' } });
     fireEvent.click(screen.getByRole('button', { name: '保存并测试 API' }));
 
@@ -173,6 +177,7 @@ describe('SettingsPanel', () => {
         baseUrl: 'https://api.deepseek.com',
         apiKey: 'sk-secret-key',
         modelName: 'deepseek-v4-pro',
+        structuredFallbackModelName: 'deepseek-v4-flash',
         temperature: 1.25,
         topP: 0.85,
       }),

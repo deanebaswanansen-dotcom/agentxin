@@ -19,6 +19,10 @@ function parseHeader(value: string | string[] | undefined): ModelConfig | undefi
         baseUrl: parsed.baseUrl,
         apiKey: parsed.apiKey,
         modelName: parsed.modelName,
+        ...(typeof parsed.structuredFallbackModelName === 'string' &&
+        parsed.structuredFallbackModelName.trim().length > 0
+          ? { structuredFallbackModelName: parsed.structuredFallbackModelName }
+          : {}),
         temperature: typeof parsed.temperature === 'number' ? parsed.temperature : undefined,
         topP: typeof parsed.topP === 'number' ? parsed.topP : undefined,
       };

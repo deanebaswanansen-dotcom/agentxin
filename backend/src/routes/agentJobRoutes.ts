@@ -77,12 +77,8 @@ export function registerAgentJobRoutes(
 
   app.get<{ Params: { id: string } }>('/api/agent/jobs/:id', async (request, reply) => {
     const clientId = getCurrentClientId();
-    let run = store.getForClient(clientId, request.params.id);
+    const run = store.getForClient(clientId, request.params.id);
     if (!run) return reply.code(404).send(NOT_FOUND);
-    if (run.status === 'waiting_user' && getRequestModelConfig()) {
-      await runner.resume(clientId, run.id, getRequestModelConfig());
-      run = store.getForClient(clientId, run.id) ?? run;
-    }
     return reply.code(200).send(toClientRun(run));
   });
 
@@ -90,18 +86,8 @@ export function registerAgentJobRoutes(
     '/api/projects/:projectId/agent-jobs',
     async (request, reply) => {
       const clientId = getCurrentClientId();
-      const modelConfig = getRequestModelConfig();
       const runs = store.listForClient(clientId, request.params.projectId);
-      if (modelConfig) {
-        await Promise.all(
-          runs
-            .filter((run) => run.status === 'waiting_user')
-            .map((run) => runner.resume(clientId, run.id, modelConfig)),
-        );
-      }
-      return reply.code(200).send(
-        store.listForClient(clientId, request.params.projectId).map(toClientRun),
-      );
+      return reply.code(200).send(runs.map(toClientRun));
     },
   );
 
