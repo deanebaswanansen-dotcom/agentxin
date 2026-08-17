@@ -10,6 +10,7 @@ import type {
 export type ScriptTextParseWarningCode =
   | 'TEXT_BEFORE_FIRST_SCENE'
   | 'SCENE_EPISODE_NUMBER_REPAIRED'
+  | 'SCENE_ORDINAL_REPAIRED'
   | 'UNPARSED_LINE'
   | 'UNKNOWN_SCENE_CHARACTER'
   | 'UNKNOWN_DIALOGUE_CHARACTER'
@@ -130,6 +131,7 @@ export function parseChineseShortDramaText(
   }
 
   const scenes: ScriptScene[] = [];
+  const usedSceneOrdinals = new Set<number>();
   let currentScene: ScriptScene | undefined;
   const lines = rawText.replace(/^\uFEFF/u, '').replace(/\r\n?/gu, '\n').split('\n');
 
@@ -172,9 +174,23 @@ export function parseChineseShortDramaText(
           line,
         );
       }
+      const originalOrdinal = Number(
+        productionHeading ? productionHeading[2] : heading ? heading[2] : numberedHeading![2],
+      );
+      let ordinal = originalOrdinal;
+      while (usedSceneOrdinals.has(ordinal)) ordinal += 1;
+      if (ordinal !== originalOrdinal) {
+        warn(
+          lineNumber,
+          'SCENE_ORDINAL_REPAIRED',
+          `重复场号 ${originalOrdinal} 已顺延为 ${ordinal}。`,
+          line,
+        );
+      }
+      usedSceneOrdinals.add(ordinal);
       currentScene = {
         id: options.createId(),
-        ordinal: Number(productionHeading ? productionHeading[2] : heading ? heading[2] : numberedHeading![2]),
+        ordinal,
         location: (productionHeading ? productionHeading[5] : heading ? heading[3] : numberedHeading![3])!.trim(),
         timeOfDay: timeOfDay((productionHeading ? productionHeading[3] : heading ? heading[4] : numberedHeading![4])!),
         interiorExterior: interiorExterior((productionHeading ? productionHeading[4] : heading ? heading[5] : numberedHeading![5])!),

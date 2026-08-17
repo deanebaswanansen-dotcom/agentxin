@@ -2808,6 +2808,59 @@ describe('ScriptDirector', () => {
     ]));
   });
 
+  it('repairs duplicate scene ordinals and saves the direct draft without a format-repair call', async () => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    const checkpoints = new InMemoryScriptCheckpointStore();
+    const calls: string[] = [];
+    const repeatedSceneText = [
+      '第1集',
+      '1-1 校报社 日/内',
+      '人物：沈清',
+      `△${'沈清核对录音笔里的原始时间戳。'.repeat(6)}`,
+      `沈清：${'这份记录能证明证据从未离开档案室。'.repeat(6)}`,
+      '1-1 档案室 日/内',
+      '人物：沈清',
+      `△${'沈清找到与时间戳对应的纸质登记表。'.repeat(6)}`,
+      `沈清：${'登记表和录音能够相互印证。'.repeat(6)}`,
+      '1-2 校报社走廊 夜/内',
+      '人物：沈清',
+      `△${'沈清把两份证据装进档案袋并贴好封条。'.repeat(6)}`,
+      `沈清：${'明天公开之前不能让原件离开视线。'.repeat(6)}`,
+    ].join('\n');
+    const director = new ScriptDirector({
+      model: {
+        async complete(request) {
+          calls.push(request.node);
+          return request.node === 'review' ? directReviewJson() : repeatedSceneText;
+        },
+        async getModelConfigFingerprint() { return 'direct-model-v1'; },
+      },
+      store,
+      checkpoints,
+    });
+
+    const result = await director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    });
+
+    expect(result.kind).toBe('episode_batch');
+    expect(calls).toEqual(['draft', 'review']);
+    expect(store.state.episodes[0]?.scenes.map((scene) => scene.ordinal)).toEqual([1, 2, 3]);
+    expect(store.atomicCommitCalls).toHaveLength(1);
+    const directDraft = (await checkpoints.list('project-1', 'script_episode_batch:1:1'))
+      .find((checkpoint) => checkpoint.node === 'direct_draft');
+    expect(directDraft).toMatchObject({
+      status: 'succeeded',
+      validationErrors: [
+        expect.objectContaining({ code: 'SCENE_ORDINAL_REPAIRED' }),
+        expect.objectContaining({ code: 'SCENE_ORDINAL_REPAIRED' }),
+      ],
+    });
+  });
+
   it('writes a five-episode direct-text batch in order with ten model calls and a continuity chain', async () => {
     const state = readySingleEpisodeState();
     state.plan = approvedPlan(5);
