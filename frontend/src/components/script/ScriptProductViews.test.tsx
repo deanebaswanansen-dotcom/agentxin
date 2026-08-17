@@ -69,7 +69,7 @@ describe('short drama product views', () => {
         id: 'scene-1', ordinal: 1, location: '便利店', timeOfDay: 'night', interiorExterior: 'interior', characterIds: ['character-1'],
         blocks: [
           { id: 'caption-1', type: 'caption', text: '凌晨两点' },
-          { id: 'action-1', type: 'action', text: '林晓攥紧账本。' },
+          { id: 'action-1', type: 'action', text: '【特写】林晓攥紧账本。' },
           { id: 'dialogue-1', type: 'dialogue', characterId: 'character-1', speaker: '林晓', mode: 'os', text: '证据终于齐了。' },
         ],
       }],
@@ -78,7 +78,7 @@ describe('short drama product views', () => {
       episodes={[episode]}
       summaries={[episodeSummary(1, 'completed')]}
       characters={[{
-        id: 'character-1', projectId: 'project-1', name: '林晓', aliases: [], role: 'lead', identity: '', biography: '',
+        id: 'character-1', projectId: 'project-1', name: '林晓', aliases: [], role: 'lead', identity: '夜班店员', biography: '',
         motivation: '', goal: '', weakness: '', arc: '', appearance: '', hairstyle: '', physique: '', defaultOutfit: '',
         personality: [], skills: [], speechStyle: '', catchphrases: [], relationships: [], revision: 1,
         updatedAt: '2026-08-15T00:00:00.000Z',
@@ -89,11 +89,12 @@ describe('short drama product views', () => {
       onEditEpisode={vi.fn()}
     />);
 
-    expect(screen.getByText('1-1 便利店 夜/内')).toBeInTheDocument();
-    expect(container.querySelector('.script-reader-characters')).toHaveTextContent('人物：林晓');
+    expect(screen.getByText('1-1 夜 内 便利店')).toBeInTheDocument();
+    expect(container.querySelector('.script-reader-characters')).toHaveTextContent('人物：林晓（夜班店员）');
     expect(screen.getByText('【字幕：凌晨两点】')).toBeInTheDocument();
-    expect(screen.getByText('△林晓攥紧账本。')).toBeInTheDocument();
-    expect(container.querySelector('.is-dialogue')).toHaveTextContent('林晓（os）：证据终于齐了。');
+    expect(container.querySelector('.is-action')).toHaveTextContent('△【特写】林晓攥紧账本。');
+    expect([...container.querySelectorAll('.is-action strong')].map((item) => item.textContent)).toEqual(['【特写】', '林晓']);
+    expect(container.querySelector('.is-dialogue')).toHaveTextContent('林晓OS：证据终于齐了。');
   });
 
   it('uses serializer-equivalent time labels and scene ordinal ordering', () => {
@@ -118,6 +119,6 @@ describe('short drama product views', () => {
     />);
 
     const headings = screen.getAllByRole('heading', { level: 5 }).map((heading) => heading.textContent);
-    expect(headings).toEqual(['2-1 厨房 晨/内', '2-2 天台 黄昏/外']);
+    expect(headings).toEqual(['2-1 晨 内 厨房', '2-2 黄昏 外 天台']);
   });
 });

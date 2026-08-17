@@ -179,10 +179,44 @@ function pageBreak(): string {
   return '<w:p><w:r><w:br w:type="page"/></w:r></w:p>';
 }
 
+function escapedRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function screenplayCharacterNames(lines: readonly string[]): string[] {
+  const names: string[] = [];
+  for (const line of lines) {
+    if (!line.startsWith('人物：')) continue;
+    const matches = line.slice('人物：'.length).matchAll(
+      /([\p{Script=Han}A-Za-z][\p{Script=Han}A-Za-z·]{0,15})(?:（[^）]*）)?(?=\s|$)/gu,
+    );
+    for (const match of matches) if (match[1]) names.push(match[1]);
+  }
+  return [...new Set(names)];
+}
+
+function screenplayActionParagraph(line: string, characterNames: readonly string[]): string {
+  const tokens = [
+    '【[^】]+】',
+    ...[...characterNames].sort((left, right) => right.length - left.length).map(escapedRegExp),
+  ];
+  const characterNameSet = new Set(characterNames);
+  const matcher = new RegExp(`(${tokens.join('|')})`, 'gu');
+  const runs = line.split(matcher).filter(Boolean).map((part) => textRun(part, {
+    bold: /^【[^】]+】$/u.test(part) || characterNameSet.has(part),
+  })).join('');
+  return `<w:p>${runs}</w:p>`;
+}
+
 function contentParagraphs(content: string): string {
   const lines = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
   if (lines.length === 0) return paragraph('');
-  return lines.map((line) => paragraph(line)).join('');
+  const characterNames = screenplayCharacterNames(lines);
+  return lines.map((line) => (
+    line.startsWith('△')
+      ? screenplayActionParagraph(line, characterNames)
+      : paragraph(line)
+  )).join('');
 }
 
 function buildDocumentXml(

@@ -2979,6 +2979,130 @@ describe('ScriptDirector', () => {
     expect(store.state.episodes).toHaveLength(0);
   });
 
+  it('regenerates only the rejected direct rewrite when explicitly resumed', async () => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    const checkpoints = new InMemoryScriptCheckpointStore();
+    let draftCalls = 0;
+    let revisionCalls = 0;
+    let reviewCalls = 0;
+    const revisionPrompts: string[] = [];
+    const director = new ScriptDirector({
+      store,
+      checkpoints,
+      model: {
+        async complete(request) {
+          if (request.node === 'draft') {
+            draftCalls += 1;
+            return directScriptText({
+              location: '市体育馆篮球场',
+              dialogue: '这场篮球赛我们一定要赢。'.repeat(14),
+            });
+          }
+          if (request.node === 'revision') {
+            revisionCalls += 1;
+            revisionPrompts.push(request.prompt);
+            return revisionCalls === 1
+              ? directScriptText({
+                  location: '市体育馆篮球场',
+                  dialogue: '这场篮球赛我们一定要赢。'.repeat(14),
+                })
+              : directScriptText({
+                  location: '校报社',
+                  dialogue: '时间戳和采访记录能够相互印证。'.repeat(14),
+                });
+          }
+          reviewCalls += 1;
+          if (reviewCalls === 3) return directReviewJson();
+          return directReviewJson({
+            verdict: 'major_issue',
+            issues: [{
+              code: 'WRONG_GENRE_OR_SETTING',
+              sceneNumber: 1,
+              evidence: '正文仍然写成篮球比赛。',
+              expected: '本集应在校报社调查证据。',
+            }],
+          });
+        },
+        async getModelConfigFingerprint() { return 'direct-model-v1'; },
+      },
+    });
+
+    await expect(director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    })).rejects.toBeInstanceOf(ScriptBatchPausedError);
+
+    const result = await director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text', resumeRejectedCandidates: true,
+    });
+
+    expect(result.kind).toBe('episode_batch');
+    expect(draftCalls).toBe(1);
+    expect(revisionCalls).toBe(2);
+    expect(reviewCalls).toBe(3);
+    expect(revisionPrompts[0]).toContain('原正文');
+    expect(revisionPrompts[1]).toContain('完全从分集卡重新写出本集');
+    expect(revisionPrompts[1]).not.toContain('原正文');
+    expect(store.state.episodes[0]?.scenes[0]?.location).toBe('校报社');
+    expect(store.atomicCommitCalls).toHaveLength(1);
+  });
+
+  it('formats and adopts a recognizable rewrite instead of silently keeping the rejected draft', async () => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    let revisionCalls = 0;
+    let reviewCalls = 0;
+    const fixed = directScriptText({
+      location: '校报社',
+      dialogue: '时间戳和采访记录能够相互印证。'.repeat(14),
+    });
+    const director = new ScriptDirector({
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+      model: {
+        async complete(request) {
+          if (request.node === 'draft') {
+            return directScriptText({
+              location: '市体育馆篮球场',
+              dialogue: '这场篮球赛我们一定要赢。'.repeat(14),
+            });
+          }
+          if (request.node === 'revision') {
+            revisionCalls += 1;
+            return revisionCalls === 1 ? `以下是改写稿：\n${fixed}` : fixed;
+          }
+          reviewCalls += 1;
+          return reviewCalls === 1
+            ? directReviewJson({
+                verdict: 'major_issue',
+                issues: [{
+                  code: 'WRONG_GENRE_OR_SETTING',
+                  sceneNumber: 1,
+                  evidence: '正文写成篮球比赛。',
+                  expected: '本集应在校报社调查证据。',
+                }],
+              })
+            : directReviewJson();
+        },
+        async getModelConfigFingerprint() { return 'direct-model-v1'; },
+      },
+    });
+
+    await director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    });
+
+    expect(revisionCalls).toBe(2);
+    expect(store.state.episodes[0]?.scenes[0]?.location).toBe('校报社');
+    expect(store.atomicCommitCalls).toHaveLength(1);
+  });
+
   it('accepts up to five scenes in direct mode even when the planning preference is three', async () => {
     const state = readySingleEpisodeState();
     const store = new MemoryScriptStore(state);
@@ -3018,12 +3142,16 @@ describe('ScriptDirector', () => {
     const text = [
       '第1集',
       '1-1 校报社前台 日/内',
-      '人物：沈清 前台 黑夹克男甲 周技师',
+      '人物：沈清 前台 黑夹克男甲 周技师 报名员 电话里的声音 金丝眼镜 程野',
       `△${'沈清把采访申请递到窗口并等待核验。'.repeat(8)}`,
       `前台：${'登记表需要负责人签字，我先替你查一下今天的值班记录。'.repeat(8)}`,
       `黑夹克男甲：${'老板让我来取走登记册，你们最好别多问。'.repeat(5)}`,
       `周技师：${'这份检测记录的编号和原件对不上。'.repeat(4)}`,
       `老周：${'我只在这一集作证，讲清楚那天看到的车辆和时间。'.repeat(4)}`,
+      `报名员：${'请先核对姓名和车辆编号，再领取地下资格赛号码牌。'.repeat(4)}`,
+      `电话里的声音（VO）：${'资格赛名单已经确认，请所有参赛者按时到场检录。'.repeat(4)}`,
+      `金丝眼镜：${'宏远车队只想提醒你，继续参赛不会有任何好处。'.repeat(4)}`,
+      `程野：${'我只负责这一场资格赛，过了终点我们各凭成绩说话。'.repeat(4)}`,
       `沈清：${'请重点核对下午三点前后的访客名单。'.repeat(6)}`,
     ].join('\n');
     const director = new ScriptDirector({
@@ -3059,6 +3187,22 @@ describe('ScriptDirector', () => {
     expect(store.state.episodes[0]?.scenes[0]?.blocks).toContainEqual(expect.objectContaining({
       type: 'dialogue',
       speaker: '老周',
+    }));
+    expect(store.state.episodes[0]?.scenes[0]?.blocks).toContainEqual(expect.objectContaining({
+      type: 'dialogue',
+      speaker: '报名员',
+    }));
+    expect(store.state.episodes[0]?.scenes[0]?.blocks).toContainEqual(expect.objectContaining({
+      type: 'dialogue',
+      speaker: '电话里的声音',
+    }));
+    expect(store.state.episodes[0]?.scenes[0]?.blocks).toContainEqual(expect.objectContaining({
+      type: 'dialogue',
+      speaker: '金丝眼镜',
+    }));
+    expect(store.state.episodes[0]?.scenes[0]?.blocks).toContainEqual(expect.objectContaining({
+      type: 'dialogue',
+      speaker: '程野',
     }));
     expect(store.atomicCommitCalls).toHaveLength(1);
   });
@@ -3106,6 +3250,7 @@ describe('ScriptDirector', () => {
 
   it('still blocks an invented named character that is not in the character bible', async () => {
     const state = readySingleEpisodeState();
+    state.plan!.coreRequirements += ' 未登记人物禁止对白。';
     const store = new MemoryScriptStore(state);
     const text = [
       '第1集',

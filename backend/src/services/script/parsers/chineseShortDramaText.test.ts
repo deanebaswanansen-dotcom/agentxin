@@ -23,6 +23,24 @@ function options() {
 }
 
 describe('parseChineseShortDramaText', () => {
+  it('recovers a registered-character dialogue line accidentally prefixed as an action', () => {
+    const result = parseChineseShortDramaText([
+      '第3集',
+      '3-1 修车铺 日/内',
+      '人物：周野',
+      '△周野：这其实是对白，不是动作。',
+    ].join('\n'), options());
+
+    expect(result.episode?.scenes[0]?.blocks).toEqual([
+      expect.objectContaining({
+        type: 'dialogue',
+        characterId: 'character-zhou',
+        speaker: '周野',
+        text: '这其实是对白，不是动作。',
+      }),
+    ]);
+  });
+
   it('parses readable Chinese screenplay text and assigns all internal IDs locally', () => {
     const result = parseChineseShortDramaText([
       '第三集',
@@ -126,6 +144,54 @@ describe('parseChineseShortDramaText', () => {
     expect(result.unparsedLines).toEqual([]);
   });
 
+  it('accepts numbered scene headings that repeat the episode prefix', () => {
+    const result = parseChineseShortDramaText([
+      '第3集 地下赛邀请',
+      '第3-1场 修车铺内 夜/内',
+      '人物：周野 林秋',
+      '△周野把地下资格赛报名表拍在工作台上。',
+      '林秋：这次我跟你一起去。',
+      '第3-2场 地下赛车场入口 夜/外',
+      '人物：周野',
+      '周野：十年了，这口气该出了。',
+    ].join('\n'), options());
+
+    expect(result.episode?.scenes).toHaveLength(2);
+    expect(result.episode?.scenes.map((scene) => scene.ordinal)).toEqual([1, 2]);
+    expect(result.unparsedLines).toEqual([]);
+    expect(result.warnings).toEqual([]);
+  });
+
+  it('accepts production-order scene headings and first-appearance role notes', () => {
+    const result = parseChineseShortDramaText([
+      '第3集：',
+      '3-1 夜 内 修车厂',
+      '人物：周野（四十岁 修车工） 林秋（律师）',
+      '【闪回】',
+      '△【特写】周野攥紧旧数据卡。',
+      '周野OS：十年前的声音又回来了。',
+      '林秋VO：有人跟过来了。',
+      '【闪回结束】',
+    ].join('\n'), options());
+
+    expect(result.unparsedLines).toEqual([]);
+    expect(result.warnings).toEqual([]);
+    expect(result.episode?.scenes[0]).toMatchObject({
+      location: '修车厂',
+      timeOfDay: 'night',
+      interiorExterior: 'interior',
+      characterIds: ['character-zhou', 'character-lin'],
+    });
+    expect(result.episode?.scenes[0]?.blocks[0]).toMatchObject({ type: 'caption', text: '闪回' });
+    expect(result.episode?.scenes[0]?.blocks[1]).toMatchObject({
+      type: 'action',
+      text: '【特写】周野攥紧旧数据卡。',
+    });
+    expect(result.episode?.scenes[0]?.blocks[2]).toMatchObject({ type: 'dialogue', speaker: '周野', mode: 'os' });
+    expect(result.episode?.scenes[0]?.blocks[3]).toMatchObject({ type: 'dialogue', speaker: '林秋', mode: 'vo' });
+    expect(result.episode?.scenes[0]?.blocks[4]).toMatchObject({ type: 'caption', text: '闪回结束' });
+  });
+
   it('accepts an unwrapped caption label as a caption instead of a dialogue speaker', () => {
     const result = parseChineseShortDramaText([
       '第3集',
@@ -177,7 +243,7 @@ describe('parseChineseShortDramaText', () => {
     };
 
     const serialized = serializeChineseShortDrama([episode], characters);
-    expect(serialized).toContain('3-1 修车厂 黄昏/内');
-    expect(serialized).toContain('林秋（vo）：赛道那边来电话了。');
+    expect(serialized).toContain('3-1 黄昏 内 修车厂');
+    expect(serialized).toContain('林秋VO：赛道那边来电话了。');
   });
 });

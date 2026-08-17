@@ -4,7 +4,7 @@ import type { ScriptCharacter, ScriptEpisode } from '../domain.js';
 import { serializeFountain } from './fountain.js';
 import { serializeScriptMarkdown } from './markdown.js';
 
-const characters = [{ id: 'lead', name: '沈清' }] as unknown as ScriptCharacter[];
+const characters = [{ id: 'lead', name: '沈清', identity: '美食工作室老板' }] as unknown as ScriptCharacter[];
 const episode = {
   id: 'episode-2',
   projectId: 'project-1',
@@ -49,8 +49,9 @@ describe('script exchange serializers', () => {
   it('exports navigable Markdown headings without JSON artifacts', () => {
     const value = serializeScriptMarkdown([episode], characters);
     expect(value).toContain('# 第2集 门缝的秘密');
-    expect(value).toContain('## 2-1 太奶奶房门口 夜/内');
-    expect(value).toContain('**沈清（vo）：**果然有问题。');
+    expect(value).toContain('## 2-1 夜 内 太奶奶房门口');
+    expect(value).toContain('人物：沈清（美食工作室老板）');
+    expect(value).toContain('**沈清VO：**果然有问题。');
     expect(value).toContain('**沈清：**我知道了。');
     expect(value).not.toContain('沈清（normal）');
     expect(value).not.toContain('```json');
@@ -61,6 +62,6 @@ describe('script exchange serializers', () => {
 
     expect(value).toContain('# 绝食逼我道歉？');
     expect(value).toContain('## 第二集 · 门缝的秘密');
-    expect(value).toContain('### 2-1 太奶奶房门口 夜/内');
+    expect(value).toContain('### 2-1 夜 内 太奶奶房门口');
   });
 });

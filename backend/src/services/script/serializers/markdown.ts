@@ -13,12 +13,27 @@ const SPACE_LABELS: Record<ScriptScene['interiorExterior'], string> = {
   exterior: '外',
 };
 
+function escapedRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+}
+
+function emphasizedAction(text: string, characterNames: readonly string[]): string {
+  const tokens = [
+    '【[^】]+】',
+    ...characterNames.filter(Boolean).sort((left, right) => right.length - left.length).map(escapedRegExp),
+  ];
+  if (tokens.length === 1) return text.replace(/【[^】]+】/gu, (value) => `**${value}**`);
+  return text.replace(new RegExp(`(${tokens.join('|')})`, 'gu'), (value) => `**${value}**`);
+}
+
 export function serializeScriptMarkdown(
   episodes: readonly ScriptEpisode[],
   characters: readonly ScriptCharacter[],
   options: { title?: string } = {},
 ): string {
-  const names = new Map(characters.map((character) => [character.id, character.name]));
+  const charactersById = new Map(characters.map((character) => [character.id, character]));
+  const characterNames = characters.map((character) => character.name);
+  const introducedCharacterIds = new Set<string>();
   const hasSeriesTitle = Boolean(options.title?.trim());
   const body = [...episodes]
     .sort((left, right) => left.episodeNumber - right.episodeNumber)
@@ -26,19 +41,28 @@ export function serializeScriptMarkdown(
       const scenes = [...episode.scenes]
         .sort((left, right) => left.ordinal - right.ordinal)
         .map((scene) => {
-          const cast = scene.characterIds.map((id) => names.get(id) ?? id).join(' ');
+          const cast = scene.characterIds.map((id) => {
+            const character = charactersById.get(id);
+            if (!character) return id;
+            if (introducedCharacterIds.has(id)) return character.name;
+            introducedCharacterIds.add(id);
+            const identity = character.identity?.trim() ?? '';
+            return identity ? `${character.name}（${identity}）` : character.name;
+          }).join(' ');
           const lines = [
-            `${hasSeriesTitle ? '###' : '##'} ${episode.episodeNumber}-${scene.ordinal} ${scene.location.trim()} ${TIME_LABELS[scene.timeOfDay]}/${SPACE_LABELS[scene.interiorExterior]}`,
+            `${hasSeriesTitle ? '###' : '##'} ${episode.episodeNumber}-${scene.ordinal} ${TIME_LABELS[scene.timeOfDay]} ${SPACE_LABELS[scene.interiorExterior]} ${scene.location.trim()}`,
           ];
           if (cast) lines.push(`人物：${cast}`);
           for (const block of scene.blocks) {
             const text = block.text.trim();
-            if (block.type === 'caption') lines.push(`> 字幕：${text}`);
-            else if (block.type === 'action') lines.push(`△${text}`);
+            if (block.type === 'caption') {
+              lines.push(/^(?:闪回|闪回结束|闪出)$/u.test(text) ? `> 【${text}】` : `> 【字幕：${text}】`);
+            }
+            else if (block.type === 'action') lines.push(`△${emphasizedAction(text, characterNames)}`);
             else {
-              const mode = block.mode === 'os' || block.mode === 'vo' ? block.mode : '';
-              const parenthetical = block.delivery?.trim() || mode;
-              lines.push(`**${block.speaker.trim()}${parenthetical ? `（${parenthetical}）` : ''}：**${text}`);
+              const mode = block.mode === 'os' || block.mode === 'vo' ? block.mode.toUpperCase() : '';
+              const delivery = block.delivery?.trim();
+              lines.push(`**${block.speaker.trim()}${mode || (delivery ? `（${delivery}）` : '')}：**${text}`);
             }
           }
           return lines.join('\n\n');

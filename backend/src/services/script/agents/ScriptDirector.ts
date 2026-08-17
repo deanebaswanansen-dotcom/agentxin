@@ -460,7 +460,7 @@ function allowsTemporaryDialogueSpeakers(plan: ScriptPlan): boolean {
 function isTemporaryDialogueRole(value: string): boolean {
   const role = value.trim();
   if (!role || role.length > 12) return false;
-  return /(?:(?:前台|保安|快递员|外卖员|服务员|店员|司机|护士|医生|警察|记者|主持人|裁判|解说员|工作人员|维修工|技师|工程师|检测员|鉴定员|邻居|同事|客户|观众|学员|乘客|门卫|秘书|助理|老板|经理|教练|队员|播音员|广播|系统音|法医|消防员|调度员|接线员|售票员|乘务员|清洁工|物业|房东|摊主|商贩|学生|老师|证人|患者|家属|路人|群众|男子|男人|女人|女子|青年|壮汉|老人|大妈|大叔|少年|少女|黑衣人|打手|手下|男|女)(?:[甲乙丙丁A-D\d]{0,2})?|(?:老|小)[\p{Script=Han}]{1,2})$/u.test(role);
+  return /(?:(?:前台|保安|报名员|检录员|车检员|赛会官员|快递员|外卖员|服务员|店员|司机|护士|医生|警察|记者|主持人|裁判|裁判员|解说员|工作人员|维修工|技师|工程师|检测员|鉴定员|邻居|同事|客户|观众|学员|乘客|门卫|秘书|助理|老板|经理|教练|队员|播音员|广播|系统音|法医|消防员|调度员|接线员|售票员|乘务员|清洁工|物业|房东|摊主|商贩|学生|老师|证人|患者|家属|路人|群众|男子|男人|女人|女子|青年|壮汉|老人|大妈|大叔|少年|少女|黑衣人|打手|手下|男|女)(?:[甲乙丙丁A-D\d]{0,2})?|(?:电话|对讲机|广播|扬声器|门外|场外)(?:里的)?(?:声音|男声|女声)|[\p{Script=Han}]{1,6}(?:眼镜|西装|夹克|背心|衬衫|帽子)(?:男|女|男人|女人)?[甲乙丙丁]?|(?:老|小)[\p{Script=Han}]{1,2}|[\p{Script=Han}]{2,4})$/u.test(role);
 }
 
 function reconcileDirectSceneCast(episode: ScriptEpisode): ScriptEpisode {
@@ -3726,7 +3726,7 @@ export class ScriptDirector {
     const storedReview = await this.latestCheckpoint(
       request.projectId,
       runKey,
-      { node: 'handoff_review', episodeNumber },
+      { node: 'handoff_review', episodeNumber, chunkStart: 1 },
     );
     let review: ScriptDirectHandoffReview | undefined;
     let reviewRevision: number | undefined;
@@ -3770,7 +3770,7 @@ export class ScriptDirector {
       reviewRevision = await this.nextCheckpointArtifactRevision(
         request.projectId,
         runKey,
-        { node: 'handoff_review', episodeNumber },
+        { node: 'handoff_review', episodeNumber, chunkStart: 1 },
       );
       const artifact: ScriptDirectReviewArtifact = {
         schemaVersion: 1,
@@ -3786,6 +3786,7 @@ export class ScriptDirector {
         attempt: 1,
         artifactRevision: reviewRevision,
         episodeNumber,
+        chunkStart: 1,
         artifact,
         inputRevisionRefs,
         upstreamArtifactRefs: [currentCandidateRef],
@@ -3863,7 +3864,15 @@ export class ScriptDirector {
       })),
     ].slice(0, 3);
     if (rewriteIssues.length > 0) {
-      const rewritePromptVersion = 'direct-rewrite-v3';
+      const storedRewrite = await this.latestCheckpoint(
+        request.projectId,
+        runKey,
+        { node: 'direct_rewrite', episodeNumber },
+      );
+      const rewriteFromOutline = storedRewrite?.status === 'stale';
+      const rewritePromptVersion = rewriteFromOutline
+        ? 'direct-rewrite-from-outline-v1'
+        : 'direct-rewrite-v4';
       const rewriteFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'direct_rewrite',
         inputRevisionRefs,
@@ -3871,11 +3880,6 @@ export class ScriptDirector {
         promptVersion: rewritePromptVersion,
         configRevision,
       });
-      const storedRewrite = await this.latestCheckpoint(
-        request.projectId,
-        runKey,
-        { node: 'direct_rewrite', episodeNumber },
-      );
       let rewriteArtifact: ScriptDirectDraftArtifact | undefined;
       let rewriteRevision: number | undefined;
       if (storedRewrite) {
@@ -3890,21 +3894,43 @@ export class ScriptDirector {
       }
       if (!rewriteArtifact) {
         request.signal?.throwIfAborted();
-        const rewrittenText = await this.dependencies.model.complete({
+        let rewrittenText = await this.dependencies.model.complete({
           node: 'revision',
           projectId: request.projectId,
           episodeNumber,
-          prompt: buildDirectRewritePrompt(context, rawText, rewriteIssues),
+          prompt: buildDirectRewritePrompt(context, rawText, rewriteIssues, {
+            rewriteFromOutline,
+          }),
           responseFormat: 'text',
           signal: request.signal,
         });
-        recordCall('revision', 'ChineseShortDramaDirectRewrite@v1', 1);
-        const rewritten = parseCandidate(rewrittenText);
-        if (rewritten.episode && rewritten.unparsedLines.length === 0) {
-          draft = rewritten.episode;
-          rawText = rewrittenText;
-          draftWarnings = rewritten.warnings;
+        let rewritten = parseCandidate(rewrittenText);
+        let rewriteCallsUsed = 1;
+        if (!rewritten.episode || rewritten.unparsedLines.length > 0) {
+          rewrittenText = await this.dependencies.model.complete({
+            node: 'revision',
+            projectId: request.projectId,
+            episodeNumber,
+            prompt: [
+              '只修正下面剧本的排版，不改变事件、人物、对白含义和篇幅。',
+              '删除解释文字与Markdown围栏，严格整理为：第N集、N-M 地点 日或夜/内或外、人物、字幕、△动作、人物对白。',
+              '只输出整理后的完整剧本文本。',
+              rewrittenText,
+            ].join('\n'),
+            responseFormat: 'text',
+            signal: request.signal,
+          });
+          rewriteCallsUsed += 1;
+          rewritten = parseCandidate(rewrittenText);
         }
+        if (!rewritten.episode) {
+          recordCall('revision', 'ChineseShortDramaDirectRewrite@v1', rewriteCallsUsed, 'needs_review');
+          throw new ScriptModelOutputError(`第 ${episodeNumber} 集改写稿没有返回可识别的剧本场景。`);
+        }
+        recordCall('revision', 'ChineseShortDramaDirectRewrite@v1', rewriteCallsUsed);
+        draft = rewritten.episode;
+        rawText = rewrittenText;
+        draftWarnings = rewritten.warnings;
         rewriteRevision = await this.nextCheckpointArtifactRevision(
           request.projectId,
           runKey,
@@ -3924,7 +3950,7 @@ export class ScriptDirector {
           runKey,
           node: 'direct_rewrite',
           status: 'succeeded',
-          attempt: 1,
+          attempt: rewriteCallsUsed,
           artifactRevision: rewriteRevision,
           episodeNumber,
           artifact: rewriteArtifact,
@@ -3957,7 +3983,7 @@ export class ScriptDirector {
       const storedPostRewriteReview = await this.latestCheckpoint(
         request.projectId,
         runKey,
-        { node: 'handoff_review', episodeNumber, chunkStart: 1 },
+        { node: 'handoff_review', episodeNumber, chunkStart: 2 },
       );
       let postRewriteReview: ScriptDirectHandoffReview | undefined;
       let postRewriteReviewRevision: number | undefined;
@@ -4004,7 +4030,7 @@ export class ScriptDirector {
         postRewriteReviewRevision = await this.nextCheckpointArtifactRevision(
           request.projectId,
           runKey,
-          { node: 'handoff_review', episodeNumber, chunkStart: 1 },
+          { node: 'handoff_review', episodeNumber, chunkStart: 2 },
         );
         const postRewriteReviewArtifact: ScriptDirectReviewArtifact = {
           schemaVersion: 1,
@@ -4020,7 +4046,7 @@ export class ScriptDirector {
           attempt: 1,
           artifactRevision: postRewriteReviewRevision,
           episodeNumber,
-          chunkStart: 1,
+          chunkStart: 2,
           artifact: postRewriteReviewArtifact,
           inputRevisionRefs,
           upstreamArtifactRefs: [currentCandidateRef],
@@ -4637,6 +4663,24 @@ export class ScriptDirector {
       const rejectedRevision = revisions.find((checkpoint) => checkpoint.status === 'needs_review');
       const completedCandidateRejected = completed?.status === 'needs_review';
       if (!rejectedRevision && !completedCandidateRejected) continue;
+
+      if (completedCandidateRejected) {
+        const directPostRewriteReview = latestScriptCheckpoint(checkpoints, {
+          node: 'handoff_review',
+          episodeNumber,
+          chunkStart: 2,
+        });
+        if (directPostRewriteReview && directPostRewriteReview.status !== 'stale') {
+          await this.markCheckpointStale(directPostRewriteReview);
+        }
+        const directRewrite = latestScriptCheckpoint(checkpoints, {
+          node: 'direct_rewrite',
+          episodeNumber,
+        });
+        if (directRewrite && directRewrite.status !== 'stale') {
+          await this.markCheckpointStale(directRewrite);
+        }
+      }
 
       for (const revision of revisions) {
         if (

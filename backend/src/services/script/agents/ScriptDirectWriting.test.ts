@@ -7,6 +7,7 @@ import type {
 } from '../domain.js';
 import {
   buildDirectDraftPrompt,
+  buildDirectRewritePrompt,
   buildDirectReviewPrompt,
   decodeDirectHandoffReview,
   mergeDirectHandoffContinuity,
@@ -54,6 +55,12 @@ describe('ScriptDirectWriting', () => {
     expect(prompt).toContain('不要输出 JSON');
     expect(prompt).toContain('必须在 endingHook 处停住');
     expect(prompt).toContain('绝不能提前完成下一集事件');
+    expect(prompt).toContain('N-1 日或夜 内或外 具体地点');
+    expect(prompt).toContain('人物在全剧第一次出场时');
+    expect(prompt).toContain('△【特写】动作');
+    expect(prompt).toContain('【闪回】和【闪回结束】');
+    expect(prompt).toContain('OS必须跟人物心里所想的话');
+    expect(prompt).toContain('VO只用于画外能听见但看不到人物');
   });
 
   it('tells the lightweight reviewer to reject events reserved for later episode cards', () => {
@@ -65,6 +72,37 @@ describe('ScriptDirectWriting', () => {
     expect(prompt).toContain('逐项比较本集 endingHook 与 nextEpisodeDirection');
     expect(prompt).toContain('提前完成下一集、后续高潮或结局');
     expect(prompt).toContain('OFF_OUTLINE');
+  });
+
+  it('tells an off-outline rewrite to delete later evidence instead of paraphrasing it', () => {
+    const prompt = buildDirectRewritePrompt({
+      episode: { endingHook: '只拍到半张维修记录' },
+      nextEpisodeDirection: { mainEvent: '继续追查资本资金链' },
+    }, '主角已经拿到完整资金流水。', [{
+      code: 'OFF_OUTLINE',
+      evidence: '提前拿到完整资金流水',
+      expected: '本集只拍到半张维修记录',
+    }]);
+
+    expect(prompt).toContain('彻底删除 evidence 涉及的越界人物、道具、证据和后续事件');
+    expect(prompt).toContain('不能只换说法或换地点保留');
+    expect(prompt).toContain('精确停在本集 endingHook');
+  });
+
+  it('drops the rejected original when retrying an off-outline rewrite', () => {
+    const prompt = buildDirectRewritePrompt({
+      episode: { endingHook: '只拍到半张维修记录' },
+      nextEpisodeDirection: { mainEvent: '继续追查资本资金链' },
+    }, '主角已经拿到完整资金流水。', [{
+      code: 'OFF_OUTLINE',
+      evidence: '提前拿到完整资金流水',
+      expected: '本集只拍到半张维修记录',
+    }], { rewriteFromOutline: true });
+
+    expect(prompt).toContain('完全从分集卡重新写出本集');
+    expect(prompt).toContain('不要参考、延续或改写上一版正文');
+    expect(prompt).not.toContain('主角已经拿到完整资金流水');
+    expect(prompt).not.toContain('原正文');
   });
 
   it('does not invent a next episode after the confirmed finale', () => {

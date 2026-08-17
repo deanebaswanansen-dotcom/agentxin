@@ -40,13 +40,21 @@ export interface ScriptTextParseResult {
 }
 
 const SCENE_HEADING = /^(\d+)\s*[-－—]\s*(\d+)\s+(.+?)\s+(日|夜|晨|清晨|黄昏|傍晚)\s*[/／]\s*(内|外)$/u;
-const NUMBERED_SCENE_HEADING = /^第\s*(\d+)\s*场\s*[：:]?\s*(.+?)\s+(日|夜|晨|清晨|黄昏|傍晚)\s*[/／]\s*(内|外)$/u;
+const PRODUCTION_SCENE_HEADING = /^(\d+)\s*[-－—]\s*(\d+)\s+(日|夜|晨|清晨|黄昏|傍晚)\s+(内|外)\s+(.+)$/u;
+const NUMBERED_SCENE_HEADING = /^第\s*(?:(\d+)\s*[-－—]\s*)?(\d+)\s*场\s*[：:]?\s*(.+?)\s+(日|夜|晨|清晨|黄昏|傍晚)\s*[/／]\s*(内|外)$/u;
 const EPISODE_HEADING = /^第\s*(?:\d+|[零〇一二三四五六七八九十百千]+)\s*集(?:\s*[：:]?.*)?$/u;
 const CHARACTER_LINE = /^人物\s*[：:]\s*(.*)$/u;
 const CAPTION_LINE = /^(?:【\s*)?字幕\s*[：:]\s*(.*?)(?:\s*】)?$/u;
+const FLASHBACK_LINE = /^【\s*(闪回|闪回结束|闪出)\s*】$/u;
 const QUOTED_SCREEN_TEXT_LINE = /^(?:[“"])(.+?)(?:[”"])$/u;
 const ACTION_LINE = /^[△▲]\s*(.*)$/u;
 const DIALOGUE_LINE = /^([^：:（）()]+?)(?:[（(]([^）)]*)[）)])?\s*[：:]\s*(.+)$/u;
+
+function dialogueSpeaker(value: string): { name: string; suffixMode?: 'OS' | 'VO' } {
+  const match = /^(.*?)(OS|VO)$/iu.exec(value.trim());
+  if (!match?.[1] || !match[2]) return { name: value.trim() };
+  return { name: match[1].trim(), suffixMode: match[2].toUpperCase() as 'OS' | 'VO' };
+}
 
 function normalizedName(value: string): string {
   return value.normalize('NFKC').replace(/[\s·•]/gu, '').toLocaleLowerCase('zh-CN');
@@ -65,6 +73,24 @@ function interiorExterior(label: string): ScriptInteriorExterior {
 
 function unique(values: readonly string[]): string[] {
   return [...new Set(values)];
+}
+
+function castLabels(value: string): string[] {
+  const labels: string[] = [];
+  let current = '';
+  let parenthesesDepth = 0;
+  for (const character of value) {
+    if (character === '（' || character === '(') parenthesesDepth += 1;
+    if (character === '）' || character === ')') parenthesesDepth = Math.max(0, parenthesesDepth - 1);
+    if (parenthesesDepth === 0 && /[、，,；;\s]/u.test(character)) {
+      if (current.trim()) labels.push(current.trim());
+      current = '';
+    } else {
+      current += character;
+    }
+  }
+  if (current.trim()) labels.push(current.trim());
+  return labels;
 }
 
 function dialogueMode(value: string | undefined): {
@@ -127,11 +153,18 @@ export function parseChineseShortDramaText(
       continue;
     }
 
+    const productionHeading = PRODUCTION_SCENE_HEADING.exec(line);
     const heading = SCENE_HEADING.exec(line);
     const numberedHeading = NUMBERED_SCENE_HEADING.exec(line);
-    if (heading || numberedHeading) {
-      const headingEpisode = heading ? Number(heading[1]) : options.episodeNumber;
-      if (heading && headingEpisode !== options.episodeNumber) {
+    if (productionHeading || heading || numberedHeading) {
+      const headingEpisode = productionHeading
+        ? Number(productionHeading[1])
+        : heading
+        ? Number(heading[1])
+        : numberedHeading![1]
+          ? Number(numberedHeading![1])
+          : options.episodeNumber;
+      if (headingEpisode !== options.episodeNumber) {
         warn(
           lineNumber,
           'SCENE_EPISODE_NUMBER_REPAIRED',
@@ -141,10 +174,10 @@ export function parseChineseShortDramaText(
       }
       currentScene = {
         id: options.createId(),
-        ordinal: Number(heading ? heading[2] : numberedHeading![1]),
-        location: (heading ? heading[3] : numberedHeading![2])!.trim(),
-        timeOfDay: timeOfDay((heading ? heading[4] : numberedHeading![3])!),
-        interiorExterior: interiorExterior((heading ? heading[5] : numberedHeading![4])!),
+        ordinal: Number(productionHeading ? productionHeading[2] : heading ? heading[2] : numberedHeading![2]),
+        location: (productionHeading ? productionHeading[5] : heading ? heading[3] : numberedHeading![3])!.trim(),
+        timeOfDay: timeOfDay((productionHeading ? productionHeading[3] : heading ? heading[4] : numberedHeading![4])!),
+        interiorExterior: interiorExterior((productionHeading ? productionHeading[4] : heading ? heading[5] : numberedHeading![5])!),
         characterIds: [],
         blocks: [],
       };
@@ -159,13 +192,11 @@ export function parseChineseShortDramaText(
 
     const characterLine = CHARACTER_LINE.exec(line);
     if (characterLine) {
-      const names = characterLine[1]!
-        .split(/[、，,；;\s]+/u)
-        .map((value) => value.trim())
-        .filter(Boolean);
+      const names = castLabels(characterLine[1]!);
       const ids: string[] = [];
       for (const name of names) {
-        const character = characterByName.get(normalizedName(name));
+        const lookupName = name.replace(/[（(][^）)]*[）)]$/u, '').trim();
+        const character = characterByName.get(normalizedName(lookupName));
         if (character) ids.push(character.id);
         else warn(lineNumber, 'UNKNOWN_SCENE_CHARACTER', `场景人物「${name}」未登记。`, line);
       }
@@ -183,6 +214,16 @@ export function parseChineseShortDramaText(
       continue;
     }
 
+    const flashback = FLASHBACK_LINE.exec(line);
+    if (flashback) {
+      currentScene.blocks.push({
+        id: options.createId(),
+        type: 'caption',
+        text: flashback[1]!,
+      });
+      continue;
+    }
+
     const quotedScreenText = QUOTED_SCREEN_TEXT_LINE.exec(line);
     if (quotedScreenText) {
       currentScene.blocks.push({
@@ -195,19 +236,50 @@ export function parseChineseShortDramaText(
 
     const action = ACTION_LINE.exec(line);
     if (action) {
+      const actionText = action[1]!.trim();
+      const embeddedDialogue = DIALOGUE_LINE.exec(actionText);
+      const embeddedSpeaker = embeddedDialogue ? dialogueSpeaker(embeddedDialogue[1]!) : undefined;
+      const embeddedCharacter = embeddedDialogue
+        ? characterByName.get(normalizedName(embeddedSpeaker!.name))
+        : undefined;
+      if (embeddedDialogue && embeddedCharacter) {
+        const mode = dialogueMode(embeddedDialogue[2] ?? embeddedSpeaker?.suffixMode);
+        currentScene.blocks.push({
+          id: options.createId(),
+          type: 'dialogue',
+          characterId: embeddedCharacter.id,
+          speaker: embeddedCharacter.name,
+          ...mode,
+          text: embeddedDialogue[3]!.trim(),
+        });
+        if (
+          mode.mode !== 'os' &&
+          mode.mode !== 'vo' &&
+          !currentScene.characterIds.includes(embeddedCharacter.id)
+        ) {
+          warn(
+            lineNumber,
+            'DIALOGUE_CHARACTER_NOT_IN_SCENE',
+            `普通对白人物「${embeddedCharacter.name}」不在场景人物表。`,
+            line,
+          );
+        }
+        continue;
+      }
       currentScene.blocks.push({
         id: options.createId(),
         type: 'action',
-        text: action[1]!.trim(),
+        text: actionText,
       });
       continue;
     }
 
     const dialogue = DIALOGUE_LINE.exec(line);
     if (dialogue) {
-      const speaker = dialogue[1]!.trim();
+      const parsedSpeaker = dialogueSpeaker(dialogue[1]!);
+      const speaker = parsedSpeaker.name;
       const character = characterByName.get(normalizedName(speaker));
-      const mode = dialogueMode(dialogue[2]);
+      const mode = dialogueMode(dialogue[2] ?? parsedSpeaker.suffixMode);
       const block: ScriptBlock = {
         id: options.createId(),
         type: 'dialogue',

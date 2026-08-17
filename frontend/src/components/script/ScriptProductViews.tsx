@@ -327,13 +327,45 @@ const PLACE_LABEL: Record<ScriptEpisode['scenes'][number]['interiorExterior'], s
   interior: '内', exterior: '外',
 };
 
-function sceneCharacterNames(scene: ScriptEpisode['scenes'][number], characterNames: Map<string, string>): string[] {
-  const explicit = scene.characterIds.map((id) => characterNames.get(id)).filter((name): name is string => Boolean(name));
+function sceneCharacterNames(
+  scene: ScriptEpisode['scenes'][number],
+  charactersById: Map<string, ScriptCharacter>,
+  introducedCharacterIds: Set<string>,
+): string[] {
+  const explicitCharacterNames = new Set(
+    scene.characterIds.map((id) => charactersById.get(id)?.name).filter((name): name is string => Boolean(name)),
+  );
+  const explicit = scene.characterIds.map((id) => {
+    const character = charactersById.get(id);
+    if (!character) return undefined;
+    if (introducedCharacterIds.has(id)) return character.name;
+    introducedCharacterIds.add(id);
+    const identity = character.identity?.trim() ?? '';
+    return identity ? `${character.name}（${identity}）` : character.name;
+  }).filter((name): name is string => Boolean(name));
   const speakers = scene.blocks
     .filter((block): block is Extract<typeof block, { type: 'dialogue' }> => block.type === 'dialogue')
     .map((block) => block.speaker)
-    .filter(Boolean);
+    .filter((name) => Boolean(name) && !explicitCharacterNames.has(name));
   return [...new Set([...explicit, ...speakers])];
+}
+
+function escapedRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+}
+
+function renderActionText(text: string, characterNames: readonly string[]): Array<string | JSX.Element> {
+  const characterNameSet = new Set(characterNames);
+  const tokens = [
+    '【[^】]+】',
+    ...characterNames.filter(Boolean).sort((left, right) => right.length - left.length).map(escapedRegExp),
+  ];
+  const matcher = new RegExp(`(${tokens.join('|')})`, 'gu');
+  return text.split(matcher).filter(Boolean).map((part, index) => (
+    /^【[^】]+】$/u.test(part) || characterNameSet.has(part)
+      ? <strong key={`${index}-${part}`}>{part}</strong>
+      : part
+  ));
 }
 
 export function ScriptEpisodeReader({
@@ -353,7 +385,9 @@ export function ScriptEpisodeReader({
   loading: boolean;
   onEditEpisode: (episodeNumber: number) => void;
 }): JSX.Element {
-  const characterNames = new Map(characters.map((character) => [character.id, character.name]));
+  const charactersById = new Map(characters.map((character) => [character.id, character]));
+  const characterNames = characters.map((character) => character.name);
+  const introducedCharacterIds = new Set<string>();
   const ordered = [...episodes].sort((left, right) => left.episodeNumber - right.episodeNumber);
   const visibleChars = summaries
     .filter((item) => item.episodeNumber >= batchStart && item.episodeNumber <= batchEnd)
@@ -371,10 +405,10 @@ export function ScriptEpisodeReader({
         <article className="script-reader-episode" key={episode.id} id={`script-episode-${episode.episodeNumber}`}>
           <header><div><span>第 {episode.episodeNumber} 集</span><h4>{episode.title}</h4></div><button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" onClick={() => onEditEpisode(episode.episodeNumber)}>编辑本集</button></header>
           {[...episode.scenes].sort((left, right) => left.ordinal - right.ordinal).map((scene) => {
-            const names = sceneCharacterNames(scene, characterNames);
+            const names = sceneCharacterNames(scene, charactersById, introducedCharacterIds);
             return (
               <section className="script-reader-scene" key={scene.id}>
-                <h5>{episode.episodeNumber}-{scene.ordinal} {scene.location} {TIME_LABEL[scene.timeOfDay]}/{PLACE_LABEL[scene.interiorExterior]}</h5>
+                <h5>{episode.episodeNumber}-{scene.ordinal} {TIME_LABEL[scene.timeOfDay]} {PLACE_LABEL[scene.interiorExterior]} {scene.location}</h5>
                 {names.length ? <p className="script-reader-characters"><strong>人物：</strong>{names.join(' ')}</p> : null}
                 <div className="script-reader-blocks">
                   {scene.blocks.map((block) => {
@@ -382,11 +416,15 @@ export function ScriptEpisodeReader({
                       const caption = block.text
                         .replace(/^【|】$/g, '')
                         .replace(/^字幕\s*[：:]\s*/, '');
-                      return <p className="is-caption" key={block.id}>【字幕：{caption}】</p>;
+                      return <p className="is-caption" key={block.id}>{/^(?:闪回|闪回结束|闪出)$/u.test(caption) ? `【${caption}】` : `【字幕：${caption}】`}</p>;
                     }
-                    if (block.type === 'action') return <p className="is-action" key={block.id}>△{block.text.replace(/^△/, '')}</p>;
-                    const directions = [block.delivery, block.mode && block.mode !== 'normal' ? block.mode : ''].filter(Boolean).join('，');
-                    return <p className="is-dialogue" key={block.id}><strong>{block.speaker}{directions ? `（${directions}）` : ''}：</strong>{block.text}</p>;
+                    if (block.type === 'action') {
+                      const action = block.text.replace(/^△/, '');
+                      return <p className="is-action" key={block.id}>△{renderActionText(action, characterNames)}</p>;
+                    }
+                    const mode = block.mode === 'os' || block.mode === 'vo' ? block.mode.toUpperCase() : '';
+                    const delivery = block.delivery?.trim();
+                    return <p className="is-dialogue" key={block.id}><strong>{block.speaker}{mode || (delivery ? `（${delivery}）` : '')}：</strong>{block.text}</p>;
                   })}
                 </div>
               </section>
