@@ -30,6 +30,33 @@ export interface MemoryFact {
   at: string;
 }
 
+/** 只跟踪可能造成正文大 Bug 的章末状态，不记录普通服装、饮食或短暂情绪。 */
+export type CriticalStateKind =
+  | 'alive_status'
+  | 'mobility_status'
+  | 'location'
+  | 'physical_state'
+  | 'ability_state'
+  | 'critical_knowledge'
+  | 'key_item'
+  | 'relationship_stage';
+
+export interface CriticalStateEntry {
+  id: string;
+  kind: CriticalStateKind;
+  /** 人物名；key_item 时为唯一物品名。 */
+  entity: string;
+  /** 同一人物下的具体能力、秘密、关系对象等；无细分时使用 current。 */
+  key: string;
+  /** 章末规范化状态，枚举约束由 MemoryService 负责。 */
+  value: string;
+  /** 正文中明确支持本次状态的短证据。 */
+  evidence: string;
+  chapterId: string;
+  chapterTitle: string;
+  updatedAt: string;
+}
+
 /** 风格学习沉淀：Agent 自我进化记录（如「该作者偏好短句、多对白、忌说教」）。 */
 export interface Learning {
   id: string;
@@ -76,6 +103,9 @@ export interface ForeshadowEntry {
 export interface ProjectMemory {
   summaries: ChapterSummary[];
   facts: MemoryFact[];
+  criticalStates: CriticalStateEntry[];
+  /** 被 P0 Gate 拦截、正文仍保留供人工查看但不得计入已提交章节的 ID。 */
+  rejectedChapterIds: string[];
   learnings: Learning[];
   workflow: WorkflowEvent[];
   /** 伏笔台账（埋设 / 呼应 / 回收）。 */
@@ -105,6 +135,8 @@ function emptyProjectMemory(): ProjectMemory {
   return {
     summaries: [],
     facts: [],
+    criticalStates: [],
+    rejectedChapterIds: [],
     learnings: [],
     workflow: [],
     foreshadows: [],
@@ -194,6 +226,8 @@ export class MemoryStore implements MemoryStorePort {
     return {
       summaries: Array.isArray(copy.summaries) ? copy.summaries : [],
       facts: Array.isArray(copy.facts) ? copy.facts : [],
+      criticalStates: Array.isArray(copy.criticalStates) ? copy.criticalStates : [],
+      rejectedChapterIds: Array.isArray(copy.rejectedChapterIds) ? copy.rejectedChapterIds : [],
       learnings: Array.isArray(copy.learnings) ? copy.learnings : [],
       workflow: Array.isArray(copy.workflow) ? copy.workflow : [],
       foreshadows: Array.isArray(copy.foreshadows) ? copy.foreshadows : [],

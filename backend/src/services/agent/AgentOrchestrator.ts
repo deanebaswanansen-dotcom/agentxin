@@ -24,7 +24,11 @@ import { countActualWords, tokenBudgetForCharacterTarget } from '../blueprint/wo
 import { ServiceError } from '../ServiceError.js';
 import { isProxyError } from '../../proxy/ProxyError.js';
 import type { ModelConfigService } from '../modelConfig/ModelConfigService.js';
-import type { MemoryService } from '../memory/MemoryService.js';
+import type {
+  CriticalStateIssue,
+  CriticalStateUpdateInput,
+  MemoryService,
+} from '../memory/MemoryService.js';
 import { scaledMemoryOptions } from '../memory/MemoryService.js';
 import type { ReferenceAnalysisService } from '../reference/ReferenceAnalysisService.js';
 import { MaterialResearchService } from '../research/MaterialResearchService.js';
@@ -1086,7 +1090,9 @@ export class AgentOrchestrator {
     );
     await this.purgeEmptyChapterShells(pid);
     const existing = await this.store.listChapters(pid);
-    const completedBefore = existing.filter((ch) => ch.content.trim().length > 0).length;
+    const completedBefore = existing.filter(
+      (ch) => ch.content.trim().length > 0 && !this.memory.isChapterRejected(pid, ch.id),
+    ).length;
     const requestedChapterCount = chapterCount;
     chapterCount = remainingLongNovelBatch(
       requestedChapterCount,
@@ -1184,16 +1190,7 @@ export class AgentOrchestrator {
         artifacts,
       );
     }
-    pack = await this.ensureChapterOutfitPlan(
-      config,
-      pid,
-      pack,
-      plannedTotalChapters,
-      signal,
-      emit,
-      artifacts,
-      steps,
-    );
+    pack = await this.ensureChapterOutfitPlan(pid, pack, artifacts);
 
     const plannedFinalChapter = Math.max(completedBefore + chapterCount, plannedTotalChapters);
     pack = await this.ensureFullNovelControlOutline(
@@ -1434,7 +1431,10 @@ export class AgentOrchestrator {
         steps.push(`已创建检查点（第${num}章）。`);
       }
 
-      if (gates.hardFail && modeConfig.stopOnCanonConflict) {
+      const hasP0Continuity = gates.findings.some(
+        (finding) => finding.gate === 'continuity' && finding.severity === 'hard',
+      );
+      if (gates.hardFail && (modeConfig.stopOnCanonConflict || hasP0Continuity)) {
         consecutiveFailures += 1;
         steps.push(
           `【Gate】「${title}」硬冲突：${gates.findings
@@ -1443,6 +1443,7 @@ export class AgentOrchestrator {
             .join('；')}`,
         );
         if (
+          hasP0Continuity ||
           consecutiveFailures >= modeConfig.maxConsecutiveFailures ||
           automationLevel === 'semi_auto' ||
           automationLevel === 'assistant'
@@ -1454,7 +1455,6 @@ export class AgentOrchestrator {
             current: i + 1,
             total: chapterCount,
           });
-          completedChapters += 1;
           break;
         }
       } else {
@@ -1582,20 +1582,13 @@ export class AgentOrchestrator {
         artifacts,
       );
     }
-    pack = await this.ensureChapterOutfitPlan(
-      config,
-      pid,
-      pack,
-      plannedTotalChapters,
-      signal,
-      emit,
-      artifacts,
-      steps,
-    );
+    pack = await this.ensureChapterOutfitPlan(pid, pack, artifacts);
 
     await this.purgeEmptyChapterShells(pid);
     const existing = await this.store.listChapters(pid);
-    const completedBefore = existing.filter((ch) => ch.content.trim().length > 0).length;
+    const completedBefore = existing.filter(
+      (ch) => ch.content.trim().length > 0 && !this.memory.isChapterRejected(pid, ch.id),
+    ).length;
     const plannedFinalChapter = Math.max(completedBefore + chapterCount, plannedTotalChapters);
     pack = await this.ensureFullNovelControlOutline(
       config,
@@ -1622,6 +1615,7 @@ export class AgentOrchestrator {
     const outlineByNumber = indexPlanChapterOutlines(planSummary?.chapterOutlines);
     let lastChapterId: Id | undefined;
     let completedChapters = 0;
+    let stoppedOnP0Title: string | undefined;
     for (let i = 0; i < chapterCount; i += 1) {
       if (signal.aborted) break;
       const num = completedBefore + i + 1;
@@ -1684,6 +1678,22 @@ export class AgentOrchestrator {
       if (processed.revised) {
         steps.push(`检测子 Agent 已触发修订「${title}」。`);
       }
+      if (processed.gates?.hardFail) {
+        steps.push(
+          `【Gate】「${title}」P0 硬冲突：${processed.gates.findings
+            .filter((finding) => finding.severity === 'hard')
+            .map((finding) => finding.message)
+            .join('；')}`,
+        );
+        emit({
+          phase: 'info',
+          message: `【主 Agent】P0 大 Bug 已拦截；「${title}」保留为待确认稿，未提交到后续记忆。`,
+          current: i + 1,
+          total: chapterCount,
+        });
+        stoppedOnP0Title = title;
+        break;
+      }
       completedChapters += 1;
       steps.push(
         `已写完「${title}」（${finalContent.length} 字）；检测评分 ${finalInspection.score0to100}。`,
@@ -1696,15 +1706,22 @@ export class AgentOrchestrator {
       });
     }
 
-    emit({ phase: 'info', message: '整本草稿生成完成。' });
+    emit({
+      phase: 'info',
+      message: stoppedOnP0Title
+        ? `整本草稿已暂停：请先确认并修复「${stoppedOnP0Title}」。`
+        : '整本草稿生成完成。',
+    });
     return {
       task: 'full_novel',
       mode: 'draft',
       projectId: pid,
       chapterId: lastChapterId,
-      summary: planSummary
-        ? `已按计划生成整本草稿：完成 ${completedChapters}/${chapterCount} 章（分章大纲与创作规则已采纳），全程带长期记忆与逐章反思。`
-        : `已一键生成整本草稿：完成 ${completedChapters}/${chapterCount} 章，全程带长期记忆与逐章反思自我进化。`,
+      summary: stoppedOnP0Title
+        ? `整本草稿因 P0 大 Bug 暂停：完成 ${completedChapters}/${chapterCount} 章；「${stoppedOnP0Title}」保留为待确认稿，未提交记忆。`
+        : planSummary
+          ? `已按计划生成整本草稿：完成 ${completedChapters}/${chapterCount} 章（分章大纲与创作规则已采纳），全程带长期记忆与逐章反思。`
+          : `已一键生成整本草稿：完成 ${completedChapters}/${chapterCount} 章，全程带长期记忆与逐章反思自我进化。`,
       steps,
       artifacts,
       metrics: {
@@ -1748,6 +1765,14 @@ export class AgentOrchestrator {
     progress: { current: number; total: number },
     steps: string[],
   ): Promise<string> {
+    const existingRejectedDraft = await this.store.getChapter(chapterId);
+    if (
+      existingRejectedDraft?.content.trim() &&
+      this.memory.isChapterRejected(projectId, chapterId)
+    ) {
+      steps.push(`【ChapterAgent】复用「${chapterTitle}」待确认稿，重新执行 P0 检查。`);
+      return existingRejectedDraft.content.trim();
+    }
     const memoryContext = this.memory.buildContext(projectId, scaledMemoryOptions(chapterNumber));
     const requirement = buildChapterBlueprintRequirement({
       chapterNumber,
@@ -2225,54 +2250,17 @@ export class AgentOrchestrator {
   }
 
   private async ensureChapterOutfitPlan(
-    config: ModelConfig,
     projectId: Id,
     pack: GeneratedPack,
-    totalChapters: number,
-    signal: AbortSignal,
-    emit: (event: AgentProgressEvent) => void,
     artifacts: AgentArtifact[],
-    steps: string[],
   ): Promise<GeneratedPack> {
     const embedded = extractChapterOutfitPlan(pack.characters);
     const existing = (await this.store.listOutlines(projectId)).find(
       (outline) => outline.title === '分章人物服装表',
     );
-    let outfitPlan = embedded ?? existing?.content.trim();
-    if (!outfitPlan) {
-      emit({ phase: 'setup', message: '【CharacterAgent】补全分章人物服装连续性表…' });
-      try {
-        const generated = await this.generateText(
-          config,
-          [
-            {
-              role: 'system',
-              content: [
-                '你是小说人物服装连续性策划。只输出 Markdown 表格，不写正文或解释。',
-                '标题固定为“## 分章人物服装连续性表”。',
-                '表头固定为“| 章节 | 人物 | 服装与配件 | 换装原因/连续性 |”。',
-                `必须覆盖第1章至第${totalChapters}章；逐章列出主要出场人物。`,
-                '服装需包含款式、颜色、材质、鞋履与关键配件；连续场景注明沿用，换装说明原因。',
-                '',
-                pack.characters.slice(0, 5000),
-                '',
-                pack.outline.slice(0, 7000),
-              ].join('\n'),
-            },
-            { role: 'user', content: `请生成全书 ${totalChapters} 章的人物服装连续性表。` },
-          ],
-          signal,
-        );
-        outfitPlan = generated.trim().startsWith('##')
-          ? generated.trim()
-          : `## 分章人物服装连续性表\n\n${generated.trim()}`;
-        steps.push('已补全分章人物服装连续性表。');
-      } catch (error) {
-        if (signal.aborted) throw error;
-        emit({ phase: 'info', message: '【CharacterAgent】服装表补全失败，正文任务继续。' });
-        return pack;
-      }
-    }
+    const outfitPlan = embedded ?? existing?.content.trim();
+    // 普通服装不属于大 Bug 硬状态。只复用用户或设定包已有的表，不再额外调用模型补全全书。
+    if (!outfitPlan) return pack;
     const saved = await this.upsertOutlineByTitle(projectId, '分章人物服装表', outfitPlan);
     if (!artifacts.some((artifact) => artifact.kind === 'outline' && artifact.id === saved.id)) {
       artifacts.push({ kind: 'outline', id: saved.id, title: saved.title });
@@ -2471,6 +2459,19 @@ export class AgentOrchestrator {
         revisionHints: inspection.revisionHints,
         fatalIssues: inspection.fatalIssues,
       });
+    } else {
+      const semanticGates = runChapterQualityGates({
+        content,
+        minWords: 1,
+        maxWords: Number.MAX_SAFE_INTEGER,
+        targetWords: Math.max(1, targetWords),
+        chapterTitle,
+        inspectorScore: inspection.score0to100,
+        recommendRevision: inspection.recommendRevision,
+        revisionHints: inspection.revisionHints,
+        fatalIssues: inspection.fatalIssues,
+      });
+      if (semanticGates.hardFail) gates = semanticGates;
     }
 
     let finalContent = content;
@@ -2575,6 +2576,19 @@ export class AgentOrchestrator {
             revisionHints: finalInspection.revisionHints,
             fatalIssues: finalInspection.fatalIssues,
           });
+        } else {
+          const semanticGates = runChapterQualityGates({
+            content: finalContent,
+            minWords: 1,
+            maxWords: Number.MAX_SAFE_INTEGER,
+            targetWords: Math.max(1, targetWords),
+            chapterTitle,
+            inspectorScore: finalInspection.score0to100,
+            recommendRevision: finalInspection.recommendRevision,
+            revisionHints: finalInspection.revisionHints,
+            fatalIssues: finalInspection.fatalIssues,
+          });
+          gates = semanticGates.hardFail ? semanticGates : undefined;
         }
       } else if (revisedContent !== undefined && revisedContent.trim().length > 0) {
         emit({
@@ -2593,17 +2607,61 @@ export class AgentOrchestrator {
       }
     }
 
-    // 仅对最终正文应用检测结论与反思记忆
-    await this.applyInspectorFindings(projectId, finalInspection);
-    if (labels?.reflect) {
-      emit({
-        phase: 'inspect',
-        message: labels.reflect(chapterTitle),
-        current: progress?.current,
-        total: progress?.total,
+    // 只让通过现有硬门的终稿进入状态提取，避免已知坏稿污染后续记忆。
+    let criticalStateIssues: CriticalStateIssue[] = [];
+    if (!gates?.hardFail) {
+      if (labels?.reflect) {
+        emit({
+          phase: 'inspect',
+          message: labels.reflect(chapterTitle),
+          current: progress?.current,
+          total: progress?.total,
+        });
+      }
+      criticalStateIssues = await this.reflectAndRemember(
+        config,
+        projectId,
+        chapterId,
+        chapterTitle,
+        finalContent,
+        signal,
+      );
+    }
+    if (criticalStateIssues.length > 0) {
+      const stateFindings: GateFinding[] = criticalStateIssues.map((issue) => ({
+        gate: 'continuity',
+        severity: 'hard',
+        message: `${issue.code}：${issue.message}`,
+        autoFixable: true,
+      }));
+      gates = {
+        ok: false,
+        hardFail: true,
+        findings: [...(gates?.findings ?? []), ...stateFindings],
+      };
+      finalInspection = {
+        ...finalInspection,
+        fatalIssues: [
+          ...finalInspection.fatalIssues,
+          ...criticalStateIssues.map((issue) => issue.message),
+        ],
+        recommendRevision: true,
+        revisionHints: [
+          ...finalInspection.revisionHints,
+          ...criticalStateIssues.map((issue) => `修复：${issue.message}`),
+        ].slice(0, 8),
+      };
+    }
+    if (!gates?.hardFail) {
+      await this.applyInspectorFindings(projectId, finalInspection);
+      await this.memory.markChapterCommitted(projectId, chapterId);
+    } else {
+      await this.memory.markChapterRejected(projectId, chapterId);
+      await this.memory.recordWorkflow(projectId, {
+        task: 'big_bug_guard',
+        summary: `「${chapterTitle}」存在 P0 大 Bug，未写入章节摘要、关键状态或伏笔台账。`,
       });
     }
-    await this.reflectAndRemember(config, projectId, chapterId, chapterTitle, finalContent, signal);
 
     return { finalContent, finalInspection, gates, revised };
   }
@@ -2729,7 +2787,9 @@ export class AgentOrchestrator {
   private async getOrCreateLongNovelChapter(projectId: Id, title: string) {
     const chapters = await this.store.listChapters(projectId);
     for (const chapter of chapters) {
-      if (chapter.title !== title || chapter.content.trim().length > 0) continue;
+      if (chapter.title !== title) continue;
+      if (this.memory.isChapterRejected(projectId, chapter.id)) return chapter;
+      if (chapter.content.trim().length > 0) continue;
       const [blueprint, drafts] = await Promise.all([
         this.store.getChapterBlueprintByChapter(chapter.id),
         this.store.listSceneDrafts(chapter.id),
@@ -2875,7 +2935,7 @@ export class AgentOrchestrator {
 
   /**
    * 反思子 Agent（自我进化核心）：读章节正文，产出
-   * { summary, facts[], learning, foreshadows[] } 并写入长期记忆。
+   * { summary, facts[], stateUpdates[], learning, foreshadows[] } 并写入长期记忆。
    * 模型未按 JSON 返回时降级：用正文截断作摘要，保证记忆始终被更新、流程不中断。
    */
   private async reflectAndRemember(
@@ -2885,13 +2945,14 @@ export class AgentOrchestrator {
     chapterTitle: string,
     content: string,
     signal: AbortSignal,
-  ): Promise<void> {
+  ): Promise<CriticalStateIssue[]> {
     const text = content.trim();
-    if (text.length === 0) return;
+    if (text.length === 0) return [];
 
     const fallbackSummary = text.replace(/\s+/g, ' ').slice(0, 200);
     let summary = fallbackSummary;
     let facts: Array<{ kind: 'character' | 'world' | 'plot'; text: string }> = [];
+    let stateUpdates: ParsedCriticalStateUpdate[] = [];
     let learning = '';
     let foreshadowOps: ParsedForeshadowOp[] = [];
 
@@ -2903,6 +2964,12 @@ export class AgentOrchestrator {
             .slice(0, 12)
             .map((f) => `- ${f.title}：${f.detail}`)
             .join('\n');
+    const criticalStateHint =
+      this.memory.formatCriticalStateLedger(projectId) || '（当前无关键状态）';
+    const reflectionExcerpt =
+      text.length <= 6000
+        ? text
+        : `${text.slice(0, 3000)}\n\n[中段省略]\n\n${text.slice(-3000)}`;
 
     try {
       const raw = await this.generateText(
@@ -2913,8 +2980,11 @@ export class AgentOrchestrator {
             content: [
               '你是小说连贯性「反思子 Agent」。阅读给定章节正文，提炼可供后续章节复用的记忆与伏笔台账变更。',
               '只输出一个 JSON 对象，不要输出任何额外文字或代码块标记，结构：',
-              '{"summary":"本章 100 字内剧情摘要","facts":[{"kind":"character|world|plot","text":"应保持一致的设定/状态，一句话"}],"learning":"一条可复用的写作风格经验","foreshadows":[{"action":"plant|echo|resolve","title":"短标题","detail":"一句话说明","urgency":"low|medium|high","suggestPayoffBy":"建议回收窗口可选"}]}',
+              '{"summary":"本章 100 字内剧情摘要","facts":[{"kind":"character|world|plot","text":"应保持一致的设定/状态，一句话"}],"stateUpdates":[{"kind":"alive_status|mobility_status|location|physical_state|ability_state|critical_knowledge|key_item|relationship_stage","entity":"人物名或唯一物品名","key":"current或能力/秘密/关系对象/holder","value":"规范值","evidence":"正文中明确发生的短证据"}],"learning":"一条可复用的写作风格经验","foreshadows":[{"action":"plant|echo|resolve","title":"短标题","detail":"一句话说明","urgency":"low|medium|high","suggestPayoffBy":"建议回收窗口可选"}]}',
               'facts 至多 5 条，聚焦人物状态变化、世界规则、关键剧情进展。',
+              'stateUpdates 只记录本章结束时正文明确建立或改变、且会影响后文的状态；禁止脑补，最多 12 条。',
+              '规范值：alive_status=alive|dead|missing；mobility_status=free|detained|unconscious|immobile；physical_state=healthy|injured|severely_injured；ability_state=available|unavailable|sealed|lost；critical_knowledge=known|unknown。',
+              'key_item 的 entity 写唯一物品名、key 固定 holder、value 写章末持有人或 unheld/destroyed。普通衣服、饮食、短暂情绪不要记录。',
               'foreshadows 至多 4 条：',
               '- plant：本章新埋设的悬念/暗示/未解释物件或人物秘密；',
               '- echo：再次点到但未完全揭晓的旧伏笔（title 尽量对应下列未回收列表）；',
@@ -2923,9 +2993,12 @@ export class AgentOrchestrator {
               '',
               '# 当前未回收伏笔',
               openLedgerHint,
+              '',
+              '# 当前关键状态账',
+              criticalStateHint,
             ].join('\n'),
           },
-          { role: 'user', content: `章节标题：${chapterTitle}\n\n正文：\n${text.slice(0, 6000)}` },
+          { role: 'user', content: `章节标题：${chapterTitle}\n\n正文：\n${reflectionExcerpt}` },
         ],
         signal,
         { jsonMode: true, disableThinking: true, maxTokens: 2048 },
@@ -2933,11 +3006,22 @@ export class AgentOrchestrator {
       const parsed = parseReflection(raw);
       if (parsed.summary.length > 0) summary = parsed.summary;
       facts = parsed.facts;
+      stateUpdates = parsed.stateUpdates;
       learning = parsed.learning;
       foreshadowOps = parsed.foreshadows;
     } catch {
       // 反思失败：保留 fallback 摘要，记忆仍前进，不中断主流程。
     }
+
+    const stateResult = await this.memory.applyCriticalStateUpdates(
+      projectId,
+      stateUpdates.map((update): CriticalStateUpdateInput => ({
+        ...update,
+        chapterId,
+        chapterTitle,
+      })),
+    );
+    if (stateResult.issues.length > 0) return stateResult.issues;
 
     await this.memory.appendChapterSummary(projectId, {
       chapterId,
@@ -2976,6 +3060,7 @@ export class AgentOrchestrator {
       );
     }
     await this.syncForeshadowLedgerOutline(projectId);
+    return [];
   }
 
   /** 把伏笔台账同步到项目大纲资料，便于作者在 UI 侧边栏查看。 */
@@ -3565,16 +3650,31 @@ interface ParsedForeshadowOp {
   suggestPayoffBy?: string;
 }
 
+interface ParsedCriticalStateUpdate {
+  kind: CriticalStateUpdateInput['kind'];
+  entity: string;
+  key?: string;
+  value: string;
+  evidence: string;
+}
+
 interface ParsedReflection {
   summary: string;
   facts: Array<{ kind: 'character' | 'world' | 'plot'; text: string }>;
+  stateUpdates: ParsedCriticalStateUpdate[];
   learning: string;
   foreshadows: ParsedForeshadowOp[];
 }
 
 /** 从反思子 Agent 的原始输出里稳健解析 JSON（容忍 ```json 包裹与前后噪声）。 */
 export function parseReflection(raw: string): ParsedReflection {
-  const empty: ParsedReflection = { summary: '', facts: [], learning: '', foreshadows: [] };
+  const empty: ParsedReflection = {
+    summary: '',
+    facts: [],
+    stateUpdates: [],
+    learning: '',
+    foreshadows: [],
+  };
   if (raw.trim().length === 0) return empty;
   const start = raw.indexOf('{');
   const end = raw.lastIndexOf('}');
@@ -3599,6 +3699,36 @@ export function parseReflection(raw: string): ParsedReflection {
       const kind =
         f.kind === 'character' || f.kind === 'world' || f.kind === 'plot' ? f.kind : 'plot';
       facts.push({ kind, text });
+    }
+  }
+  const stateUpdates: ParsedCriticalStateUpdate[] = [];
+  const allowedStateKinds = new Set<ParsedCriticalStateUpdate['kind']>([
+    'alive_status',
+    'mobility_status',
+    'location',
+    'physical_state',
+    'ability_state',
+    'critical_knowledge',
+    'key_item',
+    'relationship_stage',
+  ]);
+  if (Array.isArray(obj.stateUpdates)) {
+    for (const item of obj.stateUpdates.slice(0, 12)) {
+      if (typeof item !== 'object' || item === null) continue;
+      const state = item as Record<string, unknown>;
+      if (!allowedStateKinds.has(state.kind as ParsedCriticalStateUpdate['kind'])) continue;
+      const entity = typeof state.entity === 'string' ? state.entity.trim().slice(0, 80) : '';
+      const key = typeof state.key === 'string' ? state.key.trim().slice(0, 160) : undefined;
+      const value = typeof state.value === 'string' ? state.value.trim().slice(0, 120) : '';
+      const evidence = typeof state.evidence === 'string' ? state.evidence.trim().slice(0, 400) : '';
+      if (!entity || !value || !evidence) continue;
+      stateUpdates.push({
+        kind: state.kind as ParsedCriticalStateUpdate['kind'],
+        entity,
+        ...(key ? { key } : {}),
+        value,
+        evidence,
+      });
     }
   }
   const foreshadows: ParsedForeshadowOp[] = [];
@@ -3627,5 +3757,5 @@ export function parseReflection(raw: string): ParsedReflection {
       });
     }
   }
-  return { summary, facts, learning, foreshadows };
+  return { summary, facts, stateUpdates, learning, foreshadows };
 }

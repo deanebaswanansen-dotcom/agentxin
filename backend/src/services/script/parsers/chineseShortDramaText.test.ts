@@ -127,6 +127,70 @@ describe('parseChineseShortDramaText', () => {
     ]);
   });
 
+  it('repairs duplicate scene ordinals without losing scene content or characters', () => {
+    const result = parseChineseShortDramaText([
+      '第3集',
+      '3-1 修车厂 日/内',
+      '人物：周野',
+      '△周野把数据卡放在工作台上。',
+      '3-1 赛道入口 日/外',
+      '人物：林秋',
+      '林秋：入口的监控已经拿到了。',
+      '3-2 维修区 夜/内',
+      '人物：周野 林秋',
+      '△周野和林秋逐帧核对监控。',
+    ].join('\n'), options());
+
+    expect(result.episode?.scenes.map((scene) => scene.ordinal)).toEqual([1, 2, 3]);
+    expect(result.episode?.scenes.map((scene) => scene.characterIds)).toEqual([
+      ['character-zhou'],
+      ['character-lin'],
+      ['character-zhou', 'character-lin'],
+    ]);
+    expect(result.episode?.scenes[0]?.blocks[0]).toMatchObject({
+      type: 'action',
+      text: '周野把数据卡放在工作台上。',
+    });
+    expect(result.episode?.scenes[1]?.blocks[0]).toMatchObject({
+      type: 'dialogue',
+      characterId: 'character-lin',
+      text: '入口的监控已经拿到了。',
+    });
+    expect(result.episode?.scenes[2]?.blocks[0]).toMatchObject({
+      type: 'action',
+      text: '周野和林秋逐帧核对监控。',
+    });
+    expect(result.unparsedLines).toEqual([]);
+    expect(result.warnings).toEqual([
+      expect.objectContaining({
+        line: 5,
+        code: 'SCENE_ORDINAL_REPAIRED',
+        message: '重复场号 1 已顺延为 2。',
+      }),
+      expect.objectContaining({
+        line: 8,
+        code: 'SCENE_ORDINAL_REPAIRED',
+        message: '重复场号 2 已顺延为 3。',
+      }),
+    ]);
+  });
+
+  it('preserves legal non-consecutive scene ordinals', () => {
+    const result = parseChineseShortDramaText([
+      '第3集',
+      '3-3 赛道入口 日/外',
+      '人物：周野',
+      '△周野走向检录台。',
+      '3-4 维修区 夜/内',
+      '人物：林秋',
+      '林秋：原始记录还在。',
+    ].join('\n'), options());
+
+    expect(result.episode?.scenes.map((scene) => scene.ordinal)).toEqual([3, 4]);
+    expect(result.unparsedLines).toEqual([]);
+    expect(result.warnings).toEqual([]);
+  });
+
   it('accepts numbered scene headings without an episode prefix', () => {
     const result = parseChineseShortDramaText([
       '第4集 证据之争',

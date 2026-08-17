@@ -35,6 +35,11 @@ function isCatastrophicContinuityIssue(issue: string): boolean {
   const normalized = issue.replace(/\s+/g, '');
   return (
     /(?:死亡|已死).{0,24}(?:复活|再次出场|仍然活着|存活)/.test(normalized) ||
+    /(?:拘留|被捕|关押|囚禁|昏迷|无法行动).{0,40}(?:自由行动|正常出现|出席|参战|自行离开)/.test(normalized) ||
+    /(?:唯一|关键)(?:道具|物品|神器|钥匙).{0,40}(?:同时|同一时间).{0,24}(?:两处|两人|多人持有)/.test(normalized) ||
+    /(?:提前知道|不该知道|尚未(?:公开|调查|获知).{0,24}(?:秘密|真相|信息))/.test(normalized) ||
+    /(?:尚未获得|已经失去|已被封印|能力被封印).{0,32}(?:使用|发动|恢复|可用)/.test(normalized) ||
+    /(?:重伤|濒死).{0,24}(?:完全恢复|痊愈|正常战斗|满状态|伤势消失)/.test(normalized) ||
     /(?:身份|性别).{0,24}(?:冲突|矛盾|错误|错置|不一致)/.test(normalized) ||
     /(?:时间线|年代|时间顺序).{0,32}(?:不可能|倒置|无法成立)/.test(normalized) ||
     /(?:世界规则|力量体系|核心能力).{0,32}(?:冲突|矛盾|违反|不一致)/.test(normalized)
@@ -106,17 +111,24 @@ export function runChapterQualityGates(input: GateInput): GateResult {
   // Reviewer labels are advisory. Only catastrophic, story-breaking facts may
   // halt an unattended run; appearance, outfit and ordinary scar drift remain
   // auto-fixable soft findings.
-  const hasExplicitConflict = (input.fatalIssues ?? []).some(isCatastrophicContinuityIssue);
+  const catastrophicIssues = (input.fatalIssues ?? []).filter(isCatastrophicContinuityIssue);
+  const hasExplicitConflict = catastrophicIssues.length > 0;
+  if (hasExplicitConflict) {
+    findings.push({
+      gate: 'continuity',
+      severity: 'hard',
+      message: `检测到明确 P0 连续性冲突：${catastrophicIssues.slice(0, 2).join('；')}`,
+      autoFixable: true,
+    });
+  }
   if (input.inspectorScore !== undefined && input.inspectorScore < 50) {
     // A numeric score is a reviewer signal, not a deterministic conflict.  A
     // malformed/overly conservative reviewer must not halt a whole novel;
     // only an explicit fatal issue or structural lock failure is hard.
     findings.push({
       gate: 'continuity',
-      severity: hasExplicitConflict ? 'hard' : 'soft',
-      message: hasExplicitConflict
-        ? `一致性评分过低（${input.inspectorScore}），且检测到明确设定冲突。`
-        : `一致性评分过低（${input.inspectorScore}），先保留正文并记录待复核。`,
+      severity: 'soft',
+      message: `一致性评分过低（${input.inspectorScore}），先保留正文并记录待复核。`,
       autoFixable: Boolean(input.recommendRevision),
     });
   } else if (input.inspectorScore !== undefined && input.inspectorScore < 70) {
@@ -130,7 +142,7 @@ export function runChapterQualityGates(input: GateInput): GateResult {
   if (input.recommendRevision && (input.revisionHints?.length ?? 0) > 0) {
     findings.push({
       gate: 'continuity',
-      severity: hasExplicitConflict ? 'hard' : 'soft',
+      severity: 'soft',
       message: `检测子 Agent 要求修订：${input.revisionHints!.slice(0, 2).join('；')}`,
       autoFixable: true,
     });

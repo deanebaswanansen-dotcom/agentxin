@@ -354,11 +354,21 @@ describe('normalizeFullNovelOptions', () => {
     expect(result.metrics?.plannedWords).toBe(1_000_000);
   });
 
-  it('parses foreshadow ops from reflection JSON', () => {
+  it('parses critical state and foreshadow updates from reflection JSON', () => {
     const parsed = parseReflection(
       JSON.stringify({
         summary: '开篇',
         facts: [],
+        stateUpdates: [
+          {
+            kind: 'alive_status',
+            entity: '陆辞',
+            key: 'current',
+            value: 'alive',
+            evidence: '陆辞从废墟里站起。',
+          },
+          { kind: 'style_note', entity: '陆辞', value: '冷静', evidence: '无效类型' },
+        ],
         learning: '短句',
         foreshadows: [
           { action: 'plant', title: '神秘芯片', detail: '袖口闪过芯片', urgency: 'high' },
@@ -367,6 +377,15 @@ describe('normalizeFullNovelOptions', () => {
         ],
       }),
     );
+    expect(parsed.stateUpdates).toEqual([
+      {
+        kind: 'alive_status',
+        entity: '陆辞',
+        key: 'current',
+        value: 'alive',
+        evidence: '陆辞从废墟里站起。',
+      },
+    ]);
     expect(parsed.foreshadows).toHaveLength(2);
     expect(parsed.foreshadows[0]).toMatchObject({ action: 'plant', title: '神秘芯片', urgency: 'high' });
     expect(parsed.foreshadows[1]?.action).toBe('resolve');
@@ -532,10 +551,7 @@ describe('normalizeFullNovelOptions', () => {
     expect(worlds.filter((item) => item.title === '创作规则（计划采纳）')).toHaveLength(1);
     expect(outlines.filter((item) => item.title.endsWith('：分章大纲（计划采纳）'))).toHaveLength(1);
     expect(outlines.filter((item) => item.title === '长篇小说模式配置')).toHaveLength(1);
-    expect(outlines.filter((item) => item.title === '分章人物服装表')).toHaveLength(1);
-    expect(outlines.find((item) => item.title === '分章人物服装表')?.content).toContain(
-      '分章人物服装连续性表',
-    );
+    expect(outlines.filter((item) => item.title === '分章人物服装表')).toHaveLength(0);
   });
 
   it('runs long_novel multi-subagent pipeline with gates and config outline', async () => {
@@ -691,6 +707,83 @@ describe('normalizeFullNovelOptions', () => {
     expect(result.metrics?.completedChapters).toBe(5);
     expect(inspections).toBe(2);
     expect(revisions).toBe(0);
+  });
+
+  it('pauses on a P0 critical-state regression without committing the bad chapter to memory', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-critical-state-'));
+    const store = await FileDataStore.create(join(tempDir, 'store.json'));
+    await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock-model' });
+    const memory = new MemoryService(await MemoryStore.create(join(tempDir, 'memory.json')));
+    const proxy = new CaptureProxy();
+    const original = proxy.streamCompletion.bind(proxy);
+    let reflections = 0;
+    proxy.streamCompletion = (config, messages, signal, options) => {
+      const system = messages[0]?.content ?? '';
+      if (system.includes('正文写作子 Agent')) {
+        return (async function* () {
+          yield {
+            kind: 'content' as const,
+            text: '林远推开门，雨砸在锈蚀的招牌上。他说：“跟我来。”众人却发现地图是假的，真正的危机才刚开始。'.repeat(10),
+          };
+        })();
+      }
+      if (system.includes('反思子 Agent')) {
+        reflections += 1;
+        return (async function* () {
+          yield {
+            kind: 'content' as const,
+            text: JSON.stringify({
+              summary: reflections === 1 ? '师父确认死亡。' : '师父无解释返回宴会。',
+              facts: [],
+              stateUpdates: [{
+                kind: 'alive_status',
+                entity: '师父',
+                key: 'current',
+                value: reflections === 1 ? 'dead' : 'alive',
+                evidence: reflections === 1
+                  ? '众人确认师父已经死亡并安葬。'
+                  : '师父推门走进宴会厅。',
+              }],
+              learning: '',
+              foreshadows: [],
+            }),
+          };
+        })();
+      }
+      return original(config, messages, signal, options);
+    };
+    const orchestrator = new AgentOrchestrator(
+      store,
+      new ModelConfigService(store),
+      proxy,
+      undefined as never,
+      undefined as never,
+      memory,
+    );
+
+    const result = await orchestrator.run(
+      {
+        task: 'long_novel',
+        mode: 'draft',
+        prompt: '旧城悬疑长篇',
+        options: { chapters: 2, totalChapters: 2, targetWords: 500, automationLevel: 'semi_auto' },
+      },
+      new AbortController().signal,
+    );
+
+    expect(result.summary).toContain('已暂停');
+    expect(result.steps.join('\n')).toContain('DEAD_CHARACTER_REAPPEARS');
+    expect(memory.get(result.projectId).criticalStates).toEqual([
+      expect.objectContaining({ entity: '师父', value: 'dead', chapterTitle: '第1章' }),
+    ]);
+    expect(memory.get(result.projectId).summaries.map((item) => item.title)).toEqual(['第1章']);
+    const chapters = await store.listChapters(result.projectId);
+    expect(chapters).toHaveLength(2);
+    expect(chapters[1]?.content).toContain('林远推开门');
+    expect(memory.get(result.projectId).rejectedChapterIds).toEqual([chapters[1]?.id]);
+    expect(memory.get(result.projectId).workflow).toContainEqual(
+      expect.objectContaining({ task: 'big_bug_guard' }),
+    );
   });
 
   it('pauses on a failed chapter and resumes from that chapter without duplication', async () => {
