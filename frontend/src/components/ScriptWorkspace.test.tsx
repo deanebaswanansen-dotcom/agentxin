@@ -180,6 +180,22 @@ describe('ScriptWorkspace', () => {
     expect(client.script.plan.get).toHaveBeenCalledWith('project-1', expect.any(AbortSignal));
   });
 
+  it('lets the user choose and save the dialogue target percentage', async () => {
+    const client = createClient();
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    const dialogueTarget = await screen.findByLabelText('对白目标比例（%）');
+    expect(dialogueTarget).toHaveValue(60);
+    fireEvent.change(dialogueTarget, { target: { value: '65' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存策划' }));
+
+    await waitFor(() => expect(client.script.plan.save).toHaveBeenCalledWith(
+      'project-1',
+      expect.objectContaining({ dialogueDensityPercent: 65 }),
+      2,
+    ));
+  });
+
   it('opens completed planning material in a readable product view before editing', async () => {
     const client = createClient({ ...buildPlan(), status: 'approved' });
     render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);

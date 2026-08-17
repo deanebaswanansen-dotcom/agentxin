@@ -122,10 +122,10 @@ class DeterministicFullBookModel implements ScriptModelAdapter {
   }
 }
 
-function plan(): ScriptPlan {
+function plan(totalEpisodes = 10, projectId = PROJECT_ID): ScriptPlan {
   return {
-    id: 'plan-fullbook-10',
-    projectId: PROJECT_ID,
+    id: `plan-fullbook-${totalEpisodes}`,
+    projectId,
     status: 'approved',
     revision: 0,
     title: '十集离线连续性诊断',
@@ -137,7 +137,7 @@ function plan(): ScriptPlan {
     coreConflict: '沈清调查幕后操控者并保护证人',
     logline: '校报主编沈清用连续十集的取证击破操控网络。',
     highlights: ['逐集证据升级', '连续性追踪'],
-    totalEpisodes: 10,
+    totalEpisodes,
     episodeDurationSeconds: { min: 60, max: 90 },
     targetCharsPerEpisode: 300,
     maxPrimaryCharacters: 6,
@@ -153,10 +153,10 @@ function plan(): ScriptPlan {
   };
 }
 
-function character(): ScriptCharacter {
+function character(projectId = PROJECT_ID): ScriptCharacter {
   return {
     id: 'lead',
-    projectId: PROJECT_ID,
+    projectId,
     name: '沈清',
     aliases: [],
     role: 'lead',
@@ -182,9 +182,9 @@ function character(): ScriptCharacter {
   };
 }
 
-function worldBible(): ScriptWorldBible {
+function worldBible(projectId = PROJECT_ID): ScriptWorldBible {
   return {
-    projectId: PROJECT_ID,
+    projectId,
     era: '2026年',
     primaryLocations: ['校报社资料室'],
     worldState: '当代校园调查环境',
@@ -199,9 +199,9 @@ function worldBible(): ScriptWorldBible {
   };
 }
 
-function seriesOutline(): ScriptSeriesOutline {
+function seriesOutline(totalEpisodes = 10, projectId = PROJECT_ID): ScriptSeriesOutline {
   return {
-    projectId: PROJECT_ID,
+    projectId,
     synopsis: '沈清沿十条连续线索逐步查清操控网络。',
     openingState: '第一条证据刚刚出现。',
     midpointTurn: '关键证人确认幕后组织。',
@@ -209,7 +209,7 @@ function seriesOutline(): ScriptSeriesOutline {
     endingState: '操控网络瓦解，证人获得保护。',
     mainArc: ['发现线索', '建立证据链', '公开真相'],
     subplotArcs: ['沈清学会与团队协作'],
-    episodeCards: Array.from({ length: 10 }, (_, index) => {
+    episodeCards: Array.from({ length: totalEpisodes }, (_, index) => {
       const episodeNumber = index + 1;
       return {
         episodeNumber,
@@ -223,11 +223,15 @@ function seriesOutline(): ScriptSeriesOutline {
   };
 }
 
-async function seedProject(store: FileScriptStore): Promise<ScriptPlan> {
-  const savedPlan = await store.savePlan(plan(), 0);
-  await store.saveSeriesOutline(seriesOutline(), 0);
-  await store.saveCharacters(PROJECT_ID, [character()], 0);
-  await store.saveWorldBible(worldBible(), 0);
+async function seedProject(
+  store: FileScriptStore,
+  totalEpisodes = 10,
+  projectId = PROJECT_ID,
+): Promise<ScriptPlan> {
+  const savedPlan = await store.savePlan(plan(totalEpisodes, projectId), 0);
+  await store.saveSeriesOutline(seriesOutline(totalEpisodes, projectId), 0);
+  await store.saveCharacters(projectId, [character(projectId)], 0);
+  await store.saveWorldBible(worldBible(projectId), 0);
   return savedPlan;
 }
 
@@ -352,6 +356,80 @@ describe('ScriptDirector offline ten-episode full-book diagnostic', () => {
     }
     expect(rerunFirst.skippedEpisodeNumbers).toEqual([1, 2, 3, 4, 5]);
     expect(rerunSecond.skippedEpisodeNumbers).toEqual([6, 7, 8, 9, 10]);
+    expect(model.calls).toHaveLength(callsBeforeRerun);
+  });
+
+  it('finishes one hundred episodes in twenty fixed batches and reruns without model calls', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-hundredbook-'));
+    directories.push(directory);
+    const store = await FileScriptStore.create(join(directory, 'projects'));
+    const checkpoints = await FileScriptCheckpointStore.create(join(directory, 'checkpoints'));
+    const savedPlan = await seedProject(store, 100);
+    const model = new DeterministicFullBookModel();
+    let nextId = 0;
+    const director = new ScriptDirector({
+      model,
+      store,
+      checkpoints,
+      now: () => NOW,
+      id: () => `hundredbook-id-${++nextId}`,
+    });
+
+    let expectedPlanRevision = savedPlan.revision;
+    for (let startEpisode = 1; startEpisode <= 100; startEpisode += 5) {
+      const result = await director.run({
+        task: 'script_episode_batch',
+        projectId: PROJECT_ID,
+        startEpisode,
+        episodeCount: 5,
+        expectedPlanRevision,
+      });
+      expect(result.kind).toBe('episode_batch');
+      if (result.kind !== 'episode_batch') throw new Error('预期 episode_batch');
+      expect(result.episodes.map((episode) => episode.episodeNumber)).toEqual(
+        Array.from({ length: 5 }, (_, index) => startEpisode + index),
+      );
+      expect(result.skippedEpisodeNumbers).toEqual([]);
+      expect(result.callSummary).toMatchObject({
+        totalCalls: 16,
+        primaryCalls: 16,
+        fixupCalls: 0,
+        fallbackCalls: 0,
+        byNode: { episode_outline: 1, scene_plan: 5, draft: 5, review: 5 },
+      });
+      expectedPlanRevision = (await store.getProjectState(PROJECT_ID))!.plan!.revision;
+    }
+
+    const state = await store.getProjectState(PROJECT_ID);
+    expect(state?.episodes.map((episode) => episode.episodeNumber))
+      .toEqual(Array.from({ length: 100 }, (_, index) => index + 1));
+    expect(state?.episodes.every((episode) => episode.status === 'completed')).toBe(true);
+    const commits = currentScriptContinuityCommits(state!);
+    expect(commits).toHaveLength(100);
+    for (let index = 0; index < commits.length; index += 1) {
+      const commit = commits[index]!;
+      const episode = state!.episodes[index]!;
+      expect(commit.episodeNumber).toBe(index + 1);
+      expect(commit.episodeRevision).toBe(episode.revision);
+      if (index > 0) {
+        expect(commit.previousContinuityCommitId).toBe(commits[index - 1]!.id);
+        expect(commit.previousContinuityRevision).toBe(commits[index - 1]!.revision);
+      }
+    }
+    expect(model.calls).toHaveLength(320);
+
+    const callsBeforeRerun = model.calls.length;
+    const rerun = await director.run({
+      task: 'script_episode_batch',
+      projectId: PROJECT_ID,
+      startEpisode: 96,
+      episodeCount: 5,
+      expectedPlanRevision,
+    });
+    expect(rerun.kind).toBe('episode_batch');
+    if (rerun.kind !== 'episode_batch') throw new Error('预期 episode_batch');
+    expect(rerun.skippedEpisodeNumbers).toEqual([96, 97, 98, 99, 100]);
+    expect(rerun.callSummary.totalCalls).toBe(0);
     expect(model.calls).toHaveLength(callsBeforeRerun);
   });
 

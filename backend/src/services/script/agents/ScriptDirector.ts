@@ -79,6 +79,7 @@ import {
 import {
   generateStructured,
   type StructuredGenerationError,
+  type StructuredGenerationResult,
   type StructuredModel,
 } from './generateStructured.js';
 import {
@@ -153,6 +154,28 @@ export interface ScriptProgressEvent {
   scriptCheckpoint: ScriptCheckpointProgress;
 }
 
+export interface ScriptStructuredCallMetric {
+  node: ScriptModelNode;
+  episodeNumber?: number;
+  contractName: string;
+  status: 'completed' | 'needs_review';
+  callsUsed: number;
+  completedBy?: 'primary' | 'fixup' | 'fallback';
+  attempts: Array<{
+    stage: 'primary' | 'fixup' | 'fallback';
+    outcome: 'completed' | 'call_failed' | 'parse_failed' | 'decode_failed';
+  }>;
+}
+
+export interface ScriptBatchCallSummary {
+  totalCalls: number;
+  primaryCalls: number;
+  fixupCalls: number;
+  fallbackCalls: number;
+  byNode: Partial<Record<ScriptModelNode, number>>;
+  byEpisode: Array<{ episodeNumber: number; calls: number }>;
+}
+
 export type ScriptDirectorRequest =
   | {
       task: 'script_plan';
@@ -203,6 +226,7 @@ export type ScriptDirectorResult =
       episodes: ScriptEpisode[];
       reports: Array<{ episodeNumber: number; report: ScriptGateReport }>;
       skippedEpisodeNumbers: number[];
+      callSummary: ScriptBatchCallSummary;
     };
 
 export class ScriptBatchPausedError extends Error {
@@ -400,8 +424,52 @@ interface ScriptDraftExpansion {
 }
 
 const SCRIPT_DRAFT_PREFERRED_MIN_RATIO = 0.75;
-const SCRIPT_DRAFT_MAX_CONTINUATIONS = 4;
-const SCRIPT_DRAFT_CONTINUATION_MAX_CHARS = 450;
+const SCRIPT_DRAFT_MAX_CONTINUATIONS = 1;
+const SCRIPT_DRAFT_CONTINUATION_MAX_CHARS = 700;
+const SCRIPT_SANITY_REVIEW_MAX_ISSUES = 3;
+const SCRIPT_SANITY_REVIEW_CODES = new Set([
+  'CHARACTER_PRESENCE',
+  'SPEAKER_ATTRIBUTION',
+  'PROP_CUSTODY',
+  'KNOWLEDGE_TIMING',
+  'CAUSAL_ORDER',
+  'CONTINUITY_CONTRADICTION',
+  'REPEATED_ACTION',
+]);
+
+function summarizeStructuredCalls(
+  metrics: readonly ScriptStructuredCallMetric[],
+): ScriptBatchCallSummary {
+  const byNode: Partial<Record<ScriptModelNode, number>> = {};
+  const byEpisodeMap = new Map<number, number>();
+  let primaryCalls = 0;
+  let fixupCalls = 0;
+  let fallbackCalls = 0;
+  for (const metric of metrics) {
+    byNode[metric.node] = (byNode[metric.node] ?? 0) + metric.callsUsed;
+    if (metric.episodeNumber !== undefined) {
+      byEpisodeMap.set(
+        metric.episodeNumber,
+        (byEpisodeMap.get(metric.episodeNumber) ?? 0) + metric.callsUsed,
+      );
+    }
+    for (const attempt of metric.attempts) {
+      if (attempt.stage === 'primary') primaryCalls += 1;
+      else if (attempt.stage === 'fixup') fixupCalls += 1;
+      else fallbackCalls += 1;
+    }
+  }
+  return {
+    totalCalls: primaryCalls + fixupCalls + fallbackCalls,
+    primaryCalls,
+    fixupCalls,
+    fallbackCalls,
+    byNode,
+    byEpisode: [...byEpisodeMap.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([episodeNumber, calls]) => ({ episodeNumber, calls })),
+  };
+}
 
 function scriptTextComposition(episode: ScriptEpisode): ScriptTextComposition {
   const blocks = episode.scenes.flatMap((scene) => scene.blocks);
@@ -1469,6 +1537,10 @@ export class ScriptDirector {
       }
     }
     const range = Array.from({ length: request.episodeCount }, (_, index) => request.startEpisode + index);
+    const structuredCallMetrics: ScriptStructuredCallMetric[] = [];
+    const recordStructuredCall = (metric: ScriptStructuredCallMetric): void => {
+      structuredCallMetrics.push(metric);
+    };
     const completed = state.episodes.filter(
       (episode) =>
         range.includes(episode.episodeNumber) &&
@@ -1481,6 +1553,7 @@ export class ScriptDirector {
         episodes: completed.sort((left, right) => left.episodeNumber - right.episodeNumber),
         reports: [],
         skippedEpisodeNumbers: [...range],
+        callSummary: summarizeStructuredCalls(structuredCallMetrics),
       };
     }
 
@@ -1696,7 +1769,7 @@ export class ScriptDirector {
         projectId: request.projectId,
         prompt,
         signal: request.signal,
-      }, episodeOutlineContract);
+      }, episodeOutlineContract, recordStructuredCall);
       for (const episodeNumber of missingOutlineNumbers) {
         const outline = generated.find((item) => item.episodeNumber === episodeNumber);
         if (!outline) throw new ScriptModelOutputError(`详细大纲缺少第 ${episodeNumber} 集。`);
@@ -1808,7 +1881,7 @@ export class ScriptDirector {
             'scene_plan',
             `必须返回 plannedScenes 数组，包含 1—${plan.maxScenesPerEpisode} 个字段完整且场号唯一的场景。`,
             (value) => this.parsePlannedScenes(value.plannedScenes, plan.maxScenesPerEpisode),
-          ));
+          ), recordStructuredCall);
           scenePlanArtifact = buildScriptScenePlanArtifact({
             projectId: request.projectId,
             episodeNumber,
@@ -2081,7 +2154,7 @@ export class ScriptDirector {
             episodeNumber,
             prompt,
             signal: request.signal,
-          }, draftContract);
+          }, draftContract, recordStructuredCall);
         }
       }
       draft = this.canonicalEpisodeCandidate(draft, plan, episodeNumber);
@@ -2161,7 +2234,7 @@ export class ScriptDirector {
             '你是 ScriptWriterAgent。已有正文必须全部保留；只返回接在现有正文中的新增 blocks，不得重写、复述或总结整集。',
             '严格顶层模板：{"blocks":[...]}。每项只允许 action 或 dialogue，并必须包含 sceneOrdinal、type、text；dialogue 还必须包含本场人物的 characterId、speaker，可选 delivery、mode(normal|os|vo)。',
             'action.text 不带“△”；dialogue.text 不重复说话人或冒号。每条写成完整、可拍摄的动作或推动冲突的对白。',
-            `当前已有 ${continuationRequest.current.visibleChars} 字，本轮建议自然续写约 ${continuationRequest.requestedVisibleChars} 字；写少一些也会保留并在下一轮继续，不要为了凑数重复内容。`,
+            `当前已有 ${continuationRequest.current.visibleChars} 字，本轮最多自然续写约 ${continuationRequest.requestedVisibleChars} 字；这是唯一一次续写，请把尚未完成的冲突、行动过程和结尾卡点写完整，但不要为了凑数重复内容。`,
             `整集目标约 ${plan.targetCharsPerEpisode} 字，对白倾向约 ${plan.dialogueDensityPercent}%，二者都允许按剧情自然波动。`,
             `对白人物白名单：${JSON.stringify(knownCharacters)}`,
             rejectedDraftFeedback.length > 0
@@ -2295,8 +2368,8 @@ export class ScriptDirector {
             name: 'episode_draft_continuation',
             version: 1,
             instructions: [
-              '只返回安全的新正文 blocks；不要求本轮一次补足整集目标。',
-              '只要正文有正向增长且没有人物、场景、结构或禁止事实等明显错误，就接受并保存本轮结果。',
+              '只返回安全的新正文 blocks；这是本集唯一一次自然续写，应优先补全未完成的冲突、行动过程和结尾卡点。',
+              '只要正文有正向增长且没有人物、场景、结构或禁止事实等明显错误，就接受并保存结果；不要复述、灌水或机械凑字。',
             ].join('\n'),
             decode: (value) => {
               let continuation: ScriptDraftExpansion;
@@ -2334,7 +2407,7 @@ export class ScriptDirector {
               episodeNumber,
               prompt: continuationPrompt,
               signal: request.signal,
-            }, continuationContract);
+            }, continuationContract, recordStructuredCall);
           } catch (error) {
             if (!(error instanceof ScriptStructuredNeedsReviewError) || error.node !== 'draft') {
               throw error;
@@ -2451,7 +2524,7 @@ export class ScriptDirector {
       }> => {
         const inputRevisionRefs = buildScriptInputRevisionRefs(reviewState, episodeNumber);
         const upstreamArtifactRefs = [candidateRef];
-        const promptVersion = 'script-review-v2';
+        const promptVersion = 'script-sanity-review-v1';
         const inputFingerprint = computeScriptCheckpointInputFingerprint({
           node: 'review',
           inputRevisionRefs,
@@ -2460,11 +2533,12 @@ export class ScriptDirector {
           configRevision,
         });
         const prompt = [
-          '你是 ScriptContinuityAgent。只返回定位到场景/字段的结构化问题与记忆写回。',
+          '你是 ScriptSanityReviewAgent。只检查会让观众明显困惑的剧情、人物和连续性错误，并返回记忆写回。',
           '只返回 JSON，字段：issues, summary, newFacts, openedThreads, closedThreads, wardrobe。',
-          '严格模板：{"issues":[{"code":"字符串","severity":"hard|soft","message":"字符串","sceneId":"可选","path":"可选"}],"summary":"150—300字摘要","newFacts":["字符串"],"openedThreads":["字符串"],"closedThreads":["字符串"],"wardrobe":[{"characterId":"人物id","outfit":"服装"}]}。没有问题时 issues 返回空数组，不得改名任何键。',
-          '逐项检查：人物身份与口吻、场景人物和说话人、时间地点衔接、服装道具、人物已知信息、requiredFacts、forbiddenFacts、重复台词、不可拍摄动作、冲突升级、反转铺垫和结尾卡点。',
-          '会造成剧情矛盾、人物串线、关键事实缺失、结尾无卡点或无法拍摄的问题标为 hard；措辞、节奏、对白密度等可优化项标为 soft。每条问题必须尽量给出 sceneId 和精确 path。',
+          '严格模板：{"issues":[{"code":"CHARACTER_PRESENCE|SPEAKER_ATTRIBUTION|PROP_CUSTODY|KNOWLEDGE_TIMING|CAUSAL_ORDER|CONTINUITY_CONTRADICTION|REPEATED_ACTION","severity":"hard|soft","message":"字符串","sceneId":"可选","blockId":"可选","path":"可选"}],"summary":"150—300字摘要","newFacts":["字符串"],"openedThreads":["字符串"],"closedThreads":["字符串"],"wardrobe":[{"characterId":"人物id","outfit":"服装"}]}。没有问题时 issues 返回空数组，不得改名任何键。',
+          'issues 最多返回 3 条，只保留高置信度且能指出正文证据的明显问题：人物未在场却行动或说话、说话人错配、道具归属前后矛盾、角色提前知道信息、因果或行动顺序矛盾、与前集状态直接冲突、同一动作被当成新事件重复发生。',
+          '不要评价文风、措辞、节奏、爽点强弱、对白密度、字数、服装审美、反转力度或是否足够精彩；这些不是明显逻辑错误。每条问题必须尽量给出 sceneId 和精确 path。',
+          '只有能由正文与连续性材料直接证明的矛盾才标 hard；拿不准就不报。',
           attempt > 1 ? '这是修订后复检。不得假设上一轮问题已解决，必须以当前正文重新判断。' : '',
           `策划：${JSON.stringify(plan)}`,
           `大纲：${JSON.stringify(outline)}`,
@@ -2503,10 +2577,10 @@ export class ScriptDirector {
           prompt,
           signal: request.signal,
         }, parserContract(
-          'script_review',
+          'script_sanity_review',
           '必须返回 issues、summary、newFacts、openedThreads、closedThreads、wardrobe 全部字段；summary 不可为空。',
           (value) => this.parseReview(value),
-        ));
+        ), recordStructuredCall);
         reviewCheckpointRevision ??= await this.nextCheckpointArtifactRevision(
           request.projectId,
           runKey,
@@ -2867,7 +2941,7 @@ export class ScriptDirector {
               episodeNumber,
               prompt: revisionPrompt,
               signal: request.signal,
-            }, revisionContract);
+            }, revisionContract, recordStructuredCall);
           } catch (error) {
             if (!(error instanceof ScriptStructuredNeedsReviewError) || error.node !== 'revision') {
               throw error;
@@ -3145,6 +3219,7 @@ export class ScriptDirector {
       runKey,
       { node: 'batch_report' },
     );
+    const callSummary = summarizeStructuredCalls(structuredCallMetrics);
     await this.saveCheckpoint(request, {
       projectId: request.projectId,
       runKey,
@@ -3154,12 +3229,13 @@ export class ScriptDirector {
       artifactRevision: batchReportCheckpointRevision,
       artifact: reports,
       updatedAt: this.now(),
-    }, `第 ${request.startEpisode}—${endEpisode} 集批次完成。`);
+    }, `第 ${request.startEpisode}—${endEpisode} 集批次完成；模型调用 ${callSummary.totalCalls} 次（首答 ${callSummary.primaryCalls}、Fixup ${callSummary.fixupCalls}、fallback ${callSummary.fallbackCalls}）。`);
     return {
       kind: 'episode_batch',
       episodes: episodes.sort((left, right) => left.episodeNumber - right.episodeNumber),
       reports,
       skippedEpisodeNumbers,
+      callSummary,
     };
   }
 
@@ -3353,16 +3429,33 @@ export class ScriptDirector {
       throw new ScriptModelOutputError('模型结果缺少数组字段 issues。');
     }
     const rawIssues = value.issues;
-    const issues = rawIssues.map((candidate) => {
+    const parsedIssues = rawIssues.map((candidate) => {
       const issue = recordField(candidate, 'issue');
       return {
         code: stringField(issue.code, 'issue.code'),
         severity: enumField(issue.severity, 'issue.severity', ['hard', 'soft']),
         message: stringField(issue.message, 'issue.message'),
         ...(optionalStringField(issue.sceneId) ? { sceneId: optionalStringField(issue.sceneId) } : {}),
+        ...(optionalStringField(issue.blockId) ? { blockId: optionalStringField(issue.blockId) } : {}),
         ...(optionalStringField(issue.path) ? { path: optionalStringField(issue.path) } : {}),
       };
     });
+    const seenIssues = new Set<string>();
+    const issues = parsedIssues
+      .filter((issue) => SCRIPT_SANITY_REVIEW_CODES.has(issue.code))
+      .filter((issue) => {
+        const key = [
+          issue.code,
+          issue.sceneId ?? '',
+          issue.blockId ?? '',
+          issue.path ?? '',
+          issue.message.toLocaleLowerCase('zh-CN').replace(/[\s\p{P}\p{S}]/gu, ''),
+        ].join('|');
+        if (seenIssues.has(key)) return false;
+        seenIssues.add(key);
+        return true;
+      })
+      .slice(0, SCRIPT_SANITY_REVIEW_MAX_ISSUES);
     if (!Array.isArray(value.wardrobe)) {
       throw new ScriptModelOutputError('模型结果缺少数组字段 wardrobe。');
     }
@@ -3415,18 +3508,65 @@ export class ScriptDirector {
   ): string {
     const previous = state.episodes.find((episode) => episode.episodeNumber === episodeNumber - 1);
     const cast = state.characters.filter((character) => outline.characterIds.includes(character.id));
+    const planContext = {
+      title: plan.title,
+      theme: plan.theme,
+      genres: plan.genres,
+      coreConflict: plan.coreConflict,
+      coreRequirements: plan.coreRequirements,
+      forbiddenElements: plan.forbiddenElements,
+      endingDirection: plan.endingDirection,
+      targetCharsPerEpisode: plan.targetCharsPerEpisode,
+      dialogueDensityPercent: plan.dialogueDensityPercent,
+    };
+    const worldContext = state.worldBible ? {
+      era: state.worldBible.era,
+      primaryLocations: state.worldBible.primaryLocations,
+      worldState: state.worldBible.worldState,
+      rules: state.worldBible.rules,
+      organizations: state.worldBible.organizations,
+      recurringProps: state.worldBible.recurringProps,
+      forbiddenAnachronisms: state.worldBible.forbiddenAnachronisms,
+    } : undefined;
+    const castContext = cast.map((character) => ({
+      id: character.id,
+      name: character.name,
+      role: character.role,
+      identity: character.identity,
+      motivation: character.motivation,
+      goal: character.goal,
+      weakness: character.weakness,
+      arc: character.arc,
+      defaultOutfit: character.defaultOutfit,
+      personality: character.personality,
+      speechStyle: character.speechStyle,
+      catchphrases: character.catchphrases,
+      relationships: character.relationships,
+    }));
+    const previousContext = previous ? {
+      summary: previous.summary,
+      newFacts: previous.newFacts,
+      openedThreads: previous.openedThreads,
+      lastScene: previous.scenes.slice(-1).map((scene) => ({
+        location: scene.location,
+        timeOfDay: scene.timeOfDay,
+        interiorExterior: scene.interiorExterior,
+        characterIds: scene.characterIds,
+        blocks: scene.blocks.slice(-6),
+      })),
+    } : {};
     const sections = [
-      ['锁定策划', JSON.stringify(plan), 2_500],
-      ['世界圣经', JSON.stringify(state.worldBible), 2_500],
-      ['本集人物', JSON.stringify(cast), 6_000],
+      ['锁定策划', JSON.stringify(planContext), 1_800],
+      ['世界硬规则', JSON.stringify(worldContext), 2_000],
+      ['本集人物', JSON.stringify(castContext), 4_500],
       ['本集大纲', JSON.stringify(outline), 2_500],
-      ['上集摘要', JSON.stringify(previous ? { summary: previous.summary, scenes: previous.scenes.slice(-1) } : {}), 2_000],
+      ['上集承接', JSON.stringify(previousContext), 2_000],
       ['伏笔与当前状态', JSON.stringify({
         aggregate: projectScriptContinuity(state, episodeNumber),
         recentCommits: currentScriptContinuityCommits(state)
           .filter((commit) => commit.episodeNumber < episodeNumber)
           .slice(-2),
-      }), 4_000],
+      }), 3_500],
       ['格式规则', '结构化 JSON；1—5 场；每场含地点、时间、内外景、人物与 caption/action/dialogue 块。', 1_000],
     ] as const;
     return sections
@@ -3437,6 +3577,7 @@ export class ScriptDirector {
   private async generateNodeStructured<T>(
     request: ScriptModelRequest,
     contract: StructuredContract<T>,
+    onMetric?: (metric: ScriptStructuredCallMetric) => void,
   ): Promise<T> {
     const asStructuredModel = (modelNameOverride?: string): StructuredModel => ({
       complete: ({ prompt, signal }) => this.dependencies.model.complete({
@@ -3454,10 +3595,29 @@ export class ScriptDirector {
       ...(fallbackModelName ? { fallback: asStructuredModel(fallbackModelName) } : {}),
       ...(request.signal ? { signal: request.signal } : {}),
     });
+    onMetric?.(this.structuredCallMetric(request, result));
     if (result.status === 'needs_review') {
       throw new ScriptStructuredNeedsReviewError(request.node, result.error);
     }
     return result.value;
+  }
+
+  private structuredCallMetric<T>(
+    request: ScriptModelRequest,
+    result: StructuredGenerationResult<T>,
+  ): ScriptStructuredCallMetric {
+    return {
+      node: request.node,
+      ...(request.episodeNumber === undefined ? {} : { episodeNumber: request.episodeNumber }),
+      contractName: result.contractName,
+      status: result.status,
+      callsUsed: result.callsUsed,
+      ...(result.status === 'completed' ? { completedBy: result.completedBy } : {}),
+      attempts: result.attempts.map((attempt) => ({
+        stage: attempt.stage,
+        outcome: attempt.outcome,
+      })),
+    };
   }
 
   private async modelConfigFingerprint(): Promise<string> {

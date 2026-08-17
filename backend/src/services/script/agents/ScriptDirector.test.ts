@@ -1610,7 +1610,7 @@ describe('ScriptDirector', () => {
           reviewCalls += 1;
           return JSON.stringify({
             issues: [{
-              code: 'AI_CHARACTER_LOGIC',
+              code: 'CONTINUITY_CONTRADICTION',
               severity: 'hard',
               message: '人物动机仍与上一集冲突。',
               path: 'summary',
@@ -1646,7 +1646,7 @@ describe('ScriptDirector', () => {
     expect(store.state.episodes[0]?.status).toBe('completed');
     expect(store.state.reviewIssues).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        code: 'AI_CHARACTER_LOGIC',
+        code: 'CONTINUITY_CONTRADICTION',
         severity: 'hard',
         source: 'ai',
         status: 'open',
@@ -1654,7 +1654,67 @@ describe('ScriptDirector', () => {
     ]));
   });
 
-  it('keeps safe partial writing and appends multiple continuations until the episode is substantial', async () => {
+  it('keeps at most three focused sanity issues and drops style noise and duplicates', async () => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    const director = new ScriptDirector({
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+      model: {
+        async complete(request) {
+          if (request.node === 'draft') {
+            return JSON.stringify({
+              episodeNumber: 1,
+              title: '第一集',
+              scenes: [{
+                ordinal: 1,
+                location: '校报社',
+                timeOfDay: 'day',
+                interiorExterior: 'interior',
+                characterIds: ['lead'],
+                blocks: balancedDraftBlocks(),
+              }],
+              summary: '', newFacts: [], openedThreads: [], closedThreads: [],
+            });
+          }
+          if (request.node === 'review') {
+            expect(request.prompt).toContain('issues 最多返回 3 条');
+            expect(request.prompt).toContain('不要评价文风');
+            return JSON.stringify({
+              issues: [
+                { code: 'CHARACTER_PRESENCE', severity: 'hard', message: '证人不在场却递出文件。', sceneId: 'scene-1' },
+                { code: 'CHARACTER_PRESENCE', severity: 'hard', message: '证人不在场却递出文件。', sceneId: 'scene-1' },
+                { code: 'STYLE_WEAK', severity: 'soft', message: '台词还可以更有网感。' },
+                { code: 'PROP_CUSTODY', severity: 'hard', message: '账本交出后又回到原持有人手中。', sceneId: 'scene-1' },
+                { code: 'KNOWLEDGE_TIMING', severity: 'hard', message: '主角提前知道尚未公开的密码。', sceneId: 'scene-1' },
+                { code: 'CAUSAL_ORDER', severity: 'hard', message: '报警发生在发现尸体之前。', sceneId: 'scene-1' },
+              ],
+              summary: '沈清在校报社核查证据。',
+              newFacts: [], openedThreads: [], closedThreads: [], wardrobe: [],
+            });
+          }
+          throw new Error(`unexpected node: ${request.node}`);
+        },
+      },
+    });
+
+    await expect(director.run({
+      task: 'script_episode_batch',
+      projectId: state.projectId,
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: state.plan!.revision,
+    })).resolves.toMatchObject({ kind: 'episode_batch' });
+
+    const aiIssues = store.state.reviewIssues.filter((issue) => issue.source === 'ai');
+    expect(aiIssues.map((issue) => issue.code)).toEqual([
+      'CHARACTER_PRESENCE',
+      'PROP_CUSTODY',
+      'KNOWLEDGE_TIMING',
+    ]);
+  });
+
+  it('keeps safe partial writing and uses at most one continuation', async () => {
     const state = readySingleEpisodeState();
     state.plan = {
       ...state.plan!,
@@ -1664,7 +1724,7 @@ describe('ScriptDirector', () => {
     let baseDraftCalls = 0;
     let continuationCalls = 0;
     let reviewCalls = 0;
-    const continuationLengths = [214, 222];
+    const continuationLengths = [500];
     const store = new MemoryScriptStore(state);
     const checkpoints = new InMemoryScriptCheckpointStore();
     const director = new ScriptDirector({
@@ -1736,9 +1796,18 @@ describe('ScriptDirector', () => {
     });
 
     expect(result).toMatchObject({ kind: 'episode_batch' });
+    if (result.kind !== 'episode_batch') throw new Error('expected episode batch');
+    expect(result.callSummary).toMatchObject({
+      totalCalls: 3,
+      primaryCalls: 3,
+      fixupCalls: 0,
+      fallbackCalls: 0,
+      byNode: { draft: 2, review: 1 },
+      byEpisode: [{ episodeNumber: 1, calls: 3 }],
+    });
     expect({ baseDraftCalls, continuationCalls, reviewCalls }).toEqual({
       baseDraftCalls: 1,
-      continuationCalls: 2,
+      continuationCalls: 1,
       reviewCalls: 1,
     });
     const completed = store.state.episodes[0]!;
@@ -1753,10 +1822,10 @@ describe('ScriptDirector', () => {
       'script_episode_batch:1:1',
     )).filter((checkpoint) => checkpoint.node === 'draft');
     expect(draftHistory.filter((checkpoint) => checkpoint.status === 'stale'))
-      .toHaveLength(2);
+      .toHaveLength(1);
     expect(draftHistory).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        artifactRevision: 2,
+        artifactRevision: 1,
         status: 'succeeded',
         promptVersion: 'episode-draft-v5',
       }),
@@ -1921,7 +1990,7 @@ describe('ScriptDirector', () => {
     },
   );
 
-  it('resumes from the last saved continuation without regenerating accepted text', async () => {
+  it('resumes from a saved base draft when the only continuation is interrupted', async () => {
     const state = readySingleEpisodeState();
     state.plan = { ...state.plan!, targetCharsPerEpisode: 1_200 };
     const checkpoints = new InMemoryScriptCheckpointStore();
@@ -1929,7 +1998,7 @@ describe('ScriptDirector', () => {
     let baseDraftCalls = 0;
     let continuationCalls = 0;
     let reviewCalls = 0;
-    let interruptSecondContinuation = true;
+    let interruptFirstContinuation = true;
     const controller = new AbortController();
     const director = new ScriptDirector({
       store,
@@ -1939,14 +2008,14 @@ describe('ScriptDirector', () => {
           if (request.node === 'draft') {
             if (request.prompt.includes('episode_draft_continuation@v1')) {
               continuationCalls += 1;
-              if (interruptSecondContinuation && continuationCalls === 2) {
-                interruptSecondContinuation = false;
+              if (interruptFirstContinuation && continuationCalls === 1) {
+                interruptFirstContinuation = false;
                 controller.abort();
                 const error = new Error('cancelled during continuation');
                 error.name = 'AbortError';
                 throw error;
               }
-              const length = continuationCalls === 1 ? 214 : 320;
+              const length = 450;
               return JSON.stringify({
                 blocks: [{
                   sceneOrdinal: 1,
@@ -2008,7 +2077,7 @@ describe('ScriptDirector', () => {
       .rejects.toMatchObject({ name: 'AbortError' });
     expect({ baseDraftCalls, continuationCalls, reviewCalls }).toEqual({
       baseDraftCalls: 1,
-      continuationCalls: 2,
+      continuationCalls: 1,
       reviewCalls: 0,
     });
     expect(store.state.episodes).toEqual([]);
@@ -2016,7 +2085,7 @@ describe('ScriptDirector', () => {
     await expect(director.run(request)).resolves.toMatchObject({ kind: 'episode_batch' });
     expect({ baseDraftCalls, continuationCalls, reviewCalls }).toEqual({
       baseDraftCalls: 1,
-      continuationCalls: 3,
+      continuationCalls: 2,
       reviewCalls: 1,
     });
     const completed = store.state.episodes[0]!;
@@ -2024,8 +2093,8 @@ describe('ScriptDirector', () => {
       .flatMap((scene) => scene.blocks)
       .map((block) => block.text)
       .join('');
-    expect(combined).toContain('续写断点1');
-    expect(combined).toContain('续写断点3');
+    expect(combined).not.toContain('续写断点1');
+    expect(combined).toContain('续写断点2');
     expect(completed.status).toBe('completed');
   });
 

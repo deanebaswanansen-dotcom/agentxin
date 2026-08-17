@@ -403,7 +403,7 @@ type ScriptRevisionOperation =
 
 ### 9.3 字数不足的处理
 
-`TOO_SHORT` 不允许触发整集重写。Director 保留结构正确的已有正文，只要求模型返回新增 blocks；每轮只要正文安全增长就立即写入不可变检查点，再从新结尾继续。最多四轮，达到目标约 75% 即可进入审查；仍不足时保留现有成稿并记录 advisory，不因篇幅单独卡死任务。
+`TOO_SHORT` 不允许触发整集重写。Director 保留结构正确的已有正文，只允许一次自然续写并返回新增 blocks；续写只要安全增长就立即写入不可变检查点。达到目标约 75% 即可进入审查；仍不足时保留现有成稿并记录 advisory，不因篇幅单独卡死任务。
 
 ## 10. 质量门分轨
 
@@ -844,7 +844,7 @@ interface ScriptCheckpointFileV2 {
 - 10/10 集状态为 completed。
 - 所有集号连续唯一，批次固定且无重叠任务。
 - 每集场景、人物和正文块结构合法。
-- 每集字数必须在策划目标允许范围内；字数不足或超限仍属于 blocking，不能通过忽略 advisory 放行。
+- 每集字数以策划目标的 75%—125% 作为提示区间；字数不足或超限记录 advisory，但不单独阻止结构、人物和连续性均合法的正文完成。
 - 结构化输出修复最多 1 次；同一节点不无限循环。
 - 任一 Episode 正式 revision 只在候选通过后增加。
 - 不出现整集缩稿、空集、JSON/思维链污染或用户稿被覆盖。
@@ -951,7 +951,7 @@ T2 人物契约与表单 ────┼→ T3 结构化输出修复
 - **10.4 单集生成策略**：明确场景计划先持久化；初稿/修订稿为 checkpoint candidate；正文一次生成当前单集 scenes，不增加逐场多调用。
 - **10.6 记忆写回**：改为 Episode 与 continuity commit 原子完成，并增加时间/因果/evidence ID。
 - **11.2 节点检查点**：升级 checkpoint v2、fingerprint、stale、needs_review/waiting_user 和恢复规则。
-- **14.1/14.2 质量门**：改为 source-aware blocking/advisory；AI 原始 hard 默认不直接阻断；字数仍保持确定性 blocking。
+- **14.1/14.2 质量门**：改为 source-aware blocking/advisory；AI 原始 hard 默认不直接阻断；字数与对白密度为 advisory，明显结构、人物、场景、道具与时间线错误才 blocking。
 - **19 测试策略**：增加候选不落正式稿、Patch 不变量、checkpoint 迁移和连续性原子提交。
 - **20 调用预算**：分别统计网络重试、Fixup、fallback 和 Patch，禁止多层重试相乘。
 - **27.3 可见校稿**：前后端对 issue source/severity/status 的 blocking 规则保持一致。
