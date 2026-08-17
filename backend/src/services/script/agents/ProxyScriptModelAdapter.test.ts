@@ -52,6 +52,15 @@ describe('ProxyScriptModelAdapter', () => {
       prompt: '生成正文',
     });
     expect(calls[1]?.options?.temperature).toBe(0.6);
+
+    await adapter.complete({
+      node: 'draft',
+      projectId: 'project-1',
+      prompt: '直接写剧本',
+      responseFormat: 'text',
+    });
+    expect(calls[2]?.options).toMatchObject({ jsonMode: false, disableThinking: true });
+    expect(calls[2]?.messages[0]?.content).toContain('短剧编剧');
   });
 
   it('rejects missing configuration and empty visible output', async () => {

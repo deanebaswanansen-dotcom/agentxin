@@ -139,6 +139,30 @@ describe('agent routes', () => {
     })).toThrow('短剧正文批次必须从第 1、6、11……集开始。');
   });
 
+  it('accepts direct screenplay writing mode and rejects unknown draft modes', () => {
+    expect(parseAgentBody({
+      task: 'script_episode_batch',
+      projectId: 'script-project',
+      scriptBatchOptions: {
+        startEpisode: 1,
+        episodeCount: 5,
+        expectedPlanRevision: 3,
+        draftMode: 'direct_text',
+      },
+    }).scriptBatchOptions?.draftMode).toBe('direct_text');
+
+    expect(() => parseAgentBody({
+      task: 'script_episode_batch',
+      projectId: 'script-project',
+      scriptBatchOptions: {
+        startEpisode: 1,
+        episodeCount: 5,
+        expectedPlanRevision: 3,
+        draftMode: 'unknown',
+      },
+    })).toThrow('短剧正文模式必须是 structured_legacy 或 direct_text。');
+  });
+
   it('routes short-drama tasks through ScriptDirector instead of the novel orchestrator', async () => {
     const store = await FileDataStore.create(join(dir, 'store.json'));
     const scriptStore = await FileScriptStore.create(join(dir, 'scripts'));

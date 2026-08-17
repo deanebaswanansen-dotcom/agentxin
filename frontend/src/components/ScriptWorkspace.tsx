@@ -389,7 +389,19 @@ function OutlineEditor({
         <label className="script-field script-field--wide">主线节拍（每行一条）<textarea rows={5} value={value.mainArc.join('\n')} onChange={(e) => patch('mainArc', e.target.value.split('\n').map((item) => item.trim()).filter(Boolean))} /></label>
         <label className="script-field script-field--wide">支线（每行一条）<textarea rows={4} value={value.subplotArcs.join('\n')} onChange={(e) => patch('subplotArcs', e.target.value.split('\n').map((item) => item.trim()).filter(Boolean))} /></label>
       </div>
-      {value.episodeCards.length > 0 ? <div className="script-outline-cards"><h3>分集卡</h3>{value.episodeCards.map((card, index) => <article key={card.episodeNumber}><strong>第 {card.episodeNumber} 集</strong><input aria-label={`第 ${card.episodeNumber} 集标题`} value={card.title} onChange={(e) => patch('episodeCards', value.episodeCards.map((item, itemIndex) => itemIndex === index ? { ...item, title: e.target.value } : item))} /><textarea aria-label={`第 ${card.episodeNumber} 集梗概`} value={card.logline} onChange={(e) => patch('episodeCards', value.episodeCards.map((item, itemIndex) => itemIndex === index ? { ...item, logline: e.target.value } : item))} /></article>)}</div> : <p className="script-muted">保存策划后，可让 Agent 生成全剧总纲与连续分集卡。</p>}
+      {value.episodeCards.length > 0 ? <div className="script-outline-cards"><h3>分集卡</h3>{value.episodeCards.map((card, index) => {
+        const updateCard = (changes: Partial<typeof card>) => patch(
+          'episodeCards',
+          value.episodeCards.map((item, itemIndex) => itemIndex === index ? { ...item, ...changes } : item),
+        );
+        return <article key={card.episodeNumber}>
+          <strong>第 {card.episodeNumber} 集</strong>
+          <input aria-label={`第 ${card.episodeNumber} 集标题`} value={card.title} onChange={(e) => updateCard({ title: e.target.value })} />
+          <textarea aria-label={`第 ${card.episodeNumber} 集梗概`} value={card.logline} onChange={(e) => updateCard({ logline: e.target.value })} />
+          <textarea aria-label={`第 ${card.episodeNumber} 集主要事件`} value={card.mainEvent} onChange={(e) => updateCard({ mainEvent: e.target.value })} />
+          <textarea aria-label={`第 ${card.episodeNumber} 集结尾卡点`} value={card.endingHook} onChange={(e) => updateCard({ endingHook: e.target.value })} />
+        </article>;
+      })}</div> : <p className="script-muted">保存策划后，可让 Agent 生成全剧总纲与连续分集卡。</p>}
       </>}
       <footer className="script-stage-actions"><button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={onGenerate}>Agent 生成大纲</button><button type="button" className="nwa-button" disabled={busy} onClick={onSave}>{busy ? '保存中…' : '保存大纲'}</button></footer>
     </section>
@@ -698,6 +710,10 @@ const CHECKPOINT_LABEL: Record<NonNullable<ScriptAgentJobSnapshot['checkpoint']>
   world_bible: '世界圣经',
   episode_outline: '详细大纲',
   scene_plan: '场景计划',
+  direct_draft: '照分集卡写作',
+  continuation: '从结尾自然续写',
+  handoff_review: '明显错误检查',
+  direct_rewrite: '按明显问题重写',
   draft: '正文初稿',
   review: '连续性审查',
   revision: '定向修订',
@@ -815,6 +831,7 @@ function EpisodeBatchPanel({
       <header className="script-stage-heading">
         <div><span>第五阶段 · 五集一批</span><h2 id="script-episodes-heading">{fixedBatchStart}–{batchEnd}集剧本正文</h2></div>
         <div className="script-stage-heading__actions">
+          <span className="script-status-chip" title="按分集卡直接写正文，只检查明显剧情和人物错误">Flash 直接写作</span>
           <div className="script-view-switch" role="group" aria-label="正文查看模式"><button type="button" aria-pressed={contentMode === 'read'} onClick={() => setContentMode('read')}>成品阅读</button><button type="button" aria-pressed={contentMode === 'edit'} onClick={() => setContentMode('edit')}>编辑模式</button></div>
           <button type="button" className="nwa-button nwa-button--ghost" onClick={() => setFullscreen((value) => !value)}>{fullscreen ? '退出全屏' : '全屏阅读'}</button>
           <select aria-label="导出范围" value={exportScope} onChange={(event) => setExportScope(event.target.value as 'all' | 'batch')}><option value="all">整本</option><option value="batch">当前五集</option></select>
@@ -1452,6 +1469,7 @@ export function ScriptWorkspace({
           startEpisode,
           episodeCount,
           expectedPlanRevision: data.plan.revision,
+          draftMode: 'direct_text',
         },
       });
       setData((current) => current ? { ...current, jobs: [job, ...current.jobs.filter((item) => item.id !== job.id)] } : current);

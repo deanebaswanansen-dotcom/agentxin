@@ -153,6 +153,7 @@ function parseScriptBatchOptions(raw: unknown): AgentRunRequest['scriptBatchOpti
   const startEpisode = asOptionalPositiveInt(value.startEpisode);
   const episodeCount = asOptionalPositiveInt(value.episodeCount);
   const expectedPlanRevision = asOptionalPositiveInt(value.expectedPlanRevision);
+  const draftMode = value.draftMode;
   if (startEpisode === undefined || episodeCount === undefined || expectedPlanRevision === undefined) {
     throw ServiceError.validation('短剧批次必须包含起始集、1–5 集数量和策划版本。');
   }
@@ -162,7 +163,19 @@ function parseScriptBatchOptions(raw: unknown): AgentRunRequest['scriptBatchOpti
   if ((startEpisode - 1) % 5 !== 0) {
     throw ServiceError.validation('短剧正文批次必须从第 1、6、11……集开始。');
   }
-  return { startEpisode, episodeCount, expectedPlanRevision };
+  if (
+    draftMode !== undefined &&
+    draftMode !== 'structured_legacy' &&
+    draftMode !== 'direct_text'
+  ) {
+    throw ServiceError.validation('短剧正文模式必须是 structured_legacy 或 direct_text。');
+  }
+  return {
+    startEpisode,
+    episodeCount,
+    expectedPlanRevision,
+    ...(draftMode ? { draftMode } : {}),
+  };
 }
 
 /**

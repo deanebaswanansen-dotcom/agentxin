@@ -367,6 +367,47 @@ function balancedDraftBlocks(totalChars = 300) {
   ];
 }
 
+function directScriptText(options: {
+  episodeNumber?: number;
+  actionChars?: number;
+  dialogueChars?: number;
+  location?: string;
+  dialogue?: string;
+} = {}): string {
+  const episodeNumber = options.episodeNumber ?? 1;
+  const action = '沈清把录音笔和采访记录并排放在校报社的长桌上逐页核对。'
+    .repeat(20)
+    .slice(0, options.actionChars ?? 120);
+  const dialogue = options.dialogue ?? '这份时间戳能证明证据从未离开档案室。'
+    .repeat(20)
+    .slice(0, options.dialogueChars ?? 150);
+  return [
+    `第${episodeNumber}集`,
+    `${episodeNumber}-1 ${options.location ?? '校报社'} 日/内`,
+    '人物：沈清',
+    `△${action}`,
+    `沈清：${dialogue}`,
+  ].join('\n');
+}
+
+function directReviewJson(options: {
+  verdict?: 'pass' | 'major_issue';
+  issues?: unknown[];
+  summary?: string;
+} = {}): string {
+  return JSON.stringify({
+    verdict: options.verdict ?? 'pass',
+    issues: options.issues ?? [],
+    handoff: {
+      summary: options.summary ?? '沈清核对记录并取得能推进调查的证据。',
+      characterStates: [{ characterId: 'lead', location: '校报社', state: '继续调查', knows: ['证据时间戳有效'] }],
+      props: [{ name: '录音笔', holder: 'lead', location: '校报社', state: '由沈清保管' }],
+      openThreads: ['新证人的身份尚未公开'],
+      ending: '门外的新证人敲响玻璃门。',
+    },
+  });
+}
+
 function exactScriptText(seed: string, length: number, variant?: number): string {
   if (seed.length > length) throw new Error(`seed is longer than ${length}: ${seed}`);
   const details = [
@@ -2719,4 +2760,281 @@ describe('ScriptDirector', () => {
     expect(modelCalls).toBe(0);
     },
   );
+
+  it('writes a complete direct-text episode with one writer call and one handoff review call', async () => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    const checkpoints = new InMemoryScriptCheckpointStore();
+    const calls: Array<{ node: string; responseFormat?: string }> = [];
+    const model: ScriptModelAdapter = {
+      async complete(request) {
+        calls.push({ node: request.node, responseFormat: request.responseFormat });
+        return request.node === 'review' ? directReviewJson() : directScriptText();
+      },
+      async getModelConfigFingerprint() { return 'direct-model-v1'; },
+    };
+    const director = new ScriptDirector({ model, store, checkpoints });
+
+    const result = await director.run({
+      task: 'script_episode_batch',
+      projectId: 'project-1',
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    });
+
+    expect(result.kind).toBe('episode_batch');
+    if (result.kind !== 'episode_batch') throw new Error('unexpected result');
+    expect(result.episodes).toHaveLength(1);
+    expect(result.episodes[0]).toMatchObject({
+      status: 'completed',
+      episodeNumber: 1,
+      summary: '沈清核对记录并取得能推进调查的证据。',
+    });
+    expect(calls).toEqual([
+      { node: 'draft', responseFormat: 'text' },
+      { node: 'review', responseFormat: 'json' },
+    ]);
+    expect(result.callSummary.totalCalls).toBe(2);
+    expect(store.atomicCommitCalls).toHaveLength(1);
+    expect(store.saveEpisodeCalls).toHaveLength(0);
+    const savedCheckpoints = await checkpoints.list('project-1', 'script_episode_batch:1:1');
+    expect(savedCheckpoints).toEqual(expect.arrayContaining([
+      expect.objectContaining({ node: 'direct_draft', status: 'succeeded' }),
+      expect.objectContaining({ node: 'handoff_review', status: 'succeeded' }),
+      expect.objectContaining({ node: 'completed', status: 'succeeded' }),
+    ]));
+  });
+
+  it('writes a five-episode direct-text batch in order with ten model calls and a continuity chain', async () => {
+    const state = readySingleEpisodeState();
+    state.plan = approvedPlan(5);
+    const baseOutline = state.episodeOutlines[0]!;
+    state.seriesOutline = {
+      ...state.seriesOutline!,
+      episodeCards: Array.from({ length: 5 }, (_, index) => ({
+        episodeNumber: index + 1,
+        title: `第${index + 1}集`,
+        logline: `调查推进到第${index + 1}步。`,
+        mainEvent: `取得第${index + 1}份证据。`,
+        endingHook: `第${index + 1}条新线索出现。`,
+      })),
+    };
+    state.episodeOutlines = Array.from({ length: 5 }, (_, index) => ({
+      ...baseOutline,
+      id: `outline-${index + 1}`,
+      episodeNumber: index + 1,
+      title: `第${index + 1}集`,
+      endingHook: `第${index + 1}条新线索出现。`,
+    }));
+    const calls: Array<{ node: string; episodeNumber?: number }> = [];
+    const store = new MemoryScriptStore(state);
+    const director = new ScriptDirector({
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+      model: {
+        async complete(request) {
+          calls.push({ node: request.node, episodeNumber: request.episodeNumber });
+          return request.node === 'review'
+            ? directReviewJson({ summary: `第${request.episodeNumber}集调查完成。` })
+            : directScriptText({ episodeNumber: request.episodeNumber });
+        },
+        async getModelConfigFingerprint() { return 'direct-model-v1'; },
+      },
+    });
+
+    const result = await director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 5, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    });
+
+    expect(result.kind).toBe('episode_batch');
+    if (result.kind !== 'episode_batch') throw new Error('unexpected result');
+    expect(result.episodes.map((episode) => episode.episodeNumber)).toEqual([1, 2, 3, 4, 5]);
+    expect(result.callSummary.totalCalls).toBe(10);
+    expect(calls.map((call) => call.node)).toEqual([
+      'draft', 'review', 'draft', 'review', 'draft', 'review', 'draft', 'review', 'draft', 'review',
+    ]);
+    const continuityCommits = store.state.continuityCommits ?? [];
+    expect(continuityCommits).toHaveLength(5);
+    expect(continuityCommits.map((commit) => commit.episodeNumber)).toEqual([1, 2, 3, 4, 5]);
+    expect(store.atomicCommitCalls).toHaveLength(5);
+  });
+
+  it('continues a clearly short direct draft exactly once without rewriting the base', async () => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    const checkpoints = new InMemoryScriptCheckpointStore();
+    let draftCalls = 0;
+    const model: ScriptModelAdapter = {
+      async complete(request) {
+        if (request.node === 'review') return directReviewJson();
+        draftCalls += 1;
+        return draftCalls === 1
+          ? directScriptText({ actionChars: 45, dialogueChars: 55 })
+          : [
+              '1-1 校报社 日/内',
+              '人物：沈清',
+              `△${'沈清继续比对备份记录确认时间戳没有被替换。'.repeat(4)}`,
+              `沈清：${'这条线索还缺最后一名证人的签字。'.repeat(5)}`,
+            ].join('\n');
+      },
+      async getModelConfigFingerprint() { return 'direct-model-v1'; },
+    };
+    const director = new ScriptDirector({ model, store, checkpoints });
+
+    const result = await director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    });
+
+    expect(result.kind).toBe('episode_batch');
+    expect(draftCalls).toBe(2);
+    expect(store.state.episodes[0]?.scenes[0]?.blocks.length).toBe(4);
+    const savedCheckpoints = await checkpoints.list('project-1', 'script_episode_batch:1:1');
+    expect(savedCheckpoints.filter((item) => item.node === 'continuation')).toHaveLength(1);
+  });
+
+  it('rewrites an obvious genre drift once and does not run a second AI review', async () => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    const calls: string[] = [];
+    const model: ScriptModelAdapter = {
+      async complete(request) {
+        calls.push(request.node);
+        if (request.node === 'draft') {
+          return directScriptText({ location: '市体育馆篮球场', dialogue: '这场篮球赛我们一定要赢。'.repeat(14) });
+        }
+        if (request.node === 'review') {
+          return directReviewJson({
+            verdict: 'major_issue',
+            issues: [{
+              code: 'WRONG_GENRE_OR_SETTING',
+              sceneNumber: 1,
+              evidence: '正文把校园调查写成篮球比赛。',
+              expected: '本集应在校报社调查证据。',
+            }],
+          });
+        }
+        return directScriptText({ location: '校报社', dialogue: '时间戳和采访记录能够相互印证。'.repeat(14) });
+      },
+      async getModelConfigFingerprint() { return 'direct-model-v1'; },
+    };
+    const director = new ScriptDirector({
+      model,
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+    });
+
+    await director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    });
+
+    expect(calls).toEqual(['draft', 'review', 'revision']);
+    expect(store.state.episodes[0]?.scenes[0]?.location).toBe('校报社');
+    expect(JSON.stringify(store.state.episodes[0])).not.toContain('篮球');
+    expect(store.atomicCommitCalls).toHaveLength(1);
+  });
+
+  it('caps a format-repair plus major-rewrite episode at four model calls', async () => {
+    const state = readySingleEpisodeState();
+    const calls: string[] = [];
+    let draftCalls = 0;
+    const store = new MemoryScriptStore(state);
+    const director = new ScriptDirector({
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+      model: {
+        async complete(request) {
+          calls.push(request.node);
+          if (request.node === 'draft') {
+            draftCalls += 1;
+            return draftCalls === 1
+              ? '下面是剧本，但我先解释一下创作思路。'
+              : directScriptText({ actionChars: 45, dialogueChars: 55 });
+          }
+          if (request.node === 'review') {
+            return directReviewJson({
+              verdict: 'major_issue',
+              issues: [{
+                code: 'OFF_OUTLINE',
+                evidence: '正文没有完成取得证据的主要事件。',
+                expected: '本集必须取得证据。',
+              }],
+            });
+          }
+          return directScriptText();
+        },
+        async getModelConfigFingerprint() { return 'direct-model-v1'; },
+      },
+    });
+
+    const result = await director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    });
+
+    expect(result.kind).toBe('episode_batch');
+    if (result.kind !== 'episode_batch') throw new Error('unexpected result');
+    expect(calls).toEqual(['draft', 'draft', 'review', 'revision']);
+    expect(result.callSummary.totalCalls).toBe(4);
+    expect(store.atomicCommitCalls).toHaveLength(1);
+  });
+
+  it('reuses a durable direct draft after an interrupted review without charging for the writer again', async () => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    const checkpoints = new InMemoryScriptCheckpointStore();
+    let writerCalls = 0;
+    const interrupted = new ScriptDirector({
+      store,
+      checkpoints,
+      model: {
+        async complete(request) {
+          if (request.node === 'draft') {
+            writerCalls += 1;
+            return directScriptText();
+          }
+          throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+        },
+        async getModelConfigFingerprint() { return 'direct-model-v1'; },
+      },
+    });
+    await expect(interrupted.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(writerCalls).toBe(1);
+    expect(store.atomicCommitCalls).toHaveLength(0);
+
+    const resumed = new ScriptDirector({
+      store,
+      checkpoints,
+      model: {
+        async complete(request) {
+          if (request.node === 'draft') {
+            writerCalls += 1;
+            return directScriptText();
+          }
+          return directReviewJson();
+        },
+        async getModelConfigFingerprint() { return 'direct-model-v1'; },
+      },
+    });
+    await resumed.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    });
+
+    expect(writerCalls).toBe(1);
+    expect(store.atomicCommitCalls).toHaveLength(1);
+  });
 });

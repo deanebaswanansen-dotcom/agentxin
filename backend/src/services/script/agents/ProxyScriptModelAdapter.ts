@@ -61,12 +61,14 @@ export class ProxyScriptModelAdapter implements ScriptModelAdapter {
     const messages: ChatMessage[] = [
       {
         role: 'system',
-        content: '你是 AgentXin 短剧生产 Agent。严格遵守用户已确认的约束，只输出调用节点要求的结构化结果。',
+        content: request.responseFormat === 'text'
+          ? '你是 AgentXin 短剧编剧。严格遵守用户已确认的大纲，直接输出要求的标准中文短剧正文，不解释创作过程。'
+          : '你是 AgentXin 短剧生产 Agent。严格遵守用户已确认的约束，只输出调用节点要求的结构化结果。',
       },
       { role: 'user', content: request.prompt },
     ];
     const options: StreamCompletionOptions = {
-      jsonMode: true,
+      jsonMode: request.responseFormat !== 'text',
       disableThinking: true,
       maxTokens: NODE_OUTPUT_BUDGET[request.node],
       temperature: temperatureForNode(request.node),

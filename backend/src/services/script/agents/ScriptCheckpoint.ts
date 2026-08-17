@@ -15,6 +15,10 @@ export type ScriptCheckpointNode =
   | 'world_bible'
   | 'episode_outline'
   | 'scene_plan'
+  | 'direct_draft'
+  | 'continuation'
+  | 'handoff_review'
+  | 'direct_rewrite'
   | 'draft'
   | 'review'
   | 'revision'
@@ -164,6 +168,10 @@ const SCRIPT_CHECKPOINT_NODES: readonly ScriptCheckpointNode[] = [
   'world_bible',
   'episode_outline',
   'scene_plan',
+  'direct_draft',
+  'continuation',
+  'handoff_review',
+  'direct_rewrite',
   'draft',
   'review',
   'revision',
