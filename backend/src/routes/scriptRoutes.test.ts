@@ -688,17 +688,37 @@ describe('scriptRoutes', () => {
     expect(reviewed.statusCode).toBe(200);
     expect(reviewed.json()).toMatchObject({
       revision: 3,
-      report: { hardFailed: true },
+      report: { hardFailed: false },
       items: expect.arrayContaining([
         expect.objectContaining({ code: 'TOO_SHORT', source: 'deterministic', status: 'open' }),
         expect.objectContaining({ id: 'manual-1', source: 'user', status: 'ignored' }),
       ]),
     });
-    const hardIssue = reviewed.json().items.find((item: { severity: string }) => item.severity === 'hard');
+    const savedUserHard = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-review-issues`,
+      payload: {
+        expectedRevision: 3,
+        items: [
+          ...reviewed.json().items,
+          {
+            id: 'user-hard-blocking',
+            episodeNumber: 1,
+            code: 'CONTINUITY_CONFLICT',
+            severity: 'hard',
+            category: 'continuity',
+            message: '人工确认的连续性冲突。',
+            status: 'open',
+            source: 'user',
+          },
+        ],
+      },
+    });
+    expect(savedUserHard.statusCode).toBe(200);
     const ignoreHard = await app.inject({
       method: 'PATCH',
-      url: `/api/projects/${projectId}/script-review-issues/${hardIssue.id}`,
-      payload: { expectedRevision: 3, status: 'ignored' },
+      url: `/api/projects/${projectId}/script-review-issues/user-hard-blocking`,
+      payload: { expectedRevision: 4, status: 'ignored' },
     });
     expect(ignoreHard.statusCode).toBe(400);
     expect(ignoreHard.json()).toMatchObject({
@@ -709,9 +729,9 @@ describe('scriptRoutes', () => {
       method: 'PUT',
       url: `/api/projects/${projectId}/script-review-issues`,
       payload: {
-        expectedRevision: 3,
+        expectedRevision: 4,
         items: [
-          ...reviewed.json().items,
+          ...savedUserHard.json().items,
           {
             id: 'ai-hard-advisory',
             episodeNumber: 1,
@@ -729,11 +749,11 @@ describe('scriptRoutes', () => {
     const ignoredAiHard = await app.inject({
       method: 'PATCH',
       url: `/api/projects/${projectId}/script-review-issues/ai-hard-advisory`,
-      payload: { expectedRevision: 4, status: 'ignored' },
+      payload: { expectedRevision: 5, status: 'ignored' },
     });
     expect(ignoredAiHard.statusCode).toBe(200);
     expect(ignoredAiHard.json()).toMatchObject({
-      revision: 5,
+      revision: 6,
       item: { id: 'ai-hard-advisory', status: 'ignored', source: 'ai' },
     });
   });

@@ -408,36 +408,6 @@ function exactScriptText(seed: string, length: number, variant?: number): string
   return text.slice(0, length);
 }
 
-function exactExpansionBlocks(input: {
-  sceneOrdinal: number;
-  actionLengths: readonly number[];
-  dialogueLengths: readonly number[];
-  label: string;
-}) {
-  return [
-    ...input.actionLengths.map((length, index) => ({
-      sceneOrdinal: input.sceneOrdinal,
-      type: 'action' as const,
-      text: exactScriptText(
-        `扩写动作${input.label}${index + 1}`,
-        length,
-        input.sceneOrdinal * 11 + index,
-      ),
-    })),
-    ...input.dialogueLengths.map((length, index) => ({
-      sceneOrdinal: input.sceneOrdinal,
-      type: 'dialogue' as const,
-      characterId: 'lead',
-      speaker: '沈清',
-      text: exactScriptText(
-        `扩写对白${input.label}${index + 1}`,
-        length,
-        input.sceneOrdinal * 11 + input.actionLengths.length + index,
-      ),
-    })),
-  ];
-}
-
 describe('ScriptDirector', () => {
   it('summarizes only blocking issues and puts revision rejection first', () => {
     const ordinaryBlocking = {
@@ -1510,7 +1480,7 @@ describe('ScriptDirector', () => {
     }
   });
 
-  it('stales an episode-draft-v3 checkpoint after the v4 prompt upgrade', async () => {
+  it('stales an episode-draft-v3 checkpoint after the lightweight v5 prompt upgrade', async () => {
     const state = readySingleEpisodeState();
     let draftCalls = 0;
     const store = new MemoryScriptStore(state);
@@ -1604,7 +1574,7 @@ describe('ScriptDirector', () => {
         artifactRevision: 0, promptVersion: 'episode-draft-v3', status: 'stale',
       }),
       expect.objectContaining({
-        artifactRevision: 1, promptVersion: 'episode-draft-v4', status: 'succeeded',
+        artifactRevision: 1, promptVersion: 'episode-draft-v5', status: 'succeeded',
       }),
     ]));
   });
@@ -1684,73 +1654,73 @@ describe('ScriptDirector', () => {
     ]));
   });
 
-  it('rewrites a 515-char 1200-target draft as a complete episode before review', async () => {
+  it('keeps safe partial writing and appends multiple continuations until the episode is substantial', async () => {
     const state = readySingleEpisodeState();
-    state.plan = { ...state.plan!, targetCharsPerEpisode: 1_200, dialogueDensityPercent: 60 };
-    state.characters.push({
-      ...structuredClone(state.characters[0]!),
-      id: 'witness',
-      name: '证人',
-    });
-    const draftPrompts: string[] = [];
-    let draftCalls = 0;
+    state.plan = {
+      ...state.plan!,
+      targetCharsPerEpisode: 1_200,
+      dialogueDensityPercent: 60,
+    };
+    let baseDraftCalls = 0;
+    let continuationCalls = 0;
     let reviewCalls = 0;
-    let revisionCalls = 0;
-    const draftPayload = (
-      actionChars: number,
-      dialogueChars: number,
-      characterIds: string[],
-    ) => ({
-      episodeNumber: 1,
-      title: '第一集',
-      scenes: [{
-        ordinal: 1,
-        location: '校报社',
-        timeOfDay: 'day',
-        interiorExterior: 'interior',
-        characterIds,
-        blocks: [
-          { type: 'action', text: '动'.repeat(actionChars) },
-          {
-            type: 'dialogue',
-            characterId: 'witness',
-            speaker: '证人',
-            text: '证'.repeat(dialogueChars),
-          },
-        ],
-      }],
-      summary: '',
-      newFacts: [],
-      openedThreads: [],
-      closedThreads: [],
-    });
+    const continuationLengths = [214, 222];
     const store = new MemoryScriptStore(state);
+    const checkpoints = new InMemoryScriptCheckpointStore();
     const director = new ScriptDirector({
       store,
-      checkpoints: new InMemoryScriptCheckpointStore(),
+      checkpoints,
       model: {
         async complete(request) {
           if (request.node === 'draft') {
-            draftCalls += 1;
-            draftPrompts.push(request.prompt);
-            return JSON.stringify(draftCalls === 1
-              ? draftPayload(500, 15, ['lead'])
-              : draftPayload(472, 708, ['lead', 'witness']));
+            if (request.prompt.includes('episode_draft_continuation@v1')) {
+              const length = continuationLengths[continuationCalls] ?? 100;
+              continuationCalls += 1;
+              return JSON.stringify({
+                blocks: [{
+                  sceneOrdinal: 1,
+                  type: 'action',
+                  text: exactScriptText(`续写推进${continuationCalls}`, length),
+                }],
+              });
+            }
+            baseDraftCalls += 1;
+            return JSON.stringify({
+              episodeNumber: 1,
+              title: '第一集',
+              scenes: [{
+                ordinal: 1,
+                location: '校报社',
+                timeOfDay: 'day',
+                interiorExterior: 'interior',
+                characterIds: ['lead'],
+                blocks: [
+                  { type: 'action', text: exactScriptText('初稿调查动作', 277) },
+                  {
+                    type: 'dialogue',
+                    characterId: 'lead',
+                    speaker: '沈清',
+                    text: exactScriptText('初稿调查对白', 228),
+                  },
+                  { type: 'action', text: '门外传来急促脚步声' },
+                ],
+              }],
+              summary: '',
+              newFacts: [],
+              openedThreads: [],
+              closedThreads: [],
+            });
           }
           if (request.node === 'review') {
             reviewCalls += 1;
             return JSON.stringify({
               issues: [],
-              summary: '证人带着证据进入校报社，沈清决定继续调查。',
+              summary: '沈清核查证据，门外有人逼近。',
               newFacts: [],
               openedThreads: [],
               closedThreads: [],
               wardrobe: [],
             });
-          }
-          if (request.node === 'revision') {
-            revisionCalls += 1;
-            throw new Error('fresh draft fixup must not enter revision');
           }
           throw new Error(`unexpected node: ${request.node}`);
         },
@@ -1764,55 +1734,39 @@ describe('ScriptDirector', () => {
       episodeCount: 1,
       expectedPlanRevision: state.plan.revision,
     });
-    expect(result).toMatchObject({ kind: 'episode_batch' });
-    if (result.kind !== 'episode_batch') throw new Error('expected episode batch');
-    expect(result.reports.flatMap((item) => item.report.issues)
-      .some((issue) => issue.code === 'DUPLICATE_DIALOGUE')).toBe(false);
 
-    expect({ draftCalls, reviewCalls, revisionCalls }).toEqual({
-      draftCalls: 2,
+    expect(result).toMatchObject({ kind: 'episode_batch' });
+    expect({ baseDraftCalls, continuationCalls, reviewCalls }).toEqual({
+      baseDraftCalls: 1,
+      continuationCalls: 2,
       reviewCalls: 1,
-      revisionCalls: 0,
     });
-    expect(draftPrompts[0]).toContain('约包含 30 个');
-    expect(draftPrompts[0]).toContain('36—44 个可见字符');
-    expect(draftPrompts[0]).toContain('平均每场约 1200 字');
-    expect(draftPrompts[0]).toContain('目标约占正文 60%');
-    expect(draftPrompts[0]).toContain('episode_draft@v2');
-    expect(draftPrompts[1]).not.toContain('TOO_SHORT');
-    expect(draftPrompts[1]).toContain('SPEAKER_NOT_IN_SCENE');
-    expect(store.state.episodes[0]?.scenes.flatMap((scene) => scene.blocks)
-      .reduce((total, block) => total + block.text.replace(/\s/gu, '').length, 0))
-      .toBe(1_180);
-    expect(store.state.episodes[0]?.status).toBe('completed');
+    const completed = store.state.episodes[0]!;
+    const visibleChars = completed.scenes
+      .flatMap((scene) => scene.blocks)
+      .reduce((total, block) => total + block.text.replace(/\s/gu, '').length, 0);
+    expect(visibleChars).toBeGreaterThanOrEqual(900);
+    expect(visibleChars).toBeLessThan(1_200);
+    expect(completed.status).toBe('completed');
+    const draftHistory = (await checkpoints.list(
+      state.projectId,
+      'script_episode_batch:1:1',
+    )).filter((checkpoint) => checkpoint.node === 'draft');
+    expect(draftHistory.filter((checkpoint) => checkpoint.status === 'stale'))
+      .toHaveLength(2);
+    expect(draftHistory).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        artifactRevision: 2,
+        status: 'succeeded',
+        promptVersion: 'episode-draft-v5',
+      }),
+    ]));
   });
 
-  it('rewrites a length-valid fresh draft when dialogue density misses by over 15 points', async () => {
+  it('treats dialogue density and moderate length variation as advisory', async () => {
     const state = readySingleEpisodeState();
     let draftCalls = 0;
     let reviewCalls = 0;
-    const draftPrompts: string[] = [];
-    const payload = (dialogueChars: number) => ({
-      episodeNumber: 1,
-      title: '第一集',
-      scenes: [{
-        ordinal: 1,
-        location: '校报社',
-        timeOfDay: 'day',
-        interiorExterior: 'interior',
-        characterIds: ['lead'],
-        blocks: dialogueChars === 0
-          ? [{ type: 'action', text: '动'.repeat(300) }]
-          : [
-              { type: 'action', text: '动'.repeat(300 - dialogueChars) },
-              {
-                type: 'dialogue', characterId: 'lead', speaker: '沈清',
-                text: '话'.repeat(dialogueChars),
-              },
-            ],
-      }],
-      summary: '', newFacts: [], openedThreads: [], closedThreads: [],
-    });
     const store = new MemoryScriptStore(state);
     const director = new ScriptDirector({
       store,
@@ -1821,14 +1775,32 @@ describe('ScriptDirector', () => {
         async complete(request) {
           if (request.node === 'draft') {
             draftCalls += 1;
-            draftPrompts.push(request.prompt);
-            return JSON.stringify(draftCalls === 1 ? payload(0) : payload(180));
+            return JSON.stringify({
+              episodeNumber: 1,
+              title: '第一集',
+              scenes: [{
+                ordinal: 1,
+                location: '校报社',
+                timeOfDay: 'day',
+                interiorExterior: 'interior',
+                characterIds: ['lead'],
+                blocks: [{ type: 'action', text: exactScriptText('纯动作调查推进', 280) }],
+              }],
+              summary: '',
+              newFacts: [],
+              openedThreads: [],
+              closedThreads: [],
+            });
           }
           if (request.node === 'review') {
             reviewCalls += 1;
             return JSON.stringify({
-              issues: [], summary: '沈清取得证据并继续调查。', newFacts: [],
-              openedThreads: [], closedThreads: [], wardrobe: [],
+              issues: [],
+              summary: '沈清在校报社独自核查证据。',
+              newFacts: [],
+              openedThreads: [],
+              closedThreads: [],
+              wardrobe: [],
             });
           }
           throw new Error(`unexpected node: ${request.node}`);
@@ -1836,16 +1808,23 @@ describe('ScriptDirector', () => {
       },
     });
 
-    await expect(director.run({
-      task: 'script_episode_batch', projectId: state.projectId,
-      startEpisode: 1, episodeCount: 1, expectedPlanRevision: state.plan!.revision,
-    })).resolves.toMatchObject({ kind: 'episode_batch' });
+    const result = await director.run({
+      task: 'script_episode_batch',
+      projectId: state.projectId,
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: state.plan!.revision,
+    });
 
-    expect({ draftCalls, reviewCalls }).toEqual({ draftCalls: 2, reviewCalls: 1 });
-    expect(draftPrompts[1]).toContain('DIALOGUE_DENSITY');
+    expect({ draftCalls, reviewCalls }).toEqual({ draftCalls: 1, reviewCalls: 1 });
+    expect(result).toMatchObject({ kind: 'episode_batch' });
+    if (result.kind !== 'episode_batch') throw new Error('expected episode batch');
+    expect(result.reports[0]?.report.blockingIssues).toEqual([]);
+    expect(result.reports[0]?.report.advisoryIssues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'DIALOGUE_DENSITY', severity: 'soft' }),
+    ]));
     expect(store.state.episodes[0]?.status).toBe('completed');
   });
-
   it.each(['plan', 'characters'] as const)(
     'atomically rejects a candidate when %s changes while the review model is running',
     async (resource) => {
@@ -1942,102 +1921,39 @@ describe('ScriptDirector', () => {
     },
   );
 
-  it('uses one base call plus one incremental-block call for a normal short draft', async () => {
+  it('resumes from the last saved continuation without regenerating accepted text', async () => {
     const state = readySingleEpisodeState();
-    state.plan = { ...state.plan!, targetCharsPerEpisode: 1_200, dialogueDensityPercent: 60 };
-    let baseDraftCalls = 0;
-    let expansionCalls = 0;
-    let reviewCalls = 0;
-    const director = new ScriptDirector({
-      store: new MemoryScriptStore(state),
-      checkpoints: new InMemoryScriptCheckpointStore(),
-      model: {
-        async complete(request) {
-          if (request.node === 'draft') {
-            if (request.prompt.includes('ScriptDraftExpansionAgent')) {
-              expansionCalls += 1;
-              expect(request.prompt).toContain('新增共 700 字，其中对白 420 字、非对白 280 字');
-              return JSON.stringify({
-                blocks: exactExpansionBlocks({
-                  sceneOrdinal: 1,
-                  actionLengths: Array.from({ length: 7 }, () => 40),
-                  dialogueLengths: Array.from({ length: 10 }, () => 42),
-                  label: '甲',
-                }),
-              });
-            }
-            baseDraftCalls += 1;
-            return JSON.stringify({
-              episodeNumber: 1,
-              title: '第一集',
-              scenes: [{
-                ordinal: 1,
-                location: '校报社',
-                timeOfDay: 'day',
-                interiorExterior: 'interior',
-                characterIds: ['lead'],
-                blocks: balancedDraftBlocks(500),
-              }],
-              summary: '', newFacts: [], openedThreads: [], closedThreads: [],
-            });
-          }
-          if (request.node === 'review') {
-            reviewCalls += 1;
-            return JSON.stringify({
-              issues: [], summary: '沈清取得证据并继续调查。', newFacts: [],
-              openedThreads: [], closedThreads: [], wardrobe: [],
-            });
-          }
-          throw new Error(`unexpected node: ${request.node}`);
-        },
-      },
-    });
-
-    await expect(director.run({
-      task: 'script_episode_batch',
-      projectId: state.projectId,
-      startEpisode: 1,
-      episodeCount: 1,
-      expectedPlanRevision: state.plan.revision,
-    })).resolves.toMatchObject({ kind: 'episode_batch' });
-    expect({ baseDraftCalls, expansionCalls, reviewCalls }).toEqual({
-      baseDraftCalls: 1,
-      expansionCalls: 1,
-      reviewCalls: 1,
-    });
-  });
-
-  it('persists a running base before expansion and resumes it after cancellation', async () => {
-    const state = readySingleEpisodeState();
-    state.plan = { ...state.plan!, targetCharsPerEpisode: 1_200, dialogueDensityPercent: 60 };
-    const store = new MemoryScriptStore(state);
+    state.plan = { ...state.plan!, targetCharsPerEpisode: 1_200 };
     const checkpoints = new InMemoryScriptCheckpointStore();
+    const store = new MemoryScriptStore(state);
+    let baseDraftCalls = 0;
+    let continuationCalls = 0;
+    let reviewCalls = 0;
+    let interruptSecondContinuation = true;
     const controller = new AbortController();
-    let abortExpansion = true;
-    let baseDraftCalls = 0;
-    let expansionCalls = 0;
-    let reviewCalls = 0;
-    const expansion = {
-      blocks: exactExpansionBlocks({
-        sceneOrdinal: 1,
-        actionLengths: Array.from({ length: 7 }, () => 40),
-        dialogueLengths: Array.from({ length: 10 }, () => 42),
-        label: '断点',
-      }),
-    };
     const director = new ScriptDirector({
       store,
       checkpoints,
       model: {
         async complete(request) {
           if (request.node === 'draft') {
-            if (request.prompt.includes('ScriptDraftExpansionAgent')) {
-              expansionCalls += 1;
-              if (abortExpansion) {
+            if (request.prompt.includes('episode_draft_continuation@v1')) {
+              continuationCalls += 1;
+              if (interruptSecondContinuation && continuationCalls === 2) {
+                interruptSecondContinuation = false;
                 controller.abort();
-                request.signal?.throwIfAborted();
+                const error = new Error('cancelled during continuation');
+                error.name = 'AbortError';
+                throw error;
               }
-              return JSON.stringify(expansion);
+              const length = continuationCalls === 1 ? 214 : 320;
+              return JSON.stringify({
+                blocks: [{
+                  sceneOrdinal: 1,
+                  type: 'action',
+                  text: exactScriptText(`续写断点${continuationCalls}`, length),
+                }],
+              });
             }
             baseDraftCalls += 1;
             return JSON.stringify({
@@ -2049,449 +1965,108 @@ describe('ScriptDirector', () => {
                 timeOfDay: 'day',
                 interiorExterior: 'interior',
                 characterIds: ['lead'],
-                blocks: balancedDraftBlocks(500),
-              }],
-              summary: '', newFacts: [], openedThreads: [], closedThreads: [],
-            });
-          }
-          if (request.node === 'review') {
-            reviewCalls += 1;
-            return JSON.stringify({
-              issues: [], summary: '沈清找到关键证据。', newFacts: [],
-              openedThreads: [], closedThreads: [], wardrobe: [],
-            });
-          }
-          throw new Error(`unexpected node: ${request.node}`);
-        },
-      },
-    });
-
-    await expect(director.run({
-      task: 'script_episode_batch',
-      projectId: state.projectId,
-      startEpisode: 1,
-      episodeCount: 1,
-      expectedPlanRevision: state.plan.revision,
-      signal: controller.signal,
-    })).rejects.toMatchObject({ name: 'AbortError' });
-
-    expect({ baseDraftCalls, expansionCalls, reviewCalls }).toEqual({
-      baseDraftCalls: 1, expansionCalls: 1, reviewCalls: 0,
-    });
-    expect(store.state.episodes).toEqual([]);
-    expect(store.state.continuityCommits ?? []).toEqual([]);
-    let draftHistory = (await checkpoints.list(state.projectId, 'script_episode_batch:1:1'))
-      .filter((checkpoint) => checkpoint.node === 'draft');
-    expect(draftHistory).toEqual([
-      expect.objectContaining({
-        artifactRevision: 0,
-        status: 'running',
-        inputFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/u),
-        artifact: expect.objectContaining({
-          stage: 'draft',
-          episode: expect.objectContaining({ episodeNumber: 1 }),
-        }),
-      }),
-    ]);
-
-    abortExpansion = false;
-    await expect(director.run({
-      task: 'script_episode_batch',
-      projectId: state.projectId,
-      startEpisode: 1,
-      episodeCount: 1,
-      expectedPlanRevision: state.plan!.revision,
-    })).resolves.toMatchObject({ kind: 'episode_batch' });
-    expect({ baseDraftCalls, expansionCalls, reviewCalls }).toEqual({
-      baseDraftCalls: 1, expansionCalls: 2, reviewCalls: 1,
-    });
-    draftHistory = (await checkpoints.list(state.projectId, 'script_episode_batch:1:1'))
-      .filter((checkpoint) => checkpoint.node === 'draft');
-    expect(draftHistory).toEqual(expect.arrayContaining([
-      expect.objectContaining({ artifactRevision: 0, status: 'stale' }),
-      expect.objectContaining({ artifactRevision: 1, status: 'succeeded' }),
-    ]));
-  });
-
-  it.each([
-    { label: '0%', dialogueOnly: false },
-    { label: '100%', dialogueOnly: true },
-  ])('uses a complete-Episode fixup when a 1000-char $label base cannot reach density by appending', async ({ dialogueOnly }) => {
-    const state = readySingleEpisodeState();
-    state.plan = { ...state.plan!, targetCharsPerEpisode: 1_200, dialogueDensityPercent: 50 };
-    let baseDraftCalls = 0;
-    let expansionCalls = 0;
-    const draftPrompts: string[] = [];
-    const director = new ScriptDirector({
-      store: new MemoryScriptStore(state),
-      checkpoints: new InMemoryScriptCheckpointStore(),
-      model: {
-        async complete(request) {
-          if (request.node === 'draft') {
-            if (request.prompt.includes('ScriptDraftExpansionAgent')) {
-              expansionCalls += 1;
-              throw new Error('unreachable base must not enter expansion');
-            }
-            baseDraftCalls += 1;
-            draftPrompts.push(request.prompt);
-            return JSON.stringify({
-              episodeNumber: 1,
-              title: '第一集',
-              scenes: [{
-                ordinal: 1,
-                location: '校报社',
-                timeOfDay: 'day',
-                interiorExterior: 'interior',
-                characterIds: ['lead'],
-                blocks: baseDraftCalls === 1
-                  ? [dialogueOnly
-                      ? {
-                          type: 'dialogue', characterId: 'lead', speaker: '沈清',
-                          text: '对白'.repeat(500),
-                        }
-                      : { type: 'action', text: '动作'.repeat(500) }]
-                  : [
-                      { type: 'action', text: '动作'.repeat(300) },
-                      {
-                        type: 'dialogue', characterId: 'lead', speaker: '沈清',
-                        text: '对白'.repeat(300),
-                      },
-                    ],
-              }],
-              summary: '', newFacts: [], openedThreads: [], closedThreads: [],
-            });
-          }
-          if (request.node === 'review') {
-            return JSON.stringify({
-              issues: [], summary: '沈清继续追查。', newFacts: [],
-              openedThreads: [], closedThreads: [], wardrobe: [],
-            });
-          }
-          throw new Error(`unexpected node: ${request.node}`);
-        },
-      },
-    });
-
-    await expect(director.run({
-      task: 'script_episode_batch', projectId: state.projectId,
-      startEpisode: 1, episodeCount: 1, expectedPlanRevision: state.plan.revision,
-    })).resolves.toMatchObject({ kind: 'episode_batch' });
-    expect({ baseDraftCalls, expansionCalls }).toEqual({ baseDraftCalls: 2, expansionCalls: 0 });
-    expect(draftPrompts[1]).toContain('DIALOGUE_DENSITY');
-    expect(draftPrompts[1]).toContain('TOO_SHORT');
-  });
-
-  it('allocates a skewed 500/42-char base by per-scene deficits and preserves every original tail', async () => {
-    const state = readySingleEpisodeState();
-    state.plan = { ...state.plan!, targetCharsPerEpisode: 1_200, dialogueDensityPercent: 60 };
-    state.episodeOutlines[0]!.plannedScenes.push({
-      ordinal: 2, location: '走廊', timeOfDay: 'day',
-      interiorExterior: 'interior', purpose: '证人出现',
-    });
-    let expansionPrompt = '';
-    const store = new MemoryScriptStore(state);
-    const director = new ScriptDirector({
-      store,
-      checkpoints: new InMemoryScriptCheckpointStore(),
-      model: {
-        async complete(request) {
-          if (request.node === 'draft') {
-            if (request.prompt.includes('ScriptDraftExpansionAgent')) {
-              expansionPrompt = request.prompt;
-              return JSON.stringify({
                 blocks: [
-                  ...exactExpansionBlocks({
-                    sceneOrdinal: 1,
-                    actionLengths: [],
-                    dialogueLengths: [35, 35, 35, 35],
-                    label: '长场',
-                  }),
-                  ...exactExpansionBlocks({
-                    sceneOrdinal: 2,
-                    actionLengths: [43, 43, 43, 43],
-                    dialogueLengths: [39, 39, 39, 39, 39, 39, 39, 39, 34],
-                    label: '短场',
-                  }),
-                ],
-              });
-            }
-            return JSON.stringify({
-              episodeNumber: 1,
-              title: '第一集',
-              scenes: [{
-                ordinal: 1, location: '校报社', timeOfDay: 'day',
-                interiorExterior: 'interior', characterIds: ['lead'],
-                blocks: [
-                  { type: 'action', text: '动'.repeat(280) },
-                  { type: 'dialogue', characterId: 'lead', speaker: '沈清', text: '话'.repeat(220) },
-                ],
-              }, {
-                ordinal: 2, location: '走廊', timeOfDay: 'day',
-                interiorExterior: 'interior', characterIds: ['lead'],
-                blocks: [
-                  { type: 'action', text: '动'.repeat(24) },
-                  { type: 'dialogue', characterId: 'lead', speaker: '沈清', text: '问'.repeat(14) },
-                  { type: 'action', text: '门开了！' },
+                  { type: 'action', text: exactScriptText('可恢复基稿动作', 280) },
+                  {
+                    type: 'dialogue',
+                    characterId: 'lead',
+                    speaker: '沈清',
+                    text: exactScriptText('可恢复基稿对白', 220),
+                  },
                 ],
               }],
-              summary: '', newFacts: [], openedThreads: [], closedThreads: [],
+              summary: '',
+              newFacts: [],
+              openedThreads: [],
+              closedThreads: [],
             });
-          }
-          if (request.node === 'review') {
-            return JSON.stringify({
-              issues: [], summary: '证人现身。', newFacts: [],
-              openedThreads: [], closedThreads: [], wardrobe: [],
-            });
-          }
-          throw new Error(`unexpected node: ${request.node}`);
-        },
-      },
-    });
-
-    await expect(director.run({
-      task: 'script_episode_batch', projectId: state.projectId,
-      startEpisode: 1, episodeCount: 1, expectedPlanRevision: state.plan.revision,
-    })).resolves.toMatchObject({ kind: 'episode_batch' });
-    expect(expansionPrompt).toContain('"sceneOrdinal":1,"dialogueChars":140,"nonDialogueChars":0,"visibleChars":140');
-    expect(expansionPrompt).toContain('"sceneOrdinal":2,"dialogueChars":346,"nonDialogueChars":172,"visibleChars":518');
-    const [first, second] = store.state.episodes[0]!.scenes;
-    expect(first!.blocks.at(-1)?.text).toBe('话'.repeat(220));
-    expect(second!.blocks.slice(-2).map((block) => block.text)).toEqual(['问'.repeat(14), '门开了！']);
-    const additions = store.state.episodes[0]!.scenes.map((scene) =>
-      scene.blocks.filter((block) => block.text.startsWith('扩写')).length
-    );
-    expect(additions[1]).toBeGreaterThan(additions[0]! * 3);
-  });
-
-  it('does not require blocks for a scene whose dialogue and action deficits are both zero', async () => {
-    const state = readySingleEpisodeState();
-    state.plan = { ...state.plan!, targetCharsPerEpisode: 1_200, dialogueDensityPercent: 60 };
-    state.episodeOutlines[0]!.plannedScenes.push({
-      ordinal: 2, location: '走廊', timeOfDay: 'day',
-      interiorExterior: 'interior', purpose: '证人出现',
-    });
-    let expansionPrompt = '';
-    const store = new MemoryScriptStore(state);
-    const director = new ScriptDirector({
-      store,
-      checkpoints: new InMemoryScriptCheckpointStore(),
-      model: {
-        async complete(request) {
-          if (request.node === 'draft') {
-            if (request.prompt.includes('ScriptDraftExpansionAgent')) {
-              expansionPrompt = request.prompt;
-              return JSON.stringify({
-                blocks: exactExpansionBlocks({
-                  sceneOrdinal: 2,
-                  actionLengths: [36, 36, 36, 36, 36, 36],
-                  dialogueLengths: Array.from({ length: 9 }, () => 38),
-                  label: '补短场',
-                }),
-              });
-            }
-            return JSON.stringify({
-              episodeNumber: 1,
-              title: '第一集',
-              scenes: [{
-                ordinal: 1, location: '校报社', timeOfDay: 'day',
-                interiorExterior: 'interior', characterIds: ['lead'],
-                blocks: [
-                  { type: 'action', text: '动'.repeat(240) },
-                  { type: 'dialogue', characterId: 'lead', speaker: '沈清', text: '话'.repeat(360) },
-                ],
-              }, {
-                ordinal: 2, location: '走廊', timeOfDay: 'day',
-                interiorExterior: 'interior', characterIds: ['lead'],
-                blocks: [
-                  { type: 'action', text: '动'.repeat(20) },
-                  { type: 'dialogue', characterId: 'lead', speaker: '沈清', text: '问'.repeat(18) },
-                  { type: 'action', text: '门开了！' },
-                ],
-              }],
-              summary: '', newFacts: [], openedThreads: [], closedThreads: [],
-            });
-          }
-          if (request.node === 'review') {
-            return JSON.stringify({
-              issues: [], summary: '证人现身。', newFacts: [],
-              openedThreads: [], closedThreads: [], wardrobe: [],
-            });
-          }
-          throw new Error(`unexpected node: ${request.node}`);
-        },
-      },
-    });
-
-    await expect(director.run({
-      task: 'script_episode_batch', projectId: state.projectId,
-      startEpisode: 1, episodeCount: 1, expectedPlanRevision: state.plan.revision,
-    })).resolves.toMatchObject({ kind: 'episode_batch' });
-    expect(expansionPrompt).toContain('"sceneOrdinal":1,"dialogueChars":0,"nonDialogueChars":0,"visibleChars":0,"approximatelyBlocks":0');
-    expect(store.state.episodes[0]!.scenes[0]!.blocks).toHaveLength(2);
-    expect(store.state.episodes[0]!.scenes[1]!.blocks.slice(-2).map((block) => block.text))
-      .toEqual(['问'.repeat(18), '门开了！']);
-  });
-
-  it('rejects normalized near-duplicate dialogue in incremental blocks', async () => {
-    const state = readySingleEpisodeState();
-    state.plan = { ...state.plan!, targetCharsPerEpisode: 1_200, dialogueDensityPercent: 60 };
-    let expansionCalls = 0;
-    const director = new ScriptDirector({
-      store: new MemoryScriptStore(state),
-      checkpoints: new InMemoryScriptCheckpointStore(),
-      model: {
-        async complete(request) {
-          if (request.node !== 'draft') throw new Error('review must not run');
-          if (request.prompt.includes('ScriptDraftExpansionAgent')) {
-            expansionCalls += 1;
-            const repeatedDialogue = exactScriptText('关键证据藏在旧柜', 40);
-            return JSON.stringify({
-              blocks: [
-                { sceneOrdinal: 1, type: 'action', text: exactScriptText('扩写动作重复校验', 40) },
-                {
-                  sceneOrdinal: 1, type: 'dialogue', characterId: 'lead', speaker: '沈清',
-                  text: repeatedDialogue,
-                },
-                {
-                  sceneOrdinal: 1, type: 'dialogue', characterId: 'lead', speaker: '沈清',
-                  text: `${repeatedDialogue.slice(0, -1)}啊`,
-                },
-              ],
-            });
-          }
-          return JSON.stringify({
-            episodeNumber: 1,
-            title: '第一集',
-            scenes: [{
-              ordinal: 1, location: '校报社', timeOfDay: 'day',
-              interiorExterior: 'interior', characterIds: ['lead'],
-              blocks: balancedDraftBlocks(500),
-            }],
-            summary: '', newFacts: [], openedThreads: [], closedThreads: [],
-          });
-        },
-      },
-    });
-
-    await expect(director.run({
-      task: 'script_episode_batch', projectId: state.projectId,
-      startEpisode: 1, episodeCount: 1, expectedPlanRevision: state.plan.revision,
-    })).rejects.toThrow('EXPANSION_DUPLICATE_DIALOGUE');
-    expect(expansionCalls).toBe(2);
-  });
-
-  it('durably resumes a 542-char 44%-dialogue base by retrying only distributed blocks', async () => {
-    const state = readySingleEpisodeState();
-    state.plan = {
-      ...state.plan!,
-      targetCharsPerEpisode: 1_200,
-      dialogueDensityPercent: 60,
-    };
-    state.episodeOutlines[0]!.plannedScenes = [
-      ...state.episodeOutlines[0]!.plannedScenes,
-      {
-        ordinal: 2,
-        location: '教学楼走廊',
-        timeOfDay: 'day',
-        interiorExterior: 'interior',
-        purpose: '证人推门出现形成卡点',
-      },
-    ];
-    state.episodeOutlines[0]!.requiredFacts = ['关键账本'];
-    let baseDraftCalls = 0;
-    let expansionCalls = 0;
-    let reviewCalls = 0;
-    let expansionCanSucceed = false;
-    const expansionPrompts: string[] = [];
-    const checkpoints = new InMemoryScriptCheckpointStore();
-    const store = new MemoryScriptStore(state);
-    const baseDialogueByScene = [
-      [
-        exactScriptText('基稿对白甲一', 60, 3),
-        exactScriptText('基稿对白甲二', 59, 7),
-      ],
-      [
-        exactScriptText('基稿对白乙一', 60, 15),
-        exactScriptText('基稿对白乙二', 59, 19),
-      ],
-    ];
-    const baseDraft = {
-      episodeNumber: 1,
-      title: '第一集',
-      scenes: [{
-        ordinal: 1,
-        location: '校报社',
-        timeOfDay: 'day',
-        interiorExterior: 'interior',
-        characterIds: ['lead'],
-        blocks: [
-          { type: 'action', text: '动'.repeat(150) },
-          ...[60, 59].map((_, index) => ({
-            type: 'dialogue', characterId: 'lead', speaker: '沈清',
-            text: baseDialogueByScene[0]![index]!,
-          })),
-        ],
-      }, {
-        ordinal: 2,
-        location: '教学楼走廊',
-        timeOfDay: 'day',
-        interiorExterior: 'interior',
-        characterIds: ['lead'],
-        blocks: [
-          { type: 'action', text: '动'.repeat(150) },
-          ...[60, 59].map((_, index) => ({
-            type: 'dialogue', characterId: 'lead', speaker: '沈清',
-            text: baseDialogueByScene[1]![index]!,
-          })),
-          { type: 'action', text: '门被推开' },
-        ],
-      }],
-      summary: '',
-      newFacts: [],
-      openedThreads: [],
-      closedThreads: [],
-    };
-    const successfulExpansion = {
-      blocks: [
-        ...exactExpansionBlocks({
-          sceneOrdinal: 1,
-          actionLengths: [45, 45],
-          dialogueLengths: [41, 40, 40, 40, 40, 40],
-          label: '甲',
-        }).map((block, index) => index === 2
-          ? { ...block, text: exactScriptText('关键账本就在旧档案柜', block.text.length) }
-          : block),
-        ...exactExpansionBlocks({
-          sceneOrdinal: 2,
-          actionLengths: [43, 43],
-          dialogueLengths: [41, 40, 40, 40, 40, 40],
-          label: '乙',
-        }),
-      ],
-    };
-    const director = new ScriptDirector({
-      store,
-      checkpoints,
-      model: {
-        async complete(request) {
-          if (request.node === 'draft') {
-            if (request.prompt.includes('ScriptDraftExpansionAgent')) {
-              expansionCalls += 1;
-              expansionPrompts.push(request.prompt);
-              return JSON.stringify(expansionCanSucceed
-                ? successfulExpansion
-                : { blocks: [1, 2].map((sceneOrdinal) => ({
-                    sceneOrdinal, type: 'action', text: '不足'.repeat(10),
-                  })) });
-            }
-            baseDraftCalls += 1;
-            return JSON.stringify(baseDraft);
           }
           if (request.node === 'review') {
             reviewCalls += 1;
             return JSON.stringify({
               issues: [],
-              summary: '沈清在校报社追查证据，门外出现新的知情人。',
+              summary: '沈清保留证据并继续推进调查。',
+              newFacts: [],
+              openedThreads: [],
+              closedThreads: [],
+              wardrobe: [],
+            });
+          }
+          throw new Error(`unexpected node: ${request.node}`);
+        },
+      },
+    });
+    const request = {
+      task: 'script_episode_batch' as const,
+      projectId: state.projectId,
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: state.plan.revision,
+    };
+
+    await expect(director.run({ ...request, signal: controller.signal }))
+      .rejects.toMatchObject({ name: 'AbortError' });
+    expect({ baseDraftCalls, continuationCalls, reviewCalls }).toEqual({
+      baseDraftCalls: 1,
+      continuationCalls: 2,
+      reviewCalls: 0,
+    });
+    expect(store.state.episodes).toEqual([]);
+
+    await expect(director.run(request)).resolves.toMatchObject({ kind: 'episode_batch' });
+    expect({ baseDraftCalls, continuationCalls, reviewCalls }).toEqual({
+      baseDraftCalls: 1,
+      continuationCalls: 3,
+      reviewCalls: 1,
+    });
+    const completed = store.state.episodes[0]!;
+    const combined = completed.scenes
+      .flatMap((scene) => scene.blocks)
+      .map((block) => block.text)
+      .join('');
+    expect(combined).toContain('续写断点1');
+    expect(combined).toContain('续写断点3');
+    expect(completed.status).toBe('completed');
+  });
+
+  it('keeps a valid base draft when continuation output is unusable', async () => {
+    const state = readySingleEpisodeState();
+    state.plan = { ...state.plan!, targetCharsPerEpisode: 1_200 };
+    let baseDraftCalls = 0;
+    let continuationCalls = 0;
+    const store = new MemoryScriptStore(state);
+    const director = new ScriptDirector({
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+      model: {
+        async complete(request) {
+          if (request.node === 'draft') {
+            if (request.prompt.includes('episode_draft_continuation@v1')) {
+              continuationCalls += 1;
+              return JSON.stringify({ blocks: [] });
+            }
+            baseDraftCalls += 1;
+            return JSON.stringify({
+              episodeNumber: 1,
+              title: '第一集',
+              scenes: [{
+                ordinal: 1,
+                location: '校报社',
+                timeOfDay: 'day',
+                interiorExterior: 'interior',
+                characterIds: ['lead'],
+                blocks: balancedDraftBlocks(500),
+              }],
+              summary: '',
+              newFacts: [],
+              openedThreads: [],
+              closedThreads: [],
+            });
+          }
+          if (request.node === 'review') {
+            return JSON.stringify({
+              issues: [],
+              summary: '沈清开始调查。',
               newFacts: [],
               openedThreads: [],
               closedThreads: [],
@@ -2503,215 +2078,28 @@ describe('ScriptDirector', () => {
       },
     });
 
-    let rejected: unknown;
-    try {
-      await director.run({
-        task: 'script_episode_batch',
-        projectId: state.projectId,
-        startEpisode: 1,
-        episodeCount: 1,
-        expectedPlanRevision: state.plan.revision,
-      });
-    } catch (error) {
-      rejected = error;
-    }
-
-    expect(rejected).toBeInstanceOf(ScriptStructuredNeedsReviewError);
-    expect(rejected).toMatchObject({ node: 'draft', recoverable: true });
-    expect((rejected as Error).message).toContain('EXPANSION_BUDGET_MISS');
-    expect({ baseDraftCalls, expansionCalls, reviewCalls }).toEqual({
-      baseDraftCalls: 1,
-      expansionCalls: 2,
-      reviewCalls: 0,
-    });
-    expect(store.state.episodes).toEqual([]);
-    let draftHistory = (await checkpoints.list(state.projectId, 'script_episode_batch:1:1'))
-      .filter((checkpoint) => checkpoint.node === 'draft');
-    expect(draftHistory).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        artifactRevision: 0,
-        status: 'stale',
-        promptVersion: 'episode-draft-v4',
-        validationErrors: expect.arrayContaining([
-          expect.objectContaining({ code: 'TOO_SHORT' }),
-        ]),
-      }),
-      expect.objectContaining({
-        artifactRevision: 1,
-        status: 'needs_review',
-        promptVersion: 'episode-draft-v4',
-        validationErrors: expect.arrayContaining([
-          expect.objectContaining({ code: 'TOO_SHORT' }),
-          expect.objectContaining({ code: 'EXPANSION_BUDGET_MISS' }),
-        ]),
-      }),
-    ]));
-    expect(JSON.stringify(draftHistory)).not.toContain('sk-');
-
-    await expect(director.run({
+    const result = await director.run({
       task: 'script_episode_batch',
       projectId: state.projectId,
       startEpisode: 1,
       episodeCount: 1,
       expectedPlanRevision: state.plan.revision,
-      resumeRejectedCandidates: true,
-    })).rejects.toMatchObject({ code: 'SCRIPT_STRUCTURED_NEEDS_REVIEW', node: 'draft' });
-    expect({ baseDraftCalls, expansionCalls, reviewCalls }).toEqual({
-      baseDraftCalls: 1,
-      expansionCalls: 4,
-      reviewCalls: 0,
     });
-    draftHistory = (await checkpoints.list(state.projectId, 'script_episode_batch:1:1'))
-      .filter((checkpoint) => checkpoint.node === 'draft');
-    expect(draftHistory).toEqual(expect.arrayContaining([
-      expect.objectContaining({ artifactRevision: 0, status: 'stale' }),
-      expect.objectContaining({ artifactRevision: 1, status: 'stale' }),
-      expect.objectContaining({ artifactRevision: 2, status: 'needs_review' }),
+
+    expect({ baseDraftCalls, continuationCalls }).toEqual({
+      baseDraftCalls: 1,
+      continuationCalls: 2,
+    });
+    expect(result).toMatchObject({ kind: 'episode_batch' });
+    if (result.kind !== 'episode_batch') throw new Error('expected episode batch');
+    expect(result.reports[0]?.report.advisoryIssues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'TOO_SHORT', severity: 'soft' }),
     ]));
-
-    expansionCanSucceed = true;
-    const completed = await director.run({
-      task: 'script_episode_batch',
-      projectId: state.projectId,
-      startEpisode: 1,
-      episodeCount: 1,
-      expectedPlanRevision: state.plan.revision,
-      resumeRejectedCandidates: true,
-    });
-    expect(completed).toMatchObject({ kind: 'episode_batch' });
-    if (completed.kind !== 'episode_batch') throw new Error('expected episode batch');
-    expect(completed.reports.flatMap((item) => item.report.issues)
-      .some((issue) => issue.code === 'DUPLICATE_DIALOGUE')).toBe(false);
-
-    expect({ baseDraftCalls, expansionCalls, reviewCalls }).toEqual({
-      baseDraftCalls: 1,
-      expansionCalls: 5,
-      reviewCalls: 1,
-    });
-    const resumedPrompt = expansionPrompts.at(-1) ?? '';
-    expect(resumedPrompt).toContain('当前基稿共 542 字');
-    expect(resumedPrompt).toContain('对白 238 字（44%）');
-    expect(resumedPrompt).toContain('新增共 658 字，其中对白 482 字、非对白 176 字');
-    expect(resumedPrompt).toContain('上次增量候选被系统拒绝');
-    expect(resumedPrompt).toContain('EXPANSION_BUDGET_MISS');
-    expect(resumedPrompt).toContain('基稿尚未命中的 requiredFacts（必须由增量正文明确补齐）：["关键账本"]');
-    expect(resumedPrompt).toContain('世界圣经');
-    expect(resumedPrompt).toContain('本集人物');
-    expect(resumedPrompt).toContain('伏笔与当前状态');
     expect(store.state.episodes[0]?.status).toBe('completed');
-    const completedBlocks = store.state.episodes[0]?.scenes.flatMap((scene) => scene.blocks) ?? [];
-    const visibleChars = completedBlocks.reduce(
-      (total, block) => total + block.text.replace(/\s/gu, '').length,
-      0,
-    );
-    const dialogueChars = completedBlocks.reduce(
-      (total, block) => total + (block.type === 'dialogue'
-        ? block.text.replace(/\s/gu, '').length
-        : 0),
-      0,
-    );
-    expect({ visibleChars, dialogueChars }).toEqual({ visibleChars: 1_200, dialogueChars: 720 });
-    expect(store.state.episodes[0]?.scenes[0]?.blocks.at(-1)?.text).toBe(baseDialogueByScene[0]![1]);
-    expect(store.state.episodes[0]?.scenes.at(-1)?.blocks.slice(-2).map((block) => block.text))
-      .toEqual([baseDialogueByScene[1]![1], '门被推开']);
-    expect(store.state.episodes[0]?.scenes.map((scene) =>
-      scene.blocks.filter((block) => block.text.startsWith('扩写') || block.text.startsWith('关键账本')).length
-    )).toEqual([8, 8]);
-    draftHistory = (await checkpoints.list(state.projectId, 'script_episode_batch:1:1'))
-      .filter((checkpoint) => checkpoint.node === 'draft');
-    expect(draftHistory).toEqual(expect.arrayContaining([
-      expect.objectContaining({ artifactRevision: 0, status: 'stale' }),
-      expect.objectContaining({ artifactRevision: 1, status: 'stale' }),
-      expect.objectContaining({ artifactRevision: 2, status: 'stale' }),
-      expect.objectContaining({ artifactRevision: 3, status: 'succeeded' }),
-    ]));
+    expect(store.state.episodes[0]?.scenes.flatMap((scene) => scene.blocks))
+      .toHaveLength(2);
   });
-
-  it.each(['config', 'character'] as const)(
-    'stales a rejected draft base when %s input changes before resume',
-    async (changedInput) => {
-      const state = readySingleEpisodeState();
-      state.plan = { ...state.plan!, targetCharsPerEpisode: 1_200 };
-      const store = new MemoryScriptStore(state);
-      const checkpoints = new InMemoryScriptCheckpointStore();
-      let configRevision = 'a'.repeat(64);
-      let regenerate = false;
-      let baseDraftCalls = 0;
-      let expansionCalls = 0;
-      const episode = (chars: number) => ({
-        episodeNumber: 1,
-        title: '第一集',
-        scenes: [{
-          ordinal: 1,
-          location: '校报社',
-          timeOfDay: 'day',
-          interiorExterior: 'interior',
-          characterIds: ['lead'],
-          blocks: balancedDraftBlocks(chars),
-        }],
-        summary: '', newFacts: [], openedThreads: [], closedThreads: [],
-      });
-      const director = new ScriptDirector({
-        store,
-        checkpoints,
-        model: {
-          async getModelConfigFingerprint() { return configRevision; },
-          async complete(request) {
-            if (request.node === 'draft') {
-              if (request.prompt.includes('ScriptDraftExpansionAgent')) {
-                expansionCalls += 1;
-                return JSON.stringify({ blocks: [] });
-              }
-              baseDraftCalls += 1;
-              return JSON.stringify(episode(regenerate ? 1_200 : 500));
-            }
-            if (request.node === 'review') {
-              return JSON.stringify({
-                issues: [], summary: '沈清取得关键证据。', newFacts: [],
-                openedThreads: [], closedThreads: [], wardrobe: [],
-              });
-            }
-            throw new Error(`unexpected node: ${request.node}`);
-          },
-        },
-      });
-      const request = {
-        task: 'script_episode_batch' as const,
-        projectId: state.projectId,
-        startEpisode: 1,
-        episodeCount: 1,
-        expectedPlanRevision: state.plan.revision,
-      };
-
-      await expect(director.run(request)).rejects.toMatchObject({
-        code: 'SCRIPT_STRUCTURED_NEEDS_REVIEW',
-        node: 'draft',
-      });
-      expect({ baseDraftCalls, expansionCalls }).toEqual({ baseDraftCalls: 1, expansionCalls: 2 });
-
-      regenerate = true;
-      if (changedInput === 'config') configRevision = 'b'.repeat(64);
-      else store.state.characters[0] = {
-        ...store.state.characters[0]!,
-        revision: store.state.characters[0]!.revision + 1,
-      };
-      await expect(director.run({
-        ...request,
-        resumeRejectedCandidates: true,
-      })).resolves.toMatchObject({ kind: 'episode_batch' });
-
-      expect({ baseDraftCalls, expansionCalls }).toEqual({ baseDraftCalls: 2, expansionCalls: 2 });
-      const draftHistory = (await checkpoints.list(state.projectId, 'script_episode_batch:1:1'))
-        .filter((checkpoint) => checkpoint.node === 'draft');
-      expect(draftHistory).toEqual(expect.arrayContaining([
-        expect.objectContaining({ artifactRevision: 0, status: 'stale' }),
-        expect.objectContaining({ artifactRevision: 1, status: 'stale' }),
-        expect.objectContaining({ artifactRevision: 2, status: 'succeeded' }),
-      ]));
-    },
-  );
-
-  it('rejects a revision that fixes length but leaves a speaker outside the scene', async () => {
+  it('uses a bounded fixup when the first revision leaves a speaker outside the scene', async () => {
     const state = readySingleEpisodeState();
     state.characters.push({
       ...structuredClone(state.characters[0]!),
@@ -2758,18 +2146,11 @@ describe('ScriptDirector', () => {
               scenes: Array<{ id: string }>;
             };
             return JSON.stringify({
-              operations: [
-                ...(revisionCalls === 1 ? [] : [{
+              operations: revisionCalls === 1 ? [] : [{
                   op: 'updateSceneCharacters',
                   sceneId: current.scenes[0]!.id,
                   characterIds: ['lead', 'witness'],
-                }]),
-                {
-                  op: 'appendBlock',
-                  sceneId: current.scenes[0]!.id,
-                  block: { type: 'action', text: '补'.repeat(100) },
-                },
-              ],
+                }],
             });
           }
           if (request.node === 'draft') throw new Error('reviewing fixture must skip draft');
@@ -2787,305 +2168,117 @@ describe('ScriptDirector', () => {
     })).resolves.toMatchObject({ kind: 'episode_batch' });
 
     expect({ revisionCalls, reviewCalls }).toEqual({ revisionCalls: 2, reviewCalls: 2 });
-    expect(revisionPrompts[1]).toContain('revision.quality');
+    expect(revisionPrompts[1]).toContain('array.non_empty');
     expect(revisionPrompts[1]).toContain('SPEAKER_NOT_IN_SCENE');
     expect(store.state.episodes[0]?.scenes[0]?.characterIds).toEqual(['lead', 'witness']);
     expect(store.state.episodes[0]?.status).toBe('completed');
   });
 
-  it('revises a deterministic blocking issue and completes after the follow-up review', async () => {
+  it('revises an obvious structural error and completes after the follow-up review', async () => {
     const state = readySingleEpisodeState();
-    state.episodes = [reviewingEpisode(state, '剧情'.repeat(100))];
+    const candidate = reviewingEpisode(state, '△沈清闯进校报社。');
+    state.episodes = [candidate];
     let reviewCalls = 0;
-    const episodePayload = {
-      episodeNumber: 1,
-      title: '第一集',
-      scenes: [{
-        ordinal: 1,
-        location: '校报社',
-        timeOfDay: 'day',
-        interiorExterior: 'interior',
-        characterIds: ['lead'],
-        blocks: [{ type: 'action', text: '剧情'.repeat(150) }],
-      }],
-      summary: '',
-      newFacts: [],
-      openedThreads: [],
-      closedThreads: [],
-    };
-    const shortEpisodePayload = {
-      ...episodePayload,
-      scenes: [{
-        ...episodePayload.scenes[0],
-        blocks: [{ type: 'action', text: '剧情'.repeat(100) }],
-      }],
-    };
-    const model: ScriptModelAdapter = {
-      async complete(request) {
-        if (request.node === 'draft') return JSON.stringify(shortEpisodePayload);
-        if (request.node === 'revision') {
-          const taskPrompt = request.prompt.split('\n结构契约：')[0] ?? request.prompt;
-          const current = JSON.parse(taskPrompt.split('当前候选：').at(-1) ?? '{}') as {
-            scenes: Array<{ id: string }>;
-          };
-          return JSON.stringify({
-            operations: [{
-              op: 'appendBlock',
-              sceneId: current.scenes[0]?.id,
-              block: { type: 'action', text: '补充'.repeat(30) },
-            }],
-          });
-        }
-        if (request.node === 'review') {
-          reviewCalls += 1;
-          return JSON.stringify({
-            issues: [],
-            summary: '沈清继续调查。',
-            newFacts: [],
-            openedThreads: [],
-            closedThreads: [],
-            wardrobe: [],
-          });
-        }
-        throw new Error(`unexpected node: ${request.node}`);
-      },
-    };
+    let revisionCalls = 0;
     const store = new MemoryScriptStore(state);
     const director = new ScriptDirector({
-      model,
       store,
       checkpoints: new InMemoryScriptCheckpointStore(),
+      model: {
+        async complete(request) {
+          if (request.node === 'revision') {
+            revisionCalls += 1;
+            return JSON.stringify({
+              operations: [{
+                op: 'replaceBlockText',
+                sceneId: candidate.scenes[0]!.id,
+                blockId: candidate.scenes[0]!.blocks[0]!.id,
+                text: '沈清推门闯进校报社，把录音笔按在桌面上。',
+              }],
+            });
+          }
+          if (request.node === 'review') {
+            reviewCalls += 1;
+            return JSON.stringify({
+              issues: [],
+              summary: '沈清带着录音证据闯进校报社。',
+              newFacts: [],
+              openedThreads: [],
+              closedThreads: [],
+              wardrobe: [],
+            });
+          }
+          if (request.node === 'draft') throw new Error('reviewing fixture must skip draft');
+          throw new Error(`unexpected node: ${request.node}`);
+        },
+      },
+    });
+
+    const result = await director.run({
+      task: 'script_episode_batch',
+      projectId: state.projectId,
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: state.plan!.revision,
+    });
+
+    expect(result).toMatchObject({ kind: 'episode_batch' });
+    expect({ reviewCalls, revisionCalls }).toEqual({ reviewCalls: 2, revisionCalls: 1 });
+    expect(store.state.episodes[0]?.status).toBe('completed');
+    expect(store.state.episodes[0]?.scenes[0]?.blocks[0]?.text)
+      .toBe('沈清推门闯进校报社，把录音笔按在桌面上。');
+    expect(store.saveEpisodeCalls).toHaveLength(0);
+    expect(store.atomicCommitCalls).toHaveLength(1);
+  });
+  it('keeps an overlong but structurally valid episode as advisory instead of rewriting it', async () => {
+    const state = readySingleEpisodeState();
+    state.episodes = [reviewingEpisode(state, '超长'.repeat(200), { title: '偏长候选' })];
+    let reviewCalls = 0;
+    let revisionCalls = 0;
+    const store = new MemoryScriptStore(state);
+    const director = new ScriptDirector({
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+      model: {
+        async complete(request) {
+          if (request.node === 'review') {
+            reviewCalls += 1;
+            return JSON.stringify({
+              issues: [],
+              summary: '沈清详细梳理了全部证据。',
+              newFacts: [],
+              openedThreads: [],
+              closedThreads: [],
+              wardrobe: [],
+            });
+          }
+          if (request.node === 'revision') {
+            revisionCalls += 1;
+            throw new Error('length advice must not trigger revision');
+          }
+          if (request.node === 'draft') throw new Error('reviewing fixture must skip draft');
+          throw new Error(`unexpected node: ${request.node}`);
+        },
+      },
     });
 
     const result = await director.run({
       task: 'script_episode_batch',
-      projectId: 'project-1',
+      projectId: state.projectId,
       startEpisode: 1,
       episodeCount: 1,
-      expectedPlanRevision: 1,
+      expectedPlanRevision: state.plan!.revision,
     });
 
-    expect(result.kind).toBe('episode_batch');
-    if (result.kind !== 'episode_batch') throw new Error('预期 episode_batch');
-    expect(reviewCalls).toBe(2);
-    expect(store.state.episodes[0]?.status).toBe('completed');
-    expect(store.state.episodes[0]?.scenes[0]?.blocks).toHaveLength(2);
-    expect(store.state.episodes[0]?.scenes[0]?.blocks[0]?.text).toBe('剧情'.repeat(100));
-    expect(store.saveEpisodeCalls).toHaveLength(0);
-    expect(store.atomicCommitCalls).toHaveLength(1);
-    expect(result.reports[0]?.report.hardFailed).toBe(false);
-  });
-
-  it('repairs TOO_LONG through text-only reduction and commits once inside the target range', async () => {
-    const state = readySingleEpisodeState();
-    state.episodes = [reviewingEpisode(state, '超长'.repeat(180), { title: '超长候选' })];
-    let reviewCalls = 0;
-    let revisionCalls = 0;
-    let revisionPrompt = '';
-    const store = new MemoryScriptStore(state);
-    const director = new ScriptDirector({
-      store,
-      checkpoints: new InMemoryScriptCheckpointStore(),
-      model: {
-        async complete(request) {
-          if (request.node === 'draft') {
-            return JSON.stringify({
-              episodeNumber: 1,
-              title: '超长候选',
-              scenes: [{
-                ordinal: 1,
-                location: '校报社',
-                timeOfDay: 'day',
-                interiorExterior: 'interior',
-                characterIds: ['lead'],
-                blocks: [{ type: 'action', text: '超长'.repeat(180) }],
-              }],
-              summary: '', newFacts: [], openedThreads: [], closedThreads: [],
-            });
-          }
-          if (request.node === 'review') {
-            reviewCalls += 1;
-            return JSON.stringify({
-              issues: [], summary: '沈清精简证据说明。', newFacts: [],
-              openedThreads: [], closedThreads: [], wardrobe: [],
-            });
-          }
-          if (request.node === 'revision') {
-            revisionCalls += 1;
-            revisionPrompt = request.prompt;
-            const taskPrompt = request.prompt.split('\n结构契约：')[0] ?? request.prompt;
-            const current = JSON.parse(taskPrompt.split('当前候选：').at(-1) ?? '{}') as {
-              scenes: Array<{ id: string; blocks: Array<{ id: string }> }>;
-            };
-            return JSON.stringify({ operations: [{
-              op: 'replaceBlockText',
-              sceneId: current.scenes[0]!.id,
-              blockId: current.scenes[0]!.blocks[0]!.id,
-              text: '精简'.repeat(150),
-            }] });
-          }
-          throw new Error(`unexpected node: ${request.node}`);
-        },
-      },
-    });
-
-    const result = await director.run({
-      task: 'script_episode_batch', projectId: 'project-1',
-      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
-    });
-
-    expect(result.kind).toBe('episode_batch');
-    expect(reviewCalls).toBe(2);
-    expect(revisionCalls).toBe(1);
-    expect(revisionPrompt).toContain('修订后必须落在 255—345 个可见字符');
-    expect(revisionPrompt).toContain('精确 revisionPolicy（唯一授权来源）');
-    expect(revisionPrompt).toContain('唯一允许的操作与锚点（未列出的一律禁止）');
-    expect(revisionPrompt).toContain('每块当前可见字数');
-    expect(revisionPrompt).toContain('"idealNetChange":-60');
-    expect(revisionPrompt).not.toContain('恰好包含');
-    expect(store.state.episodes[0]?.scenes[0]?.blocks[0]?.text).toBe('精简'.repeat(150));
-    expect(store.atomicCommitCalls).toHaveLength(1);
-  });
-
-  it.each([
-    { label: 'still too long', replacement: '仍长'.repeat(175), expected: '变为 350 字' },
-    { label: 'over-reduced', replacement: '过短'.repeat(125), expected: '变为 250 字' },
-  ])('rejects a TOO_LONG patch that is $label', async ({ replacement, expected }) => {
-    const state = readySingleEpisodeState();
-    state.episodes = [reviewingEpisode(state, '超长'.repeat(180), { title: '超长候选' })];
-    const store = new MemoryScriptStore(state);
-    const checkpoints = new InMemoryScriptCheckpointStore();
-    const director = new ScriptDirector({
-      store,
-      checkpoints,
-      model: {
-        async complete(request) {
-          if (request.node === 'draft') {
-            return JSON.stringify({
-              episodeNumber: 1, title: '超长候选',
-              scenes: [{
-                ordinal: 1, location: '校报社', timeOfDay: 'day',
-                interiorExterior: 'interior', characterIds: ['lead'],
-                blocks: [{ type: 'action', text: '超长'.repeat(180) }],
-              }],
-              summary: '', newFacts: [], openedThreads: [], closedThreads: [],
-            });
-          }
-          if (request.node === 'review') {
-            return JSON.stringify({
-              issues: [], summary: '沈清精简证据说明。', newFacts: [],
-              openedThreads: [], closedThreads: [], wardrobe: [],
-            });
-          }
-          if (request.node === 'revision') {
-            const taskPrompt = request.prompt.split('\n结构契约：')[0] ?? request.prompt;
-            const current = JSON.parse(taskPrompt.split('当前候选：').at(-1) ?? '{}') as {
-              scenes: Array<{ id: string; blocks: Array<{ id: string }> }>;
-            };
-            return JSON.stringify({ operations: [{
-              op: 'replaceBlockText',
-              sceneId: current.scenes[0]!.id,
-              blockId: current.scenes[0]!.blocks[0]!.id,
-              text: replacement,
-            }] });
-          }
-          throw new Error(`unexpected node: ${request.node}`);
-        },
-      },
-    });
-
-    await expect(director.run({
-      task: 'script_episode_batch', projectId: 'project-1',
-      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
-    })).rejects.toMatchObject({ code: 'SCRIPT_BATCH_NEEDS_REVIEW', recoverable: true });
-    expect(store.state.episodes).toEqual([
-      expect.objectContaining({ id: 'candidate-episode-1', status: 'reviewing' }),
-    ]);
-    expect(store.atomicCommitCalls).toEqual([]);
-    const history = await checkpoints.list('project-1', 'script_episode_batch:1:1');
-    expect(history).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        node: 'revision', status: 'needs_review',
-        validationErrors: [expect.objectContaining({ message: expect.stringContaining(expected) })],
-      }),
+    expect({ reviewCalls, revisionCalls }).toEqual({ reviewCalls: 1, revisionCalls: 0 });
+    expect(result).toMatchObject({ kind: 'episode_batch' });
+    if (result.kind !== 'episode_batch') throw new Error('expected episode batch');
+    expect(result.reports[0]?.report.advisoryIssues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'TOO_LONG', severity: 'soft' }),
     ]));
+    expect(result.reports[0]?.report.blockingIssues).toEqual([]);
+    expect(store.state.episodes[0]?.status).toBe('completed');
   });
-
-  it('fixes a 361-to-350 TOO_LONG semantic miss to 300 in the same run', async () => {
-    const state = readySingleEpisodeState();
-    state.episodes = [reviewingEpisode(state, `${'超长'.repeat(180)}甲`, {
-      title: '超长候选',
-    })];
-    const store = new MemoryScriptStore(state);
-    const checkpoints = new InMemoryScriptCheckpointStore();
-    let draftCalls = 0;
-    let reviewCalls = 0;
-    let revisionCalls = 0;
-    const revisionPrompts: string[] = [];
-    const director = new ScriptDirector({
-      store,
-      checkpoints,
-      model: {
-        async complete(request) {
-          if (request.node === 'draft') {
-            draftCalls += 1;
-            return JSON.stringify({
-              episodeNumber: 1, title: '超长候选',
-              scenes: [{
-                ordinal: 1, location: '校报社', timeOfDay: 'day',
-                interiorExterior: 'interior', characterIds: ['lead'],
-                blocks: [{ type: 'action', text: `${'超长'.repeat(180)}甲` }],
-              }],
-              summary: '', newFacts: [], openedThreads: [], closedThreads: [],
-            });
-          }
-          if (request.node === 'review') {
-            reviewCalls += 1;
-            return JSON.stringify({
-              issues: [], summary: '沈清精简证据说明。', newFacts: [],
-              openedThreads: [], closedThreads: [], wardrobe: [],
-            });
-          }
-          if (request.node === 'revision') {
-            revisionCalls += 1;
-            revisionPrompts.push(request.prompt);
-            const taskPrompt = request.prompt.split('\n结构契约：')[0] ?? request.prompt;
-            const current = JSON.parse(taskPrompt.split('当前候选：').at(-1) ?? '{}') as {
-              scenes: Array<{ id: string; blocks: Array<{ id: string }> }>;
-            };
-            return JSON.stringify({ operations: [{
-              op: 'replaceBlockText',
-              sceneId: current.scenes[0]!.id,
-              blockId: current.scenes[0]!.blocks[0]!.id,
-              text: revisionCalls === 1 ? '仍长'.repeat(175) : '精简'.repeat(150),
-            }] });
-          }
-          throw new Error(`unexpected node: ${request.node}`);
-        },
-      },
-    });
-    const request = {
-      task: 'script_episode_batch' as const,
-      projectId: 'project-1', startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
-    };
-
-    await expect(director.run(request)).resolves.toMatchObject({ kind: 'episode_batch' });
-    expect({ draftCalls, reviewCalls, revisionCalls }).toEqual({
-      draftCalls: 0, reviewCalls: 2, revisionCalls: 2,
-    });
-    expect(revisionPrompts[0]).toContain('"current":361');
-    expect(revisionPrompts[0]).toContain('"idealNetChange":-61');
-    expect(revisionPrompts[1]).toContain('code=revision.length');
-    expect(revisionPrompts[1]).toContain('变为 350 字');
-    expect(store.state.episodes[0]?.scenes[0]?.blocks[0]?.text).toBe('精简'.repeat(150));
-    expect(store.atomicCommitCalls).toHaveLength(1);
-    const history = await checkpoints.list('project-1', 'script_episode_batch:1:1');
-    expect(history.filter((checkpoint) => checkpoint.node === 'revision')).toEqual([
-      expect.objectContaining({ artifactRevision: 0, status: 'succeeded' }),
-    ]);
-    expect(history.some((checkpoint) => checkpoint.status === 'needs_review')).toBe(false);
-  });
-
   it('repairs a truncated review response through the bounded Fixup call', async () => {
     const state = readySingleEpisodeState();
     let reviewCalls = 0;
@@ -3251,159 +2444,21 @@ describe('ScriptDirector', () => {
     ]));
   });
 
-  it('keeps the formal episode unchanged when TOO_SHORT fixup exhausts below range', async () => {
+  it('keeps the formal episode unchanged when an obvious-bug revision remains invalid', async () => {
     const state = readySingleEpisodeState();
-    const official: ScriptEpisode = {
-      id: 'official-episode-1', projectId: 'project-1', episodeNumber: 1,
-      title: '正式旧稿', outlineId: 'outline-1', status: 'failed', targetChars: 300,
-      scenes: [{
-        id: 'official-scene-1', ordinal: 1, location: '校报社', timeOfDay: 'day',
-        interiorExterior: 'interior', characterIds: ['lead'],
-        blocks: [{ id: 'official-block-1', type: 'action', text: '正式内容'.repeat(75) }],
-      }],
-      summary: '旧稿保留。', newFacts: [], openedThreads: [], closedThreads: [],
-      revision: 6, createdAt: state.updatedAt, updatedAt: state.updatedAt,
-    };
-    const candidate = reviewingEpisode(state, '候选'.repeat(100), {
-      title: '候选短稿',
-      revision: official.revision,
-    });
-    state.episodes = [structuredClone(official), candidate];
-    let reviewCalls = 0;
+    const candidate = reviewingEpisode(state, '△沈清冲进校报社。');
+    state.episodes = [structuredClone(candidate)];
     let revisionCalls = 0;
     const store = new MemoryScriptStore(state);
-    const checkpoints = new InMemoryScriptCheckpointStore();
     const director = new ScriptDirector({
       store,
-      checkpoints,
+      checkpoints: new InMemoryScriptCheckpointStore(),
       model: {
         async complete(request) {
-          if (request.node === 'draft') {
-            return JSON.stringify({
-              episodeNumber: 1, title: '候选短稿',
-              scenes: [{
-                ordinal: 1, location: '校报社', timeOfDay: 'day',
-                interiorExterior: 'interior', characterIds: ['lead'],
-                blocks: [{ type: 'action', text: '候选'.repeat(100) }],
-              }],
-              summary: '', newFacts: [], openedThreads: [], closedThreads: [],
-            });
-          }
-          if (request.node === 'review') {
-            reviewCalls += 1;
-            return JSON.stringify({
-              issues: [], summary: `第${reviewCalls}次复检仍需扩写。`, newFacts: [],
-              openedThreads: [], closedThreads: [], wardrobe: [],
-            });
-          }
-          if (request.node === 'revision') {
-            revisionCalls += 1;
-            const taskPrompt = request.prompt.split('\n结构契约：')[0] ?? request.prompt;
-            const current = JSON.parse(taskPrompt.split('当前候选：').at(-1) ?? '{}') as {
-              scenes: Array<{ id: string; blocks: Array<{ id: string }> }>;
-            };
-            return JSON.stringify({ operations: [{
-              op: 'insertBlockAfter',
-              sceneId: current.scenes[0]!.id,
-              afterBlockId: current.scenes[0]!.blocks.at(-1)!.id,
-              block: { type: 'action', text: '补'.repeat(5) },
-            }] });
-          }
-          throw new Error(`unexpected node: ${request.node}`);
-        },
-      },
-    });
-
-    await expect(director.run({
-      task: 'script_episode_batch', projectId: 'project-1',
-      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
-    })).rejects.toMatchObject({ code: 'SCRIPT_BATCH_NEEDS_REVIEW' });
-    expect(reviewCalls).toBe(1);
-    expect(revisionCalls).toBe(2);
-    expect(store.state.episodes.find((episode) => episode.id === official.id)).toEqual(official);
-    expect(store.atomicCommitCalls).toHaveLength(0);
-    const rejectedRevision = (await checkpoints.list('project-1', 'script_episode_batch:1:1'))
-      .find((checkpoint) => checkpoint.node === 'revision' && checkpoint.status === 'needs_review');
-    expect(rejectedRevision?.validationErrors).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        code: 'revision.length',
-        message: expect.stringContaining('TOO_SHORT 修订必须增加正文并一次落入'),
-      }),
-    ]));
-  });
-
-  it('checkpoints sanitized structured exhaustion and gives its feedback to resume', async () => {
-    const state = readySingleEpisodeState();
-    const official: ScriptEpisode = {
-      id: 'official-episode-1',
-      projectId: 'project-1',
-      episodeNumber: 1,
-      title: '正式旧稿',
-      outlineId: 'outline-1',
-      status: 'failed',
-      targetChars: 300,
-      scenes: [{
-        id: 'official-scene-1',
-        ordinal: 1,
-        location: '校报社',
-        timeOfDay: 'day',
-        interiorExterior: 'interior',
-        characterIds: ['lead'],
-        blocks: [{ id: 'official-block-1', type: 'action', text: '正式旧稿'.repeat(50) }],
-      }],
-      summary: '需要继续修订。',
-      newFacts: [],
-      openedThreads: [],
-      closedThreads: [],
-      revision: 7,
-      createdAt: '2026-08-14T00:00:00.000Z',
-      updatedAt: '2026-08-14T00:00:00.000Z',
-    };
-    const candidate = reviewingEpisode(state, '候选短稿'.repeat(50), {
-      title: '内存候选',
-      revision: official.revision,
-    });
-    state.episodes = [structuredClone(official), candidate];
-    let revisionCalls = 0;
-    const revisionPrompts: string[] = [];
-    const leakedSecret = 'sk-this-must-never-be-persisted';
-    const fullEpisodeResponse = {
-      episodeNumber: 1,
-      title: `错误的整集返回-${leakedSecret}`,
-      scenes: [{
-        ordinal: 1,
-        location: '校报社',
-        timeOfDay: 'day',
-        interiorExterior: 'interior',
-        characterIds: ['lead'],
-        blocks: [{ type: 'action', text: '替换内容'.repeat(80) }],
-      }],
-      summary: '',
-      newFacts: [],
-      openedThreads: [],
-      closedThreads: [],
-    };
-    const store = new MemoryScriptStore(state);
-    const checkpoints = new InMemoryScriptCheckpointStore();
-    const director = new ScriptDirector({
-      store,
-      checkpoints,
-      model: {
-        async complete(request) {
-          if (request.node === 'draft') {
-            return JSON.stringify({
-              ...fullEpisodeResponse,
-              title: '内存候选',
-              scenes: [{
-                ...fullEpisodeResponse.scenes[0],
-                blocks: [{ type: 'action', text: '候选短稿'.repeat(50) }],
-              }],
-            });
-          }
           if (request.node === 'review') {
             return JSON.stringify({
               issues: [],
-              summary: '候选等待受限修订。',
+              summary: '沈清闯进校报社。',
               newFacts: [],
               openedThreads: [],
               closedThreads: [],
@@ -3412,306 +2467,36 @@ describe('ScriptDirector', () => {
           }
           if (request.node === 'revision') {
             revisionCalls += 1;
-            revisionPrompts.push(request.prompt);
-            if (revisionCalls <= 2) return JSON.stringify(fullEpisodeResponse);
-            const taskPrompt = request.prompt.split('\n结构契约：')[0] ?? request.prompt;
-            const candidate = JSON.parse(taskPrompt.split('当前候选：').at(-1) ?? '{}') as {
-              scenes: Array<{ id: string }>;
-            };
-            return JSON.stringify({ operations: [{
-              op: 'appendBlock',
-              sceneId: candidate.scenes[0]!.id,
-              block: { type: 'action', text: '补写'.repeat(30) },
-            }] });
-          }
-          throw new Error(`unexpected node: ${request.node}`);
-        },
-      },
-    });
-
-    const request = {
-      task: 'script_episode_batch' as const,
-      projectId: 'project-1',
-      startEpisode: 1,
-      episodeCount: 1,
-      expectedPlanRevision: 1,
-    };
-    let paused: unknown;
-    try {
-      await director.run(request);
-    } catch (error) {
-      paused = error;
-    }
-    expect(paused).toBeInstanceOf(ScriptBatchPausedError);
-    expect((paused as Error).message).toContain('REVISION_PATCH_REJECTED');
-
-    expect(revisionCalls).toBe(2);
-    expect(store.state.episodes.find((episode) => episode.id === official.id)).toEqual(official);
-    expect(store.saveEpisodeCalls).toHaveLength(0);
-    expect(store.atomicCommitCalls).toHaveLength(0);
-    const rejectedHistory = await checkpoints.list('project-1', 'script_episode_batch:1:1');
-    const serializedHistory = JSON.stringify(rejectedHistory);
-    expect(serializedHistory).not.toContain(leakedSecret);
-    expect(serializedHistory).not.toContain('替换内容');
-    expect(rejectedHistory).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        node: 'revision', status: 'needs_review',
-        validationErrors: [expect.objectContaining({
-          code: 'array.non_empty',
-          message: expect.stringContaining('operations 必须是非空数组'),
-        })],
-      }),
-    ]));
-
-    await expect(director.run({
-      ...request,
-      resumeRejectedCandidates: true,
-    })).resolves.toMatchObject({ kind: 'episode_batch' });
-    expect(revisionCalls).toBe(3);
-    expect(revisionPrompts[2]).toContain('上次候选被系统拒绝');
-    expect(revisionPrompts[2]).toContain('array.non_empty');
-    expect(revisionPrompts[2]).not.toContain(leakedSecret);
-    expect(store.atomicCommitCalls).toHaveLength(1);
-    expect(store.state.episodes[0]).toMatchObject({ status: 'completed', episodeNumber: 1 });
-  });
-
-  it('fixes mixed TOO_SHORT blockers from a non-tail anchor without leaking dry-run IDs', async () => {
-    const state = readySingleEpisodeState();
-    state.episodes = [{
-      ...reviewingEpisode(state, 'unused'),
-      id: 'candidate-episode',
-      scenes: [{
-        id: 'candidate-scene',
-        ordinal: 1,
-        location: '校报社',
-        timeOfDay: 'day',
-        interiorExterior: 'interior',
-        characterIds: ['lead'],
-        blocks: [
-          { id: 'candidate-block-first', type: 'action', text: '△短' },
-          { id: 'candidate-block-last', type: 'action', text: '尾' },
-        ],
-      }],
-    }];
-    const store = new MemoryScriptStore(state);
-    const checkpoints = new InMemoryScriptCheckpointStore();
-    let revisionCalls = 0;
-    const revisionPrompts: string[] = [];
-    const allocatedIds: string[] = [];
-    const director = new ScriptDirector({
-      model: {
-        async complete(request) {
-          if (request.node === 'draft') {
             return JSON.stringify({
-              id: 'candidate-episode', episodeNumber: 1, title: '第一集',
-              scenes: [{
-                id: 'candidate-scene',
-                ordinal: 1, location: '校报社', timeOfDay: 'day',
-                interiorExterior: 'interior', characterIds: ['lead'],
-                blocks: [
-                  { id: 'candidate-block-first', type: 'action', text: '△短' },
-                  { id: 'candidate-block-last', type: 'action', text: '尾' },
-                ],
+              operations: [{
+                op: 'appendBlock',
+                sceneId: candidate.scenes[0]!.id,
+                block: { type: 'action', text: '无关补写' },
               }],
-              summary: '', newFacts: [], openedThreads: [], closedThreads: [],
             });
           }
-          if (request.node === 'review') {
-            return JSON.stringify({
-              issues: [], summary: '沈清继续调查。', newFacts: [],
-              openedThreads: [], closedThreads: [], wardrobe: [],
-            });
-          }
-          if (request.node === 'revision') {
-            revisionCalls += 1;
-            revisionPrompts.push(request.prompt);
-            const taskPrompt = request.prompt.split('\n结构契约：')[0] ?? request.prompt;
-            const candidate = JSON.parse(taskPrompt.split('当前候选：').at(-1) ?? '{}') as {
-              scenes: Array<{ id: string; blocks: Array<{ id: string }> }>;
-            };
-            return JSON.stringify({ operations: [
-              {
-                op: 'replaceBlockText',
-                sceneId: candidate.scenes[0]!.id,
-                blockId: candidate.scenes[0]!.blocks[0]!.id,
-                text: '修',
-              },
-              {
-                op: 'insertBlockAfter',
-                sceneId: candidate.scenes[0]!.id,
-                afterBlockId: revisionCalls === 1
-                  ? candidate.scenes[0]!.blocks[0]!.id
-                  : candidate.scenes[0]!.blocks.at(-1)!.id,
-                block: { type: 'action', text: '补'.repeat(298) },
-              },
-            ] });
-          }
+          if (request.node === 'draft') throw new Error('reviewing fixture must skip draft');
           throw new Error(`unexpected node: ${request.node}`);
         },
-      },
-      store,
-      checkpoints,
-      id: () => {
-        const id = `real-id-${allocatedIds.length + 1}`;
-        allocatedIds.push(id);
-        return id;
       },
     });
 
     await expect(director.run({
       task: 'script_episode_batch',
-      projectId: 'project-1',
+      projectId: state.projectId,
       startEpisode: 1,
       episodeCount: 1,
-      expectedPlanRevision: 1,
-    })).resolves.toMatchObject({ kind: 'episode_batch' });
-    expect(revisionCalls).toBe(2);
-    expect(revisionPrompts[0]).toContain('精确 revisionPolicy（唯一授权来源）');
-    expect(revisionPrompts[0]).toContain('"allowedAfterBlockIds"');
-    expect(revisionPrompts[0]).toContain('ACTION_STRUCTURE_POLLUTION');
-    expect(revisionPrompts[0]).toContain('TOO_SHORT');
-    expect(revisionPrompts[0]).toContain('"visibleChars":2');
-    expect(revisionPrompts[0]).toContain('"visibleChars":1');
-    expect(revisionPrompts[0]).toContain('"idealNetChange":297');
-    expect(revisionPrompts[0].match(/精确 revisionPolicy（唯一授权来源）/gu)).toHaveLength(1);
-    expect(revisionPrompts[0]).toContain('ScriptRevisionPatch@v2');
-    expect(revisionPrompts[1]).toContain('code=revision.policy');
-    expect(revisionPrompts[1]).toContain('candidate-block-first');
-    expect(store.state.episodes).toEqual([
-      expect.objectContaining({ episodeNumber: 1, status: 'completed' }),
-    ]);
-    expect(store.atomicCommitCalls).toHaveLength(1);
-    expect(allocatedIds).toEqual(['real-id-1']);
-    expect(JSON.stringify(store.state)).not.toContain('revision-validation-');
-    expect(JSON.stringify(await checkpoints.list('project-1', 'script_episode_batch:1:1')))
-      .not.toContain('revision-validation-');
-    expect((await checkpoints.list('project-1', 'script_episode_batch:1:1'))
-      .some((checkpoint) => checkpoint.status === 'needs_review')).toBe(false);
-  });
-
-  it('resumes after two semantic failures and reuses the reviewing episode', async () => {
-    const state = readySingleEpisodeState();
-    state.episodes = [reviewingEpisode(state, `${'超长'.repeat(180)}甲`, {
-      title: '超长候选',
-    })];
-    const store = new MemoryScriptStore(state);
-    const checkpoints = new InMemoryScriptCheckpointStore();
-    let draftCalls = 0;
-    let reviewCalls = 0;
-    let revisionCalls = 0;
-    const director = new ScriptDirector({
-      store,
-      checkpoints,
-      model: {
-        async complete(request) {
-          const taskPrompt = request.prompt.split('\n结构契约：')[0] ?? request.prompt;
-          if (request.node === 'draft') {
-            draftCalls += 1;
-            return JSON.stringify({
-              episodeNumber: 1,
-              title: '第一集',
-              scenes: [{
-                ordinal: 1,
-                location: '校报社',
-                timeOfDay: 'day',
-                interiorExterior: 'interior',
-                characterIds: ['lead'],
-                blocks: [{ type: 'action', text: `${'超长'.repeat(180)}甲` }],
-              }],
-              summary: '',
-              newFacts: [],
-              openedThreads: [],
-              closedThreads: [],
-            });
-          }
-          if (request.node === 'review') {
-            reviewCalls += 1;
-            return JSON.stringify({
-              issues: [],
-              summary: '沈清在校报社取得关键证据。',
-              newFacts: [],
-              openedThreads: [],
-              closedThreads: [],
-              wardrobe: [],
-            });
-          }
-          if (request.node === 'revision') {
-            revisionCalls += 1;
-            const candidate = JSON.parse(taskPrompt.split('当前候选：').at(-1) ?? '{}') as {
-              scenes: Array<{ id: string; blocks: Array<{ id: string }> }>;
-            };
-            return JSON.stringify({
-              operations: [{
-                op: 'replaceBlockText',
-                sceneId: candidate.scenes[0]!.id,
-                blockId: candidate.scenes[0]!.blocks[0]!.id,
-                text: revisionCalls <= 2
-                  ? '仍长'.repeat(175)
-                  : '修'.repeat(300),
-              }],
-            });
-          }
-          throw new Error(`unexpected node: ${request.node}`);
-        },
-      },
-    });
-    const request = {
-      task: 'script_episode_batch' as const,
-      projectId: 'project-1',
-      startEpisode: 1,
-      episodeCount: 1,
-      expectedPlanRevision: 1,
-    };
-
-    await expect(director.run(request)).rejects.toMatchObject({
+      expectedPlanRevision: state.plan!.revision,
+    })).rejects.toMatchObject({
       code: 'SCRIPT_BATCH_NEEDS_REVIEW',
       recoverable: true,
     });
-    expect({ draftCalls, reviewCalls, revisionCalls }).toEqual({
-      draftCalls: 0,
-      reviewCalls: 1,
-      revisionCalls: 2,
-    });
-    expect(store.state.episodes).toEqual([
-      expect.objectContaining({ id: 'candidate-episode-1', status: 'reviewing' }),
-    ]);
+
+    expect(revisionCalls).toBe(2);
+    expect(store.state.episodes).toEqual([candidate]);
     expect(store.state.continuityCommits ?? []).toEqual([]);
-
-    await expect(director.run({
-      ...request,
-      resumeRejectedCandidates: true,
-    })).resolves.toMatchObject({ kind: 'episode_batch' });
-
-    expect({ draftCalls, reviewCalls, revisionCalls }).toEqual({
-      draftCalls: 0,
-      reviewCalls: 3,
-      revisionCalls: 3,
-    });
-    expect(store.state.episodes).toEqual([
-      expect.objectContaining({ episodeNumber: 1, status: 'completed' }),
-    ]);
-    expect(store.atomicCommitCalls).toHaveLength(1);
-    expect(store.state.continuityCommits).toHaveLength(1);
-    const history = await checkpoints.list('project-1', 'script_episode_batch:1:1');
-    expect(history).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        node: 'revision', artifactRevision: 0, status: 'stale',
-      }),
-      expect.objectContaining({
-        node: 'revision', artifactRevision: 1, status: 'succeeded',
-      }),
-    ]));
-    const rejectedRevision = history.find((checkpoint) =>
-      checkpoint.node === 'revision' && checkpoint.artifactRevision === 0);
-    const succeededRevision = history.find((checkpoint) =>
-      checkpoint.node === 'revision' && checkpoint.artifactRevision === 1);
-    expect(rejectedRevision?.validationErrors).toEqual(expect.arrayContaining([
-      expect.objectContaining({ code: 'revision.length' }),
-    ]));
-    expect((rejectedRevision?.artifact as { candidateHash?: string } | undefined)?.candidateHash)
-      .not.toBe((succeededRevision?.artifact as { candidateHash?: string } | undefined)?.candidateHash);
+    expect(store.atomicCommitCalls).toHaveLength(0);
   });
-
   it('does not bypass a retained user-authored open hard issue when the director saves completed', async () => {
     const state = readySingleEpisodeState();
     state.reviewRevision = 1;
