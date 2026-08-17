@@ -680,12 +680,14 @@ describe('ScriptDirector', () => {
 
   it('generates the complete series outline in ten-episode chunks and preserves continuous numbering', async () => {
     const chunkStarts: number[] = [];
+    const prompts: string[] = [];
     const model: ScriptModelAdapter = {
       async complete(request) {
         if (request.node !== 'series_outline') throw new Error('unexpected node');
         const start = request.chunkStart ?? 1;
         const end = request.chunkEnd ?? 12;
         chunkStarts.push(start);
+        prompts.push(request.prompt);
         return JSON.stringify({
           synopsis: '女主从沉默到公开真相。',
           openingState: '新闻社被压制。',
@@ -720,6 +722,11 @@ describe('ScriptDirector', () => {
 
     expect(result.kind).toBe('series_outline');
     expect(chunkStarts).toEqual([1, 11]);
+    expect(prompts[0]).not.toContain('上一段最后两集');
+    expect(prompts[1]).toContain('上一段最后两集');
+    expect(prompts[1]).toContain('第9步');
+    expect(prompts[1]).toContain('第10步');
+    expect(prompts[1]).toContain('已经发生、取得或发现的关键事件不得重新当作首次发生');
     expect(store.state.seriesOutline?.episodeCards.map((card) => card.episodeNumber)).toEqual(
       Array.from({ length: 12 }, (_, index) => index + 1),
     );
@@ -1480,7 +1487,7 @@ describe('ScriptDirector', () => {
     }
   });
 
-  it('stales an episode-draft-v3 checkpoint after the lightweight v5 prompt upgrade', async () => {
+  it('stales an episode-draft-v3 checkpoint after the lightweight v6 prompt upgrade', async () => {
     const state = readySingleEpisodeState();
     let draftCalls = 0;
     const store = new MemoryScriptStore(state);
@@ -1574,7 +1581,7 @@ describe('ScriptDirector', () => {
         artifactRevision: 0, promptVersion: 'episode-draft-v3', status: 'stale',
       }),
       expect.objectContaining({
-        artifactRevision: 1, promptVersion: 'episode-draft-v5', status: 'succeeded',
+        artifactRevision: 1, promptVersion: 'episode-draft-v6', status: 'succeeded',
       }),
     ]));
   });
@@ -1714,7 +1721,7 @@ describe('ScriptDirector', () => {
     ]);
   });
 
-  it('keeps safe partial writing and uses at most one continuation', async () => {
+  it('keeps safe partial writing and fixes up the only continuation when it is still too short', async () => {
     const state = readySingleEpisodeState();
     state.plan = {
       ...state.plan!,
@@ -1724,7 +1731,7 @@ describe('ScriptDirector', () => {
     let baseDraftCalls = 0;
     let continuationCalls = 0;
     let reviewCalls = 0;
-    const continuationLengths = [500];
+    const continuationLengths = [100, 500];
     const store = new MemoryScriptStore(state);
     const checkpoints = new InMemoryScriptCheckpointStore();
     const director = new ScriptDirector({
@@ -1733,7 +1740,7 @@ describe('ScriptDirector', () => {
       model: {
         async complete(request) {
           if (request.node === 'draft') {
-            if (request.prompt.includes('episode_draft_continuation@v1')) {
+            if (request.prompt.includes('episode_draft_continuation@v2')) {
               const length = continuationLengths[continuationCalls] ?? 100;
               continuationCalls += 1;
               return JSON.stringify({
@@ -1745,6 +1752,9 @@ describe('ScriptDirector', () => {
               });
             }
             baseDraftCalls += 1;
+            expect(request.prompt).toContain('未登记的路人、记者、警察');
+            expect(request.prompt).toContain('同一证据、照片、电话或动作在本集只能首次发现一次');
+            expect(request.prompt).toContain('触发—反应—结果');
             return JSON.stringify({
               episodeNumber: 1,
               title: '第一集',
@@ -1798,18 +1808,19 @@ describe('ScriptDirector', () => {
     expect(result).toMatchObject({ kind: 'episode_batch' });
     if (result.kind !== 'episode_batch') throw new Error('expected episode batch');
     expect(result.callSummary).toMatchObject({
-      totalCalls: 3,
+      totalCalls: 4,
       primaryCalls: 3,
-      fixupCalls: 0,
+      fixupCalls: 1,
       fallbackCalls: 0,
-      byNode: { draft: 2, review: 1 },
-      byEpisode: [{ episodeNumber: 1, calls: 3 }],
+      byNode: { draft: 3, review: 1 },
+      byEpisode: [{ episodeNumber: 1, calls: 4 }],
     });
     expect({ baseDraftCalls, continuationCalls, reviewCalls }).toEqual({
       baseDraftCalls: 1,
-      continuationCalls: 1,
+      continuationCalls: 2,
       reviewCalls: 1,
     });
+    expect(result.callSummary.fixupCalls).toBe(1);
     const completed = store.state.episodes[0]!;
     const visibleChars = completed.scenes
       .flatMap((scene) => scene.blocks)
@@ -1827,7 +1838,7 @@ describe('ScriptDirector', () => {
       expect.objectContaining({
         artifactRevision: 1,
         status: 'succeeded',
-        promptVersion: 'episode-draft-v5',
+        promptVersion: 'episode-draft-v6',
       }),
     ]));
   });
@@ -2006,7 +2017,7 @@ describe('ScriptDirector', () => {
       model: {
         async complete(request) {
           if (request.node === 'draft') {
-            if (request.prompt.includes('episode_draft_continuation@v1')) {
+            if (request.prompt.includes('episode_draft_continuation@v2')) {
               continuationCalls += 1;
               if (interruptFirstContinuation && continuationCalls === 1) {
                 interruptFirstContinuation = false;
@@ -2110,7 +2121,7 @@ describe('ScriptDirector', () => {
       model: {
         async complete(request) {
           if (request.node === 'draft') {
-            if (request.prompt.includes('episode_draft_continuation@v1')) {
+            if (request.prompt.includes('episode_draft_continuation@v2')) {
               continuationCalls += 1;
               return JSON.stringify({ blocks: [] });
             }
