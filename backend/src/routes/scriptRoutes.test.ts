@@ -326,8 +326,8 @@ describe('scriptRoutes', () => {
     });
     expect(txt.statusCode).toBe(200);
     expect(txt.headers['content-type']).toContain('text/plain');
-    expect(txt.body).toContain('第一集');
-    expect(txt.body).toContain('1-1 沈家老宅大门 日/外');
+    expect(txt.body).toContain('第1集：');
+    expect(txt.body).toContain('1-1 日 外 沈家老宅大门');
     expect(txt.body).toContain('人物：沈清');
     expect(txt.body).toContain('【字幕：沧南市沈家百年老宅】');
     expect(txt.body).toContain('△沈清跨过门槛。');

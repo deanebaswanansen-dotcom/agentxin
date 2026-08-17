@@ -2761,8 +2761,9 @@ describe('ScriptDirector', () => {
     },
   );
 
-  it('writes a complete direct-text episode with one writer call and one handoff review call', async () => {
+  it('writes directly from the existing episode card without generating a detailed outline', async () => {
     const state = readySingleEpisodeState();
+    state.episodeOutlines = [];
     const store = new MemoryScriptStore(state);
     const checkpoints = new InMemoryScriptCheckpointStore();
     const calls: Array<{ node: string; responseFormat?: string }> = [];
@@ -2810,7 +2811,6 @@ describe('ScriptDirector', () => {
   it('writes a five-episode direct-text batch in order with ten model calls and a continuity chain', async () => {
     const state = readySingleEpisodeState();
     state.plan = approvedPlan(5);
-    const baseOutline = state.episodeOutlines[0]!;
     state.seriesOutline = {
       ...state.seriesOutline!,
       episodeCards: Array.from({ length: 5 }, (_, index) => ({
@@ -2821,13 +2821,7 @@ describe('ScriptDirector', () => {
         endingHook: `第${index + 1}条新线索出现。`,
       })),
     };
-    state.episodeOutlines = Array.from({ length: 5 }, (_, index) => ({
-      ...baseOutline,
-      id: `outline-${index + 1}`,
-      episodeNumber: index + 1,
-      title: `第${index + 1}集`,
-      endingHook: `第${index + 1}条新线索出现。`,
-    }));
+    state.episodeOutlines = [];
     const calls: Array<{ node: string; episodeNumber?: number }> = [];
     const store = new MemoryScriptStore(state);
     const director = new ScriptDirector({
@@ -2898,10 +2892,11 @@ describe('ScriptDirector', () => {
     expect(savedCheckpoints.filter((item) => item.node === 'continuation')).toHaveLength(1);
   });
 
-  it('rewrites an obvious genre drift once and does not run a second AI review', async () => {
+  it('rewrites an obvious genre drift once and rechecks the rewritten episode', async () => {
     const state = readySingleEpisodeState();
     const store = new MemoryScriptStore(state);
     const calls: string[] = [];
+    let reviewCalls = 0;
     const model: ScriptModelAdapter = {
       async complete(request) {
         calls.push(request.node);
@@ -2909,6 +2904,8 @@ describe('ScriptDirector', () => {
           return directScriptText({ location: '市体育馆篮球场', dialogue: '这场篮球赛我们一定要赢。'.repeat(14) });
         }
         if (request.node === 'review') {
+          reviewCalls += 1;
+          if (reviewCalls > 1) return directReviewJson();
           return directReviewJson({
             verdict: 'major_issue',
             issues: [{
@@ -2935,16 +2932,360 @@ describe('ScriptDirector', () => {
       draftMode: 'direct_text',
     });
 
-    expect(calls).toEqual(['draft', 'review', 'revision']);
+    expect(calls).toEqual(['draft', 'review', 'revision', 'review']);
     expect(store.state.episodes[0]?.scenes[0]?.location).toBe('校报社');
     expect(JSON.stringify(store.state.episodes[0])).not.toContain('篮球');
     expect(store.atomicCommitCalls).toHaveLength(1);
   });
 
-  it('caps a format-repair plus major-rewrite episode at four model calls', async () => {
+  it('pauses instead of committing when the rewritten episode still has an obvious major error', async () => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    const calls: string[] = [];
+    const director = new ScriptDirector({
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+      model: {
+        async complete(request) {
+          calls.push(request.node);
+          if (request.node === 'draft') {
+            return directScriptText({ location: '市体育馆篮球场', dialogue: '这场篮球赛我们一定要赢。'.repeat(14) });
+          }
+          if (request.node === 'revision') {
+            return directScriptText({ location: '校报社', dialogue: '时间戳和采访记录能够相互印证。'.repeat(14) });
+          }
+          return directReviewJson({
+            verdict: 'major_issue',
+            issues: [{
+              code: 'CAUSAL_CONTRADICTION',
+              sceneNumber: 1,
+              evidence: '重写稿仍然先宣布结论，后展示证据。',
+              expected: '必须先核验证据再得出结论。',
+            }],
+          });
+        },
+        async getModelConfigFingerprint() { return 'direct-model-v1'; },
+      },
+    });
+
+    await expect(director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    })).rejects.toBeInstanceOf(ScriptBatchPausedError);
+
+    expect(calls).toEqual(['draft', 'review', 'revision', 'review']);
+    expect(store.atomicCommitCalls).toHaveLength(0);
+    expect(store.state.episodes).toHaveLength(0);
+  });
+
+  it('regenerates only the rejected direct rewrite when explicitly resumed', async () => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    const checkpoints = new InMemoryScriptCheckpointStore();
+    let draftCalls = 0;
+    let revisionCalls = 0;
+    let reviewCalls = 0;
+    const revisionPrompts: string[] = [];
+    const director = new ScriptDirector({
+      store,
+      checkpoints,
+      model: {
+        async complete(request) {
+          if (request.node === 'draft') {
+            draftCalls += 1;
+            return directScriptText({
+              location: '市体育馆篮球场',
+              dialogue: '这场篮球赛我们一定要赢。'.repeat(14),
+            });
+          }
+          if (request.node === 'revision') {
+            revisionCalls += 1;
+            revisionPrompts.push(request.prompt);
+            return revisionCalls === 1
+              ? directScriptText({
+                  location: '市体育馆篮球场',
+                  dialogue: '这场篮球赛我们一定要赢。'.repeat(14),
+                })
+              : directScriptText({
+                  location: '校报社',
+                  dialogue: '时间戳和采访记录能够相互印证。'.repeat(14),
+                });
+          }
+          reviewCalls += 1;
+          if (reviewCalls === 3) return directReviewJson();
+          return directReviewJson({
+            verdict: 'major_issue',
+            issues: [{
+              code: 'WRONG_GENRE_OR_SETTING',
+              sceneNumber: 1,
+              evidence: '正文仍然写成篮球比赛。',
+              expected: '本集应在校报社调查证据。',
+            }],
+          });
+        },
+        async getModelConfigFingerprint() { return 'direct-model-v1'; },
+      },
+    });
+
+    await expect(director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    })).rejects.toBeInstanceOf(ScriptBatchPausedError);
+
+    const result = await director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text', resumeRejectedCandidates: true,
+    });
+
+    expect(result.kind).toBe('episode_batch');
+    expect(draftCalls).toBe(1);
+    expect(revisionCalls).toBe(2);
+    expect(reviewCalls).toBe(3);
+    expect(revisionPrompts[0]).toContain('原正文');
+    expect(revisionPrompts[1]).toContain('完全从分集卡重新写出本集');
+    expect(revisionPrompts[1]).not.toContain('原正文');
+    expect(store.state.episodes[0]?.scenes[0]?.location).toBe('校报社');
+    expect(store.atomicCommitCalls).toHaveLength(1);
+  });
+
+  it('formats and adopts a recognizable rewrite instead of silently keeping the rejected draft', async () => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    let revisionCalls = 0;
+    let reviewCalls = 0;
+    const fixed = directScriptText({
+      location: '校报社',
+      dialogue: '时间戳和采访记录能够相互印证。'.repeat(14),
+    });
+    const director = new ScriptDirector({
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+      model: {
+        async complete(request) {
+          if (request.node === 'draft') {
+            return directScriptText({
+              location: '市体育馆篮球场',
+              dialogue: '这场篮球赛我们一定要赢。'.repeat(14),
+            });
+          }
+          if (request.node === 'revision') {
+            revisionCalls += 1;
+            return revisionCalls === 1 ? `以下是改写稿：\n${fixed}` : fixed;
+          }
+          reviewCalls += 1;
+          return reviewCalls === 1
+            ? directReviewJson({
+                verdict: 'major_issue',
+                issues: [{
+                  code: 'WRONG_GENRE_OR_SETTING',
+                  sceneNumber: 1,
+                  evidence: '正文写成篮球比赛。',
+                  expected: '本集应在校报社调查证据。',
+                }],
+              })
+            : directReviewJson();
+        },
+        async getModelConfigFingerprint() { return 'direct-model-v1'; },
+      },
+    });
+
+    await director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    });
+
+    expect(revisionCalls).toBe(2);
+    expect(store.state.episodes[0]?.scenes[0]?.location).toBe('校报社');
+    expect(store.atomicCommitCalls).toHaveLength(1);
+  });
+
+  it('accepts up to five scenes in direct mode even when the planning preference is three', async () => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    const fourSceneText = [
+      '第1集',
+      ...Array.from({ length: 4 }, (_, index) => [
+        `1-${index + 1} 校报社${index + 1}区 日/内`,
+        '人物：沈清',
+        `△${'沈清依次核对采访记录并标出关键时间。'.repeat(4)}`,
+        `沈清：${'证据必须按照发生顺序公开才能说服所有人。'.repeat(4)}`,
+      ].join('\n')),
+    ].join('\n');
+    const director = new ScriptDirector({
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+      model: {
+        async complete(request) {
+          return request.node === 'review' ? directReviewJson() : fourSceneText;
+        },
+        async getModelConfigFingerprint() { return 'direct-model-v1'; },
+      },
+    });
+
+    await director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    });
+
+    expect(store.state.episodes[0]?.scenes).toHaveLength(4);
+    expect(store.atomicCommitCalls).toHaveLength(1);
+  });
+
+  it('keeps a temporary role under its own speaker name instead of relabeling it as the lead', async () => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    const text = [
+      '第1集',
+      '1-1 校报社前台 日/内',
+      '人物：沈清 前台 黑夹克男甲 周技师 报名员 电话里的声音 金丝眼镜 程野',
+      `△${'沈清把采访申请递到窗口并等待核验。'.repeat(8)}`,
+      `前台：${'登记表需要负责人签字，我先替你查一下今天的值班记录。'.repeat(8)}`,
+      `黑夹克男甲：${'老板让我来取走登记册，你们最好别多问。'.repeat(5)}`,
+      `周技师：${'这份检测记录的编号和原件对不上。'.repeat(4)}`,
+      `老周：${'我只在这一集作证，讲清楚那天看到的车辆和时间。'.repeat(4)}`,
+      `报名员：${'请先核对姓名和车辆编号，再领取地下资格赛号码牌。'.repeat(4)}`,
+      `电话里的声音（VO）：${'资格赛名单已经确认，请所有参赛者按时到场检录。'.repeat(4)}`,
+      `金丝眼镜：${'宏远车队只想提醒你，继续参赛不会有任何好处。'.repeat(4)}`,
+      `程野：${'我只负责这一场资格赛，过了终点我们各凭成绩说话。'.repeat(4)}`,
+      `沈清：${'请重点核对下午三点前后的访客名单。'.repeat(6)}`,
+    ].join('\n');
+    const director = new ScriptDirector({
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+      model: {
+        async complete(request) {
+          return request.node === 'review' ? directReviewJson() : text;
+        },
+        async getModelConfigFingerprint() { return 'direct-model-v1'; },
+      },
+    });
+
+    await director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    });
+
+    const temporaryLine = store.state.episodes[0]?.scenes[0]?.blocks.find(
+      (block) => block.type === 'dialogue' && block.speaker === '前台',
+    );
+    expect(temporaryLine).toMatchObject({ type: 'dialogue', speaker: '前台' });
+    expect(temporaryLine).not.toHaveProperty('characterId');
+    expect(store.state.episodes[0]?.scenes[0]?.blocks).toContainEqual(expect.objectContaining({
+      type: 'dialogue',
+      speaker: '黑夹克男甲',
+    }));
+    expect(store.state.episodes[0]?.scenes[0]?.blocks).toContainEqual(expect.objectContaining({
+      type: 'dialogue',
+      speaker: '周技师',
+    }));
+    expect(store.state.episodes[0]?.scenes[0]?.blocks).toContainEqual(expect.objectContaining({
+      type: 'dialogue',
+      speaker: '老周',
+    }));
+    expect(store.state.episodes[0]?.scenes[0]?.blocks).toContainEqual(expect.objectContaining({
+      type: 'dialogue',
+      speaker: '报名员',
+    }));
+    expect(store.state.episodes[0]?.scenes[0]?.blocks).toContainEqual(expect.objectContaining({
+      type: 'dialogue',
+      speaker: '电话里的声音',
+    }));
+    expect(store.state.episodes[0]?.scenes[0]?.blocks).toContainEqual(expect.objectContaining({
+      type: 'dialogue',
+      speaker: '金丝眼镜',
+    }));
+    expect(store.state.episodes[0]?.scenes[0]?.blocks).toContainEqual(expect.objectContaining({
+      type: 'dialogue',
+      speaker: '程野',
+    }));
+    expect(store.atomicCommitCalls).toHaveLength(1);
+  });
+
+  it('repairs a scene cast list when a registered dialogue speaker was omitted from the heading', async () => {
+    const state = readySingleEpisodeState();
+    state.characters.push({
+      ...structuredClone(state.characters[0]!),
+      id: 'reporter',
+      name: '王玲',
+      role: 'supporting',
+      aliases: [],
+      relationships: [],
+    });
+    state.episodeOutlines[0]!.characterIds.push('reporter');
+    const store = new MemoryScriptStore(state);
+    const text = [
+      '第1集',
+      '1-1 校报社 日/内',
+      '人物：沈清',
+      `△${'沈清把采访记录按时间顺序铺在桌面上。'.repeat(8)}`,
+      `王玲：${'我已经核对过原始录音，下午三点的证词确实被人替换。'.repeat(7)}`,
+      `沈清：${'先保留原件，我们按证据出现的顺序公开。'.repeat(7)}`,
+    ].join('\n');
+    const director = new ScriptDirector({
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+      model: {
+        async complete(request) {
+          return request.node === 'review' ? directReviewJson() : text;
+        },
+        async getModelConfigFingerprint() { return 'direct-model-v1'; },
+      },
+    });
+
+    await director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    });
+
+    expect(store.state.episodes[0]?.scenes[0]?.characterIds).toEqual(['lead', 'reporter']);
+    expect(store.atomicCommitCalls).toHaveLength(1);
+  });
+
+  it('still blocks an invented named character that is not in the character bible', async () => {
+    const state = readySingleEpisodeState();
+    state.plan!.coreRequirements += ' 未登记人物禁止对白。';
+    const store = new MemoryScriptStore(state);
+    const text = [
+      '第1集',
+      '1-1 校报社前台 日/内',
+      '人物：沈清 陈大勇',
+      `△${'沈清把采访申请递到窗口并等待核验。'.repeat(8)}`,
+      `陈大勇：${'我认识所有证人，事情就是我刚才说的那样。'.repeat(8)}`,
+      `沈清：${'请先拿出能够核验身份和时间的记录。'.repeat(6)}`,
+    ].join('\n');
+    const director = new ScriptDirector({
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+      model: {
+        async complete(request) {
+          return request.node === 'review' ? directReviewJson() : text;
+        },
+        async getModelConfigFingerprint() { return 'direct-model-v1'; },
+      },
+    });
+
+    await expect(director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    })).rejects.toBeInstanceOf(ScriptBatchPausedError);
+
+    expect(store.atomicCommitCalls).toHaveLength(0);
+    expect(store.state.episodes).toHaveLength(0);
+  });
+
+  it('caps a format-repair plus major-rewrite and recheck episode at five model calls', async () => {
     const state = readySingleEpisodeState();
     const calls: string[] = [];
     let draftCalls = 0;
+    let reviewCalls = 0;
     const store = new MemoryScriptStore(state);
     const director = new ScriptDirector({
       store,
@@ -2959,6 +3300,8 @@ describe('ScriptDirector', () => {
               : directScriptText({ actionChars: 45, dialogueChars: 55 });
           }
           if (request.node === 'review') {
+            reviewCalls += 1;
+            if (reviewCalls > 1) return directReviewJson();
             return directReviewJson({
               verdict: 'major_issue',
               issues: [{
@@ -2982,8 +3325,8 @@ describe('ScriptDirector', () => {
 
     expect(result.kind).toBe('episode_batch');
     if (result.kind !== 'episode_batch') throw new Error('unexpected result');
-    expect(calls).toEqual(['draft', 'draft', 'review', 'revision']);
-    expect(result.callSummary.totalCalls).toBe(4);
+    expect(calls).toEqual(['draft', 'draft', 'review', 'revision', 'review']);
+    expect(result.callSummary.totalCalls).toBe(5);
     expect(store.atomicCommitCalls).toHaveLength(1);
   });
 

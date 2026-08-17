@@ -103,6 +103,7 @@ import {
   directWritingContext,
   mergeDirectHandoffContinuity,
   mergeDirectContinuation,
+  reconcileDirectReviewBoundary,
   type ScriptDirectDraftArtifact,
   type ScriptDirectHandoffReview,
   type ScriptDirectReviewArtifact,
@@ -413,6 +414,78 @@ function scriptVisibleChars(episode: ScriptEpisode): number {
     .join('')
     .replace(/\s/gu, '')
     .length;
+}
+
+function directOutlineFromEpisodeCard(
+  projectId: string,
+  seriesOutline: ScriptSeriesOutline,
+  card: ScriptEpisodeCard,
+  characterIds: readonly string[],
+): ScriptEpisodeOutline {
+  const stableId = createHash('sha256')
+    .update(`${projectId}:${seriesOutline.revision}:${card.episodeNumber}`)
+    .digest('hex')
+    .slice(0, 24);
+  return {
+    id: `direct-outline-${stableId}`,
+    projectId,
+    episodeNumber: card.episodeNumber,
+    title: card.title,
+    goal: card.logline,
+    conflict: card.mainEvent,
+    beats: [card.mainEvent],
+    characterIds: [...characterIds],
+    plannedScenes: [],
+    endingHook: card.endingHook,
+    requiredFacts: [],
+    forbiddenFacts: [],
+    status: 'expanded',
+    revision: seriesOutline.revision,
+  };
+}
+
+function planForDirectDraftValidation(plan: ScriptPlan): ScriptPlan {
+  if (plan.maxScenesPerEpisode >= 5) return plan;
+  return { ...plan, maxScenesPerEpisode: 5 };
+}
+
+function allowsTemporaryDialogueSpeakers(plan: ScriptPlan): boolean {
+  const requirements = `${plan.coreRequirements}\n${plan.forbiddenElements.join('\n')}`;
+  return !(
+    /(?:只能|仅允许|只允许)[^。；\n]{0,24}(?:已登记|登记)[^。；\n]{0,16}(?:人物)?[^。；\n]{0,12}(?:对白|说话)/u.test(requirements) ||
+    /(?:未登记|临时|路人)[^。；\n]{0,16}(?:人物)?[^。；\n]{0,12}(?:禁止|不能|不得)[^。；\n]{0,12}(?:对白|说话)/u.test(requirements)
+  );
+}
+
+function isTemporaryDialogueRole(value: string): boolean {
+  const role = value.trim();
+  if (!role || role.length > 12) return false;
+  return /(?:(?:前台|保安|报名员|检录员|车检员|赛会官员|快递员|外卖员|服务员|店员|司机|护士|医生|警察|记者|主持人|裁判|裁判员|解说员|工作人员|维修工|技师|工程师|检测员|鉴定员|邻居|同事|客户|观众|学员|乘客|门卫|秘书|助理|老板|经理|教练|队员|播音员|广播|系统音|法医|消防员|调度员|接线员|售票员|乘务员|清洁工|物业|房东|摊主|商贩|学生|老师|证人|患者|家属|路人|群众|男子|男人|女人|女子|青年|壮汉|老人|大妈|大叔|少年|少女|黑衣人|打手|手下|男|女)(?:[甲乙丙丁A-D\d]{0,2})?|(?:电话|对讲机|广播|扬声器|门外|场外)(?:里的)?(?:声音|男声|女声)|[\p{Script=Han}]{1,6}(?:眼镜|西装|夹克|背心|衬衫|帽子)(?:男|女|男人|女人)?[甲乙丙丁]?|(?:老|小)[\p{Script=Han}]{1,2}|[\p{Script=Han}]{2,4})$/u.test(role);
+}
+
+function reconcileDirectSceneCast(episode: ScriptEpisode): ScriptEpisode {
+  return {
+    ...episode,
+    scenes: episode.scenes.map((scene) => {
+      const blocks: ScriptBlock[] = scene.blocks.map((block) => (
+        block.type === 'dialogue' &&
+        !block.characterId &&
+        block.speaker.trim() === '字幕'
+          ? { id: block.id, type: 'caption', text: block.text }
+          : block
+      ));
+      return {
+        ...scene,
+        blocks,
+        characterIds: [...new Set([
+          ...scene.characterIds,
+          ...blocks.flatMap((block) => (
+            block.type === 'dialogue' && block.characterId ? [block.characterId] : []
+          )),
+        ])],
+      };
+    }),
+  };
 }
 
 interface ScriptTextComposition {
@@ -1687,7 +1760,21 @@ export class ScriptDirector {
     const missingOutlineNumbers = range.filter(
       (episodeNumber) => !outlines.some((outline) => outline.episodeNumber === episodeNumber),
     );
-    if (missingOutlineNumbers.length > 0) {
+    if (request.draftMode === 'direct_text' && missingOutlineNumbers.length > 0) {
+      const characterIds = state.characters.map((character) => character.id);
+      for (const episodeNumber of missingOutlineNumbers) {
+        const card = seriesOutline.episodeCards.find(
+          (candidate) => candidate.episodeNumber === episodeNumber,
+        );
+        if (!card) throw new ScriptModelOutputError(`全剧分集卡缺少第 ${episodeNumber} 集。`);
+        outlines.push(directOutlineFromEpisodeCard(
+          request.projectId,
+          seriesOutline,
+          card,
+          characterIds,
+        ));
+      }
+    } else if (missingOutlineNumbers.length > 0) {
       const registeredCharacterIds = new Set(
         state.characters.map((character) => character.id),
       );
@@ -3323,7 +3410,14 @@ export class ScriptDirector {
     const inputRevisionRefs = buildScriptInputRevisionRefs(state, episodeNumber);
     const outlineRef = buildScriptUpstreamArtifactRef('episode_outline', outline.revision, outline);
     const context = directWritingContext(state, plan, outline);
-    const promptVersion = 'direct-draft-v1';
+    const directValidationPlan = planForDirectDraftValidation(plan);
+    const canonicalDirectCandidate = (value: ScriptEpisode): ScriptEpisode =>
+      reconcileDirectSceneCast(this.canonicalEpisodeCandidate(
+        value,
+        directValidationPlan,
+        episodeNumber,
+      ));
+    const promptVersion = 'direct-draft-v2';
     const draftFingerprint = computeScriptCheckpointInputFingerprint({
       node: 'direct_draft',
       inputRevisionRefs,
@@ -3350,14 +3444,14 @@ export class ScriptDirector {
         return { warnings: parsed.warnings, unparsedLines: parsed.unparsedLines };
       }
       const now = this.now();
-      const episode = this.canonicalEpisodeCandidate({
+      const episode = canonicalDirectCandidate({
         ...parsed.episode,
         id: currentEpisode?.id ?? this.createId(),
         projectId: request.projectId,
         revision: baseEpisodeRevision,
         createdAt: currentEpisode?.createdAt ?? now,
         updatedAt: now,
-      }, plan, episodeNumber);
+      });
       return { ...parsed, episode };
     };
 
@@ -3399,7 +3493,7 @@ export class ScriptDirector {
       ) return undefined;
       let episode: ScriptEpisode;
       try {
-        episode = this.canonicalEpisodeCandidate(candidate.episode, plan, episodeNumber);
+          episode = canonicalDirectCandidate(candidate.episode);
       } catch {
         return undefined;
       }
@@ -3562,11 +3656,7 @@ export class ScriptDirector {
         recordCall('draft', 'ChineseShortDramaContinuation@v1', 1);
         const addition = parseCandidate(additionText);
         if (addition.episode) {
-          draft = this.canonicalEpisodeCandidate(
-            mergeDirectContinuation(draft, addition.episode),
-            plan,
-            episodeNumber,
-          );
+          draft = canonicalDirectCandidate(mergeDirectContinuation(draft, addition.episode));
           rawText = directEpisodeText(draft, state.characters);
           draftWarnings = [...draftWarnings, ...addition.warnings];
         }
@@ -3625,7 +3715,7 @@ export class ScriptDirector {
         ending: outline.endingHook,
       },
     });
-    const reviewPromptVersion = 'direct-handoff-review-v1';
+    const reviewPromptVersion = 'direct-handoff-review-v3';
     const reviewFingerprint = computeScriptCheckpointInputFingerprint({
       node: 'handoff_review',
       inputRevisionRefs,
@@ -3636,7 +3726,7 @@ export class ScriptDirector {
     const storedReview = await this.latestCheckpoint(
       request.projectId,
       runKey,
-      { node: 'handoff_review', episodeNumber },
+      { node: 'handoff_review', episodeNumber, chunkStart: 1 },
     );
     let review: ScriptDirectHandoffReview | undefined;
     let reviewRevision: number | undefined;
@@ -3667,7 +3757,10 @@ export class ScriptDirector {
           responseFormat: 'json',
           signal: request.signal,
         });
-        review = decodeDirectHandoffReview(parseStructuredModelOutput(rawReview));
+        review = reconcileDirectReviewBoundary(
+          context,
+          decodeDirectHandoffReview(parseStructuredModelOutput(rawReview)),
+        );
         recordCall('review', 'ScriptDirectHandoffReview@v1', 1);
       } catch (error) {
         if (!(error instanceof ScriptModelOutputError)) throw error;
@@ -3677,7 +3770,7 @@ export class ScriptDirector {
       reviewRevision = await this.nextCheckpointArtifactRevision(
         request.projectId,
         runKey,
-        { node: 'handoff_review', episodeNumber },
+        { node: 'handoff_review', episodeNumber, chunkStart: 1 },
       );
       const artifact: ScriptDirectReviewArtifact = {
         schemaVersion: 1,
@@ -3693,6 +3786,7 @@ export class ScriptDirector {
         attempt: 1,
         artifactRevision: reviewRevision,
         episodeNumber,
+        chunkStart: 1,
         artifact,
         inputRevisionRefs,
         upstreamArtifactRefs: [currentCandidateRef],
@@ -3703,9 +3797,10 @@ export class ScriptDirector {
         updatedAt: this.now(),
       }, `第 ${episodeNumber} 集明显错误检查与连续性交接已完成。`);
     }
+    review = reconcileDirectReviewBoundary(context, review);
     const reviewRef = buildScriptUpstreamArtifactRef('handoff_review', reviewRevision!, review);
     episodeUpstreamRefs.push(reviewRef);
-    draft = this.canonicalEpisodeCandidate({
+    draft = canonicalDirectCandidate({
       ...draft,
       summary: review.handoff.summary || outline.goal,
       newFacts: [...new Set([
@@ -3715,22 +3810,38 @@ export class ScriptDirector {
       openedThreads: review.handoff.openThreads,
       closedThreads: [],
       updatedAt: this.now(),
-    }, plan, episodeNumber);
+    });
     if (!draft) throw new ScriptModelOutputError(`第 ${episodeNumber} 集直接写作候选丢失。`);
 
-    const validateDraft = (candidate: ScriptEpisode, aiIssues: readonly ScriptGateIssue[] = []): ScriptGateReport =>
-      validateScriptEpisode(candidate, plan, {
+    const registeredCharacterNames = new Set(state.characters.map((character) => character.name));
+    const validateDraft = (candidate: ScriptEpisode, reviewIssues: readonly ScriptGateIssue[] = []): ScriptGateReport => {
+      const temporarySpeakers = new Set<string>();
+      if (allowsTemporaryDialogueSpeakers(plan)) {
+        for (const scene of candidate.scenes) {
+          for (const block of scene.blocks) {
+            if (
+              block.type === 'dialogue' &&
+              !block.characterId &&
+              !registeredCharacterNames.has(block.speaker.trim()) &&
+              isTemporaryDialogueRole(block.speaker)
+            ) temporarySpeakers.add(block.speaker.trim());
+          }
+        }
+      }
+      return validateScriptEpisode(candidate, directValidationPlan, {
         expectedEpisodeNumber: episodeNumber,
         registeredCharacterIds: new Set(state.characters.map((character) => character.id)),
-        registeredCharacterNames: new Set(state.characters.map((character) => character.name)),
+        registeredCharacterNames,
         characterNamesById: new Map(state.characters.map((character) => [character.id, character.name])),
+        temporarySpeakers,
         outline,
         previousEpisode: state.episodes
           .filter((episode) => episode.episodeNumber < episodeNumber)
           .sort((left, right) => right.episodeNumber - left.episodeNumber)[0],
         continuity: projectScriptContinuity(state, episodeNumber),
-        reviewIssues: aiIssues,
+        reviewIssues,
       });
+    };
     const draftForReview = draft;
     const aiIssues: ScriptGateIssue[] = review.issues.map((issue) => ({
       code: `DIRECT_${issue.code}`,
@@ -3753,7 +3864,15 @@ export class ScriptDirector {
       })),
     ].slice(0, 3);
     if (rewriteIssues.length > 0) {
-      const rewritePromptVersion = 'direct-rewrite-v1';
+      const storedRewrite = await this.latestCheckpoint(
+        request.projectId,
+        runKey,
+        { node: 'direct_rewrite', episodeNumber },
+      );
+      const rewriteFromOutline = storedRewrite?.status === 'stale';
+      const rewritePromptVersion = rewriteFromOutline
+        ? 'direct-rewrite-from-outline-v1'
+        : 'direct-rewrite-v4';
       const rewriteFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'direct_rewrite',
         inputRevisionRefs,
@@ -3761,11 +3880,6 @@ export class ScriptDirector {
         promptVersion: rewritePromptVersion,
         configRevision,
       });
-      const storedRewrite = await this.latestCheckpoint(
-        request.projectId,
-        runKey,
-        { node: 'direct_rewrite', episodeNumber },
-      );
       let rewriteArtifact: ScriptDirectDraftArtifact | undefined;
       let rewriteRevision: number | undefined;
       if (storedRewrite) {
@@ -3780,21 +3894,43 @@ export class ScriptDirector {
       }
       if (!rewriteArtifact) {
         request.signal?.throwIfAborted();
-        const rewrittenText = await this.dependencies.model.complete({
+        let rewrittenText = await this.dependencies.model.complete({
           node: 'revision',
           projectId: request.projectId,
           episodeNumber,
-          prompt: buildDirectRewritePrompt(context, rawText, rewriteIssues),
+          prompt: buildDirectRewritePrompt(context, rawText, rewriteIssues, {
+            rewriteFromOutline,
+          }),
           responseFormat: 'text',
           signal: request.signal,
         });
-        recordCall('revision', 'ChineseShortDramaDirectRewrite@v1', 1);
-        const rewritten = parseCandidate(rewrittenText);
-        if (rewritten.episode && rewritten.unparsedLines.length === 0) {
-          draft = rewritten.episode;
-          rawText = rewrittenText;
-          draftWarnings = rewritten.warnings;
+        let rewritten = parseCandidate(rewrittenText);
+        let rewriteCallsUsed = 1;
+        if (!rewritten.episode || rewritten.unparsedLines.length > 0) {
+          rewrittenText = await this.dependencies.model.complete({
+            node: 'revision',
+            projectId: request.projectId,
+            episodeNumber,
+            prompt: [
+              '只修正下面剧本的排版，不改变事件、人物、对白含义和篇幅。',
+              '删除解释文字与Markdown围栏，严格整理为：第N集、N-M 地点 日或夜/内或外、人物、字幕、△动作、人物对白。',
+              '只输出整理后的完整剧本文本。',
+              rewrittenText,
+            ].join('\n'),
+            responseFormat: 'text',
+            signal: request.signal,
+          });
+          rewriteCallsUsed += 1;
+          rewritten = parseCandidate(rewrittenText);
         }
+        if (!rewritten.episode) {
+          recordCall('revision', 'ChineseShortDramaDirectRewrite@v1', rewriteCallsUsed, 'needs_review');
+          throw new ScriptModelOutputError(`第 ${episodeNumber} 集改写稿没有返回可识别的剧本场景。`);
+        }
+        recordCall('revision', 'ChineseShortDramaDirectRewrite@v1', rewriteCallsUsed);
+        draft = rewritten.episode;
+        rawText = rewrittenText;
+        draftWarnings = rewritten.warnings;
         rewriteRevision = await this.nextCheckpointArtifactRevision(
           request.projectId,
           runKey,
@@ -3814,7 +3950,7 @@ export class ScriptDirector {
           runKey,
           node: 'direct_rewrite',
           status: 'succeeded',
-          attempt: 1,
+          attempt: rewriteCallsUsed,
           artifactRevision: rewriteRevision,
           episodeNumber,
           artifact: rewriteArtifact,
@@ -3836,7 +3972,121 @@ export class ScriptDirector {
         rewriteArtifact,
       );
       episodeUpstreamRefs.push(currentCandidateRef);
-      deterministicReport = validateDraft(draft);
+      const postRewriteReviewPromptVersion = 'direct-handoff-review-after-rewrite-v3';
+      const postRewriteReviewFingerprint = computeScriptCheckpointInputFingerprint({
+        node: 'handoff_review',
+        inputRevisionRefs,
+        upstreamArtifactRefs: [currentCandidateRef],
+        promptVersion: postRewriteReviewPromptVersion,
+        configRevision,
+      });
+      const storedPostRewriteReview = await this.latestCheckpoint(
+        request.projectId,
+        runKey,
+        { node: 'handoff_review', episodeNumber, chunkStart: 2 },
+      );
+      let postRewriteReview: ScriptDirectHandoffReview | undefined;
+      let postRewriteReviewRevision: number | undefined;
+      if (storedPostRewriteReview) {
+        const decision = decideScriptCheckpointResume(
+          storedPostRewriteReview,
+          postRewriteReviewFingerprint,
+        );
+        if (decision.disposition === 'reuse') {
+          const value = storedPostRewriteReview.artifact;
+          if (value && typeof value === 'object' && !Array.isArray(value)) {
+            const artifact = value as Partial<ScriptDirectReviewArtifact>;
+            if (artifact.schemaVersion === 1 && artifact.stage === 'direct_review' && artifact.review) {
+              postRewriteReview = artifact.review;
+              postRewriteReviewRevision = storedPostRewriteReview.artifactRevision;
+            }
+          }
+          if (!postRewriteReview) await this.markCheckpointStale(storedPostRewriteReview);
+        } else if (decision.disposition === 'stale') {
+          await this.markCheckpointStale(storedPostRewriteReview);
+        }
+      }
+      if (!postRewriteReview) {
+        request.signal?.throwIfAborted();
+        try {
+          const rawPostRewriteReview = await this.dependencies.model.complete({
+            node: 'review',
+            projectId: request.projectId,
+            episodeNumber,
+            prompt: buildDirectReviewPrompt(context, rawText),
+            responseFormat: 'json',
+            signal: request.signal,
+          });
+          postRewriteReview = reconcileDirectReviewBoundary(
+            context,
+            decodeDirectHandoffReview(parseStructuredModelOutput(rawPostRewriteReview)),
+          );
+          recordCall('review', 'ScriptDirectHandoffReviewAfterRewrite@v1', 1);
+        } catch (error) {
+          if (!(error instanceof ScriptModelOutputError)) throw error;
+          postRewriteReview = fallbackReview();
+          recordCall('review', 'ScriptDirectHandoffReviewAfterRewrite@v1', 1, 'needs_review');
+        }
+        postRewriteReviewRevision = await this.nextCheckpointArtifactRevision(
+          request.projectId,
+          runKey,
+          { node: 'handoff_review', episodeNumber, chunkStart: 2 },
+        );
+        const postRewriteReviewArtifact: ScriptDirectReviewArtifact = {
+          schemaVersion: 1,
+          stage: 'direct_review',
+          review: postRewriteReview,
+          createdAt: this.now(),
+        };
+        await this.saveCheckpoint(request, {
+          projectId: request.projectId,
+          runKey,
+          node: 'handoff_review',
+          status: 'succeeded',
+          attempt: 1,
+          artifactRevision: postRewriteReviewRevision,
+          episodeNumber,
+          chunkStart: 2,
+          artifact: postRewriteReviewArtifact,
+          inputRevisionRefs,
+          upstreamArtifactRefs: [currentCandidateRef],
+          promptVersion: postRewriteReviewPromptVersion,
+          configRevision,
+          inputFingerprint: postRewriteReviewFingerprint,
+          validationErrors: [],
+          updatedAt: this.now(),
+        }, `第 ${episodeNumber} 集重写后复核已完成。`);
+      }
+      review = reconcileDirectReviewBoundary(context, postRewriteReview);
+      const postRewriteReviewRef = buildScriptUpstreamArtifactRef(
+        'handoff_review',
+        postRewriteReviewRevision!,
+        postRewriteReview,
+      );
+      episodeUpstreamRefs.push(postRewriteReviewRef);
+      const postRewriteDraft = canonicalDirectCandidate({
+        ...draft,
+        summary: review.handoff.summary || outline.goal,
+        newFacts: [...new Set([
+          ...review.handoff.characterStates.flatMap((item) => item.knows),
+          ...review.handoff.props.map((item) => `${item.name}：${item.state}`),
+        ])],
+        openedThreads: review.handoff.openThreads,
+        closedThreads: [],
+        updatedAt: this.now(),
+      });
+      draft = postRewriteDraft;
+      const postRewriteBlockingIssues: ScriptGateIssue[] = review.issues.map((issue) => ({
+        code: `DIRECT_RECHECK_${issue.code}`,
+        severity: 'hard',
+        source: 'deterministic',
+        message: `${issue.evidence}；应为：${issue.expected}`,
+        ...(issue.sceneNumber
+          ? { sceneId: postRewriteDraft.scenes.find((scene) => scene.ordinal === issue.sceneNumber)?.id }
+          : {}),
+        path: 'scenes',
+      }));
+      deterministicReport = validateDraft(postRewriteDraft, postRewriteBlockingIssues);
       report = deterministicReport;
     }
 
@@ -4413,6 +4663,24 @@ export class ScriptDirector {
       const rejectedRevision = revisions.find((checkpoint) => checkpoint.status === 'needs_review');
       const completedCandidateRejected = completed?.status === 'needs_review';
       if (!rejectedRevision && !completedCandidateRejected) continue;
+
+      if (completedCandidateRejected) {
+        const directPostRewriteReview = latestScriptCheckpoint(checkpoints, {
+          node: 'handoff_review',
+          episodeNumber,
+          chunkStart: 2,
+        });
+        if (directPostRewriteReview && directPostRewriteReview.status !== 'stale') {
+          await this.markCheckpointStale(directPostRewriteReview);
+        }
+        const directRewrite = latestScriptCheckpoint(checkpoints, {
+          node: 'direct_rewrite',
+          episodeNumber,
+        });
+        if (directRewrite && directRewrite.status !== 'stale') {
+          await this.markCheckpointStale(directRewrite);
+        }
+      }
 
       for (const revision of revisions) {
         if (

@@ -6,8 +6,8 @@ import { serializeChineseShortDrama } from './chineseShortDrama.js';
 describe('serializeChineseShortDrama', () => {
   it('renders structured scenes as standard Chinese short-drama text', () => {
     const characters = [
-      { id: 'c-1', name: '沈清' },
-      { id: 'c-2', name: '周慧兰' },
+      { id: 'c-1', name: '沈清', identity: '美食工作室老板' },
+      { id: 'c-2', name: '周慧兰', identity: '沈家儿媳' },
     ] as unknown as ScriptCharacter[];
     const episode = {
       id: 'episode-1',
@@ -67,14 +67,14 @@ describe('serializeChineseShortDrama', () => {
     const serialized = serializeChineseShortDrama([episode], characters);
     expect(serialized).toBe(
       [
-        '第一集',
+        '第1集：',
         '',
-        '1-1 沈家老宅大门 日/外',
-        '人物：沈清 周慧兰',
+        '1-1 日 外 沈家老宅大门',
+        '人物：沈清（美食工作室老板） 周慧兰（沈家儿媳）',
         '【字幕：沧南市沈家百年老宅】',
         '△沈清跨过门槛。',
         '周慧兰（嗓子哑）：恭请太奶奶出房用膳——！',
-        '沈清（os）：这规矩，该改改了。',
+        '沈清OS：这规矩，该改改了。',
         '沈清：饭凉了，我去热。',
       ].join('\n'),
     );
