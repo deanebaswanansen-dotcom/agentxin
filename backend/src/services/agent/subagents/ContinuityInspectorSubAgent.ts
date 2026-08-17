@@ -124,9 +124,10 @@ export class ContinuityInspectorSubAgent {
       recentChapterSamples: input.recentChapterSamples,
       structuralChecks,
       questions: [
-        '20–30章之前出场的角色，姓名/身份/状态是否仍一致？',
-        '有无死人复活、道具复原、主角性别或核心能力被改写？',
-        '剧情是一以贯之，还是碎片化、像鸡毛一样乱？',
+        '有无死人复活、被捕或昏迷者无解释自由行动？',
+        '唯一物品是否同时在两处，封印或失去的能力是否突然可用？',
+        '人物是否提前知道秘密，重大伤势是否无治疗直接消失？',
+        '本章核心结果是否违背章纲，已结束事件是否被当作第一次发生？',
       ],
     };
 
@@ -136,6 +137,8 @@ export class ContinuityInspectorSubAgent {
         content: [
           '你是「检测子 Agent」，只负责审查，绝不写正文。',
           '写作子 Agent 已完成本章，你的任务是发现设定漂移、人物混乱、剧情断裂。',
+          '只报告会破坏剧情的明确 P0/P1 问题；不要评价文采、节奏、对白密度、服装颜色或一般措辞。',
+          'fatalIssues 只放有前文状态与本章原句共同支持的 P0；证据不足时放 revisionHints，不得猜测。',
           '只输出 JSON：',
           '{"score0to100":number,"verdict":string,"plotCoherence":string,',
           '"fatalIssues":string[],"earlyCharacterStatus":[{"id":string,"consistent":boolean,"note":string}],',

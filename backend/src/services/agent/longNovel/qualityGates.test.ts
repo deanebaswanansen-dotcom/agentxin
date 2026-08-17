@@ -89,6 +89,44 @@ describe('long novel quality gates', () => {
     expect(fixableDateMismatch.hardFail).toBe(false);
   });
 
+  it.each([
+    '角色此前被捕关押，本章却无解释地自由行动并出席宴会',
+    '唯一神器归墟钥匙同一时间被两人持有',
+    '主角提前知道尚未公开的核心秘密',
+    '能力已被封印，本章却直接发动并恢复可用',
+    '人物上一章重伤濒死，本章却伤势消失并满状态战斗',
+  ])('hard-fails an explicit story-breaking continuity issue: %s', (fatalIssue) => {
+    const result = runChapterQualityGates({
+      content: '林远冲进雨里，却发现地图是假的。他说：“我们被骗了。”下一秒警报响起。'.repeat(30),
+      minWords: 100,
+      maxWords: 8000,
+      targetWords: 1500,
+      chapterTitle: '第2章',
+      inspectorScore: 45,
+      fatalIssues: [fatalIssue],
+    });
+
+    expect(result.hardFail).toBe(true);
+    expect(result.findings).toContainEqual(expect.objectContaining({
+      gate: 'continuity',
+      severity: 'hard',
+    }));
+  });
+
+  it('does not let a high reviewer score override an explicit P0 finding', () => {
+    const result = runChapterQualityGates({
+      content: '林远冲进雨里，却发现地图是假的。他说：“我们被骗了。”下一秒警报响起。'.repeat(30),
+      minWords: 100,
+      maxWords: 8000,
+      targetWords: 1500,
+      chapterTitle: '第2章',
+      inspectorScore: 92,
+      fatalIssues: ['角色此前已经死亡，本章却无解释再次出场'],
+    });
+
+    expect(result.hardFail).toBe(true);
+  });
+
   it('default config maps automation levels to max chapters per run', () => {
     expect(defaultLongNovelConfig({ automationLevel: 'assistant' }).maxChaptersPerRun).toBe(1);
     expect(defaultLongNovelConfig({ automationLevel: 'semi_auto' }).maxChaptersPerRun).toBe(5);

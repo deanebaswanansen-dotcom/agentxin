@@ -200,6 +200,9 @@ function buildBlueprintSystemContent(): string {
     '- 场景数量必须为 3 到 7 个。',
     '- 各场景 target_words 之和应尽量接近章节 target_words（偏差比例不超过 0.1）。',
     '- 不要新增重大设定，应在用户提供的大纲、人物与世界观范围内规划。',
+    '- required_plot_points 只列本章必须真正发生的核心事件；不得把后续章节事件提前塞入本章。',
+    '- forbidden_points 优先记录章节需求与故事记忆中明确禁止的提前揭底、状态回退和设定冲突。',
+    '- 每个 ending_state 必须写清本场结束时人物、关键物品或冲突发生了什么变化。',
     '- 必须输出合法 JSON，不要输出除 JSON 之外的多余解释文字。',
   ].join('\n');
 }

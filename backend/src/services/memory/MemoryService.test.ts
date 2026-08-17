@@ -229,7 +229,7 @@ describe('MemoryService', () => {
     expect(ledger).toContain('导师的芯片');
   });
 
-  it('loads legacy memory without foreshadows field as empty array', async () => {
+  it('loads legacy memory without foreshadows, critical states or rejection markers as empty arrays', async () => {
     const file = join(dir, 'legacy.json');
     const { writeFile } = await import('node:fs/promises');
     await writeFile(
@@ -250,7 +250,107 @@ describe('MemoryService', () => {
     );
     const svc = new MemoryService(await MemoryStore.create(file));
     expect(svc.get('p1').foreshadows).toEqual([]);
+    expect(svc.get('p1').criticalStates).toEqual([]);
+    expect(svc.get('p1').rejectedChapterIds).toEqual([]);
     expect(svc.listOpenForeshadows('p1')).toEqual([]);
+  });
+
+  it('tracks rejected chapter drafts separately from committed chapters', async () => {
+    const { svc } = await service();
+    await svc.markChapterRejected('p1', 'c2');
+    await svc.markChapterRejected('p1', 'c2');
+    expect(svc.isChapterRejected('p1', 'c2')).toBe(true);
+    expect(svc.get('p1').rejectedChapterIds).toEqual(['c2']);
+
+    await svc.markChapterCommitted('p1', 'c2');
+    expect(svc.isChapterRejected('p1', 'c2')).toBe(false);
+  });
+
+  it('commits explicit critical states and injects them into later chapter context', async () => {
+    const { svc } = await service();
+    const applied = await svc.applyCriticalStateUpdates('p1', [
+      {
+        kind: 'alive_status',
+        entity: '陆闲',
+        value: 'alive',
+        evidence: '陆闲从祭坛旁站起。',
+        chapterId: 'c1',
+        chapterTitle: '第1章',
+      },
+      {
+        kind: 'key_item',
+        entity: '归墟钥匙·北',
+        key: 'holder',
+        value: '陆闲',
+        evidence: '陆闲把归墟钥匙收进贴身口袋。',
+        chapterId: 'c1',
+        chapterTitle: '第1章',
+      },
+    ]);
+
+    expect(applied).toEqual({ applied: 2, issues: [] });
+    expect(svc.get('p1').criticalStates).toHaveLength(2);
+    const context = svc.buildContext('p1');
+    expect(context).toContain('关键状态账');
+    expect(context).toContain('归墟钥匙·北 · holder = 陆闲');
+  });
+
+  it('rejects a dead character reappearing without an explanation and keeps the prior state', async () => {
+    const { svc } = await service();
+    await svc.applyCriticalStateUpdates('p1', [{
+      kind: 'alive_status',
+      entity: '师父',
+      value: 'dead',
+      evidence: '众人确认师父已经死亡并安葬。',
+      chapterId: 'c1',
+      chapterTitle: '第1章',
+    }]);
+
+    const rejected = await svc.applyCriticalStateUpdates('p1', [{
+      kind: 'alive_status',
+      entity: '师父',
+      value: 'alive',
+      evidence: '师父推门走进宴会厅。',
+      chapterId: 'c2',
+      chapterTitle: '第2章',
+    }]);
+
+    expect(rejected.applied).toBe(0);
+    expect(rejected.issues).toEqual([
+      expect.objectContaining({ severity: 'P0', code: 'DEAD_CHARACTER_REAPPEARS' }),
+    ]);
+    expect(svc.get('p1').criticalStates).toEqual([
+      expect.objectContaining({ entity: '师父', value: 'dead', chapterId: 'c1' }),
+    ]);
+  });
+
+  it('allows an otherwise forbidden state transition when the chapter explicitly explains it', async () => {
+    const { svc } = await service();
+    await svc.applyCriticalStateUpdates('p1', [{
+      kind: 'ability_state',
+      entity: '陆闲',
+      key: '万法归闲',
+      value: 'sealed',
+      evidence: '封印落下，万法归闲无法使用。',
+      chapterId: 'c1',
+      chapterTitle: '第1章',
+    }]);
+
+    const applied = await svc.applyCriticalStateUpdates('p1', [{
+      kind: 'ability_state',
+      entity: '陆闲',
+      key: '万法归闲',
+      value: 'available',
+      evidence: '苏晚璃解封万法归闲，陆闲重新获得这股力量。',
+      chapterId: 'c2',
+      chapterTitle: '第2章',
+    }]);
+
+    expect(applied).toEqual({ applied: 1, issues: [] });
+    expect(svc.get('p1').criticalStates[0]).toMatchObject({
+      value: 'available',
+      chapterId: 'c2',
+    });
   });
 
   it('serializes concurrent mutators so unique facts / summaries / foreshadows are not lost', async () => {

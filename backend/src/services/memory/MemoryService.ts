@@ -17,6 +17,8 @@
 import { randomUUID } from 'node:crypto';
 import type {
   ChapterSummary,
+  CriticalStateEntry,
+  CriticalStateKind,
   ForeshadowEntry,
   ForeshadowStatus,
   ForeshadowUrgency,
@@ -32,6 +34,8 @@ export interface BuildContextOptions {
   maxSummaries?: number;
   /** 最多回灌的故事事实条数（默认 24）。 */
   maxFacts?: number;
+  /** 最多回灌的关键章末状态条数（默认 48）。 */
+  maxCriticalStates?: number;
   /** 最多回灌的学习沉淀条数（默认 8）。 */
   maxLearnings?: number;
   /** 最多回灌的最近工作流事件条数（默认 6）。 */
@@ -65,6 +69,36 @@ export interface TouchForeshadowInput {
   chapterTitle?: string;
 }
 
+export interface CriticalStateUpdateInput {
+  kind: CriticalStateKind;
+  entity: string;
+  key?: string;
+  value: string;
+  evidence: string;
+  chapterId: string;
+  chapterTitle: string;
+}
+
+export interface CriticalStateIssue {
+  severity: 'P0';
+  code:
+    | 'DEAD_CHARACTER_REAPPEARS'
+    | 'RESTRICTED_CHARACTER_MOVES_FREELY'
+    | 'SEALED_ABILITY_REAPPEARS'
+    | 'SEVERE_INJURY_DISAPPEARS'
+    | 'CRITICAL_KNOWLEDGE_LOST'
+    | 'KEY_ITEM_TRANSFER_WITHOUT_SOURCE';
+  kind: CriticalStateKind;
+  entity: string;
+  message: string;
+  evidence: string;
+}
+
+export interface CriticalStateApplyResult {
+  applied: number;
+  issues: CriticalStateIssue[];
+}
+
 /**
  * 长篇写作使用固定窗口和固定字符预算，章数增长只增加持久化记忆，不增加单章 prompt。
  */
@@ -72,6 +106,7 @@ export function scaledMemoryOptions(_chapterCount: number): BuildContextOptions 
   return {
     maxSummaries: 2,
     maxFacts: 24,
+    maxCriticalStates: 48,
     maxLearnings: 6,
     maxWorkflow: 3,
     maxForeshadows: 10,
@@ -82,14 +117,156 @@ export function scaledMemoryOptions(_chapterCount: number): BuildContextOptions 
 /** 上限：防止记忆无限膨胀拖垮 prompt 与文件体积。 */
 const MAX_SUMMARIES = 200;
 const MAX_FACTS = 400;
+const MAX_CRITICAL_STATES = 400;
 const MAX_LEARNINGS = 100;
 const MAX_WORKFLOW = 200;
 const MAX_FORESHADOWS = 120;
 
 const OPEN_STATUSES: readonly ForeshadowStatus[] = ['planted', 'echoed'];
 
+const CRITICAL_STATE_VALUES: Partial<Record<CriticalStateKind, ReadonlySet<string>>> = {
+  alive_status: new Set(['alive', 'dead', 'missing']),
+  mobility_status: new Set(['free', 'detained', 'unconscious', 'immobile']),
+  physical_state: new Set(['healthy', 'injured', 'severely_injured']),
+  ability_state: new Set(['available', 'unavailable', 'sealed', 'lost']),
+  critical_knowledge: new Set(['known', 'unknown']),
+};
+
 function normalize(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
+}
+
+function normalizedCriticalStateKey(
+  kind: CriticalStateKind,
+  entity: string,
+  key: string,
+): string {
+  return [kind, entity, key]
+    .map((value) => value.normalize('NFKC').replace(/\s+/gu, '').toLocaleLowerCase('zh-CN'))
+    .join(':');
+}
+
+function normalizeCriticalStateUpdate(
+  input: CriticalStateUpdateInput,
+): Omit<CriticalStateEntry, 'id' | 'updatedAt'> | undefined {
+  const entity = normalize(input.entity).slice(0, 80);
+  const key = normalize(input.key ?? 'current').slice(0, 160) || 'current';
+  const rawValue = normalize(input.value).slice(0, 120);
+  const enumValues = CRITICAL_STATE_VALUES[input.kind];
+  const value = enumValues ? rawValue.toLocaleLowerCase('en-US') : rawValue;
+  const evidence = normalize(input.evidence).slice(0, 400);
+  if (!entity || !value || !evidence || (enumValues && !enumValues.has(value))) return undefined;
+  return {
+    kind: input.kind,
+    entity,
+    key,
+    value,
+    evidence,
+    chapterId: input.chapterId,
+    chapterTitle: normalize(input.chapterTitle).slice(0, 200),
+  };
+}
+
+function hasTransitionExplanation(kind: CriticalStateKind, evidence: string): boolean {
+  if (kind === 'alive_status') {
+    return /复活|死而复生|假死|误判死亡|抢救成功|还魂|重生/u.test(evidence);
+  }
+  if (kind === 'mobility_status') {
+    return /获释|释放|保释|越狱|逃脱|苏醒|醒来|恢复行动|解除拘禁|被救出/u.test(evidence);
+  }
+  if (kind === 'ability_state') {
+    return /解封|解除封印|恢复能力|重新获得|取回力量|修复|补充能量|充能/u.test(evidence);
+  }
+  if (kind === 'physical_state') {
+    return /治疗|治愈|疗伤|康复|痊愈|休养|数日后|数月后|多年后|时间跳转/u.test(evidence);
+  }
+  if (kind === 'critical_knowledge') {
+    return /失忆|记忆被抹|洗去记忆|遗忘术|催眠/u.test(evidence);
+  }
+  if (kind === 'key_item') {
+    return /交给|递给|转交|赠予|归还|夺走|抢走|偷走|取回|捡到|找到|获得|继承|丢失|遗失|销毁/u.test(evidence);
+  }
+  return false;
+}
+
+function criticalTransitionIssue(
+  previous: CriticalStateEntry,
+  next: Omit<CriticalStateEntry, 'id' | 'updatedAt'>,
+): CriticalStateIssue | undefined {
+  if (previous.value === next.value || hasTransitionExplanation(next.kind, next.evidence)) {
+    return undefined;
+  }
+  const base = {
+    severity: 'P0' as const,
+    kind: next.kind,
+    entity: next.entity,
+    evidence: next.evidence,
+  };
+  if (next.kind === 'alive_status' && previous.value === 'dead' && next.value === 'alive') {
+    return {
+      ...base,
+      code: 'DEAD_CHARACTER_REAPPEARS',
+      message: `「${next.entity}」此前已死亡，本章却在没有复活或假死说明时恢复存活。`,
+    };
+  }
+  if (
+    next.kind === 'mobility_status' &&
+    ['detained', 'unconscious', 'immobile'].includes(previous.value) &&
+    next.value === 'free'
+  ) {
+    return {
+      ...base,
+      code: 'RESTRICTED_CHARACTER_MOVES_FREELY',
+      message: `「${next.entity}」此前处于受限状态，本章却在没有获释、苏醒或恢复说明时自由行动。`,
+    };
+  }
+  if (
+    next.kind === 'ability_state' &&
+    ['unavailable', 'sealed', 'lost'].includes(previous.value) &&
+    next.value === 'available'
+  ) {
+    return {
+      ...base,
+      code: 'SEALED_ABILITY_REAPPEARS',
+      message: `「${next.entity}」的能力「${next.key}」此前不可用，本章却在没有恢复或解封说明时重新可用。`,
+    };
+  }
+  if (
+    next.kind === 'physical_state' &&
+    previous.value === 'severely_injured' &&
+    next.value === 'healthy'
+  ) {
+    return {
+      ...base,
+      code: 'SEVERE_INJURY_DISAPPEARS',
+      message: `「${next.entity}」此前重伤，本章却在没有治疗、休养或时间跳转时恢复健康。`,
+    };
+  }
+  if (
+    next.kind === 'critical_knowledge' &&
+    previous.value === 'known' &&
+    next.value === 'unknown'
+  ) {
+    return {
+      ...base,
+      code: 'CRITICAL_KNOWLEDGE_LOST',
+      message: `「${next.entity}」此前已知「${next.key}」，本章却在没有失忆说明时变为未知。`,
+    };
+  }
+  if (
+    next.kind === 'key_item' &&
+    previous.value !== 'unheld' &&
+    previous.value !== 'destroyed' &&
+    next.value !== 'unheld' &&
+    next.value !== 'destroyed'
+  ) {
+    return {
+      ...base,
+      code: 'KEY_ITEM_TRANSFER_WITHOUT_SOURCE',
+      message: `唯一物品「${next.entity}」从「${previous.value}」变为「${next.value}」持有，但正文没有明确转移来源。`,
+    };
+  }
+  return undefined;
 }
 
 /**
@@ -213,6 +390,105 @@ export class MemoryService {
     });
 
     return added;
+  }
+
+  /**
+   * 原子校验并提交本章关键状态。任何一条 P0 转换不成立时整批拒绝，避免半章状态污染后文。
+   */
+  async applyCriticalStateUpdates(
+    projectId: string,
+    inputs: CriticalStateUpdateInput[],
+  ): Promise<CriticalStateApplyResult> {
+    const latestByKey = new Map<string, Omit<CriticalStateEntry, 'id' | 'updatedAt'>>();
+    for (const input of inputs.slice(0, 24)) {
+      const normalized = normalizeCriticalStateUpdate(input);
+      if (!normalized) continue;
+      latestByKey.set(
+        normalizedCriticalStateKey(normalized.kind, normalized.entity, normalized.key),
+        normalized,
+      );
+    }
+    if (latestByKey.size === 0) return { applied: 0, issues: [] };
+
+    let result: CriticalStateApplyResult = { applied: 0, issues: [] };
+    await this.store.update(projectId, (memory) => {
+      const existingByKey = new Map(
+        memory.criticalStates.map((entry) => [
+          normalizedCriticalStateKey(entry.kind, entry.entity, entry.key),
+          entry,
+        ]),
+      );
+      const issues: CriticalStateIssue[] = [];
+      for (const [stateKey, update] of latestByKey) {
+        const previous = existingByKey.get(stateKey);
+        if (!previous) continue;
+        const issue = criticalTransitionIssue(previous, update);
+        if (issue) issues.push(issue);
+      }
+      if (issues.length > 0) {
+        result = { applied: 0, issues };
+        return;
+      }
+
+      const now = new Date().toISOString();
+      for (const [stateKey, update] of latestByKey) {
+        const previous = existingByKey.get(stateKey);
+        existingByKey.set(stateKey, {
+          ...update,
+          id: previous?.id ?? randomUUID(),
+          updatedAt: now,
+        });
+      }
+      memory.criticalStates = [...existingByKey.values()]
+        .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt))
+        .slice(-MAX_CRITICAL_STATES);
+      result = { applied: latestByKey.size, issues: [] };
+    });
+    return result;
+  }
+
+  /** 标记 P0 拦截稿；正文可供人工查看，但续写时不得把它当作已提交章节。 */
+  async markChapterRejected(projectId: string, chapterId: string): Promise<void> {
+    const id = normalize(chapterId);
+    if (!id) return;
+    await this.store.update(projectId, (memory) => {
+      if (!memory.rejectedChapterIds.includes(id)) memory.rejectedChapterIds.push(id);
+      memory.rejectedChapterIds = memory.rejectedChapterIds.slice(-100);
+    });
+  }
+
+  /** 章节通过全部硬门后清除拦截标记。 */
+  async markChapterCommitted(projectId: string, chapterId: string): Promise<void> {
+    const id = normalize(chapterId);
+    if (!id) return;
+    await this.store.update(projectId, (memory) => {
+      memory.rejectedChapterIds = memory.rejectedChapterIds.filter((item) => item !== id);
+    });
+  }
+
+  isChapterRejected(projectId: string, chapterId: string): boolean {
+    return this.store.read(projectId).rejectedChapterIds.includes(chapterId);
+  }
+
+  formatCriticalStateLedger(projectId: string, maxEntries = 80): string {
+    const states = this.store.read(projectId).criticalStates.slice(-Math.max(0, maxEntries));
+    if (states.length === 0) return '';
+    const labels: Record<CriticalStateKind, string> = {
+      alive_status: '生死',
+      mobility_status: '行动',
+      location: '地点',
+      physical_state: '伤势',
+      ability_state: '能力',
+      critical_knowledge: '关键知识',
+      key_item: '唯一物品',
+      relationship_stage: '关系阶段',
+    };
+    return [
+      '# 关键状态账（只含可能造成大 Bug 的章末事实，后文不得无解释推翻）',
+      ...states.map((state) =>
+        `- [${labels[state.kind]}] ${state.entity} · ${state.key} = ${state.value}（${state.chapterTitle}）`,
+      ),
+    ].join('\n');
   }
 
   /** 记录一条风格学习（自我进化），按文本去重。返回是否新增。 */
@@ -411,6 +687,7 @@ export class MemoryService {
   buildContext(projectId: string, options: BuildContextOptions = {}): string {
     const maxSummaries = options.maxSummaries ?? 6;
     const maxFacts = options.maxFacts ?? 24;
+    const maxCriticalStates = options.maxCriticalStates ?? 48;
     const maxLearnings = options.maxLearnings ?? 8;
     const maxWorkflow = options.maxWorkflow ?? 6;
     const maxForeshadows = options.maxForeshadows ?? 12;
@@ -420,8 +697,17 @@ export class MemoryService {
         : undefined;
 
     const memory = this.store.read(projectId);
-    type ContextSectionKind = 'facts' | 'foreshadows' | 'summaries' | 'learnings' | 'workflow';
+    type ContextSectionKind =
+      | 'criticalStates'
+      | 'facts'
+      | 'foreshadows'
+      | 'summaries'
+      | 'learnings'
+      | 'workflow';
     const sections: Array<{ kind: ContextSectionKind; content: string }> = [];
+
+    const criticalStates = this.formatCriticalStateLedger(projectId, maxCriticalStates);
+    if (criticalStates) sections.push({ kind: 'criticalStates', content: criticalStates });
 
     const facts = memory.facts.slice(-maxFacts);
     if (facts.length > 0) {
@@ -501,11 +787,12 @@ export class MemoryService {
     }
 
     const ratios: Record<ContextSectionKind, number> = {
-      facts: 0.35,
+      criticalStates: 0.25,
+      facts: 0.2,
       foreshadows: 0.15,
       summaries: 0.25,
-      learnings: 0.15,
-      workflow: 0.1,
+      learnings: 0.1,
+      workflow: 0.05,
     };
     const keepTail = new Set<ContextSectionKind>(['summaries', 'learnings', 'workflow']);
     const bounded = sections.map((section) => {
