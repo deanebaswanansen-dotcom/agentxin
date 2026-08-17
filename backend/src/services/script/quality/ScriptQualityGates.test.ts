@@ -65,6 +65,30 @@ describe('validateScriptEpisode', () => {
     expect(report.visibleChars).toBe(90);
   });
 
+  it('keeps large length deviations advisory instead of blocking a usable episode', () => {
+    const shortReport = validateScriptEpisode(episode({
+      scenes: [{
+        ...validScene(),
+        blocks: [{ id: 'short', type: 'action', text: '短'.repeat(40) }],
+      }],
+    }), plan, { expectedEpisodeNumber: 1 });
+    const longReport = validateScriptEpisode(episode({
+      scenes: [{
+        ...validScene(),
+        blocks: [{ id: 'long', type: 'action', text: '长'.repeat(130) }],
+      }],
+    }), plan, { expectedEpisodeNumber: 1 });
+
+    expect(shortReport.hardFailed).toBe(false);
+    expect(longReport.hardFailed).toBe(false);
+    expect(shortReport.advisoryIssues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'TOO_SHORT', severity: 'soft' }),
+    ]));
+    expect(longReport.advisoryIssues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'TOO_LONG', severity: 'soft' }),
+    ]));
+  });
+
   it('reports all deterministic hard failures with stable issue codes', () => {
     const invalidScene = {
       ...validScene(1),

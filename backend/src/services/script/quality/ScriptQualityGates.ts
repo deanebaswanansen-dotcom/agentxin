@@ -344,19 +344,19 @@ export function validateScriptEpisode(
   if (episode.scenes.some((scene, index) => scene.ordinal !== index + 1)) {
     addHard('SCENES_OUT_OF_ORDER', '场景必须按场号升序排列。', 'scenes');
   }
-  if (episode.scenes.length > 0 && visibleChars < Math.ceil(plan.targetCharsPerEpisode * 0.85)) {
+  if (episode.scenes.length > 0 && visibleChars < Math.ceil(plan.targetCharsPerEpisode * 0.75)) {
     issues.push({
       code: 'TOO_SHORT',
-      severity: 'hard',
-      message: `可见字符 ${visibleChars}，低于目标的 85%。`,
+      severity: 'soft',
+      message: `可见字符 ${visibleChars}，低于建议目标的 75%；正文仍可完成，但建议补写。`,
       path: 'scenes',
     });
   }
-  if (visibleChars > Math.floor(plan.targetCharsPerEpisode * 1.15)) {
+  if (visibleChars > Math.floor(plan.targetCharsPerEpisode * 1.25)) {
     issues.push({
       code: 'TOO_LONG',
-      severity: 'hard',
-      message: `可见字符 ${visibleChars}，超过目标的 115%。`,
+      severity: 'soft',
+      message: `可见字符 ${visibleChars}，超过建议目标的 125%；正文仍可完成，可按节奏精简。`,
       path: 'scenes',
     });
   }
