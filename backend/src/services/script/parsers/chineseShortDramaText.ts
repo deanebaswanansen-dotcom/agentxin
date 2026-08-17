@@ -9,6 +9,7 @@ import type {
 
 export type ScriptTextParseWarningCode =
   | 'TEXT_BEFORE_FIRST_SCENE'
+  | 'SCENE_EPISODE_NUMBER_REPAIRED'
   | 'UNPARSED_LINE'
   | 'UNKNOWN_SCENE_CHARACTER'
   | 'UNKNOWN_DIALOGUE_CHARACTER'
@@ -39,9 +40,11 @@ export interface ScriptTextParseResult {
 }
 
 const SCENE_HEADING = /^(\d+)\s*[-－—]\s*(\d+)\s+(.+?)\s+(日|夜|晨|清晨|黄昏|傍晚)\s*[/／]\s*(内|外)$/u;
+const NUMBERED_SCENE_HEADING = /^第\s*(\d+)\s*场\s*[：:]?\s*(.+?)\s+(日|夜|晨|清晨|黄昏|傍晚)\s*[/／]\s*(内|外)$/u;
 const EPISODE_HEADING = /^第\s*(?:\d+|[零〇一二三四五六七八九十百千]+)\s*集(?:\s*[：:]?.*)?$/u;
 const CHARACTER_LINE = /^人物\s*[：:]\s*(.*)$/u;
-const CAPTION_LINE = /^【\s*字幕\s*[：:]\s*(.*?)\s*】$/u;
+const CAPTION_LINE = /^(?:【\s*)?字幕\s*[：:]\s*(.*?)(?:\s*】)?$/u;
+const QUOTED_SCREEN_TEXT_LINE = /^(?:[“"])(.+?)(?:[”"])$/u;
 const ACTION_LINE = /^[△▲]\s*(.*)$/u;
 const DIALOGUE_LINE = /^([^：:（）()]+?)(?:[（(]([^）)]*)[）)])?\s*[：:]\s*(.+)$/u;
 
@@ -125,25 +128,23 @@ export function parseChineseShortDramaText(
     }
 
     const heading = SCENE_HEADING.exec(line);
-    if (heading) {
-      const headingEpisode = Number(heading[1]);
-      if (headingEpisode !== options.episodeNumber) {
+    const numberedHeading = NUMBERED_SCENE_HEADING.exec(line);
+    if (heading || numberedHeading) {
+      const headingEpisode = heading ? Number(heading[1]) : options.episodeNumber;
+      if (heading && headingEpisode !== options.episodeNumber) {
         warn(
           lineNumber,
-          'UNPARSED_LINE',
-          `场景头集号 ${headingEpisode} 与当前第 ${options.episodeNumber} 集不一致。`,
+          'SCENE_EPISODE_NUMBER_REPAIRED',
+          `场景头集号 ${headingEpisode} 已按当前第 ${options.episodeNumber} 集修正。`,
           line,
-          true,
         );
-        currentScene = undefined;
-        continue;
       }
       currentScene = {
         id: options.createId(),
-        ordinal: Number(heading[2]),
-        location: heading[3]!.trim(),
-        timeOfDay: timeOfDay(heading[4]!),
-        interiorExterior: interiorExterior(heading[5]!),
+        ordinal: Number(heading ? heading[2] : numberedHeading![1]),
+        location: (heading ? heading[3] : numberedHeading![2])!.trim(),
+        timeOfDay: timeOfDay((heading ? heading[4] : numberedHeading![3])!),
+        interiorExterior: interiorExterior((heading ? heading[5] : numberedHeading![4])!),
         characterIds: [],
         blocks: [],
       };
@@ -178,6 +179,16 @@ export function parseChineseShortDramaText(
         id: options.createId(),
         type: 'caption',
         text: caption[1]!.trim(),
+      });
+      continue;
+    }
+
+    const quotedScreenText = QUOTED_SCREEN_TEXT_LINE.exec(line);
+    if (quotedScreenText) {
+      currentScene.blocks.push({
+        id: options.createId(),
+        type: 'caption',
+        text: quotedScreenText[1]!.trim(),
       });
       continue;
     }

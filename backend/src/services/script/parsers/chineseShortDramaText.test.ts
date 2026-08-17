@@ -88,6 +88,76 @@ describe('parseChineseShortDramaText', () => {
     ]);
   });
 
+  it('repairs copied scene episode prefixes instead of discarding an otherwise valid episode', () => {
+    const result = parseChineseShortDramaText([
+      '第3集 公开挑战',
+      '1-1 修车厂 日/内',
+      '人物：周野 林秋',
+      '△周野把旧赛车服铺在工作台上。',
+      '林秋：记者已经到了，我们现在就公开证据。',
+      '1-2 赛车场媒体中心 日/内',
+      '人物：周野',
+      '周野：十年前的记录，今天必须重见天日。',
+    ].join('\n'), options());
+
+    expect(result.episode?.episodeNumber).toBe(3);
+    expect(result.episode?.scenes.map((scene) => scene.ordinal)).toEqual([1, 2]);
+    expect(result.unparsedLines).toEqual([]);
+    expect(result.warnings.map((item) => item.code)).toEqual([
+      'SCENE_EPISODE_NUMBER_REPAIRED',
+      'SCENE_EPISODE_NUMBER_REPAIRED',
+    ]);
+  });
+
+  it('accepts numbered scene headings without an episode prefix', () => {
+    const result = parseChineseShortDramaText([
+      '第4集 证据之争',
+      '第1场 市郊资格赛场 日/外',
+      '人物：周野',
+      '△周野戴上头盔走向发车区。',
+      '周野：先拿到资格，决赛再把真相说清楚。',
+      '第2场 修车铺 夜/内',
+      '人物：周野',
+      '字幕：明天就是你的终点。',
+    ].join('\n'), options());
+
+    expect(result.episode?.scenes).toHaveLength(2);
+    expect(result.episode?.scenes.map((scene) => scene.ordinal)).toEqual([1, 2]);
+    expect(result.unparsedLines).toEqual([]);
+  });
+
+  it('accepts an unwrapped caption label as a caption instead of a dialogue speaker', () => {
+    const result = parseChineseShortDramaText([
+      '第3集',
+      '3-1 赛车场 日/外',
+      '人物：周野',
+      '字幕：十年前事故调查发布会',
+      '△周野把旧检测报告放在镜头前。',
+    ].join('\n'), options());
+
+    expect(result.unparsedLines).toEqual([]);
+    expect(result.episode?.scenes[0]?.blocks[0]).toMatchObject({
+      type: 'caption',
+      text: '十年前事故调查发布会',
+    });
+  });
+
+  it('keeps a standalone quoted phone message as on-screen text', () => {
+    const result = parseChineseShortDramaText([
+      '第3集',
+      '3-1 修车厂 夜/内',
+      '人物：周野',
+      '△手机屏幕突然亮起，出现一条陌生短信。',
+      '“证据没了，人也没了。你还要继续吗？”',
+    ].join('\n'), options());
+
+    expect(result.unparsedLines).toEqual([]);
+    expect(result.episode?.scenes[0]?.blocks[1]).toMatchObject({
+      type: 'caption',
+      text: '证据没了，人也没了。你还要继续吗？',
+    });
+  });
+
   it('round-trips the supported screenplay surface through the existing serializer', () => {
     const parsed = parseChineseShortDramaText([
       '第3集',

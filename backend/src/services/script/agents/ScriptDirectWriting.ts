@@ -69,6 +69,30 @@ export interface ScriptDirectReviewArtifact {
   createdAt: string;
 }
 
+function hasNextEpisodeDirection(context: Record<string, unknown>): boolean {
+  return Boolean(
+    context.nextEpisodeDirection &&
+    typeof context.nextEpisodeDirection === 'object' &&
+    !Array.isArray(context.nextEpisodeDirection)
+  );
+}
+
+export function reconcileDirectReviewBoundary(
+  context: Record<string, unknown>,
+  review: ScriptDirectHandoffReview,
+): ScriptDirectHandoffReview {
+  if (hasNextEpisodeDirection(context)) return review;
+  const issues = review.issues.filter((issue) => !(
+    (issue.code === 'OFF_OUTLINE' || issue.code === 'DUPLICATE_MAJOR_EVENT') &&
+    /(?:下一集|后续集|留待后续|留到后续)/u.test(issue.expected)
+  ));
+  return {
+    ...review,
+    verdict: issues.length > 0 ? 'major_issue' : 'pass',
+    issues,
+  };
+}
+
 function compactCharacter(character: ScriptCharacter): Record<string, unknown> {
   return {
     id: character.id,
@@ -160,12 +184,18 @@ export function directWritingContext(
 }
 
 export function buildDirectDraftPrompt(context: Record<string, unknown>): string {
+  const boundaryInstruction = hasNextEpisodeDirection(context)
+    ? '本集必须在 endingHook 处停住；nextEpisodeDirection 是下一集边界，只能做铺垫，绝不能提前完成下一集事件、后续决赛或全剧结局。'
+    : '这是全剧最后一集，nextEpisodeDirection 为空；必须完成本集分集卡、endingHook 与已确认的全剧结局，不得凭空保留到不存在的下一集。';
   return [
     '请严格照已确认的当前分集卡，直接写出本集完整中文短剧正文。',
     '这是创作任务，不是数据填表；不要解释，不要分析，不要输出 JSON 或 Markdown 围栏。',
     '必须保持项目题材、人物身份、职业、关系和证物状态一致，不能把项目换成另一种题材。',
     '必须落实本集 goal、conflict、beats 与 endingHook；forbiddenFacts 和 forbiddenElements 不得出现。',
+    boundaryInstruction,
     '篇幅和对白比例是建议，不要为了精确数字机械重复：尽量接近 targetChars，对白用冲突推进。',
+    '若创作要求禁止临时角色对白，就让路人用动作表达；否则前台、保安、快递员等临时角色必须用自己的称谓署名，绝不能把他们的台词挂到主角或其他登记人物名下。',
+    '通常控制在 maxScenes 场；如完整讲清本集确有需要，最多可以写5场，不要因场数限制截断主要事件。',
     '只使用以下格式：',
     '第N集',
     'N-1 具体地点 日或夜/内或外',
@@ -199,9 +229,13 @@ export function buildDirectReviewPrompt(
   context: Record<string, unknown>,
   rawText: string,
 ): string {
+  const boundaryInstruction = hasNextEpisodeDirection(context)
+    ? '必须逐项比较本集 endingHook 与 nextEpisodeDirection：若正文越过 endingHook，提前完成下一集、后续高潮或结局，必须判 major_issue，并使用 OFF_OUTLINE 或 DUPLICATE_MAJOR_EVENT。'
+    : '这是全剧最后一集，nextEpisodeDirection 为空：正文应完成本集分集卡、endingHook 与已确认结局，禁止虚构“应留到下一集”并据此判错。';
   return [
     '你是短剧明显错误检查员，同时为下一集提取极简交接状态。',
     '只检查：跑出当前大纲、题材或场景类型错误、人物身份关系冲突、主要事件重复发生、明显因果倒置、重要道具状态矛盾。',
+    boundaryInstruction,
     '不要评论服装丰富度、文学性、节奏、镜头、表演和普通台词润色。没有明显错误必须 verdict=pass、issues=[]。',
     '只返回 JSON：',
     '{"verdict":"pass|major_issue","issues":[{"code":"OFF_OUTLINE|WRONG_GENRE_OR_SETTING|CHARACTER_IDENTITY_CONFLICT|DUPLICATE_MAJOR_EVENT|CAUSAL_CONTRADICTION|PROP_STATE_CONTRADICTION","sceneNumber":1,"evidence":"正文证据","expected":"大纲或连续性要求"}],"handoff":{"summary":"本集摘要","characterStates":[{"characterId":"登记ID","location":"最后地点","state":"当前状态","knows":["已知信息"]}],"props":[{"name":"道具","holder":"人物ID","location":"地点","state":"状态"}],"openThreads":["未解决悬念"],"ending":"本集最后状态"}}',
@@ -216,9 +250,13 @@ export function buildDirectRewritePrompt(
   rawText: string,
   issues: readonly ScriptDirectReviewIssue[],
 ): string {
+  const boundaryInstruction = hasNextEpisodeDirection(context)
+    ? '重写后必须在本集 endingHook 停住，不得保留已经越界到 nextEpisodeDirection 或后续高潮的事件。'
+    : '这是全剧最后一集：重写后必须完成本集 endingHook 与已确认结局，不得凭空删成“留待下一集”。';
   return [
     '请根据明确问题重写本集完整中文短剧正文。',
     '只修列出的大问题，保留原稿中没有问题的事件、人物关系和可用对白。',
+    boundaryInstruction,
     '输出完整标准剧本文本，不要解释，不要JSON，不要Markdown围栏。',
     `问题：${JSON.stringify(issues.slice(0, 3))}`,
     `创作资料：${JSON.stringify(context)}`,
