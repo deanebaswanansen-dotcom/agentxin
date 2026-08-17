@@ -33,7 +33,7 @@ function scriptSummary(result: ScriptDirectorResult): string {
     case 'bible':
       return `人物圣经（${result.characters.length} 人）和世界圣经已生成。`;
     case 'episode_batch':
-      return `已完成 ${result.episodes.length} 集，跳过 ${result.skippedEpisodeNumbers.length} 集。`;
+      return `已完成 ${result.episodes.length} 集，跳过 ${result.skippedEpisodeNumbers.length} 集；模型调用 ${result.callSummary.totalCalls} 次（Fixup ${result.callSummary.fixupCalls}、fallback ${result.callSummary.fallbackCalls}）。`;
     case 'planning_questions':
       return `短剧策划仍需回答 ${result.questions.length} 个问题。`;
     case 'planning_waiting':
