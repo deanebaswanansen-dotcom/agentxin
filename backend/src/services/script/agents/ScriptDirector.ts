@@ -36,9 +36,11 @@ import {
 } from '../ScriptCanonicalInput.js';
 import { ScriptServiceError } from '../ScriptServiceError.js';
 import {
+  computeScriptEpisodeCandidateHash,
   computeScriptInputFingerprint,
   type ScriptStore,
 } from '../ScriptStore.js';
+import { parseChineseShortDramaText } from '../parsers/chineseShortDramaText.js';
 import {
   createScriptReviewIssues,
   isBlockingScriptReviewIssue,
@@ -91,7 +93,22 @@ import {
   type ScriptRevisionPatch,
   type ScriptRevisionPatchPolicy,
 } from './ScriptRevisionPatch.js';
-import { ScriptModelOutputError } from './structuredOutput.js';
+import {
+  buildDirectContinuationPrompt,
+  buildDirectDraftPrompt,
+  buildDirectReviewPrompt,
+  buildDirectRewritePrompt,
+  decodeDirectHandoffReview,
+  directEpisodeText,
+  directWritingContext,
+  mergeDirectHandoffContinuity,
+  mergeDirectContinuation,
+  type ScriptDirectDraftArtifact,
+  type ScriptDirectHandoffReview,
+  type ScriptDirectReviewArtifact,
+  type ScriptDirectReviewIssue,
+} from './ScriptDirectWriting.js';
+import { parseStructuredModelOutput, ScriptModelOutputError } from './structuredOutput.js';
 
 export { InMemoryScriptCheckpointStore } from './ScriptCheckpoint.js';
 export type {
@@ -119,6 +136,7 @@ export interface ScriptModelRequest {
   chunkStart?: number;
   chunkEnd?: number;
   prompt: string;
+  responseFormat?: 'json' | 'text';
   /** Uses another model on the same request-scoped provider credentials. */
   modelNameOverride?: string;
   signal?: AbortSignal;
@@ -202,6 +220,7 @@ export type ScriptDirectorRequest =
       startEpisode: number;
       episodeCount: number;
       expectedPlanRevision: number;
+      draftMode?: 'structured_legacy' | 'direct_text';
       signal?: AbortSignal;
       /** Regenerate the candidate that caused a durable needs-review pause. */
       resumeRejectedCandidates?: boolean;
@@ -1845,6 +1864,20 @@ export class ScriptDirector {
       let outline = state.episodeOutlines.find((item) => item.episodeNumber === episodeNumber)
         ?? outlines.find((item) => item.episodeNumber === episodeNumber);
       if (!outline) throw new ScriptModelOutputError(`第 ${episodeNumber} 集详细大纲不存在。`);
+      if (request.draftMode === 'direct_text') {
+        const direct = await this.generateDirectTextEpisode({
+          request,
+          state,
+          plan,
+          outline,
+          runKey,
+          configRevision,
+          recordStructuredCall,
+        });
+        episodes.push(direct.episode);
+        reports.push({ episodeNumber, report: direct.report });
+        continue;
+      }
       let scenePlanArtifact: ScriptScenePlanArtifact | undefined;
       let scenePlanCheckpointRevision: number | undefined;
       if (outline.plannedScenes.length === 0) {
@@ -3272,6 +3305,644 @@ export class ScriptDirector {
       skippedEpisodeNumbers,
       callSummary,
     };
+  }
+
+  private async generateDirectTextEpisode(input: {
+    request: Extract<ScriptDirectorRequest, { task: 'script_episode_batch' }>;
+    state: ScriptProjectState;
+    plan: ScriptPlan;
+    outline: ScriptEpisodeOutline;
+    runKey: string;
+    configRevision: string;
+    recordStructuredCall: (metric: ScriptStructuredCallMetric) => void;
+  }): Promise<{ episode: ScriptEpisode; report: ScriptGateReport }> {
+    const { request, state, plan, outline, runKey, configRevision, recordStructuredCall } = input;
+    const episodeNumber = outline.episodeNumber;
+    const currentEpisode = state.episodes.find((episode) => episode.episodeNumber === episodeNumber);
+    const baseEpisodeRevision = currentEpisode?.revision ?? 0;
+    const inputRevisionRefs = buildScriptInputRevisionRefs(state, episodeNumber);
+    const outlineRef = buildScriptUpstreamArtifactRef('episode_outline', outline.revision, outline);
+    const context = directWritingContext(state, plan, outline);
+    const promptVersion = 'direct-draft-v1';
+    const draftFingerprint = computeScriptCheckpointInputFingerprint({
+      node: 'direct_draft',
+      inputRevisionRefs,
+      upstreamArtifactRefs: [outlineRef],
+      promptVersion,
+      configRevision,
+    });
+
+    const parseCandidate = (rawText: string): {
+      episode?: ScriptEpisode;
+      warnings: ReturnType<typeof parseChineseShortDramaText>['warnings'];
+      unparsedLines: ReturnType<typeof parseChineseShortDramaText>['unparsedLines'];
+    } => {
+      const parsed = parseChineseShortDramaText(rawText, {
+        projectId: request.projectId,
+        episodeNumber,
+        title: outline.title,
+        outlineId: outline.id,
+        targetChars: plan.targetCharsPerEpisode,
+        characters: state.characters,
+        createId: () => this.createId(),
+      });
+      if (!parsed.episode) {
+        return { warnings: parsed.warnings, unparsedLines: parsed.unparsedLines };
+      }
+      const now = this.now();
+      const episode = this.canonicalEpisodeCandidate({
+        ...parsed.episode,
+        id: currentEpisode?.id ?? this.createId(),
+        projectId: request.projectId,
+        revision: baseEpisodeRevision,
+        createdAt: currentEpisode?.createdAt ?? now,
+        updatedAt: now,
+      }, plan, episodeNumber);
+      return { ...parsed, episode };
+    };
+
+    const recordCall = (
+      node: ScriptModelNode,
+      contractName: string,
+      callsUsed: number,
+      status: ScriptStructuredCallMetric['status'] = 'completed',
+    ): void => recordStructuredCall({
+      node,
+      episodeNumber,
+      contractName,
+      status,
+      callsUsed,
+      ...(status === 'completed'
+        ? { completedBy: callsUsed === 1 ? 'primary' as const : 'fixup' as const }
+        : {}),
+      attempts: Array.from({ length: callsUsed }, (_, index) => ({
+        stage: index === 0 ? 'primary' as const : 'fixup' as const,
+        outcome: status === 'completed' && index === callsUsed - 1
+          ? 'completed' as const
+          : 'decode_failed' as const,
+      })),
+    });
+
+    const decodeDraftArtifact = (
+      value: unknown,
+      expectedStage: ScriptDirectDraftArtifact['stage'],
+    ): ScriptDirectDraftArtifact | undefined => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+      const candidate = value as Partial<ScriptDirectDraftArtifact>;
+      if (
+        candidate.schemaVersion !== 1 ||
+        candidate.stage !== expectedStage ||
+        typeof candidate.rawText !== 'string' ||
+        !candidate.episode ||
+        typeof candidate.candidateHash !== 'string' ||
+        !Array.isArray(candidate.parseWarnings)
+      ) return undefined;
+      let episode: ScriptEpisode;
+      try {
+        episode = this.canonicalEpisodeCandidate(candidate.episode, plan, episodeNumber);
+      } catch {
+        return undefined;
+      }
+      if (computeScriptEpisodeCandidateHash(episode) !== candidate.candidateHash) return undefined;
+      return { ...candidate, episode } as ScriptDirectDraftArtifact;
+    };
+
+    let rawText = '';
+    let draft: ScriptEpisode | undefined;
+    let draftWarnings: ReturnType<typeof parseChineseShortDramaText>['warnings'] = [];
+    let directDraftRevision: number | undefined;
+    let writerCallsUsed = 0;
+    const storedDirectDraft = await this.latestCheckpoint(
+      request.projectId,
+      runKey,
+      { node: 'direct_draft', episodeNumber },
+    );
+    if (storedDirectDraft) {
+      const decision = decideScriptCheckpointResume(storedDirectDraft, draftFingerprint);
+      if (decision.disposition === 'reuse') {
+        const restored = decodeDraftArtifact(storedDirectDraft.artifact, 'direct_draft');
+        if (restored) {
+          rawText = restored.rawText;
+          draft = restored.episode;
+          draftWarnings = restored.parseWarnings;
+          directDraftRevision = storedDirectDraft.artifactRevision;
+          writerCallsUsed = Math.max(1, storedDirectDraft.attempt);
+        } else {
+          await this.markCheckpointStale(storedDirectDraft);
+        }
+      } else if (decision.disposition === 'stale') {
+        await this.markCheckpointStale(storedDirectDraft);
+      }
+    }
+
+    if (!draft) {
+      request.signal?.throwIfAborted();
+      rawText = await this.dependencies.model.complete({
+        node: 'draft',
+        projectId: request.projectId,
+        episodeNumber,
+        prompt: buildDirectDraftPrompt(context),
+        responseFormat: 'text',
+        signal: request.signal,
+      });
+      let parsed = parseCandidate(rawText);
+      let callsUsed = 1;
+      if (!parsed.episode || parsed.unparsedLines.length > 0) {
+        const formatPrompt = [
+          '只修正下面剧本的排版，不改变事件、人物、对白含义和篇幅。',
+          '删除解释文字与Markdown围栏，严格整理为：第N集、N-M 地点 日或夜/内或外、人物、字幕、△动作、人物对白。',
+          '只输出整理后的完整剧本文本。',
+          rawText,
+        ].join('\n');
+        rawText = await this.dependencies.model.complete({
+          node: 'draft',
+          projectId: request.projectId,
+          episodeNumber,
+          prompt: formatPrompt,
+          responseFormat: 'text',
+          signal: request.signal,
+        });
+        callsUsed += 1;
+        parsed = parseCandidate(rawText);
+      }
+      if (!parsed.episode) {
+        recordCall('draft', 'ChineseShortDramaText@v1', callsUsed, 'needs_review');
+        throw new ScriptModelOutputError(`第 ${episodeNumber} 集没有返回可识别的剧本场景。`);
+      }
+      recordCall('draft', 'ChineseShortDramaText@v1', callsUsed);
+      writerCallsUsed = callsUsed;
+      draft = parsed.episode;
+      draftWarnings = parsed.warnings;
+      directDraftRevision = await this.nextCheckpointArtifactRevision(
+        request.projectId,
+        runKey,
+        { node: 'direct_draft', episodeNumber },
+      );
+      const artifact: ScriptDirectDraftArtifact = {
+        schemaVersion: 1,
+        stage: 'direct_draft',
+        rawText,
+        episode: draft,
+        candidateHash: computeScriptEpisodeCandidateHash(draft),
+        parseWarnings: draftWarnings,
+        createdAt: this.now(),
+      };
+      await this.saveCheckpoint(request, {
+        projectId: request.projectId,
+        runKey,
+        node: 'direct_draft',
+        status: 'succeeded',
+        attempt: callsUsed,
+        artifactRevision: directDraftRevision,
+        episodeNumber,
+        artifact,
+        inputRevisionRefs,
+        upstreamArtifactRefs: [outlineRef],
+        promptVersion,
+        configRevision,
+        inputFingerprint: draftFingerprint,
+        validationErrors: draftWarnings.map((warning) => ({
+          path: `line:${warning.line}`,
+          code: warning.code,
+          message: warning.message,
+        })),
+        updatedAt: this.now(),
+      }, `第 ${episodeNumber} 集首稿已保存。`);
+    }
+
+    const directDraftRef = buildScriptUpstreamArtifactRef(
+      'direct_draft',
+      directDraftRevision!,
+      { rawText, candidateHash: computeScriptEpisodeCandidateHash(draft) },
+    );
+    let currentCandidateRef = directDraftRef;
+    const episodeUpstreamRefs: ScriptUpstreamArtifactRef[] = [outlineRef, directDraftRef];
+    const continuationThreshold = Math.max(150, Math.round(plan.targetCharsPerEpisode * 0.58));
+    if (writerCallsUsed <= 1 && scriptVisibleChars(draft) < continuationThreshold) {
+      const continuationPromptVersion = 'direct-continuation-v1';
+      const continuationFingerprint = computeScriptCheckpointInputFingerprint({
+        node: 'continuation',
+        inputRevisionRefs,
+        upstreamArtifactRefs: [currentCandidateRef],
+        promptVersion: continuationPromptVersion,
+        configRevision,
+      });
+      const storedContinuation = await this.latestCheckpoint(
+        request.projectId,
+        runKey,
+        { node: 'continuation', episodeNumber },
+      );
+      let continuationRevision: number | undefined;
+      let continued: ScriptDirectDraftArtifact | undefined;
+      if (storedContinuation) {
+        const decision = decideScriptCheckpointResume(storedContinuation, continuationFingerprint);
+        if (decision.disposition === 'reuse') {
+          continued = decodeDraftArtifact(storedContinuation.artifact, 'direct_continuation');
+          continuationRevision = continued ? storedContinuation.artifactRevision : undefined;
+          if (!continued) await this.markCheckpointStale(storedContinuation);
+        } else if (decision.disposition === 'stale') {
+          await this.markCheckpointStale(storedContinuation);
+        }
+      }
+      if (!continued) {
+        request.signal?.throwIfAborted();
+        const additionText = await this.dependencies.model.complete({
+          node: 'draft',
+          projectId: request.projectId,
+          episodeNumber,
+          prompt: buildDirectContinuationPrompt(
+            context,
+            rawText,
+            scriptVisibleChars(draft),
+            plan.targetCharsPerEpisode,
+          ),
+          responseFormat: 'text',
+          signal: request.signal,
+        });
+        recordCall('draft', 'ChineseShortDramaContinuation@v1', 1);
+        const addition = parseCandidate(additionText);
+        if (addition.episode) {
+          draft = this.canonicalEpisodeCandidate(
+            mergeDirectContinuation(draft, addition.episode),
+            plan,
+            episodeNumber,
+          );
+          rawText = directEpisodeText(draft, state.characters);
+          draftWarnings = [...draftWarnings, ...addition.warnings];
+        }
+        continuationRevision = await this.nextCheckpointArtifactRevision(
+          request.projectId,
+          runKey,
+          { node: 'continuation', episodeNumber },
+        );
+        continued = {
+          schemaVersion: 1,
+          stage: 'direct_continuation',
+          rawText,
+          episode: draft,
+          candidateHash: computeScriptEpisodeCandidateHash(draft),
+          parseWarnings: draftWarnings,
+          createdAt: this.now(),
+        };
+        await this.saveCheckpoint(request, {
+          projectId: request.projectId,
+          runKey,
+          node: 'continuation',
+          status: 'succeeded',
+          attempt: 1,
+          artifactRevision: continuationRevision,
+          episodeNumber,
+          artifact: continued,
+          inputRevisionRefs,
+          upstreamArtifactRefs: [currentCandidateRef],
+          promptVersion: continuationPromptVersion,
+          configRevision,
+          inputFingerprint: continuationFingerprint,
+          validationErrors: [],
+          updatedAt: this.now(),
+        }, `第 ${episodeNumber} 集已完成一次自然续写。`);
+      } else {
+        draft = continued.episode;
+        rawText = continued.rawText;
+        draftWarnings = continued.parseWarnings;
+      }
+      currentCandidateRef = buildScriptUpstreamArtifactRef(
+        'continuation',
+        continuationRevision!,
+        continued,
+      );
+      episodeUpstreamRefs.push(currentCandidateRef);
+    }
+
+    const fallbackReview = (): ScriptDirectHandoffReview => ({
+      verdict: 'pass',
+      issues: [],
+      handoff: {
+        summary: outline.goal,
+        characterStates: [],
+        props: [],
+        openThreads: outline.endingHook ? [outline.endingHook] : [],
+        ending: outline.endingHook,
+      },
+    });
+    const reviewPromptVersion = 'direct-handoff-review-v1';
+    const reviewFingerprint = computeScriptCheckpointInputFingerprint({
+      node: 'handoff_review',
+      inputRevisionRefs,
+      upstreamArtifactRefs: [currentCandidateRef],
+      promptVersion: reviewPromptVersion,
+      configRevision,
+    });
+    const storedReview = await this.latestCheckpoint(
+      request.projectId,
+      runKey,
+      { node: 'handoff_review', episodeNumber },
+    );
+    let review: ScriptDirectHandoffReview | undefined;
+    let reviewRevision: number | undefined;
+    if (storedReview) {
+      const decision = decideScriptCheckpointResume(storedReview, reviewFingerprint);
+      if (decision.disposition === 'reuse') {
+        const value = storedReview.artifact;
+        if (value && typeof value === 'object' && !Array.isArray(value)) {
+          const artifact = value as Partial<ScriptDirectReviewArtifact>;
+          if (artifact.schemaVersion === 1 && artifact.stage === 'direct_review' && artifact.review) {
+            review = artifact.review;
+            reviewRevision = storedReview.artifactRevision;
+          }
+        }
+        if (!review) await this.markCheckpointStale(storedReview);
+      } else if (decision.disposition === 'stale') {
+        await this.markCheckpointStale(storedReview);
+      }
+    }
+    if (!review) {
+      request.signal?.throwIfAborted();
+      try {
+        const rawReview = await this.dependencies.model.complete({
+          node: 'review',
+          projectId: request.projectId,
+          episodeNumber,
+          prompt: buildDirectReviewPrompt(context, rawText),
+          responseFormat: 'json',
+          signal: request.signal,
+        });
+        review = decodeDirectHandoffReview(parseStructuredModelOutput(rawReview));
+        recordCall('review', 'ScriptDirectHandoffReview@v1', 1);
+      } catch (error) {
+        if (!(error instanceof ScriptModelOutputError)) throw error;
+        review = fallbackReview();
+        recordCall('review', 'ScriptDirectHandoffReview@v1', 1, 'needs_review');
+      }
+      reviewRevision = await this.nextCheckpointArtifactRevision(
+        request.projectId,
+        runKey,
+        { node: 'handoff_review', episodeNumber },
+      );
+      const artifact: ScriptDirectReviewArtifact = {
+        schemaVersion: 1,
+        stage: 'direct_review',
+        review,
+        createdAt: this.now(),
+      };
+      await this.saveCheckpoint(request, {
+        projectId: request.projectId,
+        runKey,
+        node: 'handoff_review',
+        status: 'succeeded',
+        attempt: 1,
+        artifactRevision: reviewRevision,
+        episodeNumber,
+        artifact,
+        inputRevisionRefs,
+        upstreamArtifactRefs: [currentCandidateRef],
+        promptVersion: reviewPromptVersion,
+        configRevision,
+        inputFingerprint: reviewFingerprint,
+        validationErrors: [],
+        updatedAt: this.now(),
+      }, `第 ${episodeNumber} 集明显错误检查与连续性交接已完成。`);
+    }
+    const reviewRef = buildScriptUpstreamArtifactRef('handoff_review', reviewRevision!, review);
+    episodeUpstreamRefs.push(reviewRef);
+    draft = this.canonicalEpisodeCandidate({
+      ...draft,
+      summary: review.handoff.summary || outline.goal,
+      newFacts: [...new Set([
+        ...review.handoff.characterStates.flatMap((item) => item.knows),
+        ...review.handoff.props.map((item) => `${item.name}：${item.state}`),
+      ])],
+      openedThreads: review.handoff.openThreads,
+      closedThreads: [],
+      updatedAt: this.now(),
+    }, plan, episodeNumber);
+    if (!draft) throw new ScriptModelOutputError(`第 ${episodeNumber} 集直接写作候选丢失。`);
+
+    const validateDraft = (candidate: ScriptEpisode, aiIssues: readonly ScriptGateIssue[] = []): ScriptGateReport =>
+      validateScriptEpisode(candidate, plan, {
+        expectedEpisodeNumber: episodeNumber,
+        registeredCharacterIds: new Set(state.characters.map((character) => character.id)),
+        registeredCharacterNames: new Set(state.characters.map((character) => character.name)),
+        characterNamesById: new Map(state.characters.map((character) => [character.id, character.name])),
+        outline,
+        previousEpisode: state.episodes
+          .filter((episode) => episode.episodeNumber < episodeNumber)
+          .sort((left, right) => right.episodeNumber - left.episodeNumber)[0],
+        continuity: projectScriptContinuity(state, episodeNumber),
+        reviewIssues: aiIssues,
+      });
+    const draftForReview = draft;
+    const aiIssues: ScriptGateIssue[] = review.issues.map((issue) => ({
+      code: `DIRECT_${issue.code}`,
+      severity: 'soft',
+      source: 'ai',
+      message: `${issue.evidence}；应为：${issue.expected}`,
+      ...(issue.sceneNumber
+        ? { sceneId: draftForReview.scenes.find((scene) => scene.ordinal === issue.sceneNumber)?.id }
+        : {}),
+      path: 'scenes',
+    }));
+    let deterministicReport = validateDraft(draft);
+    let report = validateDraft(draft, aiIssues);
+    const rewriteIssues: ScriptDirectReviewIssue[] = [
+      ...review.issues,
+      ...deterministicReport.blockingIssues.map((issue) => ({
+        code: 'CHARACTER_IDENTITY_CONFLICT' as const,
+        evidence: issue.message,
+        expected: '修正该明确结构或人物错误，同时保持分集卡事件不变。',
+      })),
+    ].slice(0, 3);
+    if (rewriteIssues.length > 0) {
+      const rewritePromptVersion = 'direct-rewrite-v1';
+      const rewriteFingerprint = computeScriptCheckpointInputFingerprint({
+        node: 'direct_rewrite',
+        inputRevisionRefs,
+        upstreamArtifactRefs: [currentCandidateRef, reviewRef],
+        promptVersion: rewritePromptVersion,
+        configRevision,
+      });
+      const storedRewrite = await this.latestCheckpoint(
+        request.projectId,
+        runKey,
+        { node: 'direct_rewrite', episodeNumber },
+      );
+      let rewriteArtifact: ScriptDirectDraftArtifact | undefined;
+      let rewriteRevision: number | undefined;
+      if (storedRewrite) {
+        const decision = decideScriptCheckpointResume(storedRewrite, rewriteFingerprint);
+        if (decision.disposition === 'reuse') {
+          rewriteArtifact = decodeDraftArtifact(storedRewrite.artifact, 'direct_rewrite');
+          rewriteRevision = rewriteArtifact ? storedRewrite.artifactRevision : undefined;
+          if (!rewriteArtifact) await this.markCheckpointStale(storedRewrite);
+        } else if (decision.disposition === 'stale') {
+          await this.markCheckpointStale(storedRewrite);
+        }
+      }
+      if (!rewriteArtifact) {
+        request.signal?.throwIfAborted();
+        const rewrittenText = await this.dependencies.model.complete({
+          node: 'revision',
+          projectId: request.projectId,
+          episodeNumber,
+          prompt: buildDirectRewritePrompt(context, rawText, rewriteIssues),
+          responseFormat: 'text',
+          signal: request.signal,
+        });
+        recordCall('revision', 'ChineseShortDramaDirectRewrite@v1', 1);
+        const rewritten = parseCandidate(rewrittenText);
+        if (rewritten.episode && rewritten.unparsedLines.length === 0) {
+          draft = rewritten.episode;
+          rawText = rewrittenText;
+          draftWarnings = rewritten.warnings;
+        }
+        rewriteRevision = await this.nextCheckpointArtifactRevision(
+          request.projectId,
+          runKey,
+          { node: 'direct_rewrite', episodeNumber },
+        );
+        rewriteArtifact = {
+          schemaVersion: 1,
+          stage: 'direct_rewrite',
+          rawText,
+          episode: draft,
+          candidateHash: computeScriptEpisodeCandidateHash(draft),
+          parseWarnings: draftWarnings,
+          createdAt: this.now(),
+        };
+        await this.saveCheckpoint(request, {
+          projectId: request.projectId,
+          runKey,
+          node: 'direct_rewrite',
+          status: 'succeeded',
+          attempt: 1,
+          artifactRevision: rewriteRevision,
+          episodeNumber,
+          artifact: rewriteArtifact,
+          inputRevisionRefs,
+          upstreamArtifactRefs: [currentCandidateRef, reviewRef],
+          promptVersion: rewritePromptVersion,
+          configRevision,
+          inputFingerprint: rewriteFingerprint,
+          validationErrors: [],
+          updatedAt: this.now(),
+        }, `第 ${episodeNumber} 集已按明显问题重写一次。`);
+      } else {
+        draft = rewriteArtifact.episode;
+        rawText = rewriteArtifact.rawText;
+      }
+      currentCandidateRef = buildScriptUpstreamArtifactRef(
+        'direct_rewrite',
+        rewriteRevision!,
+        rewriteArtifact,
+      );
+      episodeUpstreamRefs.push(currentCandidateRef);
+      deterministicReport = validateDraft(draft);
+      report = deterministicReport;
+    }
+
+    const persistedReview = await this.persistReviewIssues(
+      request.projectId,
+      episodeNumber,
+      deterministicReport.issues,
+      rewriteIssues.length > 0 ? [] : aiIssues,
+    );
+    if (report.hardFailed) {
+      const completedCheckpointRevision = await this.nextCheckpointArtifactRevision(
+        request.projectId,
+        runKey,
+        { node: 'completed', episodeNumber },
+      );
+      const needsReviewArtifact = buildScriptEpisodeCandidateArtifact({
+        projectId: request.projectId,
+        episodeNumber,
+        baseEpisodeRevision,
+        inputRevisionRefs,
+        upstreamArtifactRefs: episodeUpstreamRefs,
+        promptVersion: 'direct-quality-needs-review-v1',
+        configRevision,
+        validationErrors: report.blockingIssues.map((issue) => ({
+          ...(issue.path ? { path: issue.path } : {}),
+          code: issue.code,
+          message: issue.message,
+        })),
+        createdAt: this.now(),
+      }, 'patched', draft);
+      await this.saveCheckpoint(request, {
+        projectId: request.projectId,
+        runKey,
+        node: 'completed',
+        status: 'needs_review',
+        attempt: 1,
+        artifactRevision: completedCheckpointRevision,
+        episodeNumber,
+        artifact: needsReviewArtifact,
+        ...checkpointArtifactMetadata(needsReviewArtifact),
+        updatedAt: this.now(),
+      }, `第 ${episodeNumber} 集仍有明确结构或人物错误，候选已保留。`);
+      throw new ScriptBatchPausedError(episodeNumber, report);
+    }
+
+    const completedCheckpointRevision = await this.nextCheckpointArtifactRevision(
+      request.projectId,
+      runKey,
+      { node: 'completed', episodeNumber },
+    );
+    const finalCandidateArtifact = buildScriptEpisodeCandidateArtifact({
+      projectId: request.projectId,
+      episodeNumber,
+      baseEpisodeRevision,
+      inputRevisionRefs,
+      upstreamArtifactRefs: episodeUpstreamRefs,
+      promptVersion: 'direct-writing-final-v1',
+      configRevision,
+      createdAt: this.now(),
+    }, 'patched', draft);
+    const finalCandidateRef = buildScriptUpstreamArtifactRef(
+      'completed',
+      completedCheckpointRevision,
+      finalCandidateArtifact,
+    );
+    const reviewState = state;
+    const continuity = mergeDirectHandoffContinuity(
+      buildScriptContinuityCandidate(reviewState, draft, []),
+      review,
+      draft,
+      state.characters,
+    );
+    const commitInput = buildScriptAtomicCommitInput({
+      ...reviewState,
+      reviewRevision: persistedReview.revision,
+    }, draft, continuity, {
+      upstreamArtifactRefs: [...episodeUpstreamRefs, finalCandidateRef],
+      promptVersion: 'short-drama-direct-writing-v1',
+      modelConfigFingerprint: configRevision,
+    });
+    commitInput.inputRevisionRefs = structuredClone(inputRevisionRefs);
+    commitInput.expectedReviewRevision = persistedReview.revision;
+    commitInput.candidateHash = computeScriptEpisodeCandidateHash(draft);
+    commitInput.inputFingerprint = computeScriptInputFingerprint(commitInput);
+    const commitEpisodeWithContinuity = this.dependencies.store.commitEpisodeWithContinuity;
+    if (!commitEpisodeWithContinuity) {
+      throw new ScriptModelOutputError('正文存储未实现原子连续性提交。');
+    }
+    request.signal?.throwIfAborted();
+    const { episode: saved } = await commitEpisodeWithContinuity.call(
+      this.dependencies.store,
+      commitInput,
+    );
+    await this.saveCheckpoint(request, {
+      projectId: request.projectId,
+      runKey,
+      node: 'completed',
+      status: 'completed',
+      attempt: 1,
+      artifactRevision: completedCheckpointRevision,
+      episodeNumber,
+      artifact: finalCandidateArtifact,
+      ...checkpointArtifactMetadata(finalCandidateArtifact),
+      updatedAt: this.now(),
+    }, `第 ${episodeNumber} 集直接写作已完成。`);
+    return { episode: saved, report };
   }
 
   private parseEpisodeOutline(

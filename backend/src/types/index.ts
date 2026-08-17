@@ -245,6 +245,7 @@ export interface AgentRunRequest {
     startEpisode: number;
     episodeCount: number;
     expectedPlanRevision: number;
+    draftMode?: 'structured_legacy' | 'direct_text';
   };
   options?: {
     targetWords?: number;

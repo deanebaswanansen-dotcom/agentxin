@@ -791,13 +791,14 @@ describe('ScriptWorkspace', () => {
 
     await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
     fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
+    expect(screen.getByText('Flash 直接写作')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '生成第 1–5 集' }));
 
     await waitFor(() => {
       expect(client.script.jobs.create).toHaveBeenCalledWith({
         projectId: 'project-1',
         task: 'script_episode_batch',
-        scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 2 },
+        scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 2, draftMode: 'direct_text' },
       });
     });
     expect(await screen.findByText('第 1 集 · 正文初稿')).toBeInTheDocument();
@@ -842,7 +843,7 @@ describe('ScriptWorkspace', () => {
     ]);
     vi.mocked(client.script.jobs.create).mockResolvedValue({
       id: 'job-restart-1-5', projectId: 'project-1', task: 'script_episode_batch', status: 'queued', continuable: false,
-      scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 2 },
+      scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 2, draftMode: 'direct_text' },
     });
     render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
 
@@ -854,7 +855,7 @@ describe('ScriptWorkspace', () => {
     await waitFor(() => expect(client.script.jobs.create).toHaveBeenCalledWith({
       projectId: 'project-1',
       task: 'script_episode_batch',
-      scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 2 },
+      scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 2, draftMode: 'direct_text' },
     }));
   });
 
@@ -869,7 +870,13 @@ describe('ScriptWorkspace', () => {
       endingState: '结局',
       mainArc: ['破局'],
       subplotArcs: ['亲情'],
-      episodeCards: [],
+      episodeCards: [{
+        episodeNumber: 1,
+        title: '旧标题',
+        logline: '旧梗概',
+        mainEvent: '旧事件',
+        endingHook: '旧卡点',
+      }],
       revision: 4,
     };
     vi.mocked(client.script.outline.get).mockResolvedValue(outline);
@@ -880,10 +887,18 @@ describe('ScriptWorkspace', () => {
     fireEvent.click(screen.getByRole('tab', { name: '剧本大纲' }));
     fireEvent.click(screen.getByRole('button', { name: '编辑模式' }));
     fireEvent.change(screen.getByLabelText('全剧梗概'), { target: { value: '新梗概' } });
+    fireEvent.change(screen.getByLabelText('第 1 集主要事件'), { target: { value: '原始数据卡首次现身' } });
+    fireEvent.change(screen.getByLabelText('第 1 集结尾卡点'), { target: { value: '修车佬收到禁赛复核通知' } });
     fireEvent.click(screen.getByRole('button', { name: '保存大纲' }));
 
     await waitFor(() => expect(client.script.outline.save).toHaveBeenCalledWith(
-      'project-1', expect.objectContaining({ synopsis: '新梗概' }), 4,
+      'project-1', expect.objectContaining({
+        synopsis: '新梗概',
+        episodeCards: [expect.objectContaining({
+          mainEvent: '原始数据卡首次现身',
+          endingHook: '修车佬收到禁赛复核通知',
+        })],
+      }), 4,
     ));
   });
 

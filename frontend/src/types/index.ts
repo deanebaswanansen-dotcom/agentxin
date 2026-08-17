@@ -1469,6 +1469,7 @@ export interface ScriptBatchOptions {
   startEpisode: number;
   episodeCount: number;
   expectedPlanRevision: number;
+  draftMode?: 'structured_legacy' | 'direct_text';
 }
 
 export type ScriptAgentTask =
@@ -1484,6 +1485,10 @@ export type ScriptCheckpointNode =
   | 'world_bible'
   | 'episode_outline'
   | 'scene_plan'
+  | 'direct_draft'
+  | 'continuation'
+  | 'handoff_review'
+  | 'direct_rewrite'
   | 'draft'
   | 'review'
   | 'revision'
