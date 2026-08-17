@@ -496,6 +496,7 @@ function draftContinuationRequest(
   targetChars: number,
 ): {
   current: ScriptTextComposition;
+  minimumVisibleChars: number;
   requestedVisibleChars: number;
 } | undefined {
   const current = scriptTextComposition(episode);
@@ -507,6 +508,7 @@ function draftContinuationRequest(
   );
   return {
     current,
+    minimumVisibleChars: preferredMinimum,
     requestedVisibleChars,
   };
 }
@@ -920,12 +922,30 @@ export class ScriptDirector {
     const chunks: Record<string, unknown>[] = [];
     for (let start = 1; start <= plan.totalEpisodes; start += 10) {
       const end = Math.min(plan.totalEpisodes, start + 9);
+      const previousChunkCards = chunks.at(-1)?.episodeCards;
+      const previousBoundary = Array.isArray(previousChunkCards)
+        ? previousChunkCards.slice(-2).map((candidate) => {
+            const card = recordField(candidate, 'previousEpisodeCard');
+            return {
+              episodeNumber: numberField(card.episodeNumber, 'episodeNumber'),
+              title: stringField(card.title, 'title'),
+              mainEvent: stringField(card.mainEvent, 'mainEvent'),
+              endingHook: stringField(card.endingHook, 'endingHook'),
+            };
+          })
+        : [];
       const upstreamArtifactRefs = [buildScriptUpstreamArtifactRef(
         'series_outline_range',
         start,
         { start, end, totalEpisodes: plan.totalEpisodes },
-      )];
-      const promptVersion = 'series-outline-chunk-v2';
+      ), ...(previousBoundary.length > 0
+        ? [buildScriptUpstreamArtifactRef(
+            'series_outline_previous_boundary',
+            start,
+            previousBoundary,
+          )]
+        : [])];
+      const promptVersion = 'series-outline-chunk-v3';
       const inputFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'series_outline',
         inputRevisionRefs,
@@ -950,8 +970,11 @@ export class ScriptDirector {
         `本段只返回第 ${start}—${end} 集，集号必须连续。`,
         '只返回 JSON，字段：synopsis, openingState, midpointTurn, climax, endingState, mainArc, subplotArcs, episodeCards。',
         '严格模板：{"synopsis":"字符串","openingState":"字符串","midpointTurn":"字符串","climax":"字符串","endingState":"字符串","mainArc":["字符串"],"subplotArcs":["字符串"],"episodeCards":[{"episodeNumber":1,"title":"字符串","logline":"字符串","mainEvent":"字符串","endingHook":"字符串"}]}。不得翻译、缩写或改名任何键。',
+        previousBoundary.length > 0
+          ? `上一段最后两集：${JSON.stringify(previousBoundary)}。本段第 ${start} 集必须直接承接上一集 endingHook；已经发生、取得或发现的关键事件不得重新当作首次发生。`
+          : '',
         `已锁定策划：${JSON.stringify(plan)}`,
-      ].join('\n');
+      ].filter(Boolean).join('\n');
       const parsed = await this.generateNodeStructured({
         node: 'series_outline',
         projectId,
@@ -2033,7 +2056,7 @@ export class ScriptDirector {
       );
       episodeUpstreamRefs.push(scenePlanRef);
       const draftInputRevisionRefs = buildScriptInputRevisionRefs(state, episodeNumber);
-      const draftPromptVersion = 'episode-draft-v5';
+      const draftPromptVersion = 'episode-draft-v6';
       const currentEpisodeRevision = state.episodes.find(
         (episode) => episode.episodeNumber === episodeNumber,
       )?.revision ?? 0;
@@ -2102,6 +2125,8 @@ export class ScriptDirector {
           'blocks.text 只写内容本身：caption 不要包“【字幕：】”，action 不要带“△”，dialogue 不要重复说话人或冒号；这些格式由序列化器统一添加。',
           'scene.characterIds 必须列出本场所有实际出场或说话人物，且对白 speaker 与 characterId 必须一一匹配。普通对白 mode 使用 normal；只有画外音和内心独白才使用 vo/os。',
           '正文必须是可拍摄的竖屏短剧：前三个正文块内出现人物、处境与冲突；动作使用镜头可见行为，避免小说式心理概述；单句对白简洁、有对抗性，不写大段说教。',
+          '未登记的路人、记者、警察等不能借用已登记人物的 characterId 或 speaker 代替说话；若不是正式人物，用 action 或 caption 表达其反应。',
+          '同一证据、照片、电话或动作在本集只能首次发现一次；后续只能写核验、转交、追查或产生的新后果。事件必须按“触发—反应—结果”的可见顺序发生，禁止先有结果后补原因。',
           '首次出现的重要人物或地点可用 caption 交代身份；后续不得机械重复字幕。最后一至两个正文块必须兑现本集 endingHook，以反转、证据、人物闯入或未完成动作收尾。',
           '严格遵守大纲 requiredFacts 与 forbiddenFacts；继承上一集结尾状态、服装、道具、人物已知信息和未回收伏笔，禁止让角色无理由换装、瞬移或提前知道秘密。',
           scriptLengthInstruction(
@@ -2234,7 +2259,7 @@ export class ScriptDirector {
             '你是 ScriptWriterAgent。已有正文必须全部保留；只返回接在现有正文中的新增 blocks，不得重写、复述或总结整集。',
             '严格顶层模板：{"blocks":[...]}。每项只允许 action 或 dialogue，并必须包含 sceneOrdinal、type、text；dialogue 还必须包含本场人物的 characterId、speaker，可选 delivery、mode(normal|os|vo)。',
             'action.text 不带“△”；dialogue.text 不重复说话人或冒号。每条写成完整、可拍摄的动作或推动冲突的对白。',
-            `当前已有 ${continuationRequest.current.visibleChars} 字，本轮最多自然续写约 ${continuationRequest.requestedVisibleChars} 字；这是唯一一次续写，请把尚未完成的冲突、行动过程和结尾卡点写完整，但不要为了凑数重复内容。`,
+            `当前已有 ${continuationRequest.current.visibleChars} 字，本轮最多自然续写约 ${continuationRequest.requestedVisibleChars} 字；续写后至少达到 ${continuationRequest.minimumVisibleChars} 字（目标的 75%）。这是唯一一次续写，请把尚未完成的冲突、行动过程和结尾卡点写完整，但不要为了凑数重复内容。`,
             `整集目标约 ${plan.targetCharsPerEpisode} 字，对白倾向约 ${plan.dialogueDensityPercent}%，二者都允许按剧情自然波动。`,
             `对白人物白名单：${JSON.stringify(knownCharacters)}`,
             rejectedDraftFeedback.length > 0
@@ -2358,6 +2383,16 @@ export class ScriptDirector {
                 }],
               };
             }
+            if (after.visibleChars < continuationRequest.minimumVisibleChars) {
+              return {
+                candidate: continuationBase,
+                issues: [{
+                  path: ['blocks'],
+                  code: 'CONTINUATION_STILL_SHORT',
+                  message: `续写后正文约 ${after.visibleChars} 字，仍低于轻量可读底线 ${continuationRequest.minimumVisibleChars} 字；请在同一份 blocks 中补足冲突过程与结尾。`,
+                }],
+              };
+            }
             const gate = deterministicEpisodeGate(candidate);
             return gate.blockingIssues.length > 0
               ? { candidate: continuationBase, issues: gateDecodeIssues(gate.blockingIssues) }
@@ -2366,10 +2401,10 @@ export class ScriptDirector {
 
           const continuationContract = defineStructuredContract<ScriptDraftExpansion>({
             name: 'episode_draft_continuation',
-            version: 1,
+            version: 2,
             instructions: [
               '只返回安全的新正文 blocks；这是本集唯一一次自然续写，应优先补全未完成的冲突、行动过程和结尾卡点。',
-              '只要正文有正向增长且没有人物、场景、结构或禁止事实等明显错误，就接受并保存结果；不要复述、灌水或机械凑字。',
+              `续写应用后必须达到至少 ${continuationRequest.minimumVisibleChars} 字，同时没有人物、场景、结构或禁止事实等明显错误；不要复述、灌水或机械凑字。`,
             ].join('\n'),
             decode: (value) => {
               let continuation: ScriptDraftExpansion;
@@ -2538,7 +2573,7 @@ export class ScriptDirector {
           '严格模板：{"issues":[{"code":"CHARACTER_PRESENCE|SPEAKER_ATTRIBUTION|PROP_CUSTODY|KNOWLEDGE_TIMING|CAUSAL_ORDER|CONTINUITY_CONTRADICTION|REPEATED_ACTION","severity":"hard|soft","message":"字符串","sceneId":"可选","blockId":"可选","path":"可选"}],"summary":"150—300字摘要","newFacts":["字符串"],"openedThreads":["字符串"],"closedThreads":["字符串"],"wardrobe":[{"characterId":"人物id","outfit":"服装"}]}。没有问题时 issues 返回空数组，不得改名任何键。',
           'issues 最多返回 3 条，只保留高置信度且能指出正文证据的明显问题：人物未在场却行动或说话、说话人错配、道具归属前后矛盾、角色提前知道信息、因果或行动顺序矛盾、与前集状态直接冲突、同一动作被当成新事件重复发生。',
           '不要评价文风、措辞、节奏、爽点强弱、对白密度、字数、服装审美、反转力度或是否足够精彩；这些不是明显逻辑错误。每条问题必须尽量给出 sceneId 和精确 path。',
-          '只有能由正文与连续性材料直接证明的矛盾才标 hard；拿不准就不报。',
+          '只有能由正文与连续性材料直接证明的矛盾才标 hard；hard 必须给 sceneId，能定位到正文块时必须给 blockId；拿不准或无法定位就不报。',
           attempt > 1 ? '这是修订后复检。不得假设上一轮问题已解决，必须以当前正文重新判断。' : '',
           `策划：${JSON.stringify(plan)}`,
           `大纲：${JSON.stringify(outline)}`,
