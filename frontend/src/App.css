@@ -591,6 +591,18 @@
   border: none;
 }
 
+.nwa-lazy-load-error strong,
+.nwa-lazy-load-error p {
+  display: block;
+  margin: 0 auto 0.75rem;
+}
+
+.nwa-lazy-load-error p {
+  max-width: 28rem;
+  color: var(--text-muted);
+  line-height: 1.6;
+}
+
 /* ==========================================================================
    右侧 AI 对话栏
    ========================================================================== */

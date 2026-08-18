@@ -212,6 +212,8 @@ systemctl status agentxin --no-pager
 
 ### 6.4 Nginx
 
+仓库内可直接部署的配置位于 `deploy/nginx/agentxin.conf`。它为内容哈希静态资源启用长期缓存和 gzip，确保丢失的旧分包返回 404，并把 `/health` 转发到后端。下方配置应与该文件保持一致：
+
 ```nginx
 server {
     listen 80 default_server;
@@ -220,6 +222,21 @@ server {
     root /var/www/agentxin;
     index index.html;
     client_max_body_size 20m;
+
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_comp_level 5;
+    gzip_types application/javascript application/json application/xml image/svg+xml text/css text/plain;
+
+    location = /health {
+        proxy_pass http://127.0.0.1:3000/health;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_connect_timeout 3s;
+        proxy_read_timeout 5s;
+    }
 
     location /api/ {
         proxy_pass http://127.0.0.1:3000;
@@ -232,13 +249,24 @@ server {
         proxy_send_timeout 3600s;
     }
 
+    location /assets/ {
+        try_files $uri =404;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        access_log off;
+    }
+
+    location = /index.html {
+        add_header Cache-Control "no-cache" always;
+    }
+
     location / {
         try_files $uri $uri/ /index.html;
+        add_header Cache-Control "no-cache" always;
     }
 }
 ```
 
-保存为 `/etc/nginx/sites-available/agentxin`，然后执行：
+将 `deploy/nginx/agentxin.conf` 复制为 `/etc/nginx/sites-available/agentxin`，然后执行：
 
 ```bash
 ln -sf /etc/nginx/sites-available/agentxin /etc/nginx/sites-enabled/agentxin
@@ -336,11 +364,12 @@ systemctl status agentxin --no-pager
 | 清理浏览器后项目为空 | Local Storage 客户端编号已重建 | 服务器数据可能仍在；不要继续创建大量同名项目，先备份 `/var/lib/agentxin` |
 | API 测试失败 | 浏览器设置、模型服务地址、模型名、后端日志 | 在该电脑重新填写自己的 API 配置；不要把 Key 发给开发 Agent |
 | 返回 502 | `journalctl -u agentxin`、Nginx error log | 先确认后端存活，再检查上游模型返回和网络连接 |
+| 页面偶发白屏或一直加载模块 | `curl -I http://127.0.0.1/assets/<文件名>`、Nginx error log、ECS 带宽 | 部署仓库内 Nginx 配置；确认 `/assets/` 返回长期缓存头且丢失文件为 404 |
 | 计划模式重复询问 | 计划会话历史、问题 ID、`NovelPlanService` 测试 | 按 `PLAN_MODE_SPEC.md` 修复，禁止用固定问卷替代 Agent 决策 |
 | 分章结果为 0/N 章 | 模型原始响应、解析与重试日志 | 验证结构化解析、分批策略和重试；不得伪造已生成章节 |
 | 长篇结果提示正文为空 | ChapterAgent 重试日志、模型原始响应 | 最多生成 3 次；拿到非空正文前禁止进入审校；无蓝图的空壳删除，有场景检查点的章节保留并在下次恢复 |
 
-项目没有 `/api/health` 路由，访问该地址返回 404 不代表代理失败。可用首页 HTTP 200、systemd 状态和真实 API 请求共同判断服务状态。
+可用 `curl -fsS http://127.0.0.1:3000/health` 检查后端直连，用 `curl -fsS http://127.0.0.1/api/health` 检查 Nginx 代理；二者均应返回 `{"status":"ok"}`，且不需要客户端编号。
 
 ## 11. 接手 Agent 必读
 

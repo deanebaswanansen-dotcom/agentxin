@@ -705,6 +705,59 @@ describe('FileScriptStore', () => {
     expect(second).toEqual(first);
   });
 
+  it('closes stale unknown-speaker findings after normalizing camera labels', async () => {
+    const legacyEpisode = episode({
+      status: 'completed',
+      scenes: [{
+        id: 'scene-1',
+        ordinal: 1,
+        location: '广播室',
+        timeOfDay: 'night',
+        interiorExterior: 'interior',
+        characterIds: [],
+        blocks: [{ id: 'shot-plain', type: 'dialogue', speaker: '特写', text: '王强抬头。' }],
+      }],
+    });
+    await writeFile(
+      join(root, 'project-1.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        projectId: 'project-1',
+        characters: [],
+        episodeOutlines: [],
+        episodes: [legacyEpisode],
+        continuity: { currentState: [], openThreads: [], wardrobeLedger: [] },
+        reviewRevision: 2,
+        reviewIssues: [
+          reviewIssue({
+            id: 'shot-issue',
+            code: 'UNKNOWN_SPEAKER',
+            severity: 'hard',
+            category: 'character',
+            message: '说话人「特写」未登记。',
+          }),
+          reviewIssue({
+            id: 'real-issue',
+            code: 'UNKNOWN_SPEAKER',
+            severity: 'hard',
+            category: 'character',
+            message: '说话人「陌生人」未登记。',
+          }),
+        ],
+        updatedAt: '2026-08-14T00:00:00.000Z',
+      }),
+      'utf8',
+    );
+
+    const store = await FileScriptStore.create(root);
+    const state = await store.getProjectState('project-1');
+
+    expect(state?.reviewIssues).toEqual([
+      expect.objectContaining({ id: 'shot-issue', status: 'fixed' }),
+      expect.objectContaining({ id: 'real-issue', status: 'open' }),
+    ]);
+  });
+
   it('persists review issues with collection conflicts and safely replaces one episode source', async () => {
     const store = await FileScriptStore.create(root);
     const userIssue = reviewIssue({ id: 'user-1', source: 'user', code: 'USER_NOTE' });

@@ -39,7 +39,14 @@ export function registerClientScope(app: FastifyInstance): void {
       done();
       return;
     }
-    if (required && supplied === undefined && request.url.startsWith('/api/')) {
+    const path = request.url.split('?', 1)[0];
+    const isPublicHealthProbe = path === '/health' || path === '/api/health';
+    if (
+      required &&
+      supplied === undefined &&
+      request.url.startsWith('/api/') &&
+      !isPublicHealthProbe
+    ) {
       void reply.code(400).send({
         error: { code: 'VALIDATION_ERROR', message: '缺少客户端库标识' },
       });
