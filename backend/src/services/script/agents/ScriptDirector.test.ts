@@ -20,7 +20,11 @@ import type {
 } from '../domain.js';
 import { FileScriptStore } from '../FileScriptStore.js';
 import { buildScriptInputRevisionRefs } from '../ScriptContinuityCommit.js';
-import { ScriptConflictError, type ScriptStore } from '../ScriptStore.js';
+import {
+  computeScriptEpisodeCandidateHash,
+  ScriptConflictError,
+  type ScriptStore,
+} from '../ScriptStore.js';
 import { computeScriptCheckpointInputFingerprint } from './ScriptCheckpoint.js';
 import {
   InMemoryScriptCheckpointStore,
@@ -3156,6 +3160,48 @@ describe('ScriptDirector', () => {
     expect(store.atomicCommitCalls).toHaveLength(1);
   });
 
+  it('keeps the original candidate when both rewrite responses are unparseable', async () => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    const calls: string[] = [];
+    let reviewCalls = 0;
+    const director = new ScriptDirector({
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+      model: {
+        async complete(request) {
+          calls.push(request.node);
+          if (request.node === 'draft') return directScriptText();
+          if (request.node === 'revision') return '这不是可识别的剧本场景。';
+          reviewCalls += 1;
+          return reviewCalls === 1
+            ? directReviewJson({
+                verdict: 'major_issue',
+                issues: [{
+                  code: 'OFF_OUTLINE',
+                  evidence: '正文遗漏了一项次要线索。',
+                  expected: '补充次要线索但不要改变主事件。',
+                }],
+              })
+            : directReviewJson();
+        },
+        async getModelConfigFingerprint() { return 'direct-model-v1'; },
+      },
+    });
+
+    const result = await director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    });
+
+    expect(result.kind).toBe('episode_batch');
+    expect(calls).toEqual(['draft', 'review', 'revision', 'revision']);
+    expect(reviewCalls).toBe(1);
+    expect(store.state.episodes[0]?.scenes[0]?.location).toBe('校报社');
+    expect(store.atomicCommitCalls).toHaveLength(1);
+  });
+
   it('accepts up to five scenes in direct mode even when the planning preference is three', async () => {
     const state = readySingleEpisodeState();
     const store = new MemoryScriptStore(state);
@@ -3431,6 +3477,85 @@ describe('ScriptDirector', () => {
     });
 
     expect(writerCalls).toBe(1);
+    expect(store.atomicCommitCalls).toHaveLength(1);
+  });
+
+  it('repairs shot directions already stored as dialogue in an older direct-draft checkpoint', async () => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    const checkpoints = new InMemoryScriptCheckpointStore();
+    let writerCalls = 0;
+    const interrupted = new ScriptDirector({
+      store,
+      checkpoints,
+      model: {
+        async complete(request) {
+          if (request.node === 'draft') {
+            writerCalls += 1;
+            return directScriptText();
+          }
+          throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+        },
+        async getModelConfigFingerprint() { return 'direct-model-v1'; },
+      },
+    });
+    await expect(interrupted.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    })).rejects.toMatchObject({ name: 'AbortError' });
+
+    const directDraft = (await checkpoints.list('project-1', 'script_episode_batch:1:1'))
+      .find((checkpoint) => checkpoint.node === 'direct_draft');
+    if (!directDraft?.artifact || typeof directDraft.artifact !== 'object') {
+      throw new Error('missing direct draft checkpoint');
+    }
+    const artifact = structuredClone(directDraft.artifact) as {
+      episode: ScriptEpisode;
+      candidateHash: string;
+    };
+    const originalBlock = artifact.episode.scenes[0]?.blocks[0];
+    if (!originalBlock) throw new Error('missing direct draft block');
+    const screenValue = '007。'.repeat(40);
+    artifact.episode.scenes[0]!.blocks[0] = {
+      id: originalBlock.id,
+      type: 'dialogue',
+      speaker: '【特写】屏幕上，门禁记录滚动刷新，最后一条记录显示',
+      mode: 'normal',
+      text: screenValue,
+    };
+    artifact.candidateHash = computeScriptEpisodeCandidateHash(artifact.episode);
+    await checkpoints.save({
+      ...directDraft,
+      artifactRevision: directDraft.artifactRevision + 1,
+      artifact,
+    });
+
+    const resumed = new ScriptDirector({
+      store,
+      checkpoints,
+      model: {
+        async complete(request) {
+          if (request.node === 'draft') {
+            writerCalls += 1;
+            return directScriptText();
+          }
+          return directReviewJson();
+        },
+        async getModelConfigFingerprint() { return 'direct-model-v1'; },
+      },
+    });
+    await resumed.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    });
+
+    expect(writerCalls).toBe(1);
+    expect(store.state.episodes[0]?.scenes[0]?.blocks[0]).toMatchObject({
+      type: 'action',
+      text: `【特写】屏幕上，门禁记录滚动刷新，最后一条记录显示：${screenValue}`,
+    });
     expect(store.atomicCommitCalls).toHaveLength(1);
   });
 });
