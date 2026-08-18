@@ -5,9 +5,54 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="%23172126"/><path d="M18 18h19a9 9 0 0 1 0 18H24v10h-6V18Zm6 6v6h12a3 3 0 0 0 0-6H24Z" fill="%23f4f7f5"/></svg>' />
     <title>AI 小说创作工作台</title>
+    <style>
+      .nwa-boot-screen { min-height: 100vh; display: grid; place-items: center; box-sizing: border-box; padding: 24px; background: #101719; color: #e8efec; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+      .nwa-boot-card { width: min(420px, 100%); padding: 28px; border: 1px solid #31403b; border-radius: 16px; background: #172126; text-align: center; box-shadow: 0 18px 50px rgb(0 0 0 / 28%); }
+      .nwa-boot-card strong { display: block; margin-bottom: 10px; font-size: 18px; }
+      .nwa-boot-card p { margin: 0; color: #aebdb7; line-height: 1.65; }
+      .nwa-boot-card button { margin-top: 18px; padding: 9px 16px; border: 0; border-radius: 9px; background: #d8b56f; color: #172126; font: inherit; font-weight: 700; cursor: pointer; }
+    </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div class="nwa-boot-screen" role="status" aria-live="polite">
+        <div class="nwa-boot-card">
+          <strong>正在连接创作工作台…</strong>
+          <p>首次打开需要加载基础程序，请稍候。</p>
+        </div>
+      </div>
+    </div>
+    <script id="nwa-boot-recovery">
+      (function () {
+        var root = document.getElementById('root');
+        var reloadKey = 'nwa:boot-recovery:last-reload-at';
+        var reloadCooldownMs = 30000;
+        var bootTimeoutMs = 15000;
+        var showManualRecovery = function () {
+          if (!root) return;
+          root.innerHTML = '<div class="nwa-boot-screen" role="alert"><div class="nwa-boot-card"><strong>工作台加载超时</strong><p>当前网络连接不稳定，刷新会重新建立连接，已保存的项目不会丢失。</p><button id="nwa-boot-retry" type="button">刷新并重试</button></div></div>';
+          var retryButton = document.getElementById('nwa-boot-retry');
+          if (retryButton) retryButton.addEventListener('click', function () { window.location.reload(); });
+        };
+        var timer = window.setTimeout(function () {
+          var now = Date.now();
+          try {
+            var stored = window.sessionStorage.getItem(reloadKey);
+            var lastReloadAt = stored === null ? Number.NaN : Number(stored);
+            if (!Number.isFinite(lastReloadAt) || now - lastReloadAt >= reloadCooldownMs) {
+              window.sessionStorage.setItem(reloadKey, String(now));
+              window.location.reload();
+              return;
+            }
+          } catch (_error) {
+            // Hardened browsers may disable session storage; manual recovery
+            // remains available without risking an automatic reload loop.
+          }
+          showManualRecovery();
+        }, bootTimeoutMs);
+        window.addEventListener('nwa:app-started', function () { window.clearTimeout(timer); }, { once: true });
+      }());
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
