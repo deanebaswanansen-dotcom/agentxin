@@ -87,7 +87,8 @@ export interface CriticalStateIssue {
     | 'SEALED_ABILITY_REAPPEARS'
     | 'SEVERE_INJURY_DISAPPEARS'
     | 'CRITICAL_KNOWLEDGE_LOST'
-    | 'KEY_ITEM_TRANSFER_WITHOUT_SOURCE';
+    | 'KEY_ITEM_TRANSFER_WITHOUT_SOURCE'
+    | 'KEY_ITEM_DUPLICATE_ACQUISITION';
   kind: CriticalStateKind;
   entity: string;
   message: string;
@@ -184,7 +185,37 @@ function hasTransitionExplanation(kind: CriticalStateKind, evidence: string): bo
     return /失忆|记忆被抹|洗去记忆|遗忘术|催眠/u.test(evidence);
   }
   if (kind === 'key_item') {
-    return /交给|递给|转交|赠予|归还|夺走|抢走|偷走|取回|捡到|找到|获得|继承|丢失|遗失|销毁/u.test(evidence);
+    return /交给|递给|转交|赠予|归还|交还|放回|换手|夺走|抢走|偷走|取回|取出|取走|拿走|带走|收回|捡到|找到|获得|继承|丢失|遗失|销毁/u.test(evidence);
+  }
+  return false;
+}
+
+function regexEscape(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+}
+
+function hasDuplicateKeyItemAcquisition(entity: string, evidence: string): boolean {
+  const withoutQualifier = entity.replace(/[（(][^）)]*[）)]/gu, '').trim();
+  const aliases = new Set([withoutQualifier]);
+  const possessive = withoutQualifier.lastIndexOf('的');
+  if (possessive >= 0 && withoutQualifier.length - possessive > 2) {
+    aliases.add(withoutQualifier.slice(possessive + 1));
+  }
+  const source =
+    '(?:底座|砖缝|墙缝|柜底|箱底|暗格|夹层|水底|河底|沟中|沟里|洞中|洞里|土中|土里|地上|地面|现场|废墟|尸体旁|遗体旁)';
+  const acquire = '(?:取出|取到|取得|找到|发现|拿到|捡到|获得|寻获|搜出|挖出)';
+  for (const alias of aliases) {
+    if (alias.length < 2) continue;
+    const escaped = regexEscape(alias);
+    const externalSource = new RegExp(
+      `(?:从|在)[^。！？\\n]{0,48}${source}[^。！？\\n]{0,24}${acquire}[^。！？\\n]{0,24}${escaped}`,
+      'u',
+    );
+    const explicitAgain = new RegExp(
+      `(?:再次|重新|又一次)[^。！？\\n]{0,20}(?:取得|取到|找到|拿到|捡到|获得|寻获)[^。！？\\n]{0,24}${escaped}`,
+      'u',
+    );
+    if (externalSource.test(evidence) || explicitAgain.test(evidence)) return true;
   }
   return false;
 }
@@ -193,7 +224,25 @@ function criticalTransitionIssue(
   previous: CriticalStateEntry,
   next: Omit<CriticalStateEntry, 'id' | 'updatedAt'>,
 ): CriticalStateIssue | undefined {
-  if (previous.value === next.value || hasTransitionExplanation(next.kind, next.evidence)) {
+  if (previous.value === next.value) {
+    if (
+      next.kind === 'key_item' &&
+      previous.value !== 'unheld' &&
+      previous.value !== 'destroyed' &&
+      hasDuplicateKeyItemAcquisition(next.entity, next.evidence)
+    ) {
+      return {
+        severity: 'P0',
+        code: 'KEY_ITEM_DUPLICATE_ACQUISITION',
+        kind: next.kind,
+        entity: next.entity,
+        evidence: next.evidence,
+        message: `唯一物品「${next.entity}」账面仍由「${next.value}」持有，本章却又从外部藏点取得，疑似重复出现。`,
+      };
+    }
+    return undefined;
+  }
+  if (hasTransitionExplanation(next.kind, next.evidence)) {
     return undefined;
   }
   const base = {

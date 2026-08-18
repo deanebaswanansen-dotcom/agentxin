@@ -353,6 +353,75 @@ describe('MemoryService', () => {
     });
   });
 
+  it('allows a key-item transfer when the text explicitly says it was put back and taken', async () => {
+    const { svc } = await service();
+    await svc.applyCriticalStateUpdates('p1', [{
+      kind: 'key_item',
+      entity: '黄铜牌（赣航清6号·阿贵）',
+      key: 'holder',
+      value: '顾棠',
+      evidence: '顾棠将黄铜牌收进外套内袋。',
+      chapterId: 'c15',
+      chapterTitle: '第15章',
+    }]);
+
+    const applied = await svc.applyCriticalStateUpdates('p1', [{
+      kind: 'key_item',
+      entity: '黄铜牌（赣航清6号·阿贵）',
+      key: 'holder',
+      value: '取牌人',
+      evidence: '顾棠将黄铜牌放回砖缝，取牌人随后取走。',
+      chapterId: 'c16',
+      chapterTitle: '第16章',
+    }]);
+
+    expect(applied).toEqual({ applied: 1, issues: [] });
+    expect(svc.get('p1').criticalStates[0]).toMatchObject({
+      value: '取牌人',
+      chapterId: 'c16',
+    });
+  });
+
+  it('rejects reacquiring the same key item from an external hiding place while it is still held', async () => {
+    const { svc } = await service();
+    await svc.applyCriticalStateUpdates('p1', [{
+      kind: 'key_item',
+      entity: '横线纸（停电记录）',
+      key: 'holder',
+      value: '顾棠',
+      evidence: '顾棠从机柜底座深处取出横线纸，折好放入衬衣口袋。',
+      chapterId: 'c14',
+      chapterTitle: '第14章',
+    }]);
+
+    const rejected = await svc.applyCriticalStateUpdates('p1', [{
+      kind: 'key_item',
+      entity: '横线纸（停电记录）',
+      key: 'holder',
+      value: '顾棠',
+      evidence: '她将横线纸收进防水袋；本章摘要：顾棠在铁栅门后的砖缝中再次取得横线纸。',
+      chapterId: 'c17',
+      chapterTitle: '第17章',
+    }]);
+
+    expect(rejected.applied).toBe(0);
+    expect(rejected.issues).toEqual([
+      expect.objectContaining({ severity: 'P0', code: 'KEY_ITEM_DUPLICATE_ACQUISITION' }),
+    ]);
+    expect(svc.get('p1').criticalStates[0]).toMatchObject({ chapterId: 'c14' });
+
+    const ordinaryUse = await svc.applyCriticalStateUpdates('p1', [{
+      kind: 'key_item',
+      entity: '横线纸（停电记录）',
+      key: 'holder',
+      value: '顾棠',
+      evidence: '顾棠从外套内袋抽出横线纸查看，随后仍收在内袋。',
+      chapterId: 'c15',
+      chapterTitle: '第15章',
+    }]);
+    expect(ordinaryUse).toEqual({ applied: 1, issues: [] });
+  });
+
   it('serializes concurrent mutators so unique facts / summaries / foreshadows are not lost', async () => {
     const { svc } = await service();
     const N = 40;

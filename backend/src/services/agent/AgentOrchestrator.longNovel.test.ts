@@ -771,6 +771,7 @@ describe('normalizeFullNovelOptions', () => {
       new AbortController().signal,
     );
 
+    expect(reflections).toBe(2);
     expect(result.summary).toContain('已暂停');
     expect(result.steps.join('\n')).toContain('DEAD_CHARACTER_REAPPEARS');
     expect(memory.get(result.projectId).criticalStates).toEqual([
@@ -784,6 +785,148 @@ describe('normalizeFullNovelOptions', () => {
     expect(memory.get(result.projectId).workflow).toContainEqual(
       expect.objectContaining({ task: 'big_bug_guard' }),
     );
+  });
+
+  it('pauses when the summary reveals a duplicate acquisition of an already-held key item', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-duplicate-key-item-'));
+    const store = await FileDataStore.create(join(tempDir, 'store.json'));
+    await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock-model' });
+    const memory = new MemoryService(await MemoryStore.create(join(tempDir, 'memory.json')));
+    const proxy = new CaptureProxy();
+    const original = proxy.streamCompletion.bind(proxy);
+    let chaptersWritten = 0;
+    let reflections = 0;
+    proxy.streamCompletion = (config, messages, signal, options) => {
+      const system = messages[0]?.content ?? '';
+      if (system.includes('正文写作子 Agent')) {
+        chaptersWritten += 1;
+        const paragraph = chaptersWritten === 1
+          ? '顾棠从机柜底座深处取出一张横线纸，折好放进衬衣口袋。她确认纸上记录着停电时刻，随后继续沿维修通道前行。'
+          : '顾棠在铁栅门后的砖缝中再次发现同一张横线纸，将它收进防水袋。她核对纸上的停电记录，字迹和先前见过的完全一致。';
+        return (async function* () {
+          yield { kind: 'content' as const, text: paragraph.repeat(8) };
+        })();
+      }
+      if (system.includes('反思子 Agent')) {
+        reflections += 1;
+        return (async function* () {
+          yield {
+            kind: 'content' as const,
+            text: JSON.stringify({
+              summary: reflections === 1
+                ? '顾棠从机柜底座取得横线纸并随身保存。'
+                : '顾棠在铁栅门后的砖缝中再次取得横线纸。',
+              facts: [],
+              stateUpdates: [{
+                kind: 'key_item',
+                entity: '横线纸（停电记录）',
+                key: 'holder',
+                value: '顾棠',
+                evidence: reflections === 1
+                  ? '顾棠把横线纸折好放进衬衣口袋。'
+                  : '她将横线纸收进防水袋。',
+              }],
+              learning: '',
+              foreshadows: [],
+            }),
+          };
+        })();
+      }
+      return original(config, messages, signal, options);
+    };
+    const orchestrator = new AgentOrchestrator(
+      store,
+      new ModelConfigService(store),
+      proxy,
+      undefined as never,
+      undefined as never,
+      memory,
+    );
+
+    const result = await orchestrator.run(
+      {
+        task: 'long_novel',
+        mode: 'draft',
+        prompt: '旧城悬疑长篇',
+        options: { chapters: 2, totalChapters: 2, targetWords: 500, automationLevel: 'semi_auto' },
+      },
+      new AbortController().signal,
+    );
+
+    expect(chaptersWritten).toBe(2);
+    expect(reflections).toBe(2);
+    expect(result.summary).toContain('已暂停');
+    expect(result.steps.join('\n')).toContain('KEY_ITEM_DUPLICATE_ACQUISITION');
+    expect(memory.get(result.projectId).criticalStates).toEqual([
+      expect.objectContaining({ entity: '横线纸（停电记录）', value: '顾棠', chapterTitle: '第1章' }),
+    ]);
+    expect(memory.get(result.projectId).summaries.map((item) => item.title)).toEqual(['第1章']);
+  });
+
+  it('pauses on an explicit dead-character return when reflection omits state updates', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-local-critical-state-'));
+    const store = await FileDataStore.create(join(tempDir, 'store.json'));
+    await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock-model' });
+    const memory = new MemoryService(await MemoryStore.create(join(tempDir, 'memory.json')));
+    const proxy = new CaptureProxy();
+    const original = proxy.streamCompletion.bind(proxy);
+    let chaptersWritten = 0;
+    let reflections = 0;
+    proxy.streamCompletion = (config, messages, signal, options) => {
+      const system = messages[0]?.content ?? '';
+      if (system.includes('正文写作子 Agent')) {
+        chaptersWritten += 1;
+        const paragraph = chaptersWritten === 1
+          ? '暴雨压住旧城。沈砚倒在石阶上，指尖冰凉。顾棠俯身探查，沈砚没有脉搏，也没有呼吸。医师反复确认沈砚已经死亡，众人当夜将他安葬。'
+          : '宴会进行到一半，沈砚推门走进大厅，径直坐到顾棠对面。他端起酒杯，亲口对顾棠说：“我回来晚了。”在场众人都看见他行动自如。';
+        return (async function* () {
+          yield { kind: 'content' as const, text: paragraph.repeat(8) };
+        })();
+      }
+      if (system.includes('反思子 Agent')) {
+        reflections += 1;
+        return (async function* () {
+          yield {
+            kind: 'content' as const,
+            text: JSON.stringify({
+              summary: reflections === 1 ? '沈砚确认死亡并安葬。' : '沈砚无解释返回宴会。',
+              facts: [],
+              stateUpdates: [],
+              learning: '',
+              foreshadows: [],
+            }),
+          };
+        })();
+      }
+      return original(config, messages, signal, options);
+    };
+    const orchestrator = new AgentOrchestrator(
+      store,
+      new ModelConfigService(store),
+      proxy,
+      undefined as never,
+      undefined as never,
+      memory,
+    );
+
+    const result = await orchestrator.run(
+      {
+        task: 'long_novel',
+        mode: 'draft',
+        prompt: '旧城悬疑长篇',
+        options: { chapters: 2, totalChapters: 2, targetWords: 500, automationLevel: 'semi_auto' },
+      },
+      new AbortController().signal,
+    );
+
+    expect(chaptersWritten).toBe(2);
+    expect(reflections).toBe(2);
+    expect(result.summary).toContain('已暂停');
+    expect(result.steps.join('\n')).toContain('DEAD_CHARACTER_REAPPEARS');
+    expect(memory.get(result.projectId).criticalStates).toEqual([
+      expect.objectContaining({ entity: '沈砚', value: 'dead', chapterTitle: '第1章' }),
+    ]);
+    expect(memory.get(result.projectId).summaries.map((item) => item.title)).toEqual(['第1章']);
   });
 
   it('pauses on a failed chapter and resumes from that chapter without duplication', async () => {
