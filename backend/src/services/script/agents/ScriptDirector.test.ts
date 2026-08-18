@@ -3524,6 +3524,13 @@ describe('ScriptDirector', () => {
       mode: 'normal',
       text: screenValue,
     };
+    artifact.episode.scenes[0]!.blocks.splice(1, 0, {
+      id: `${originalBlock.id}-plain-shot`,
+      type: 'dialogue',
+      speaker: '特写',
+      mode: 'normal',
+      text: '王强的嘴角微微上扬。',
+    });
     artifact.candidateHash = computeScriptEpisodeCandidateHash(artifact.episode);
     await checkpoints.save({
       ...directDraft,
@@ -3555,6 +3562,10 @@ describe('ScriptDirector', () => {
     expect(store.state.episodes[0]?.scenes[0]?.blocks[0]).toMatchObject({
       type: 'action',
       text: `【特写】屏幕上，门禁记录滚动刷新，最后一条记录显示：${screenValue}`,
+    });
+    expect(store.state.episodes[0]?.scenes[0]?.blocks[1]).toMatchObject({
+      type: 'action',
+      text: '特写：王强的嘴角微微上扬。',
     });
     expect(store.atomicCommitCalls).toHaveLength(1);
   });

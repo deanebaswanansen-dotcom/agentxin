@@ -1085,6 +1085,13 @@ export function ScriptWorkspace({
         const nextSignature = jobResourceSignature(jobs);
         const resourcesChanged = nextSignature !== jobSignature.current;
         if (resourcesChanged && client.script.workspace?.get) {
+          // Do not keep showing a stale queued card while the larger workspace
+          // snapshot and open episode bodies are being synchronized. Terminal
+          // states still wait for that synchronization so the UI never claims
+          // completion before the generated body is available.
+          if (jobs.some((job) => POLLING_JOB_STATUSES.has(job.status))) {
+            setData((current) => current ? { ...current, jobs } : current);
+          }
           const snapshot = await client.script.workspace.get(projectId, controller.signal);
           if (controller.signal.aborted) return;
 

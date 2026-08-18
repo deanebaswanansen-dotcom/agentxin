@@ -1317,6 +1317,43 @@ describe('ScriptWorkspace', () => {
     expect(client.script.episodes.list).not.toHaveBeenCalled();
   });
 
+  it('shows an active job status before a slower workspace refresh finishes', async () => {
+    const client = createClient();
+    const snapshot = buildWorkspaceSnapshot({ episodeSummaries: [] });
+    let resolveWorkspaceRefresh!: (value: typeof snapshot) => void;
+    const pendingWorkspaceRefresh = new Promise<typeof snapshot>((resolve) => {
+      resolveWorkspaceRefresh = resolve;
+    });
+    const workspaceGet = vi.fn()
+      .mockResolvedValueOnce(snapshot)
+      .mockReturnValueOnce(pendingWorkspaceRefresh);
+    Object.assign(client.script, { workspace: { get: workspaceGet } });
+    const queuedJob: ScriptAgentJobSnapshot = {
+      id: 'job-status', projectId: 'project-1', task: 'script_episode_batch',
+      status: 'queued', continuable: false,
+      scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 2 },
+    };
+    vi.mocked(client.script.jobs.list)
+      .mockResolvedValueOnce([queuedJob])
+      .mockResolvedValueOnce([{ ...queuedJob, status: 'running' }]);
+    const intervalSpy = vi.spyOn(globalThis, 'setInterval');
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
+    expect(screen.getByText('排队中')).toBeInTheDocument();
+    const poll = intervalSpy.mock.calls.find((call) => call[1] === 2000)?.[0] as () => Promise<void>;
+    let polling!: Promise<void>;
+    await act(async () => {
+      polling = poll();
+      await Promise.resolve();
+    });
+
+    expect(await screen.findByText('运行中')).toBeInTheDocument();
+    resolveWorkspaceRefresh(snapshot);
+    await act(async () => { await polling; });
+  });
+
   it('keeps dirty resources and their CAS revisions intact across an external job refresh', async () => {
     const client = createClient();
     const initial = buildWorkspaceSnapshot({ plan: { ...buildPlan(), revision: 1 } });
