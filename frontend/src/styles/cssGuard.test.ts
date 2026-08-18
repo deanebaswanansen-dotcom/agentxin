@@ -72,4 +72,13 @@ describe('CSS guardrails', () => {
       /\.script-episodes-panel\.is-fullscreen\s*\{[^}]*z-index:\s*var\(--z-modal\)/s,
     );
   });
+
+  it('keeps global error toasts visible above fullscreen and modal surfaces', () => {
+    const modalLayer = Number(themeCss.match(/--z-modal:\s*(\d+)/)?.[1]);
+    const toastLayer = Number(themeCss.match(/--z-toast:\s*(\d+)/)?.[1]);
+
+    expect(Number.isFinite(modalLayer)).toBe(true);
+    expect(Number.isFinite(toastLayer)).toBe(true);
+    expect(toastLayer).toBeGreaterThan(modalLayer);
+  });
 });

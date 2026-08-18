@@ -990,6 +990,7 @@ export function ScriptWorkspace({
   const jobSignature = useRef('');
   const pollErrorReported = useRef(false);
   const pollErrorId = useRef<string>();
+  const projectNameRef = useRef(projectName);
   const dirtyResources = useRef<ScriptResourceFlags>(cleanResourceFlags());
   const resourceEditVersions = useRef<ScriptResourceVersions>(cleanResourceVersions());
   const stageRef = useRef<ScriptStage>('plan');
@@ -997,6 +998,11 @@ export function ScriptWorkspace({
   const selectedEpisodeRef = useRef<ScriptEpisode>();
   const selectedEpisodeDirty = useRef(false);
   const selectedEpisodeEditVersion = useRef(0);
+
+  // A rename only changes the project's display metadata. Keep the newest
+  // value available to async loads without treating it as a workspace switch,
+  // which would otherwise discard unsaved screenplay edits.
+  projectNameRef.current = projectName;
 
   useEffect(() => {
     stageRef.current = stage;
@@ -1039,7 +1045,7 @@ export function ScriptWorkspace({
             const snapshot = await workspaceRequest(projectId, controller.signal);
             if (controller.signal.aborted) return;
             jobSignature.current = jobResourceSignature(jobs);
-            setData(fromWorkspaceSnapshot(snapshot, jobs, projectId, projectName));
+            setData(fromWorkspaceSnapshot(snapshot, jobs, projectId, projectNameRef.current));
             return;
           } catch (error) {
             if (!isMissing(error)) throw error;
@@ -1057,7 +1063,7 @@ export function ScriptWorkspace({
         if (controller.signal.aborted) return;
         jobSignature.current = jobResourceSignature(jobs);
         setData({
-          plan: plan ?? emptyPlan(projectId, projectName),
+          plan: plan ?? emptyPlan(projectId, projectNameRef.current),
           characters,
           world,
           outline,
@@ -1076,7 +1082,7 @@ export function ScriptWorkspace({
       episodeRequest.current?.abort();
       batchRequest.current?.abort();
     };
-  }, [client, onError, projectId, projectName]);
+  }, [client, onError, projectId]);
 
   const hasPollingJobs = data?.jobs.some((job) => POLLING_JOB_STATUSES.has(job.status)) ?? false;
 
@@ -1119,7 +1125,7 @@ export function ScriptWorkspace({
           }
 
           jobSignature.current = nextSignature;
-          const incoming = fromWorkspaceSnapshot(snapshot, jobs, projectId, projectName);
+          const incoming = fromWorkspaceSnapshot(snapshot, jobs, projectId, projectNameRef.current);
           setData((current) => current
             ? mergeWorkspaceSnapshot(current, incoming, dirtyResources.current)
             : incoming);
@@ -1173,7 +1179,7 @@ export function ScriptWorkspace({
       pollErrorId.current = undefined;
       pollErrorReported.current = false;
     };
-  }, [client, hasPollingJobs, onError, onErrorClear, projectId, projectName]);
+  }, [client, hasPollingJobs, onError, onErrorClear, projectId]);
 
   const markResourceDirty = useCallback((resource: EditableScriptResource) => {
     dirtyResources.current[resource] = true;

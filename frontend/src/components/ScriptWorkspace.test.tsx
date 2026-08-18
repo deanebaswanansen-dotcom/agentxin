@@ -180,6 +180,24 @@ describe('ScriptWorkspace', () => {
     expect(client.script.plan.get).toHaveBeenCalledWith('project-1', expect.any(AbortSignal));
   });
 
+  it('preserves unsaved screenplay edits when the selected project is renamed', async () => {
+    const client = createClient();
+    const view = render(
+      <ScriptWorkspace projectId="project-1" projectName="旧项目名" client={client} />,
+    );
+
+    const title = await screen.findByLabelText('剧本名称');
+    fireEvent.change(title, { target: { value: '尚未保存的剧本名' } });
+
+    view.rerender(
+      <ScriptWorkspace projectId="project-1" projectName="新项目名" client={client} />,
+    );
+
+    expect(screen.getByLabelText('剧本名称')).toHaveValue('尚未保存的剧本名');
+    expect(client.script.jobs.list).toHaveBeenCalledTimes(1);
+    expect(client.script.plan.get).toHaveBeenCalledTimes(1);
+  });
+
   it('lets the user choose and save the dialogue target percentage', async () => {
     const client = createClient();
     render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);

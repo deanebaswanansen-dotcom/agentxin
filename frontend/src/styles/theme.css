@@ -50,8 +50,8 @@
   --z-mobile-sidebar: 80;
   --z-mobile-chat: 85;
   --z-drawer: 100;
-  --z-toast: 900;
   --z-modal: 1000;
+  --z-toast: 1100;
 
   --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
     'Hiragino Sans GB', 'Microsoft YaHei', '微软雅黑', Roboto, Helvetica, Arial,
