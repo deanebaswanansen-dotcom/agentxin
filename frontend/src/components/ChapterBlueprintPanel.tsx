@@ -49,7 +49,7 @@ function isAbort(error: unknown): boolean {
 
 /** 判断错误是否为「资源不存在」（章节尚无蓝图，需求 14.7）。 */
 function isNotFound(error: unknown): boolean {
-  return isApiClientError(error) && error.code === 'NOT_FOUND';
+  return isApiClientError(error) && (error.code === 'NOT_FOUND' || error.status === 404);
 }
 
 /** 章节级字段摘要展示。 */

@@ -102,6 +102,21 @@ describe('ChapterBlueprintPanel', () => {
     expect(onError).not.toHaveBeenCalled();
   });
 
+  it('treats any HTTP 404 blueprint response as an empty state', async () => {
+    const missing = new ApiClientError(
+      { error: { code: 'STORE_ERROR', message: 'blueprint missing' } },
+      404,
+    );
+    const client = makeClient({ get: vi.fn().mockRejectedValue(missing) });
+    const onError = vi.fn();
+
+    render(<ChapterBlueprintPanel chapterId="ch-1" onError={onError} client={client} />);
+
+    expect(await screen.findByText('该章节尚无蓝图，请先生成章节蓝图。')).toBeInTheDocument();
+    expect(screen.queryByText('加载中…')).not.toBeInTheDocument();
+    expect(onError).not.toHaveBeenCalled();
+  });
+
   it('renders the chapter field summary and scene list after automatic load (Requirement 14.1)', async () => {
     const blueprint = makeBlueprint();
     const client = makeClient({ get: vi.fn().mockResolvedValue(blueprint) });

@@ -140,6 +140,17 @@ export function useWorkspaceSelection({
     });
   }, []);
 
+  const handleChapterRenamed = useCallback((chapter: Chapter) => {
+    setSelectedChapter((prev) => {
+      if (prev && prev.id === chapter.id) {
+        // Keep the editor's current content; a title-only rename must not replace
+        // unsaved text with the content returned by the rename endpoint.
+        return { ...prev, title: chapter.title };
+      }
+      return prev;
+    });
+  }, []);
+
   return {
     selectedProjectId,
     selectedProjectName,
@@ -158,6 +169,7 @@ export function useWorkspaceSelection({
     clearSelectedProject,
     applyAgentResult,
     handleSaved,
+    handleChapterRenamed,
   };
 }
 
