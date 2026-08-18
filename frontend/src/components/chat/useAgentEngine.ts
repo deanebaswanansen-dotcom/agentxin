@@ -10,7 +10,7 @@
  * 任务定义与编排步骤常量从 agentTasks.ts 复用，保持单一数据源。
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import apiClient from '../../api/apiClient.js';
+import apiClient, { isApiClientError } from '../../api/apiClient.js';
 import type {
   AgentProgressEvent,
   AgentRunMode,
@@ -23,6 +23,11 @@ import type {
 } from '../../types/index.js';
 import { AGENT_TASKS, TASK_PLANS } from './agentTasks.js';
 import { buildAgentRunOptions } from './buildAgentRunOptions.js';
+import {
+  forgetActiveAgentJob,
+  loadActiveAgentJob,
+  rememberActiveAgentJob,
+} from './activeAgentJob.js';
 import { type ChatMessage } from './types.js';
 import { makeId } from './types-shared.js';
 
@@ -31,7 +36,7 @@ export interface UseAgentEngineOptions {
   chapterId?: Id | null;
   onError?: (error: unknown) => void;
   /** 任务完成回调（供 App 刷新列表/加载章节到抽屉）。 */
-  onCompleted?: (result: AgentRunResult) => void;
+  onCompleted?: (result: AgentRunResult, sourceProjectId?: Id | null) => void;
   /** 流式进度（供中央预览面板实时显示当前在干什么）。 */
   onStreamingChange?: (state: { streaming: boolean; content: string; thinking: string }) => void;
   /** 注入对话流的消息操作（来自 useChatEngine）。 */
@@ -109,6 +114,7 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
     if (jobId && typeof apiClient.agent.cancelJob === 'function') {
       void apiClient.agent.cancelJob(jobId).catch(() => undefined);
     }
+    if (jobId) forgetActiveAgentJob(jobId);
     abortRef.current?.abort();
   }, []);
 
@@ -121,11 +127,20 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
       setRunningTask(null);
       projectRef.current = projectId;
     }
-    if (!projectId) return;
+    const rememberedJob = loadActiveAgentJob();
+    const recoverRememberedJob = rememberedJob &&
+      isRunnableAgentTask(rememberedJob.task) &&
+      rememberedJob.sourceProjectId === (projectId ?? null)
+      ? rememberedJob
+      : null;
+    if (!projectId && !recoverRememberedJob) return;
     if (typeof apiClient.agent.listJobs !== 'function' || typeof apiClient.agent.watchJob !== 'function') return;
     const controller = new AbortController();
     let disposed = false;
-    void apiClient.agent.listJobs(projectId, controller.signal).then(async (jobs) => {
+    const recover = async (): Promise<void> => {
+      const jobs = recoverRememberedJob
+        ? []
+        : await apiClient.agent.listJobs(projectId as Id, controller.signal);
       const completed = jobs.find((candidate) =>
         candidate.status === 'completed' && candidate.result && candidate.request &&
         isRunnableAgentTask(candidate.request.task));
@@ -140,19 +155,20 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
       const job = jobs.find((candidate) =>
         candidate.status === 'queued' || candidate.status === 'running' ||
         candidate.status === 'retrying' || candidate.status === 'waiting_user');
-      if (!job || disposed || !job.request || !isRunnableAgentTask(job.request.task)) return;
-      const task = job.request.task;
+      const jobId = recoverRememberedJob?.id ?? job?.id;
+      const task = recoverRememberedJob?.task ?? job?.request?.task;
+      if (!jobId || !task || disposed || !isRunnableAgentTask(task)) return;
       const taskTitle = AGENT_TASKS.find((item) => item.key === task)?.title ?? task;
-      const progressId = `agent-job:${job.id}:progress`;
+      const progressId = recoverRememberedJob?.progressMessageId ?? `agent-job:${jobId}:progress`;
       abortRef.current = controller;
-      activeJobIdRef.current = job.id;
+      activeJobIdRef.current = jobId;
       setRunning(true);
       setRunningTask(task);
       appendMessage({
-        id: progressId, role: 'assistant', kind: 'agent-progress', task, taskTitle, events: job.events,
+        id: progressId, role: 'assistant', kind: 'agent-progress', task, taskTitle, events: job?.events ?? [],
       });
       try {
-        const result = await apiClient.agent.watchJob(job.id, {
+        const result = await apiClient.agent.watchJob(jobId, {
           signal: controller.signal,
           onProgress: (event) => updateMessage(progressId, (previous) => previous.kind === 'agent-progress'
             ? { ...previous, events: [...previous.events, event] }
@@ -160,23 +176,34 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
         });
         if (disposed) return;
         removeMessage(progressId);
+        forgetActiveAgentJob(jobId);
         appendMessage({
-          id: `agent-job:${job.id}:result`, role: 'assistant', kind: 'agent-result', task,
+          id: `agent-job:${jobId}:result`, role: 'assistant', kind: 'agent-result', task,
           summary: result.summary, steps: result.steps, artifacts: result.artifacts,
           metrics: result.metrics, chapterPreview: null,
         });
-        onCompletedRef.current?.(result);
+        onCompletedRef.current?.(
+          result,
+          recoverRememberedJob?.sourceProjectId ?? projectId,
+        );
       } catch (error) {
-        if (!isAbort(error) && !disposed) onErrorRef.current?.(error);
+        if (!isAbort(error) && !disposed) {
+          forgetActiveAgentJob(jobId);
+          removeMessage(progressId);
+          if (!(isApiClientError(error) && error.code === 'NOT_FOUND')) {
+            onErrorRef.current?.(error);
+          }
+        }
       } finally {
-        if (!disposed) {
+        if (!disposed && abortRef.current === controller) {
           setRunning(false);
           setRunningTask(null);
           activeJobIdRef.current = null;
           abortRef.current = null;
         }
       }
-    }).catch(() => undefined);
+    };
+    void recover().catch(() => undefined);
     return () => {
       disposed = true;
       controller.abort();
@@ -260,7 +287,15 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
           apiClient.agent.runStream !== undefined
             ? await apiClient.agent.runStream(body, {
                 signal: controller.signal,
-                onJobCreated: (jobId) => { activeJobIdRef.current = jobId; },
+                onJobCreated: (jobId) => {
+                  activeJobIdRef.current = jobId;
+                  rememberActiveAgentJob({
+                    id: jobId,
+                    task,
+                    sourceProjectId: projectId ?? null,
+                    progressMessageId: progressMsgId,
+                  });
+                },
                 onProgress: (event: AgentProgressEvent) => {
                   updateMessage(progressMsgId, (prev) => {
                     if (prev.kind !== 'agent-progress') return prev;
@@ -309,6 +344,7 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
 
         // 移除进度占位，替换为结果消息
         removeMessage(progressMsgId);
+        if (activeJobIdRef.current) forgetActiveAgentJob(activeJobIdRef.current);
         appendMessage({
           id: makeId(),
           role: 'assistant',
@@ -321,7 +357,7 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
           chapterPreview,
         });
 
-        onCompleted?.(next);
+        onCompleted?.(next, projectId);
       } catch (error) {
         if (isAbort(error)) {
           progressLines.push('任务已停止。');
@@ -345,6 +381,7 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
           });
           return;
         }
+        if (activeJobIdRef.current) forgetActiveAgentJob(activeJobIdRef.current);
         // 失败时把进度消息转成错误提示
         updateMessage(progressMsgId, (prev) => {
           if (prev.kind !== 'agent-progress') return prev;
@@ -362,11 +399,13 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
         });
         if (!isAbort(error)) onError?.(error);
       } finally {
-        setRunning(false);
-        setRunningTask(null);
-        abortRef.current = null;
-        activeJobIdRef.current = null;
-        onStreamingChange?.({ streaming: false, content: '', thinking: '' });
+        if (abortRef.current === controller) {
+          setRunning(false);
+          setRunningTask(null);
+          abortRef.current = null;
+          activeJobIdRef.current = null;
+          onStreamingChange?.({ streaming: false, content: '', thinking: '' });
+        }
       }
     },
     [

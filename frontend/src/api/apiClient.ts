@@ -304,6 +304,15 @@ export class ApiClientError extends Error {
   }
 }
 
+/** A silent HTTP poll exceeded its inactivity window. Persistent jobs may retry this safely. */
+class RequestTimeoutError extends ApiClientError {
+  constructor(apiError: ApiError) {
+    super(apiError);
+    this.name = 'RequestTimeoutError';
+    Object.setPrototypeOf(this, RequestTimeoutError.prototype);
+  }
+}
+
 export interface ScriptProjectStateResponse {
   schemaVersion: 1;
   projectId: Id;
@@ -469,7 +478,7 @@ async function request<T>(
     return parsedBody as T;
   } catch (error) {
     if (timeout.didTimeout()) {
-      throw new ApiClientError(
+      throw new RequestTimeoutError(
         { error: { code: 'PROVIDER_ERROR', message: '请求超过 45 秒没有响应，请检查后端或模型服务。' } },
       );
     }
@@ -1279,14 +1288,33 @@ export async function watchPersistentAgentJob(
   options?: AgentRunStreamOptions,
 ): Promise<AgentRunResult> {
   let deliveredEvents = 0;
+  let reconnecting = false;
   for (;;) {
-    const snapshot = await request<PersistentAgentJobSnapshot>(
-      baseUrl,
-      'GET',
-      `/agent/jobs/${seg(jobId)}`,
-      undefined,
-      { signal: options?.signal, includeModelConfig: true },
-    );
+    let snapshot: PersistentAgentJobSnapshot;
+    try {
+      snapshot = await request<PersistentAgentJobSnapshot>(
+        baseUrl,
+        'GET',
+        `/agent/jobs/${seg(jobId)}`,
+        undefined,
+        { signal: options?.signal, includeModelConfig: true },
+      );
+    } catch (error) {
+      if (!(error instanceof RequestTimeoutError) || options?.signal?.aborted === true) throw error;
+      if (!reconnecting) {
+        reconnecting = true;
+        options?.onProgress?.({
+          phase: 'info',
+          message: '后台仍在生成，页面连接较慢，正在自动重连…',
+        });
+      }
+      await waitForPoll(1_000, options?.signal);
+      continue;
+    }
+    if (reconnecting) {
+      reconnecting = false;
+      options?.onProgress?.({ phase: 'info', message: '已恢复连接，任务继续运行。' });
+    }
     for (const event of snapshot.events.slice(deliveredEvents)) options?.onProgress?.(event);
     deliveredEvents = snapshot.events.length;
     if (snapshot.status === 'completed' && snapshot.result) return snapshot.result;

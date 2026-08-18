@@ -66,6 +66,7 @@ function installFetch(impl: (url: string, init?: RequestInit) => Response | Prom
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   client().modelConfig.clear();
   try {
     window.localStorage.removeItem('nwa.modelConfig.v1');
@@ -704,6 +705,41 @@ describe('persistent backend Agent jobs', () => {
     expect(progress).toHaveBeenCalledTimes(1);
     expect(mock.mock.calls.map((call) => String(call[0]))).toEqual([
       '/api/agent/jobs', '/api/agent/jobs/job-1', '/api/agent/jobs/job-1',
+    ]);
+  });
+
+  it('keeps polling after one silent status request times out', async () => {
+    vi.useFakeTimers();
+    const progress = vi.fn();
+    let polls = 0;
+    const result: AgentRunResult = {
+      task: 'long_novel', mode: 'draft', projectId: 'p1', summary: '完成', steps: [], artifacts: [],
+    };
+    installFetch((url, init) => {
+      if (String(url).endsWith('/agent/jobs') && init?.method === 'POST') {
+        return jsonResponse({ id: 'job-1', status: 'queued', events: [] }, { status: 202 });
+      }
+      polls += 1;
+      if (polls === 1) {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            reject(init.signal?.reason ?? new DOMException('Aborted', 'AbortError'));
+          }, { once: true });
+        });
+      }
+      return jsonResponse({ id: 'job-1', status: 'completed', events: [], result });
+    });
+
+    const pending = runPersistentAgentJob('/api', {
+      task: 'long_novel', mode: 'draft', prompt: '写一章', projectId: 'p1',
+    }, { onProgress: progress });
+    await vi.advanceTimersByTimeAsync(46_100);
+
+    await expect(pending).resolves.toEqual(result);
+    expect(polls).toBe(2);
+    expect(progress.mock.calls.map(([event]) => event.message)).toEqual([
+      '后台仍在生成，页面连接较慢，正在自动重连…',
+      '已恢复连接，任务继续运行。',
     ]);
   });
 });
