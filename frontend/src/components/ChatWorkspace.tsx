@@ -201,14 +201,17 @@ export function ChatWorkspace({
     chapterId,
     onError,
     onStreamingChange,
-    onCompleted: (result) => {
+    onCompleted: (result, sourceProjectId) => {
       // 只有结果会切换到另一个项目/章节时，才把本轮任务消息写入目标
       // 会话。同一上下文完成时不复制，避免后续手动新建项目看到旧消息。
       const resultChapterId = result.chapterId ?? null;
-      if (result.projectId !== projectId || resultChapterId !== chapterId) {
+      if (
+        projectId === (sourceProjectId ?? null) &&
+        (result.projectId !== projectId || resultChapterId !== chapterId)
+      ) {
         chat.carryNextSession(result.projectId, resultChapterId);
       }
-      onAgentCompleted?.(result, projectId);
+      onAgentCompleted?.(result, sourceProjectId);
     },
     appendMessage: chat.appendMessage,
     updateMessage: chat.updateMessage,
