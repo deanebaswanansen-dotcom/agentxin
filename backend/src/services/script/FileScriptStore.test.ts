@@ -655,6 +655,56 @@ describe('FileScriptStore', () => {
     expect(second).toEqual(first);
   });
 
+  it('normalizes legacy camera and caption labels stored as dialogue on read', async () => {
+    const legacyEpisode = episode({
+      status: 'completed',
+      scenes: [{
+        id: 'scene-1',
+        ordinal: 1,
+        location: '广播室',
+        timeOfDay: 'night',
+        interiorExterior: 'interior',
+        characterIds: ['character-1'],
+        blocks: [
+          { id: 'shot-plain', type: 'dialogue', speaker: '特写', text: '王强的嘴角微微上扬。' },
+          {
+            id: 'shot-bracketed',
+            type: 'dialogue',
+            speaker: '【特写】屏幕上的第七码',
+            text: '闪烁了一次。',
+          },
+          { id: 'caption', type: 'dialogue', speaker: '字幕', text: '00:00 雨未停' },
+          { id: 'real-line', type: 'dialogue', speaker: '沈清', characterId: 'character-1', text: '我看到了。' },
+        ],
+      }],
+    });
+    await writeFile(
+      join(root, 'project-1.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        projectId: 'project-1',
+        characters: [character()],
+        episodeOutlines: [],
+        episodes: [legacyEpisode],
+        continuity: { currentState: [], openThreads: [], wardrobeLedger: [] },
+        updatedAt: '2026-08-14T00:00:00.000Z',
+      }),
+      'utf8',
+    );
+
+    const store = await FileScriptStore.create(root);
+    const first = await store.getProjectState('project-1');
+    const second = await store.getProjectState('project-1');
+
+    expect(first?.episodes[0]?.scenes[0]?.blocks).toEqual([
+      { id: 'shot-plain', type: 'action', text: '特写：王强的嘴角微微上扬。' },
+      { id: 'shot-bracketed', type: 'action', text: '【特写】屏幕上的第七码：闪烁了一次。' },
+      { id: 'caption', type: 'caption', text: '00:00 雨未停' },
+      { id: 'real-line', type: 'dialogue', speaker: '沈清', characterId: 'character-1', text: '我看到了。' },
+    ]);
+    expect(second).toEqual(first);
+  });
+
   it('persists review issues with collection conflicts and safely replaces one episode source', async () => {
     const store = await FileScriptStore.create(root);
     const userIssue = reviewIssue({ id: 'user-1', source: 'user', code: 'USER_NOTE' });

@@ -2865,6 +2865,102 @@ describe('ScriptDirector', () => {
     });
   });
 
+  it('stores an unparseable direct draft and changes the prompt on explicit resume', async () => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    const checkpoints = new InMemoryScriptCheckpointStore();
+    const draftPrompts: string[] = [];
+    let draftCalls = 0;
+    const director = new ScriptDirector({
+      store,
+      checkpoints,
+      model: {
+        async complete(request) {
+          if (request.node === 'review') return directReviewJson();
+          draftCalls += 1;
+          draftPrompts.push(request.prompt);
+          return draftCalls <= 4
+            ? '这是创作说明，没有剧本场景头。'
+            : directScriptText();
+        },
+        async getModelConfigFingerprint() { return 'direct-model-v1'; },
+      },
+    });
+
+    const request = {
+      task: 'script_episode_batch' as const,
+      projectId: 'project-1',
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: 1,
+      draftMode: 'direct_text' as const,
+    };
+    await expect(director.run(request)).rejects.toThrow('没有返回可识别的剧本场景');
+
+    const rejected = (await checkpoints.list('project-1', 'script_episode_batch:1:1'))
+      .find((checkpoint) => checkpoint.node === 'direct_draft');
+    expect(rejected).toMatchObject({
+      status: 'needs_review',
+      attempt: 2,
+      artifactRevision: 0,
+      artifact: { stage: 'direct_draft_rejected' },
+    });
+    await expect(director.run(request)).rejects.toThrow('请从检查点继续');
+    expect(draftCalls).toBe(2);
+
+    await expect(director.run({
+      ...request,
+      resumeRejectedCandidates: true,
+    })).rejects.toThrow('没有返回可识别的剧本场景');
+    expect(draftCalls).toBe(4);
+    expect(draftPrompts[2]).toContain('显式恢复重写（第 1 次）');
+
+    const result = await director.run({ ...request, resumeRejectedCandidates: true });
+
+    expect(result.kind).toBe('episode_batch');
+    expect(draftCalls).toBe(5);
+    expect(draftPrompts[4]).toContain('显式恢复重写（第 2 次）');
+    expect(new Set([draftPrompts[0], draftPrompts[2], draftPrompts[4]])).toHaveLength(3);
+    expect(store.atomicCommitCalls).toHaveLength(1);
+    const directDraftHistory = await checkpoints.list('project-1', 'script_episode_batch:1:1');
+    expect(directDraftHistory).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        node: 'direct_draft', status: 'succeeded', artifactRevision: 2,
+      }),
+    ]));
+  });
+
+  it('uses a recovery prompt for a legacy failed job that has no rejected checkpoint', async () => {
+    const state = readySingleEpisodeState();
+    const prompts: string[] = [];
+    const director = new ScriptDirector({
+      store: new MemoryScriptStore(state),
+      checkpoints: new InMemoryScriptCheckpointStore(),
+      model: {
+        async complete(request) {
+          if (request.node === 'review') return directReviewJson();
+          prompts.push(request.prompt);
+          return directScriptText();
+        },
+        async getModelConfigFingerprint() { return 'direct-model-v1'; },
+      },
+    });
+
+    const result = await director.run({
+      task: 'script_episode_batch',
+      projectId: 'project-1',
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+      resumeRejectedCandidates: true,
+    });
+
+    expect(result.kind).toBe('episode_batch');
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('显式恢复重写（第 1 次）');
+  });
+
   it('writes a five-episode direct-text batch in order with ten model calls and a continuity chain', async () => {
     const state = readySingleEpisodeState();
     state.plan = approvedPlan(5);
