@@ -1,6 +1,6 @@
 /**
  * 单一数据源：组装 Agent 运行请求的 options。
- * useAgentEngine（Chat 路径）与 AgentCommandCenter（遗留面板）共用，避免 long_novel 等参数分叉。
+ * Chat 路径统一从这里生成请求参数，避免 long_novel 等任务的默认值分叉。
  */
 import type {
   AgentRunRequest,
@@ -61,8 +61,7 @@ export function buildAgentRunOptions(
       input.totalChapters ??
       input.chapters ??
       LONG_NOVEL_DEFAULT_TOTAL_CHAPTERS;
-    // 优先显式 totalWords / 计划规模；否则 20 万字（Chat 路径默认）。
-    // 调用方可传 chapters*targetWords 作为全书目标（AgentCommandCenter 即如此）。
+    // 优先显式 totalWords / 计划规模；否则使用 Chat 路径的 20 万字默认值。
     const totalWords =
       input.totalWords ??
       planSummary?.totalWords ??

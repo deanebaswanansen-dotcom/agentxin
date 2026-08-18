@@ -104,7 +104,9 @@ describe('App shell', () => {
     render(<App />);
     fireEvent.click(await screen.findByTitle('竖屏短剧'));
 
-    expect(await screen.findByRole('tab', { name: '剧本策划' })).toBeInTheDocument();
+    expect(
+      await screen.findByRole('tab', { name: '剧本策划' }, { timeout: 5_000 }),
+    ).toBeInTheDocument();
     expect(screen.getByText('短剧生产工作台')).toBeInTheDocument();
     await waitFor(() => expect(screen.queryByRole('textbox', { name: '对话输入' })).not.toBeInTheDocument());
   });
