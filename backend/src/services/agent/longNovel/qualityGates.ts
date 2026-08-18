@@ -48,6 +48,32 @@ function isCatastrophicContinuityIssue(issue: string): boolean {
 
 const META_LEAK =
   /^(?:好的|当然|作为|以下是|我来|下面给出|根据你的要求|JSON|system prompt)/im;
+const CHAPTER_NUMBER = '第[0-9一二三四五六七八九十百零〇两]+章';
+const LEADING_CHAPTER_HEADING = new RegExp(
+  `^(?:#{1,6}\\s*)?(?:——\\s*)?${CHAPTER_NUMBER}(?:[　 \\t]+[^\\n]{0,80})?(?:\\s*——)?$`,
+  'u',
+);
+const NARRATIVE_CHAPTER_REFERENCE = new RegExp(
+  CHAPTER_NUMBER,
+  'gu',
+);
+const DOCUMENT_CHAPTER_QUALIFIER =
+  /(?:协议|合同|小说|书籍|报告|文件|条例|法案|手册|卷宗|档案|目录|经文|剧本|教材)[^。！？\n]{0,8}$/u;
+
+function narrativeChapterReference(text: string): string | undefined {
+  const trimmed = text.trimStart();
+  const newline = trimmed.indexOf('\n');
+  const firstLine = (newline >= 0 ? trimmed.slice(0, newline) : trimmed).trim();
+  const body = LEADING_CHAPTER_HEADING.test(firstLine)
+    ? (newline >= 0 ? trimmed.slice(newline + 1) : '')
+    : trimmed;
+  for (const match of body.matchAll(NARRATIVE_CHAPTER_REFERENCE)) {
+    const prefix = body.slice(Math.max(0, (match.index ?? 0) - 28), match.index ?? 0);
+    if (DOCUMENT_CHAPTER_QUALIFIER.test(prefix.replace(/\s+/gu, ''))) continue;
+    return match[0];
+  }
+  return undefined;
+}
 
 export function runChapterQualityGates(input: GateInput): GateResult {
   const findings: GateFinding[] = [];
@@ -83,6 +109,15 @@ export function runChapterQualityGates(input: GateInput): GateResult {
       gate: 'format',
       severity: 'hard',
       message: '疑似模型说明/代码块泄漏，不得作为正文。',
+      autoFixable: true,
+    });
+  }
+  const leakedChapterReference = narrativeChapterReference(text);
+  if (leakedChapterReference) {
+    findings.push({
+      gate: 'format',
+      severity: 'hard',
+      message: `正文出现疑似章节编号元叙事「${leakedChapterReference}」，应改写为故事内时间或事件。`,
       autoFixable: true,
     });
   }

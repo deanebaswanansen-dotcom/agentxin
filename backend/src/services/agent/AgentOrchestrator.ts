@@ -40,6 +40,7 @@ import {
   type GateFinding,
   type GateResult,
 } from './longNovel/qualityGates.js';
+import { inferDeterministicCriticalStateUpdates } from './longNovel/deterministicCriticalState.js';
 import {
   ContinuityInspectorSubAgent,
   type InspectorReport,
@@ -3013,10 +3014,30 @@ export class AgentOrchestrator {
       // 反思失败：保留 fallback 摘要，记忆仍前进，不中断主流程。
     }
 
+    // 反思模型偶尔会漏填 stateUpdates；用同一章现成文本做极保守的确定性兜底，
+    // 不增加模型调用。模型已明确给出的同键状态优先，避免本地规则过度推断。
+    const inferredStateUpdates = inferDeterministicCriticalStateUpdates({
+      content: text,
+      summary,
+      facts,
+      existingStates: this.memory.get(projectId).criticalStates,
+    });
+    const stateKey = (update: ParsedCriticalStateUpdate): string =>
+      [update.kind, update.entity, update.key ?? 'current']
+        .map((value) => value.normalize('NFKC').replace(/\s+/gu, '').toLocaleLowerCase('zh-CN'))
+        .join(':');
+    const modelStateKeys = new Set(stateUpdates.map(stateKey));
+    for (const update of inferredStateUpdates) {
+      if (!modelStateKeys.has(stateKey(update))) stateUpdates.push(update);
+    }
+
     const stateResult = await this.memory.applyCriticalStateUpdates(
       projectId,
       stateUpdates.map((update): CriticalStateUpdateInput => ({
         ...update,
+        evidence: update.kind === 'key_item' && summary
+          ? `${update.evidence}；本章摘要：${summary}`.slice(0, 400)
+          : update.evidence,
         chapterId,
         chapterTitle,
       })),

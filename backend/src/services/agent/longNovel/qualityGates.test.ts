@@ -23,6 +23,37 @@ describe('long novel quality gates', () => {
     expect(leak.findings.some((f) => f.gate === 'format' && f.severity === 'hard')).toBe(true);
   });
 
+  it('hard-fails narrative chapter-number leaks but allows the leading heading and document clauses', () => {
+    const leaked = runChapterQualityGates({
+      content: [
+        '第20章　引航台',
+        '',
+        '顾棠从外套内袋抽出横线纸——第17章从泵站底座取到的那张。',
+        '她终于发现纸背还有一组数字。',
+      ].join('\n'),
+      minWords: 1,
+      maxWords: 8000,
+      targetWords: 2000,
+      chapterTitle: '第20章',
+    });
+
+    expect(leaked.findings).toContainEqual(expect.objectContaining({
+      gate: 'format',
+      severity: 'hard',
+      message: expect.stringContaining('章节编号'),
+    }));
+
+    const documentReference = runChapterQualityGates({
+      content: '## 第20章　引航台\n\n顾棠翻开协议，发现协议第三章中明确写着污染处置流程。',
+      minWords: 1,
+      maxWords: 8000,
+      targetWords: 2000,
+      chapterTitle: '第20章',
+    });
+    expect(documentReference.findings.some((finding) =>
+      finding.gate === 'format' && finding.severity === 'hard')).toBe(false);
+  });
+
   it('keeps an unsubstantiated low reviewer score recoverable', () => {
     const body = '林远冲进雨里，却发现地图是假的。他说：“我们被骗了。”下一秒警报响起。'.repeat(30);
     const result = runChapterQualityGates({

@@ -345,6 +345,7 @@ async function main(): Promise<void> {
   const orchestrator = new AgentOrchestrator(store, modelConfigService, proxy, undefined, undefined, memory);
   const report = await readReport(reportPath, args, config);
   resetCacheStats();
+  let stoppedOnRejectedChapter = false;
 
   for (let batchIndex = 0; batchIndex < args.maxBatches; batchIndex += 1) {
     const existingChapters = report.projectId ? await store.listChapters(report.projectId) : [];
@@ -379,11 +380,13 @@ async function main(): Promise<void> {
       metrics: result.metrics,
     });
     await writeReports(reportPath, markdownPath, report);
+    stoppedOnRejectedChapter = chapters.some((chapter) => memory.isChapterRejected(result.projectId, chapter.id));
+    if (stoppedOnRejectedChapter) break;
   }
 
   await writeReports(reportPath, markdownPath, report);
 
-  if (args.audit && report.projectId) {
+  if (args.audit && report.projectId && !stoppedOnRejectedChapter) {
     report.audit = await runAudit(proxy, config, store, memory, report.projectId);
     await persistAuditFeedback(memory, report.projectId, report.audit);
     await writeReports(reportPath, markdownPath, report);
