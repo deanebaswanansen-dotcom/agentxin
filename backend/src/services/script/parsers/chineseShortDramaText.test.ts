@@ -288,6 +288,35 @@ describe('parseChineseShortDramaText', () => {
     });
   });
 
+  it('keeps an unprefixed shot direction containing colons as an action', () => {
+    const result = parseChineseShortDramaText([
+      '第3集',
+      '3-1 监控室 夜/内',
+      '人物：周野 林秋',
+      '【特写】屏幕上，门禁记录滚动刷新，最后一条记录显示：007。',
+      '【特写】监控画面时间：凌晨四点二十分。',
+      '周野：这两条记录对不上。',
+    ].join('\n'), options());
+
+    expect(result.unparsedLines).toEqual([]);
+    expect(result.warnings).toEqual([]);
+    expect(result.episode?.scenes[0]?.blocks).toEqual([
+      expect.objectContaining({
+        type: 'action',
+        text: '【特写】屏幕上，门禁记录滚动刷新，最后一条记录显示：007。',
+      }),
+      expect.objectContaining({
+        type: 'action',
+        text: '【特写】监控画面时间：凌晨四点二十分。',
+      }),
+      expect.objectContaining({
+        type: 'dialogue',
+        characterId: 'character-zhou',
+        speaker: '周野',
+      }),
+    ]);
+  });
+
   it('round-trips the supported screenplay surface through the existing serializer', () => {
     const parsed = parseChineseShortDramaText([
       '第3集',
