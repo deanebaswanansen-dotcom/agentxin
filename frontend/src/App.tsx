@@ -92,6 +92,7 @@ function Workbench(): JSX.Element {
     applyAgentResult,
     handleSaved,
     handleChapterRenamed,
+    handleProjectRenamed,
   } = useWorkspaceSelection({
     reportError,
     onOpenChapterTools: openChapterTools,
@@ -460,6 +461,7 @@ function Workbench(): JSX.Element {
                 onSelectProject={handleSelectProject}
                 onSelectChapter={(id) => void handleSelectChapter(id)}
                 onProjectDeleted={handleProjectDeleted}
+                onProjectRenamed={handleProjectRenamed}
                 onChapterDeleted={clearSelectedChapter}
                 refreshToken={projectListVersion + chapterTreeVersion}
                 onError={reportError}

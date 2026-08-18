@@ -25,6 +25,7 @@ export interface ProjectTreeProps {
   onSelectProject: (projectId: Id, kind: Project['kind']) => void;
   onSelectChapter: (chapterId: Id) => void;
   onProjectDeleted?: (projectId: Id) => void;
+  onProjectRenamed?: (projectId: Id, name: string) => void;
   onChapterDeleted?: (chapterId: Id) => void;
   refreshToken?: number;
   onError?: (error: unknown) => void;
@@ -41,6 +42,7 @@ export function ProjectTree({
   onSelectProject,
   onSelectChapter,
   onProjectDeleted,
+  onProjectRenamed,
   onChapterDeleted,
   refreshToken = 0,
   onError,
@@ -156,13 +158,14 @@ export function ProjectTree({
       setProjects((current) =>
         current.map((project) => (project.id === renameTarget.id ? { ...project, name } : project)),
       );
+      onProjectRenamed?.(renameTarget.id, name);
     } catch (error) {
       handleError(error);
     } finally {
       setBusy(false);
       setRenameTarget(null);
     }
-  }, [renameTarget, renameInput, client, handleError]);
+  }, [renameTarget, renameInput, client, handleError, onProjectRenamed]);
 
   const doDelete = useCallback(async () => {
     if (!deleteTarget) return;

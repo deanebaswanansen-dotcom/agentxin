@@ -1546,4 +1546,22 @@ describe('ScriptWorkspace', () => {
     fireEvent.click(screen.getByRole('button', { name: '导出 Fountain' }));
     await waitFor(() => expect(client.script.exportFile).toHaveBeenCalledWith('project-1', 'fountain'));
   });
+
+  it('enters and exits screenplay fullscreen by button or Escape', async () => {
+    const client = createClient();
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
+    const panel = screen.getAllByRole('heading', { name: '1–5集剧本正文' })[0].closest('section');
+
+    fireEvent.click(screen.getByRole('button', { name: '全屏阅读' }));
+    expect(panel).toHaveClass('is-fullscreen');
+    fireEvent.click(screen.getByRole('button', { name: '退出全屏' }));
+    expect(panel).not.toHaveClass('is-fullscreen');
+
+    fireEvent.click(screen.getByRole('button', { name: '全屏阅读' }));
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(panel).not.toHaveClass('is-fullscreen');
+  });
 });

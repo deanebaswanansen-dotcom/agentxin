@@ -239,6 +239,12 @@
   min-height: 0;
 }
 
+/* The screenplay fullscreen panel lives inside the workspace stacking
+   context. Raise that context above the global header while it is active. */
+.nwa-tavern-workspace:has(.script-episodes-panel.is-fullscreen) {
+  z-index: var(--z-modal);
+}
+
 .nwa-reader-mode-main {
   position: relative;
   z-index: var(--z-workspace);
