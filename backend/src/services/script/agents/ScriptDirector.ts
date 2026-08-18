@@ -3555,18 +3555,36 @@ export class ScriptDirector {
 
     if (!draft) {
       request.signal?.throwIfAborted();
+      const storedRecoveryAttempt = rejectedDirectDraft
+        ? (() => {
+            const artifact = rejectedDirectDraft.artifact;
+            if (artifact && typeof artifact === 'object' && !Array.isArray(artifact)) {
+              const value = (artifact as Record<string, unknown>).recoveryAttempt;
+              if (typeof value === 'number' && Number.isInteger(value) && value >= 0) {
+                return value;
+              }
+            }
+            // Checkpoints written before recoveryAttempt was persisted are ambiguous.
+            // Treat revision 0 as at least recovery 1 so the next retry cannot reuse
+            // the same primary and format-repair cache keys.
+            return rejectedDirectDraft.artifactRevision + 1;
+          })()
+        : undefined;
       const recoveryAttempt = rejectedDirectDraft
-        ? rejectedDirectDraft.artifactRevision + 1
+        ? storedRecoveryAttempt! + 1
         : request.resumeRejectedCandidates
           ? 1
           : 0;
       const directDraftPrompt = recoveryAttempt > 0
         ? [
-            buildDirectDraftPrompt(context),
-            '',
             `显式恢复重写（第 ${recoveryAttempt} 次）：上一份正文和排版修正结果都无法识别。`,
             '必须从分集卡重新写一份完整正文，不得复用上次结果或输出解释。',
-            '开头直接输出“第N集”和首个“N-M 地点 日或夜/内或外”场景头。',
+            '必须严格用下面三行开头：',
+            `第${episodeNumber}集`,
+            `${episodeNumber}-1 地点 日/内`,
+            '人物：角色名',
+            '',
+            buildDirectDraftPrompt(context),
           ].join('\n')
         : buildDirectDraftPrompt(context);
       rawText = await this.dependencies.model.complete({
@@ -3581,8 +3599,17 @@ export class ScriptDirector {
       let callsUsed = 1;
       if (!parsed.episode || parsed.unparsedLines.length > 0) {
         const formatPrompt = [
+          ...(recoveryAttempt > 0
+            ? [`恢复排版（第 ${recoveryAttempt} 次）：不得复用此前的排版结果。`]
+            : []),
           '只修正下面剧本的排版，不改变事件、人物、对白含义和篇幅。',
-          '删除解释文字与Markdown围栏，严格整理为：第N集、N-M 地点 日或夜/内或外、人物、字幕、△动作、人物对白。',
+          `删除解释文字与Markdown围栏，严格整理为：第${episodeNumber}集、${episodeNumber}-M 地点 日或夜/内或外、人物、字幕、△动作、人物对白。`,
+          '格式示例：',
+          `第${episodeNumber}集`,
+          `${episodeNumber}-1 地点 夜/内`,
+          '人物：角色名',
+          '△动作',
+          '角色名：对白',
           '只输出整理后的完整剧本文本。',
           rawText,
         ].join('\n');
@@ -3615,6 +3642,7 @@ export class ScriptDirector {
           artifact: {
             schemaVersion: 1,
             stage: 'direct_draft_rejected',
+            recoveryAttempt,
             rawText,
             createdAt: this.now(),
           },
