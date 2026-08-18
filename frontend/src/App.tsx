@@ -89,6 +89,7 @@ function Workbench(): JSX.Element {
     clearSelectedProject,
     applyAgentResult,
     handleSaved,
+    handleChapterRenamed,
   } = useWorkspaceSelection({
     reportError,
     onOpenChapterTools: openChapterTools,
@@ -107,7 +108,11 @@ function Workbench(): JSX.Element {
   } = usePaneLayout();
   // 资料抽屉受控 tab
   const [resourceTab, setResourceTab] = useState<WorkspaceTab>('chapters');
+  const [chapterTreeVersion, setChapterTreeVersion] = useState(0);
   const openChaptersTab = useCallback(() => setResourceTab('chapters'), []);
+  const refreshChapterTree = useCallback(() => {
+    setChapterTreeVersion((version) => version + 1);
+  }, []);
   const {
     importDragActive,
     importBusy,
@@ -454,7 +459,7 @@ function Workbench(): JSX.Element {
                 onSelectChapter={(id) => void handleSelectChapter(id)}
                 onProjectDeleted={handleProjectDeleted}
                 onChapterDeleted={clearSelectedChapter}
-                refreshToken={projectListVersion}
+                refreshToken={projectListVersion + chapterTreeVersion}
                 onError={reportError}
               />
             </div>
@@ -688,6 +693,8 @@ function Workbench(): JSX.Element {
             selectedChapterId={selectedChapterId}
             refreshToken={projectListVersion}
             onChapterDeleted={clearSelectedChapter}
+            onChapterRenamed={handleChapterRenamed}
+            onChapterListChanged={refreshChapterTree}
             onClose={handleCloseDrawer}
             onError={reportError}
           />

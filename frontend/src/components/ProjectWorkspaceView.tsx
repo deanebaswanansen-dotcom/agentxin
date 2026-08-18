@@ -16,6 +16,10 @@ export interface ProjectWorkspaceViewProps {
   selectedChapterId?: Id | null;
   onSelectChapter: (chapterId: Id) => void;
   onChapterDeleted?: (chapterId: Id) => void;
+  /** Keep chapter consumers outside this panel in sync after a title change. */
+  onChapterRenamed?: (chapter: Chapter) => void;
+  /** Notify sibling chapter lists after create, rename, delete or reorder. */
+  onChapterListChanged?: () => void;
   onError?: (error: unknown) => void;
   client?: WorkspaceClient;
 
@@ -228,6 +232,8 @@ export function ProjectWorkspaceView({
   selectedChapterId,
   onSelectChapter,
   onChapterDeleted,
+  onChapterRenamed,
+  onChapterListChanged,
   onError,
   client = apiClient,
   workspaceTab: controlledWorkspaceTab,
@@ -284,18 +290,26 @@ export function ProjectWorkspaceView({
     async (signal?: AbortSignal) => {
       setLoading(true);
       try {
-        const [ch, chars, worlds, outs] = await Promise.all([
-          client.chapters.list(projectId, signal),
-          client.settings.characters.list(projectId, signal),
-          client.settings.worldSettings.list(projectId, signal),
-          client.settings.outlines.list(projectId, signal),
+        const results = await Promise.allSettled([
+          client.chapters.list(projectId, signal).then((items) => {
+            if (!signal?.aborted) setChapters(items);
+          }),
+          client.settings.characters.list(projectId, signal).then((items) => {
+            if (!signal?.aborted) setCharacters(items);
+          }),
+          client.settings.worldSettings.list(projectId, signal).then((items) => {
+            if (!signal?.aborted) setWorldSettings(items);
+          }),
+          client.settings.outlines.list(projectId, signal).then((items) => {
+            if (!signal?.aborted) setOutlines(items);
+          }),
         ]);
-        setChapters(ch);
-        setCharacters(chars);
-        setWorldSettings(worlds);
-        setOutlines(outs);
-      } catch (error) {
-        handleError(error);
+        if (signal?.aborted) return;
+        const failure = results.find(
+          (result): result is PromiseRejectedResult =>
+            result.status === 'rejected' && !isAbort(result.reason),
+        );
+        if (failure) handleError(failure.reason);
       } finally {
         if (!signal?.aborted) setLoading(false);
       }
@@ -342,10 +356,11 @@ export function ProjectWorkspaceView({
             position: current.length,
           },
         ]);
+        onChapterListChanged?.();
       },
       () => setChapterTitle(''),
     );
-  }, [chapterTitle, client, projectId, runLocalMutation]);
+  }, [chapterTitle, client, onChapterListChanged, projectId, runLocalMutation]);
 
   const handleDragEnd = useCallback(async (result: DropResult) => {
     if (!result.destination) return;
@@ -363,13 +378,14 @@ export function ProjectWorkspaceView({
     try {
       const orderedIds = newChapters.map(c => c.id);
       await client.chapters.reorder(projectId, orderedIds);
+      onChapterListChanged?.();
     } catch (error) {
       handleError(error);
       await refresh(); // Revert on failure
     } finally {
       setBusy(false);
     }
-  }, [chapters, projectId, client, handleError, refresh]);
+  }, [chapters, projectId, client, handleError, onChapterListChanged, refresh]);
 
   const handleCreateCharacter = useCallback(() => {
     const name = characterName.trim();
@@ -427,13 +443,15 @@ export function ProjectWorkspaceView({
     try {
       const updated = await client.chapters.rename(renameChapterTarget.id, title);
       setChapters((current) => current.map((chapter) => (chapter.id === updated.id ? updated : chapter)));
+      onChapterRenamed?.(updated);
+      onChapterListChanged?.();
     } catch (error) {
       handleError(error);
     } finally {
       setBusy(false);
       setRenameChapterTarget(null);
     }
-  }, [renameChapterTarget, renameChapterInput, client, handleError]);
+  }, [renameChapterTarget, renameChapterInput, client, handleError, onChapterListChanged, onChapterRenamed]);
 
   const handleDeleteChapter = useCallback((chapter: Chapter) => {
     setDeleteChapterTarget(chapter);
@@ -445,6 +463,7 @@ export function ProjectWorkspaceView({
     try {
       await client.chapters.remove(deleteChapterTarget.id);
       setChapters((current) => current.filter((chapter) => chapter.id !== deleteChapterTarget.id));
+      onChapterListChanged?.();
       if (deleteChapterTarget.id === selectedChapterId) {
         onChapterDeleted?.(deleteChapterTarget.id);
       }
@@ -454,7 +473,7 @@ export function ProjectWorkspaceView({
       setBusy(false);
       setDeleteChapterTarget(null);
     }
-  }, [deleteChapterTarget, selectedChapterId, client, handleError, onChapterDeleted]);
+  }, [deleteChapterTarget, selectedChapterId, client, handleError, onChapterDeleted, onChapterListChanged]);
 
   const startEditCharacter = useCallback((item: Character) => {
     setEditDraft({ kind: 'character', id: item.id, title: item.name, body: item.description });

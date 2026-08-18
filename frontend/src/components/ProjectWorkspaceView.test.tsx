@@ -11,13 +11,21 @@
  * mocked with `vi.fn()` so no real network calls happen.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import type { Chapter, Character, Outline, WorldSetting } from '../types/index.js';
 import {
   ProjectWorkspaceView,
   type ProjectWorkspaceViewProps,
   type WorkspaceClient,
 } from './ProjectWorkspaceView.js';
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
+}
 
 function makeClient(data: {
   chapters?: Chapter[];
@@ -142,6 +150,30 @@ describe('ProjectWorkspaceView', () => {
     expect(client.settings.characters.list).toHaveBeenCalledWith('p-1', expect.anything());
     expect(client.settings.worldSettings.list).toHaveBeenCalledWith('p-1', expect.anything());
     expect(client.settings.outlines.list).toHaveBeenCalledWith('p-1', expect.anything());
+  });
+
+  it('renders finished resource lists while another list is still loading', async () => {
+    const outlineRequest = deferred<Outline[]>();
+    const client = makeClient({
+      chapters: [{ id: 'ch-1', projectId: 'p-1', title: '第一章', content: '', position: 0 }],
+      characters: [{ id: 'c-1', projectId: 'p-1', name: '林动', description: '主角' }],
+      worldSettings: [{ id: 'w-1', projectId: 'p-1', title: '大荒古界', content: '修炼世界' }],
+    });
+    (client.settings.outlines.list as ReturnType<typeof vi.fn>).mockReturnValue(outlineRequest.promise);
+
+    render(<ProjectWorkspaceView {...baseProps} onSelectChapter={vi.fn()} client={client} />);
+
+    expect(await screen.findByRole('button', { name: '第一章' })).toBeInTheDocument();
+    expect(screen.getByLabelText('项目统计')).toHaveTextContent('1 章');
+    expect(screen.getByLabelText('项目统计')).toHaveTextContent('1 人物');
+    expect(screen.getByLabelText('项目统计')).toHaveTextContent('1 设定');
+    expect(screen.getByText('加载中…')).toBeInTheDocument();
+
+    await act(async () => {
+      outlineRequest.resolve([]);
+      await outlineRequest.promise;
+    });
+    await waitFor(() => expect(screen.queryByText('加载中…')).not.toBeInTheDocument());
   });
 
   it('selecting a chapter invokes onSelectChapter', async () => {
@@ -324,6 +356,40 @@ describe('ProjectWorkspaceView', () => {
 
     await waitFor(() => expect(client.chapters.remove).toHaveBeenCalledWith('ch-1'));
     expect(onChapterDeleted).toHaveBeenCalledWith('ch-1');
+  });
+
+  it('notifies the parent after a chapter is renamed', async () => {
+    const onChapterRenamed = vi.fn();
+    const onChapterListChanged = vi.fn();
+    const client = makeClient({
+      chapters: [{ id: 'ch-1', projectId: 'p-1', title: '第一章', content: '', position: 0 }],
+    });
+    render(
+      <ProjectWorkspaceView
+        {...baseProps}
+        selectedChapterId="ch-1"
+        onChapterRenamed={onChapterRenamed}
+        onChapterListChanged={onChapterListChanged}
+        client={client}
+      />,
+    );
+
+    await screen.findByRole('button', { name: '第一章' });
+    fireEvent.click(screen.getByRole('button', { name: '重命名' }));
+    const dialog = screen.getByRole('dialog', { name: '重命名章节' });
+    fireEvent.change(within(dialog).getByRole('textbox'), { target: { value: '新章名' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: '保存' }));
+
+    const updated = {
+      id: 'ch-1',
+      title: 'renamed',
+      content: '',
+      position: 0,
+      projectId: 'p-1',
+    };
+    await waitFor(() => expect(onChapterRenamed).toHaveBeenCalledWith(updated));
+    expect(onChapterListChanged).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: 'renamed' })).toBeInTheDocument();
   });
 
   it('surfaces backend errors via onError when a list load fails (Requirement 8.6)', async () => {

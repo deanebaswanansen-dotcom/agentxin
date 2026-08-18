@@ -7,7 +7,7 @@
  * 章节相关的操作（新建/选中/重命名/删除）仍在抽屉内可见，但"选中章节"会触发父组件打开章节抽屉。
  */
 import { createPortal } from 'react-dom';
-import type { Id } from '../types/index.js';
+import type { Chapter, Id } from '../types/index.js';
 import { Icon } from './Icon.js';
 import { ProjectWorkspaceView, type WorkspaceTab } from './ProjectWorkspaceView.js';
 import './components.css';
@@ -20,6 +20,8 @@ export interface ResourceDrawerProps {
   /** 选中章节（打开章节抽屉）。 */
   onSelectChapter?: (chapterId: Id) => void;
   onChapterDeleted?: (chapterId: Id) => void;
+  onChapterRenamed?: (chapter: Chapter) => void;
+  onChapterListChanged?: () => void;
   selectedChapterId?: Id | null;
   /** 刷新令牌（Agent 写入后刷新）。 */
   refreshToken?: number;
@@ -33,6 +35,8 @@ export function ResourceDrawer({
   onTabChange,
   onSelectChapter,
   onChapterDeleted,
+  onChapterRenamed,
+  onChapterListChanged,
   selectedChapterId,
   refreshToken,
   onClose,
@@ -71,6 +75,8 @@ export function ResourceDrawer({
             refreshToken={refreshToken}
             selectedChapterId={selectedChapterId}
             onChapterDeleted={onChapterDeleted}
+            onChapterRenamed={onChapterRenamed}
+            onChapterListChanged={onChapterListChanged}
             onSelectChapter={(id) => {
               onSelectChapter?.(id);
               onClose();

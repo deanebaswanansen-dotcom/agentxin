@@ -83,4 +83,27 @@ describe('useWorkspaceSelection', () => {
     expect(result.current.selectedProjectId).toBe('p-new');
     expect(result.current.selectedProjectName).toBe('新项目');
   });
+
+  it('updates the selected chapter title without replacing editor content', async () => {
+    vi.mocked(apiClient.chapters.list).mockResolvedValue([
+      { id: 'ch-1', projectId: 'p-1', title: '旧章名', content: '已保存正文', position: 0 },
+    ]);
+    const { result } = renderHook(() => useWorkspaceSelection({ reportError: vi.fn() }));
+
+    await act(async () => {
+      await result.current.loadChapter('p-1', 'ch-1');
+    });
+    act(() => result.current.setEditorContent('尚未保存的正文'));
+    act(() => result.current.handleChapterRenamed({
+      id: 'ch-1',
+      projectId: 'p-1',
+      title: '新章名',
+      content: '接口返回的旧正文',
+      position: 0,
+    }));
+
+    expect(result.current.selectedChapter?.title).toBe('新章名');
+    expect(result.current.selectedChapter?.content).toBe('已保存正文');
+    expect(result.current.editorContent).toBe('尚未保存的正文');
+  });
 });
