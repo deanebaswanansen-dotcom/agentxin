@@ -73,6 +73,30 @@ describe('ProjectTree', () => {
     expect(client.chapters.list).not.toHaveBeenCalled();
   });
 
+  it('notifies the parent after a project is renamed', async () => {
+    const client = makeClient({ projects: [{ id: 'p-1', name: '旧项目', kind: 'short_drama' }] });
+    const onProjectRenamed = vi.fn();
+    render(
+      <ProjectTree
+        selectedProjectId="p-1"
+        onSelectProject={vi.fn()}
+        onSelectChapter={vi.fn()}
+        onProjectRenamed={onProjectRenamed}
+        client={client}
+      />,
+    );
+
+    expect(await screen.findByText('旧项目')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '重命名 旧项目' }));
+    const dialog = screen.getByRole('dialog', { name: '重命名项目' });
+    fireEvent.change(dialog.querySelector('input')!, { target: { value: '新项目名' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+
+    await waitFor(() => expect(client.projects.rename).toHaveBeenCalledWith('p-1', '新项目名'));
+    expect(onProjectRenamed).toHaveBeenCalledWith('p-1', '新项目名');
+    expect(screen.getByText('新项目名')).toBeInTheDocument();
+  });
+
   it('deletes the selected project locally and notifies the parent', async () => {
     const client = makeClient({ projects: [{ id: 'p-1', name: '旧项目' }] });
     const onProjectDeleted = vi.fn();

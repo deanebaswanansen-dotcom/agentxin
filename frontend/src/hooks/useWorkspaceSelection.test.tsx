@@ -84,6 +84,19 @@ describe('useWorkspaceSelection', () => {
     expect(result.current.selectedProjectName).toBe('新项目');
   });
 
+  it('updates the selected project name and ignores an older lookup response', async () => {
+    const pending = deferred<Array<{ id: string; name: string; kind: 'short_drama' }>>();
+    vi.mocked(apiClient.projects.list).mockReturnValueOnce(pending.promise);
+    const { result } = renderHook(() => useWorkspaceSelection({ reportError: vi.fn() }));
+
+    act(() => result.current.selectProject('p-1'));
+    act(() => result.current.handleProjectRenamed('p-1', '新项目名'));
+    expect(result.current.selectedProjectName).toBe('新项目名');
+
+    await act(async () => pending.resolve([{ id: 'p-1', name: '旧项目名', kind: 'short_drama' }]));
+    expect(result.current.selectedProjectName).toBe('新项目名');
+  });
+
   it('updates the selected chapter title without replacing editor content', async () => {
     vi.mocked(apiClient.chapters.list).mockResolvedValue([
       { id: 'ch-1', projectId: 'p-1', title: '旧章名', content: '已保存正文', position: 0 },

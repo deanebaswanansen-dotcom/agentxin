@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 const appCss = readFileSync(join(process.cwd(), 'src', 'App.css'), 'utf8');
 const componentsCss = readFileSync(join(process.cwd(), 'src', 'components', 'components.css'), 'utf8');
+const scriptWorkspaceCss = readFileSync(join(process.cwd(), 'src', 'components', 'script-workspace.css'), 'utf8');
 const themeCss = readFileSync(join(process.cwd(), 'src', 'styles', 'theme.css'), 'utf8');
 
 const cssFiles = [
@@ -63,5 +64,12 @@ describe('CSS guardrails', () => {
     });
 
     expect(violations).toEqual([]);
+  });
+
+  it('keeps screenplay fullscreen above the global header with semantic layers', () => {
+    expect(appCss).toContain('.nwa-tavern-workspace:has(.script-episodes-panel.is-fullscreen)');
+    expect(scriptWorkspaceCss).toMatch(
+      /\.script-episodes-panel\.is-fullscreen\s*\{[^}]*z-index:\s*var\(--z-modal\)/s,
+    );
   });
 });

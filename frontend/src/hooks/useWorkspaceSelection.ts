@@ -151,6 +151,14 @@ export function useWorkspaceSelection({
     });
   }, []);
 
+  const handleProjectRenamed = useCallback((projectId: Id, name: string) => {
+    if (selectedProjectId !== projectId) return;
+    // A pending name lookup was started when the project was selected. Do not
+    // let its older response overwrite the rename that just completed.
+    projectNameRequestRef.current += 1;
+    setSelectedProjectName(name);
+  }, [selectedProjectId]);
+
   return {
     selectedProjectId,
     selectedProjectName,
@@ -170,6 +178,7 @@ export function useWorkspaceSelection({
     applyAgentResult,
     handleSaved,
     handleChapterRenamed,
+    handleProjectRenamed,
   };
 }
 

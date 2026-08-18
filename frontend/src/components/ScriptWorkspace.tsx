@@ -791,6 +791,14 @@ function EpisodeBatchPanel({
   const [exportScope, setExportScope] = useState<'all' | 'batch'>('all');
   const [contentMode, setContentMode] = useState<'read' | 'edit'>('read');
   const [fullscreen, setFullscreen] = useState(false);
+  useEffect(() => {
+    if (!fullscreen) return undefined;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setFullscreen(false);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [fullscreen]);
   const fixedBatchStart = fixedBatchStartForEpisode(batchStart);
   const batchEnd = Math.min(fixedBatchStart + 4, data.plan.totalEpisodes);
   const batchCount = Math.max(0, batchEnd - fixedBatchStart + 1);

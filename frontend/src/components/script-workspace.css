@@ -187,7 +187,7 @@
 .script-reader-status.is-completed { color: #397a62; }
 .script-reader-status.is-failed { color: #a3342f; }
 .script-reader-status.is-reviewing { color: #b06b2e; }
-.script-episodes-panel.is-fullscreen { position: fixed; inset: 0; z-index: 1000; max-width: none; overflow: auto; padding: 1.5rem clamp(1rem,5vw,5rem); background: linear-gradient(135deg,#f2f5ff,#fff9f8); }
+.script-episodes-panel.is-fullscreen { position: fixed; inset: 0; z-index: var(--z-modal); max-width: none; overflow: auto; padding: 1.5rem clamp(1rem,5vw,5rem); background: linear-gradient(135deg,#f2f5ff,#fff9f8); }
 
 .script-outline-cards { margin-top: 1.25rem; }
 .script-outline-cards article { display: grid; grid-template-columns: 6rem minmax(10rem,.7fr) minmax(16rem,1.3fr); gap: .75rem; align-items: start; padding: .75rem 0; border-top: 1px solid rgba(122,104,151,.14); }
