@@ -464,7 +464,9 @@ function isTemporaryDialogueRole(value: string): boolean {
 }
 
 function isDirectStageDirectionSpeaker(value: string): boolean {
-  return /^【\s*(?:特写|近景|中景|远景|全景|空镜|俯拍|仰拍|航拍|跟拍|推镜|拉镜|摇镜|慢镜头|定格|蒙太奇|画面|镜头)\s*】/u.test(value.trim());
+  const speaker = value.trim();
+  return /^【\s*(?:特写|近景|中景|远景|全景|空镜|俯拍|仰拍|航拍|跟拍|推镜|拉镜|摇镜|慢镜头|定格|蒙太奇|画面|镜头)\s*】/u.test(speaker) ||
+    /^(?:特写|近景|中景|远景|全景|空镜|俯拍|仰拍|航拍|跟拍|推镜|拉镜|摇镜|慢镜头|定格|蒙太奇|画面|镜头)$/u.test(speaker);
 }
 
 function reconcileDirectSceneCast(episode: ScriptEpisode): ScriptEpisode {
