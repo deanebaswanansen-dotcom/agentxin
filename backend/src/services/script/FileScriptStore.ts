@@ -93,6 +93,33 @@ function normalizeLegacyEpisodeBlocks(items: ScriptEpisode[]): ScriptEpisode[] {
   }));
 }
 
+function legacyStageDirectionFromIssue(issue: ScriptReviewIssue): string | undefined {
+  if (
+    issue.source !== 'deterministic' ||
+    issue.status !== 'open' ||
+    issue.code !== 'UNKNOWN_SPEAKER'
+  ) return undefined;
+  const match = /^说话人「(.+)」未登记。$/u.exec(issue.message);
+  const speaker = match?.[1]?.trim();
+  if (!speaker) return undefined;
+  return (
+    LEGACY_STAGE_DIRECTION_SPEAKER.test(speaker) ||
+    LEGACY_BRACKETED_STAGE_DIRECTION_SPEAKER.test(speaker)
+  ) ? speaker : undefined;
+}
+
+/** Close deterministic findings made obsolete by legacy block normalization. */
+function normalizeLegacyReviewIssues(
+  items: ScriptReviewIssue[],
+  projectId: string,
+): ScriptReviewIssue[] {
+  return items.map((issue) => ({
+    ...issue,
+    projectId,
+    ...(legacyStageDirectionFromIssue(issue) ? { status: 'fixed' as const } : {}),
+  }));
+}
+
 function normalizeState(value: unknown, projectId: string): ScriptProjectState {
   if (typeof value !== 'object' || value === null) {
     throw new StoreError(`短剧项目文件格式无效: ${projectId}`);
@@ -141,7 +168,7 @@ function normalizeState(value: unknown, projectId: string): ScriptProjectState {
         ? (input.reviewRevision as number)
         : 0,
     reviewIssues: Array.isArray(input.reviewIssues)
-      ? clone(input.reviewIssues).map((item) => ({ ...item, projectId }))
+      ? normalizeLegacyReviewIssues(clone(input.reviewIssues), projectId)
       : [],
     updatedAt:
       typeof input.updatedAt === 'string'

@@ -32,6 +32,7 @@ import { useNovelImportDrop } from './hooks/useNovelImportDrop.js';
 import type { AgentArtifact, Id, ProjectKind } from './types/index.js';
 import type { WorkspaceTab } from './components/ProjectWorkspaceView.js';
 import type { EditorSelectionRequest } from './components/ChapterEditor.js';
+import { LazyLoadBoundary } from './components/LazyLoadBoundary.js';
 import './components/components.css';
 import './App.css';
 
@@ -484,15 +485,17 @@ function Workbench(): JSX.Element {
         {/* 中间：章节编辑板 */}
         <section className="nwa-tavern-center">
           {isScriptProject && selectedProjectId ? (
-            <Suspense fallback={<div className="nwa-empty-state-small" role="status">正在加载短剧工作台…</div>}>
-              <ScriptWorkspace
-                key={selectedProjectId}
-                projectId={selectedProjectId}
-                projectName={selectedProjectName}
-                onError={reportError}
-                onErrorClear={dismissError}
-              />
-            </Suspense>
+            <LazyLoadBoundary label="短剧工作台">
+              <Suspense fallback={<div className="nwa-empty-state-small" role="status">正在加载短剧工作台…</div>}>
+                <ScriptWorkspace
+                  key={selectedProjectId}
+                  projectId={selectedProjectId}
+                  projectName={selectedProjectName}
+                  onError={reportError}
+                  onErrorClear={dismissError}
+                />
+              </Suspense>
+            </LazyLoadBoundary>
           ) : <div className="nwa-editor-board">
             <div className="nwa-editor-board__toolbar">
               <div className="nwa-editor-board__meta">
@@ -660,22 +663,24 @@ function Workbench(): JSX.Element {
         </main>
       ) : (
         <main className="nwa-reader-mode-main">
-          <Suspense fallback={<div className="nwa-empty-state-small" role="status">正在加载阅读工作台…</div>}>
-            <ReaderWorkspace
-              projectId={selectedProjectId}
-              projectName={selectedProjectName}
-              refreshToken={projectListVersion}
-              onOpenAgentMode={openAgentMode}
-              onError={reportError}
-              onProjectCreated={(projectId) => {
-                bumpProjectList();
-                setSelectedProjectKind('novel');
-                selectProject(projectId);
-              }}
-              onChapterUpdated={handleSaved}
-              onSendToReferenceAnalysis={handleSendToReferenceAnalysis}
-            />
-          </Suspense>
+          <LazyLoadBoundary label="阅读工作台">
+            <Suspense fallback={<div className="nwa-empty-state-small" role="status">正在加载阅读工作台…</div>}>
+              <ReaderWorkspace
+                projectId={selectedProjectId}
+                projectName={selectedProjectName}
+                refreshToken={projectListVersion}
+                onOpenAgentMode={openAgentMode}
+                onError={reportError}
+                onProjectCreated={(projectId) => {
+                  bumpProjectList();
+                  setSelectedProjectKind('novel');
+                  selectProject(projectId);
+                }}
+                onChapterUpdated={handleSaved}
+                onSendToReferenceAnalysis={handleSendToReferenceAnalysis}
+              />
+            </Suspense>
+          </LazyLoadBoundary>
         </main>
       )}
 
@@ -691,21 +696,23 @@ function Workbench(): JSX.Element {
 
           {/* —— 资料抽屉 —— */}
           {drawer === 'resource' && selectedProjectId !== null ? (
-            <Suspense fallback={<div className="nwa-muted" role="status">正在加载项目资料…</div>}>
-              <ResourceDrawer
-                projectId={selectedProjectId}
-                tab={resourceTab}
-                onTabChange={setResourceTab}
-                onSelectChapter={(id) => void handleSelectChapter(id)}
-                selectedChapterId={selectedChapterId}
-                refreshToken={projectListVersion}
-                onChapterDeleted={clearSelectedChapter}
-                onChapterRenamed={handleChapterRenamed}
-                onChapterListChanged={refreshChapterTree}
-                onClose={handleCloseDrawer}
-                onError={reportError}
-              />
-            </Suspense>
+            <LazyLoadBoundary label="项目资料">
+              <Suspense fallback={<div className="nwa-muted" role="status">正在加载项目资料…</div>}>
+                <ResourceDrawer
+                  projectId={selectedProjectId}
+                  tab={resourceTab}
+                  onTabChange={setResourceTab}
+                  onSelectChapter={(id) => void handleSelectChapter(id)}
+                  selectedChapterId={selectedChapterId}
+                  refreshToken={projectListVersion}
+                  onChapterDeleted={clearSelectedChapter}
+                  onChapterRenamed={handleChapterRenamed}
+                  onChapterListChanged={refreshChapterTree}
+                  onClose={handleCloseDrawer}
+                  onError={reportError}
+                />
+              </Suspense>
+            </LazyLoadBoundary>
           ) : null}
         </>
       ) : null}
@@ -732,13 +739,15 @@ function Workbench(): JSX.Element {
               </button>
             </div>
             <div className="nwa-modal-body">
-              <Suspense fallback={<div className="nwa-muted" role="status">正在加载设置…</div>}>
-                <SettingsPanel
-                  onError={reportError}
-                  themeMode={themeMode}
-                  onThemeModeChange={setThemeMode}
-                />
-              </Suspense>
+              <LazyLoadBoundary label="设置面板">
+                <Suspense fallback={<div className="nwa-muted" role="status">正在加载设置…</div>}>
+                  <SettingsPanel
+                    onError={reportError}
+                    themeMode={themeMode}
+                    onThemeModeChange={setThemeMode}
+                  />
+                </Suspense>
+              </LazyLoadBoundary>
             </div>
           </div>
         </div>

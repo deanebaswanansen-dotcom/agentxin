@@ -263,10 +263,11 @@ export function buildServer(
   const sceneRewriter = new SceneRewriter(store, modelConfigService, proxy);
   const importService = new NovelImportService(store);
 
-  // Liveness probe (unchanged from the scaffold).
-  app.get('/health', async () => {
-    return { status: 'ok' };
-  });
+  // Public liveness probes. `/api/health` works through the standard reverse
+  // proxy while `/health` remains available to direct backend monitors.
+  const health = async (): Promise<{ status: 'ok' }> => ({ status: 'ok' });
+  app.get('/health', health);
+  app.get('/api/health', health);
 
   registerRequestModelConfig(app);
 

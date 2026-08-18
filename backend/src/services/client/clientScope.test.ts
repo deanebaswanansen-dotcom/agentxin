@@ -34,4 +34,15 @@ describe('clientScope', () => {
     expect(response.statusCode).toBe(400);
     await app.close();
   });
+
+  it('keeps the API health probe public in client-scoped production', async () => {
+    process.env.REQUIRE_CLIENT_ID = '1';
+    const app = Fastify();
+    registerClientScope(app);
+    app.get('/api/health', async () => ({ status: 'ok' }));
+    const response = await app.inject({ method: 'GET', url: '/api/health' });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ status: 'ok' });
+    await app.close();
+  });
 });

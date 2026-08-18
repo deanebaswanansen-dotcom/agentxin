@@ -44,6 +44,12 @@ describe('buildServer wiring', () => {
     expect(res.headers['access-control-expose-headers']).toBe('Content-Disposition');
   });
 
+  it('exposes the liveness probe through the proxied API prefix', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/health' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ status: 'ok' });
+  });
+
   it('registers the project routes (GET /api/projects → 200 [])', async () => {
     const res = await app.inject({ method: 'GET', url: '/api/projects' });
     expect(res.statusCode).toBe(200);
