@@ -3522,6 +3522,7 @@ export class ScriptDirector {
     let draftWarnings: ReturnType<typeof parseChineseShortDramaText>['warnings'] = [];
     let directDraftRevision: number | undefined;
     let writerCallsUsed = 0;
+    let rejectedDirectDraft: ScriptPipelineCheckpoint | undefined;
     const storedDirectDraft = await this.latestCheckpoint(
       request.projectId,
       runKey,
@@ -3542,16 +3543,37 @@ export class ScriptDirector {
         }
       } else if (decision.disposition === 'stale') {
         await this.markCheckpointStale(storedDirectDraft);
+      } else if (storedDirectDraft.status === 'needs_review') {
+        if (!request.resumeRejectedCandidates) {
+          throw new ScriptModelOutputError(
+            `第 ${episodeNumber} 集上次没有返回可识别的剧本场景，请从检查点继续。`,
+          );
+        }
+        rejectedDirectDraft = storedDirectDraft;
       }
     }
 
     if (!draft) {
       request.signal?.throwIfAborted();
+      const recoveryAttempt = rejectedDirectDraft
+        ? rejectedDirectDraft.artifactRevision + 1
+        : request.resumeRejectedCandidates
+          ? 1
+          : 0;
+      const directDraftPrompt = recoveryAttempt > 0
+        ? [
+            buildDirectDraftPrompt(context),
+            '',
+            `显式恢复重写（第 ${recoveryAttempt} 次）：上一份正文和排版修正结果都无法识别。`,
+            '必须从分集卡重新写一份完整正文，不得复用上次结果或输出解释。',
+            '开头直接输出“第N集”和首个“N-M 地点 日或夜/内或外”场景头。',
+          ].join('\n')
+        : buildDirectDraftPrompt(context);
       rawText = await this.dependencies.model.complete({
         node: 'draft',
         projectId: request.projectId,
         episodeNumber,
-        prompt: buildDirectDraftPrompt(context),
+        prompt: directDraftPrompt,
         responseFormat: 'text',
         signal: request.signal,
       });
@@ -3577,6 +3599,44 @@ export class ScriptDirector {
       }
       if (!parsed.episode) {
         recordCall('draft', 'ChineseShortDramaText@v1', callsUsed, 'needs_review');
+        const rejectedRevision = await this.nextCheckpointArtifactRevision(
+          request.projectId,
+          runKey,
+          { node: 'direct_draft', episodeNumber },
+        );
+        await this.saveCheckpoint(request, {
+          projectId: request.projectId,
+          runKey,
+          node: 'direct_draft',
+          status: 'needs_review',
+          attempt: (rejectedDirectDraft?.attempt ?? 0) + callsUsed,
+          artifactRevision: rejectedRevision,
+          episodeNumber,
+          artifact: {
+            schemaVersion: 1,
+            stage: 'direct_draft_rejected',
+            rawText,
+            createdAt: this.now(),
+          },
+          inputRevisionRefs,
+          upstreamArtifactRefs: [outlineRef],
+          promptVersion,
+          configRevision,
+          inputFingerprint: draftFingerprint,
+          validationErrors: [
+            ...parsed.warnings.map((warning) => ({
+              path: `line:${warning.line}`,
+              code: warning.code,
+              message: warning.message,
+            })),
+            ...parsed.unparsedLines.map((line) => ({
+              path: `line:${line.line}`,
+              code: 'UNPARSED_LINE',
+              message: '无法识别该剧本行。',
+            })),
+          ],
+          updatedAt: this.now(),
+        }, `第 ${episodeNumber} 集排版仍无法识别，可从检查点恢复重写。`);
         throw new ScriptModelOutputError(`第 ${episodeNumber} 集没有返回可识别的剧本场景。`);
       }
       recordCall('draft', 'ChineseShortDramaText@v1', callsUsed);

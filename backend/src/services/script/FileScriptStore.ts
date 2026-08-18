@@ -39,6 +39,8 @@ import { isBlockingScriptReviewIssue } from './quality/ScriptQualityGates.js';
 
 const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const RENAME_DELAYS_MS = [5, 15, 35, 75, 150, 300] as const;
+const LEGACY_STAGE_DIRECTION_SPEAKER = /^(?:特写|近景|中景|远景|全景|空镜|俯拍|仰拍|航拍|跟拍|推镜|拉镜|摇镜|慢镜头|定格|蒙太奇|画面|镜头)$/u;
+const LEGACY_BRACKETED_STAGE_DIRECTION_SPEAKER = /^【\s*(?:特写|近景|中景|远景|全景|空镜|俯拍|仰拍|航拍|跟拍|推镜|拉镜|摇镜|慢镜头|定格|蒙太奇|画面|镜头)\s*】/u;
 
 function clone<T>(value: T): T {
   return structuredClone(value);
@@ -63,6 +65,34 @@ function emptyState(projectId: string): ScriptProjectState {
   };
 }
 
+/**
+ * Older direct-text drafts could persist camera/caption labels as dialogue.
+ * Normalize them at the storage boundary so existing projects benefit from
+ * parser fixes without rewriting episode revisions or continuity evidence.
+ */
+function normalizeLegacyEpisodeBlocks(items: ScriptEpisode[]): ScriptEpisode[] {
+  return items.map((episode) => ({
+    ...episode,
+    scenes: episode.scenes.map((scene) => ({
+      ...scene,
+      blocks: scene.blocks.map((block) => {
+        if (block.type !== 'dialogue' || block.characterId) return block;
+        const speaker = block.speaker.trim();
+        if (speaker === '字幕') {
+          return { id: block.id, type: 'caption' as const, text: block.text };
+        }
+        if (
+          LEGACY_STAGE_DIRECTION_SPEAKER.test(speaker) ||
+          LEGACY_BRACKETED_STAGE_DIRECTION_SPEAKER.test(speaker)
+        ) {
+          return { id: block.id, type: 'action' as const, text: `${speaker}：${block.text}` };
+        }
+        return block;
+      }),
+    })),
+  }));
+}
+
 function normalizeState(value: unknown, projectId: string): ScriptProjectState {
   if (typeof value !== 'object' || value === null) {
     throw new StoreError(`短剧项目文件格式无效: ${projectId}`);
@@ -75,7 +105,9 @@ function normalizeState(value: unknown, projectId: string): ScriptProjectState {
     throw new StoreError(`短剧项目标识与文件名不一致: ${projectId}`);
   }
   const continuity = input.continuity;
-  const episodes = Array.isArray(input.episodes) ? clone(input.episodes) : [];
+  const episodes = Array.isArray(input.episodes)
+    ? normalizeLegacyEpisodeBlocks(clone(input.episodes))
+    : [];
   const continuityCommits = normalizeContinuityCommits(
     input.continuityCommits,
     projectId,
