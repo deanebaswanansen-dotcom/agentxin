@@ -101,6 +101,10 @@ const USE_BACKGROUND_AGENT_JOBS = env?.VITE_AGENT_BACKGROUND_JOBS === 'true';
 // proxy to a browser.  The backend emits SSE heartbeats while long jobs run,
 // so this is an inactivity limit rather than a total job limit.
 const REQUEST_TIMEOUT_MS = 45_000;
+// A whole-book export can briefly wait behind the screenplay store's
+// serialized final writes immediately after a large generation job. Keep the
+// ordinary UI timeout strict, but give file downloads enough time to finish.
+const FILE_REQUEST_TIMEOUT_MS = 120_000;
 const STREAM_IDLE_TIMEOUT_MS = 45_000;
 
 /** Browser-local persistence so API Key survives refresh (local-dev tool UX). */
@@ -550,7 +554,7 @@ async function requestFile(
   fallbackFilename: string,
   signal?: AbortSignal,
 ): Promise<ScriptExportFile> {
-  const timeout = linkedTimeoutSignal(signal, REQUEST_TIMEOUT_MS);
+  const timeout = linkedTimeoutSignal(signal, FILE_REQUEST_TIMEOUT_MS);
   try {
     const response = await fetch(`${baseUrl}${path}`, {
       method: 'GET',
@@ -589,7 +593,7 @@ async function requestFile(
   } catch (error) {
     if (timeout.didTimeout()) {
       throw new ApiClientError({
-        error: { code: 'PROVIDER_ERROR', message: '导出请求超过 45 秒没有响应，请检查后端服务。' },
+        error: { code: 'PROVIDER_ERROR', message: '导出请求超过 120 秒没有响应，请检查后端服务。' },
       });
     }
     throw error;
