@@ -188,6 +188,27 @@ describe('apiClient request building', () => {
     expect(mock).toHaveBeenCalledTimes(1);
   });
 
+  it('allows a whole-book export to wait behind long-running final writes', async () => {
+    vi.useFakeTimers();
+    installFetch((_url, init) => new Promise<Response>((resolve, reject) => {
+      const finish = setTimeout(() => resolve(new Response('整本正文', {
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+      })), 60_000);
+      init?.signal?.addEventListener('abort', () => {
+        clearTimeout(finish);
+        reject(init.signal?.reason ?? new DOMException('Aborted', 'AbortError'));
+      }, { once: true });
+    }));
+
+    const exportRequest = client().script.exportFile('project-1', 'txt');
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    await expect(exportRequest).resolves.toMatchObject({
+      filename: 'short-drama-project-1.txt',
+      contentType: 'text/plain; charset=utf-8',
+    });
+  });
+
   it('uses a safe fallback export filename when Content-Disposition is unavailable', async () => {
     installFetch(() => new Response('正文', { headers: { 'Content-Type': 'text/plain; charset=utf-8' } }));
 
