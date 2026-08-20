@@ -31,8 +31,8 @@ interface UseNovelImportDropOptions {
   reportError: (error: unknown) => void;
   bumpProjectList: () => void;
   loadChapter: (projectId: Id, chapterId: Id) => Promise<void>;
-  selectProject: (projectId: Id) => void;
-  selectCreatedProject: (projectId: Id, projectName: string) => void;
+  selectProject: (projectId: Id, kind?: 'novel' | 'short_drama') => void;
+  selectCreatedProject: (projectId: Id, projectName: string, kind?: 'novel' | 'short_drama') => void;
   openChaptersTab: () => void;
 }
 

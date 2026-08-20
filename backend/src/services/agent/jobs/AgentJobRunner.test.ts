@@ -305,6 +305,93 @@ describe('AgentJobRunner', () => {
     });
   });
 
+  it('parks unparseable script drafts for resume instead of marking them failed', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-script-invalid-'));
+    const store = await AgentRunStore.create(join(directory, 'runs.json'));
+    let attempts = 0;
+    const run = vi.fn(async (request, _signal, _onProgress, context) => {
+      attempts += 1;
+      if (attempts === 1) {
+        expect(context).toBeUndefined();
+        throw Object.assign(new Error('第 1 集没有返回可识别的剧本场景。'), {
+          code: 'SCRIPT_MODEL_OUTPUT_INVALID',
+        });
+      }
+      expect(context).toEqual({ resumeRejectedCandidates: true });
+      return {
+        task: request.task,
+        mode: request.mode,
+        projectId: request.projectId ?? 'p1',
+        summary: '从检查点重写完成',
+        steps: [],
+        artifacts: [],
+      };
+    });
+    const runner = new AgentJobRunner(store, { run }, { maxAttempts: 3, retryDelayMs: 1 });
+    const created = await runner.start(
+      CLIENT_ID,
+      {
+        task: 'script_episode_batch',
+        mode: 'draft',
+        prompt: '',
+        projectId: 'p1',
+        scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 1 },
+      },
+      undefined,
+    );
+    await runner.waitUntilIdle(created.id);
+    expect(store.get(created.id)?.status).toBe('waiting_user');
+
+    await runner.resume(CLIENT_ID, created.id, undefined);
+    await runner.waitUntilIdle(created.id);
+    expect(store.get(created.id)).toMatchObject({
+      status: 'completed',
+      result: { summary: '从检查点重写完成' },
+    });
+  });
+
+  it('binds a created project id before retrying a full_novel job', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-bind-project-'));
+    const store = await AgentRunStore.create(join(directory, 'runs.json'));
+    const projectIds: Array<string | undefined> = [];
+    let attempts = 0;
+    const runner = new AgentJobRunner(store, {
+      run: async (request, _signal, onProgress) => {
+        attempts += 1;
+        projectIds.push(request.projectId);
+        onProgress?.({
+          phase: 'setup',
+          message: '已创建项目',
+          projectId: 'created-project',
+        });
+        if (attempts === 1) {
+          throw Object.assign(new Error('网关暂时不可用'), { code: 'PROVIDER_ERROR', status: 503 });
+        }
+        return {
+          task: request.task,
+          mode: request.mode,
+          projectId: request.projectId ?? 'created-project',
+          summary: '完成',
+          steps: [],
+          artifacts: [],
+        };
+      },
+    }, { retryDelayMs: 1 });
+
+    const created = await runner.start(
+      CLIENT_ID,
+      { task: 'full_novel', mode: 'draft', prompt: '写三章' },
+      undefined,
+    );
+    await runner.waitUntilIdle(created.id);
+
+    expect(projectIds).toEqual([undefined, 'created-project']);
+    expect(store.get(created.id)).toMatchObject({
+      status: 'completed',
+      request: { projectId: 'created-project' },
+    });
+  });
+
   it('keeps a cancelled job cancelled when an executor returns late', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-cancel-'));
     const store = await AgentRunStore.create(join(directory, 'runs.json'));

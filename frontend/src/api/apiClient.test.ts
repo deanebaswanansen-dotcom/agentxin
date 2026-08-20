@@ -729,6 +729,35 @@ describe('persistent backend Agent jobs', () => {
     ]);
   });
 
+  it('automatically resumes an interrupted persistent job', async () => {
+    const result: AgentRunResult = {
+      task: 'long_novel', mode: 'draft', projectId: 'p1', summary: '继续完成', steps: [], artifacts: [],
+    };
+    let resumed = false;
+    installFetch((url, init) => {
+      if (String(url).endsWith('/agent/jobs') && init?.method === 'POST') {
+        return jsonResponse({ id: 'job-1', status: 'queued', events: [] }, { status: 202 });
+      }
+      if (String(url).endsWith('/resume') && init?.method === 'POST') {
+        resumed = true;
+        return jsonResponse({ id: 'job-1', status: 'queued', events: [] });
+      }
+      return jsonResponse(resumed
+        ? { id: 'job-1', status: 'completed', events: [], result }
+        : {
+          id: 'job-1',
+          status: 'waiting_user',
+          events: [],
+          error: { code: 'RUN_INTERRUPTED', message: '服务已重启，请重新连接以继续任务。' },
+        });
+    });
+
+    await expect(runPersistentAgentJob('/api', {
+      task: 'long_novel', mode: 'draft', prompt: '写一章', projectId: 'p1',
+    })).resolves.toEqual(result);
+    expect(resumed).toBe(true);
+  });
+
   it('keeps polling after one silent status request times out', async () => {
     vi.useFakeTimers();
     const progress = vi.fn();

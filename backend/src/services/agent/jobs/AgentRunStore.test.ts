@@ -133,6 +133,27 @@ describe('AgentRunStore', () => {
     });
   });
 
+  it('rejects a second long-form novel job on the same project', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-runs-novel-dedup-'));
+    const store = await AgentRunStore.create(join(directory, 'runs.json'));
+    const existing = await store.create(CLIENT_A, {
+      task: 'long_novel',
+      mode: 'draft',
+      prompt: '写二十章',
+      projectId: 'project-a',
+    });
+
+    await expect(store.create(CLIENT_A, {
+      task: 'full_novel',
+      mode: 'draft',
+      prompt: '再写十章',
+      projectId: 'project-a',
+    })).rejects.toMatchObject({
+      code: 'CONFLICT',
+      existingJobId: existing.id,
+    });
+  });
+
   it('rejects exact and partial episode-batch overlaps but allows adjacent ranges', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'agentxin-runs-batch-dedup-'));
     const store = await AgentRunStore.create(join(directory, 'runs.json'));
@@ -157,7 +178,7 @@ describe('AgentRunStore', () => {
     });
   });
 
-  it('allows a replacement after terminal script jobs and preserves non-script duplicates', async () => {
+  it('allows a replacement after terminal script jobs and blocks overlapping long-form novels', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'agentxin-runs-terminal-dedup-'));
     const store = await AgentRunStore.create(join(directory, 'runs.json'));
 
@@ -184,7 +205,14 @@ describe('AgentRunStore', () => {
       task: 'long_novel', mode: 'draft', prompt: '写一章', projectId: 'project-a',
     };
     const firstNovel = await store.create(CLIENT_A, novelRequest);
-    const secondNovel = await store.create(CLIENT_A, novelRequest);
-    expect(secondNovel.id).not.toBe(firstNovel.id);
+    await expect(store.create(CLIENT_A, novelRequest)).rejects.toMatchObject({
+      code: 'CONFLICT',
+      existingJobId: firstNovel.id,
+    });
+    await store.complete(firstNovel.id, {
+      task: 'long_novel', mode: 'draft', projectId: 'project-a',
+      summary: '完成', steps: [], artifacts: [],
+    });
+    await expect(store.create(CLIENT_A, novelRequest)).resolves.toMatchObject({ status: 'queued' });
   });
 });

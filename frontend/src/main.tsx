@@ -12,5 +12,4 @@ if (rootElement) {
       <App />
     </StrictMode>,
   );
-  window.dispatchEvent(new Event('nwa:app-started'));
 }

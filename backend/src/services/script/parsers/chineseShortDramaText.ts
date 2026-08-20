@@ -41,7 +41,10 @@ export interface ScriptTextParseResult {
 }
 
 const SCENE_HEADING = /^(\d+)\s*[-－—]\s*(\d+)\s+(.+?)\s+(日|夜|晨|清晨|黄昏|傍晚)\s*[/／]\s*(内|外)$/u;
+const SCENE_HEADING_SPACED = /^(\d+)\s*[-－—]\s*(\d+)\s+(.+?)\s+(日|夜|晨|清晨|黄昏|傍晚)\s+(内|外)$/u;
+const SCENE_HEADING_PAREN = /^(\d+)\s*[-－—]\s*(\d+)\s+(.+?)\s*[（(]\s*(日|夜|晨|清晨|黄昏|傍晚)\s*[/／]?\s*(内|外)\s*[）)]$/u;
 const PRODUCTION_SCENE_HEADING = /^(\d+)\s*[-－—]\s*(\d+)\s+(日|夜|晨|清晨|黄昏|傍晚)\s+(内|外)\s+(.+)$/u;
+const PRODUCTION_SCENE_HEADING_SLASH = /^(\d+)\s*[-－—]\s*(\d+)\s+(日|夜|晨|清晨|黄昏|傍晚)\s*[/／]\s*(内|外)\s+(.+)$/u;
 const NUMBERED_SCENE_HEADING = /^第\s*(?:(\d+)\s*[-－—]\s*)?(\d+)\s*场\s*[：:]?\s*(.+?)\s+(日|夜|晨|清晨|黄昏|傍晚)\s*[/／]\s*(内|外)$/u;
 const EPISODE_HEADING = /^第\s*(?:\d+|[零〇一二三四五六七八九十百千]+)\s*集(?:\s*[：:]?.*)?$/u;
 const CHARACTER_LINE = /^人物\s*[：:]\s*(.*)$/u;
@@ -71,6 +74,78 @@ function timeOfDay(label: string): ScriptTimeOfDay {
 
 function interiorExterior(label: string): ScriptInteriorExterior {
   return label === '外' ? 'exterior' : 'interior';
+}
+
+interface ParsedSceneHeading {
+  episodeNumber: number;
+  originalOrdinal: number;
+  location: string;
+  timeOfDay: ScriptTimeOfDay;
+  interiorExterior: ScriptInteriorExterior;
+}
+
+function matchSceneHeading(line: string, fallbackEpisode: number): ParsedSceneHeading | undefined {
+  const productionSlash = PRODUCTION_SCENE_HEADING_SLASH.exec(line);
+  if (productionSlash) {
+    return {
+      episodeNumber: Number(productionSlash[1]),
+      originalOrdinal: Number(productionSlash[2]),
+      timeOfDay: timeOfDay(productionSlash[3]!),
+      interiorExterior: interiorExterior(productionSlash[4]!),
+      location: productionSlash[5]!.trim(),
+    };
+  }
+  const production = PRODUCTION_SCENE_HEADING.exec(line);
+  if (production) {
+    return {
+      episodeNumber: Number(production[1]),
+      originalOrdinal: Number(production[2]),
+      timeOfDay: timeOfDay(production[3]!),
+      interiorExterior: interiorExterior(production[4]!),
+      location: production[5]!.trim(),
+    };
+  }
+  const slash = SCENE_HEADING.exec(line);
+  if (slash) {
+    return {
+      episodeNumber: Number(slash[1]),
+      originalOrdinal: Number(slash[2]),
+      location: slash[3]!.trim(),
+      timeOfDay: timeOfDay(slash[4]!),
+      interiorExterior: interiorExterior(slash[5]!),
+    };
+  }
+  const spaced = SCENE_HEADING_SPACED.exec(line);
+  if (spaced) {
+    return {
+      episodeNumber: Number(spaced[1]),
+      originalOrdinal: Number(spaced[2]),
+      location: spaced[3]!.trim(),
+      timeOfDay: timeOfDay(spaced[4]!),
+      interiorExterior: interiorExterior(spaced[5]!),
+    };
+  }
+  const paren = SCENE_HEADING_PAREN.exec(line);
+  if (paren) {
+    return {
+      episodeNumber: Number(paren[1]),
+      originalOrdinal: Number(paren[2]),
+      location: paren[3]!.trim(),
+      timeOfDay: timeOfDay(paren[4]!),
+      interiorExterior: interiorExterior(paren[5]!),
+    };
+  }
+  const numbered = NUMBERED_SCENE_HEADING.exec(line);
+  if (numbered) {
+    return {
+      episodeNumber: numbered[1] ? Number(numbered[1]) : fallbackEpisode,
+      originalOrdinal: Number(numbered[2]),
+      location: numbered[3]!.trim(),
+      timeOfDay: timeOfDay(numbered[4]!),
+      interiorExterior: interiorExterior(numbered[5]!),
+    };
+  }
+  return undefined;
 }
 
 function unique(values: readonly string[]): string[] {
@@ -156,35 +231,23 @@ export function parseChineseShortDramaText(
       continue;
     }
 
-    const productionHeading = PRODUCTION_SCENE_HEADING.exec(line);
-    const heading = SCENE_HEADING.exec(line);
-    const numberedHeading = NUMBERED_SCENE_HEADING.exec(line);
-    if (productionHeading || heading || numberedHeading) {
-      const headingEpisode = productionHeading
-        ? Number(productionHeading[1])
-        : heading
-        ? Number(heading[1])
-        : numberedHeading![1]
-          ? Number(numberedHeading![1])
-          : options.episodeNumber;
-      if (headingEpisode !== options.episodeNumber) {
+    const heading = matchSceneHeading(line, options.episodeNumber);
+    if (heading) {
+      if (heading.episodeNumber !== options.episodeNumber) {
         warn(
           lineNumber,
           'SCENE_EPISODE_NUMBER_REPAIRED',
-          `场景头集号 ${headingEpisode} 已按当前第 ${options.episodeNumber} 集修正。`,
+          `场景头集号 ${heading.episodeNumber} 已按当前第 ${options.episodeNumber} 集修正。`,
           line,
         );
       }
-      const originalOrdinal = Number(
-        productionHeading ? productionHeading[2] : heading ? heading[2] : numberedHeading![2],
-      );
-      let ordinal = originalOrdinal;
+      let ordinal = heading.originalOrdinal;
       while (usedSceneOrdinals.has(ordinal)) ordinal += 1;
-      if (ordinal !== originalOrdinal) {
+      if (ordinal !== heading.originalOrdinal) {
         warn(
           lineNumber,
           'SCENE_ORDINAL_REPAIRED',
-          `重复场号 ${originalOrdinal} 已顺延为 ${ordinal}。`,
+          `重复场号 ${heading.originalOrdinal} 已顺延为 ${ordinal}。`,
           line,
         );
       }
@@ -192,9 +255,9 @@ export function parseChineseShortDramaText(
       currentScene = {
         id: options.createId(),
         ordinal,
-        location: (productionHeading ? productionHeading[5] : heading ? heading[3] : numberedHeading![3])!.trim(),
-        timeOfDay: timeOfDay((productionHeading ? productionHeading[3] : heading ? heading[4] : numberedHeading![4])!),
-        interiorExterior: interiorExterior((productionHeading ? productionHeading[4] : heading ? heading[5] : numberedHeading![5])!),
+        location: heading.location,
+        timeOfDay: heading.timeOfDay,
+        interiorExterior: heading.interiorExterior,
         characterIds: [],
         blocks: [],
       };

@@ -49,20 +49,26 @@ function isRetryable(error: unknown): boolean {
   return candidate.code === 'PROVIDER_ERROR';
 }
 
+function isRejectedCandidateCode(code: string | undefined): boolean {
+  return code === 'SCRIPT_STRUCTURED_NEEDS_REVIEW' ||
+    code === 'SCRIPT_MODEL_OUTPUT_INVALID' ||
+    (typeof code === 'string' && code.endsWith('_NEEDS_REVIEW'));
+}
+
 function isRecoverableNeedsReview(error: unknown): boolean {
   if (!error || typeof error !== 'object') return false;
   const candidate = error as { code?: unknown; recoverable?: unknown };
-  if (candidate.code === 'SCRIPT_STRUCTURED_NEEDS_REVIEW') return true;
-  return candidate.recoverable === true &&
-    typeof candidate.code === 'string' &&
-    candidate.code.endsWith('_NEEDS_REVIEW');
+  if (typeof candidate.code !== 'string') return false;
+  if (isRejectedCandidateCode(candidate.code)) return true;
+  return candidate.recoverable === true && candidate.code.endsWith('_NEEDS_REVIEW');
 }
 
-function pausedForRejectedCandidate(run: StoredAgentRun): boolean {
-  const code = run.error?.code;
-  return run.status === 'waiting_user' &&
-    typeof code === 'string' &&
-    (code === 'SCRIPT_STRUCTURED_NEEDS_REVIEW' || code.endsWith('_NEEDS_REVIEW'));
+function shouldResumeRejectedCandidates(run: StoredAgentRun): boolean {
+  if (run.error?.code === 'RUN_INTERRUPTED') return false;
+  if (!isRejectedCandidateCode(run.error?.code)) return false;
+  if (run.status === 'waiting_user') return true;
+  return run.request.task.startsWith('script_') &&
+    (run.status === 'failed' || run.status === 'cancelled');
 }
 
 function delay(milliseconds: number, signal: AbortSignal): Promise<void> {
@@ -116,7 +122,7 @@ export class AgentJobRunner {
       resumableScriptFailure
     ) {
       if (!this.active.has(id)) {
-        const context = pausedForRejectedCandidate(run)
+        const context = shouldResumeRejectedCandidates(run)
           ? { resumeRejectedCandidates: true }
           : undefined;
         // Persist the hand-off before launching. The HTTP resume response must
@@ -163,12 +169,16 @@ export class AgentJobRunner {
         const maxAttempts = this.options.maxAttempts ?? 3;
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
           await this.store.markRunning(id);
+          const latestRequest = this.store.get(id)?.request ?? request;
           let progressWrites: Promise<void> = Promise.resolve();
           try {
             const result = await runWithClientId(clientId, () =>
               runWithRequestModelConfig(modelConfig, () =>
-                this.executor.run(request, controller.signal, (event) => {
+                this.executor.run(latestRequest, controller.signal, (event) => {
                   progressWrites = progressWrites.then(async () => {
+                    if (typeof event.projectId === 'string' && event.projectId.trim().length > 0) {
+                      await this.store.bindRequestProjectId(id, event.projectId);
+                    }
                     await this.store.appendEvent(id, event);
                   });
                 }, context),
@@ -178,6 +188,7 @@ export class AgentJobRunner {
             // from preserving event order, this makes the latest resumable
             // script node durable before the job becomes completed.
             await progressWrites;
+            if (result.projectId) await this.store.bindRequestProjectId(id, result.projectId);
             await this.store.complete(id, result);
             return;
           } catch (error) {

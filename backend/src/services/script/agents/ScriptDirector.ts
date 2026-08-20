@@ -3455,15 +3455,31 @@ export class ScriptDirector {
         return { warnings: parsed.warnings, unparsedLines: parsed.unparsedLines };
       }
       const now = this.now();
-      const episode = canonicalDirectCandidate({
-        ...parsed.episode,
-        id: currentEpisode?.id ?? this.createId(),
-        projectId: request.projectId,
-        revision: baseEpisodeRevision,
-        createdAt: currentEpisode?.createdAt ?? now,
-        updatedAt: now,
-      });
-      return { ...parsed, episode };
+      try {
+        const episode = canonicalDirectCandidate({
+          ...parsed.episode,
+          id: currentEpisode?.id ?? this.createId(),
+          projectId: request.projectId,
+          revision: baseEpisodeRevision,
+          createdAt: currentEpisode?.createdAt ?? now,
+          updatedAt: now,
+        });
+        return { ...parsed, episode };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '剧本结构无法规范化。';
+        return {
+          warnings: [
+            ...parsed.warnings,
+            {
+              line: 0,
+              code: 'UNPARSED_LINE' as const,
+              message,
+              text: '',
+            },
+          ],
+          unparsedLines: parsed.unparsedLines,
+        };
+      }
     };
 
     const recordCall = (
@@ -3595,7 +3611,9 @@ export class ScriptDirector {
         responseFormat: 'text',
         signal: request.signal,
       });
+      const originalRawText = rawText;
       let parsed = parseCandidate(rawText);
+      const firstParsed = parsed;
       let callsUsed = 1;
       if (!parsed.episode || parsed.unparsedLines.length > 0) {
         const formatPrompt = [
@@ -3613,7 +3631,7 @@ export class ScriptDirector {
           '只输出整理后的完整剧本文本。',
           rawText,
         ].join('\n');
-        rawText = await this.dependencies.model.complete({
+        const repairedText = await this.dependencies.model.complete({
           node: 'draft',
           projectId: request.projectId,
           episodeNumber,
@@ -3622,7 +3640,17 @@ export class ScriptDirector {
           signal: request.signal,
         });
         callsUsed += 1;
-        parsed = parseCandidate(rawText);
+        const repaired = parseCandidate(repairedText);
+        if (repaired.episode) {
+          rawText = repairedText;
+          parsed = repaired;
+        } else if (firstParsed.episode) {
+          rawText = originalRawText;
+          parsed = firstParsed;
+        } else {
+          rawText = originalRawText;
+          parsed = repaired.unparsedLines.length > 0 ? repaired : firstParsed;
+        }
       }
       if (!parsed.episode) {
         recordCall('draft', 'ChineseShortDramaText@v1', callsUsed, 'needs_review');

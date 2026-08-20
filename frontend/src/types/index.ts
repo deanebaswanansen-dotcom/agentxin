@@ -304,6 +304,8 @@ export interface AgentProgressEvent {
   current?: number;
   /** 总数（如总章节数）。 */
   total?: number;
+  /** Bind a newly created project onto the durable job request. */
+  projectId?: Id;
   /** Durable short-drama node checkpoint, when the running task is script based. */
   scriptCheckpoint?: {
     episodeNumber?: number;

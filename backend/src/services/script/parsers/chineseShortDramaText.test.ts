@@ -226,6 +226,26 @@ describe('parseChineseShortDramaText', () => {
     expect(result.warnings).toEqual([]);
   });
 
+  it('accepts mixed scene-heading families used by Flash drafts', () => {
+    const result = parseChineseShortDramaText([
+      '第3集',
+      '3-1 日/内 修车铺',
+      '人物：周野',
+      '△周野拧紧螺丝。',
+      '3-2 修车铺 日 内',
+      '人物：周野',
+      '周野：先把车修好。',
+      '3-3 修车铺（夜/内）',
+      '人物：周野',
+      '周野：今晚不能睡。',
+    ].join('\n'), options());
+
+    expect(result.unparsedLines).toEqual([]);
+    expect(result.episode?.scenes).toHaveLength(3);
+    expect(result.episode?.scenes.map((scene) => scene.location)).toEqual(['修车铺', '修车铺', '修车铺']);
+    expect(result.episode?.scenes.map((scene) => scene.timeOfDay)).toEqual(['day', 'day', 'night']);
+  });
+
   it('accepts production-order scene headings and first-appearance role notes', () => {
     const result = parseChineseShortDramaText([
       '第3集：',

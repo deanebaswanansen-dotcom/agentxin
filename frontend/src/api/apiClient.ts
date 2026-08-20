@@ -1293,6 +1293,7 @@ export async function watchPersistentAgentJob(
 ): Promise<AgentRunResult> {
   let deliveredEvents = 0;
   let reconnecting = false;
+  let resumedInterrupted = false;
   for (;;) {
     let snapshot: PersistentAgentJobSnapshot;
     try {
@@ -1327,6 +1328,26 @@ export async function watchPersistentAgentJob(
         error: {
           code: snapshot.error?.code === 'PROVIDER_ERROR' ? 'PROVIDER_ERROR' : 'STORE_ERROR',
           message: snapshot.error?.message ?? '后台 Agent 任务失败。',
+        },
+      });
+    }
+    if (snapshot.status === 'waiting_user') {
+      if (snapshot.error?.code === 'RUN_INTERRUPTED' && !resumedInterrupted) {
+        resumedInterrupted = true;
+        options?.onProgress?.({
+          phase: 'info',
+          message: snapshot.error.message || '服务已重启，正在自动继续任务…',
+        });
+        await request(baseUrl, 'POST', `/agent/jobs/${seg(jobId)}/resume`, {}, {
+          signal: options?.signal,
+          includeModelConfig: true,
+        });
+        continue;
+      }
+      throw new ApiClientError({
+        error: {
+          code: snapshot.error?.code === 'PROVIDER_ERROR' ? 'PROVIDER_ERROR' : 'STORE_ERROR',
+          message: snapshot.error?.message ?? '任务等待确认后才能继续。',
         },
       });
     }

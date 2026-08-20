@@ -18,6 +18,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import type { ChatMessage, ModelConfig } from '../types/index.js';
+import { getCurrentClientId } from '../services/client/clientScope.js';
 import { recordLocalCacheHit, recordLocalCacheMiss } from './cacheStats.js';
 import type { ModelProxy, StreamCompletionOptions } from './ModelProxy.js';
 import type { StreamDelta } from './sseParser.js';
@@ -68,6 +69,7 @@ export class CachingModelProxy implements ModelProxy {
 
   private cacheKey(config: ModelConfig, messages: ChatMessage[], options?: StreamCompletionOptions): string {
     const payload = JSON.stringify({
+      clientId: getCurrentClientId(),
       model: config.modelName,
       temperature: config.temperature ?? null,
       topP: config.topP ?? null,

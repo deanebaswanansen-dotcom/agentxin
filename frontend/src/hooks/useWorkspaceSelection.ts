@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from 'react';
 import apiClient from '../api/apiClient.js';
-import type { AgentRunResult, Chapter, Id } from '../types/index.js';
+import type { AgentRunResult, Chapter, Id, ProjectKind } from '../types/index.js';
 import type { EditorSelection } from '../components/ChapterEditor.js';
 
 interface UseWorkspaceSelectionOptions {
@@ -16,6 +16,7 @@ export function useWorkspaceSelection({
 }: UseWorkspaceSelectionOptions) {
   const [selectedProjectId, setSelectedProjectId] = useState<Id | null>(null);
   const [selectedProjectName, setSelectedProjectName] = useState<string | undefined>(undefined);
+  const [selectedProjectKind, setSelectedProjectKind] = useState<ProjectKind>('novel');
   const [selectedChapterId, setSelectedChapterId] = useState<Id | null>(null);
   const [selectedChapter, setSelectedChapter] = useState<Chapter | null>(null);
   const [projectListVersion, setProjectListVersion] = useState(0);
@@ -36,6 +37,9 @@ export function useWorkspaceSelection({
         if (requestId !== projectNameRequestRef.current) return;
         const found = list.find((p) => p.id === projectId);
         setSelectedProjectName(found?.name);
+        if (found?.kind === 'novel' || found?.kind === 'short_drama') {
+          setSelectedProjectKind(found.kind);
+        }
       })
       .catch(() => {
         /* Project name is cosmetic; keep the previous value on lookup failure. */
@@ -74,18 +78,24 @@ export function useWorkspaceSelection({
   );
 
   const selectProject = useCallback(
-    (projectId: Id) => {
+    (projectId: Id, kind?: ProjectKind) => {
       setSelectedProjectId(projectId);
+      if (kind === 'novel' || kind === 'short_drama') setSelectedProjectKind(kind);
       resetChapter();
       selectProjectNameFromServer(projectId);
     },
     [resetChapter, selectProjectNameFromServer],
   );
 
-  const selectCreatedProject = useCallback((projectId: Id, projectName: string) => {
+  const selectCreatedProject = useCallback((
+    projectId: Id,
+    projectName: string,
+    kind: ProjectKind = 'novel',
+  ) => {
     projectNameRequestRef.current += 1;
     setSelectedProjectId(projectId);
     setSelectedProjectName(projectName);
+    setSelectedProjectKind(kind);
     resetChapter();
   }, [resetChapter]);
 
@@ -104,6 +114,7 @@ export function useWorkspaceSelection({
       projectNameRequestRef.current += 1;
       setSelectedProjectId(null);
       setSelectedProjectName(undefined);
+      setSelectedProjectKind('novel');
       clearSelectedChapter();
       bumpProjectList();
     },
@@ -123,12 +134,11 @@ export function useWorkspaceSelection({
       }
       setSelectedProjectId(result.projectId);
       selectProjectNameFromServer(result.projectId);
-      if (result.chapterId !== undefined) {
-        // 直接打开刚生成的章节，避免只清空编辑器、用户以为还在「生成中」。
+      if (result.chapterId !== undefined && selectedChapterId === null) {
         void loadChapter(result.projectId, result.chapterId);
       }
     },
-    [bumpProjectList, loadChapter, selectProjectNameFromServer, selectedProjectId],
+    [bumpProjectList, loadChapter, selectProjectNameFromServer, selectedChapterId, selectedProjectId],
   );
 
   const handleSaved = useCallback((chapterId: Id, content: string) => {
@@ -162,6 +172,7 @@ export function useWorkspaceSelection({
   return {
     selectedProjectId,
     selectedProjectName,
+    selectedProjectKind,
     selectedChapterId,
     selectedChapter,
     projectListVersion,
