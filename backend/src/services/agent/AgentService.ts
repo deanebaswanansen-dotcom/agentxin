@@ -137,7 +137,7 @@ export class AgentService {
         task: request.task,
         projectId,
         ...options,
-        draftMode: options.draftMode ?? 'structured_legacy',
+        draftMode: options.draftMode ?? 'direct_text',
         signal,
         ...(context?.resumeRejectedCandidates ? { resumeRejectedCandidates: true } : {}),
         onProgress: (event) => {

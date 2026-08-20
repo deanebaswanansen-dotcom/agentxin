@@ -7,12 +7,15 @@ interface ImportParams {
   id: Id;
 }
 
+const NOVEL_IMPORT_BODY_LIMIT_BYTES = 8 * 1024 * 1024;
+
 export function registerImportRoutes(
   app: FastifyInstance,
   importService: NovelImportService,
 ): void {
   app.post<{ Params: ImportParams; Body: ImportNovelRequest }>(
     '/api/projects/:id/import/novel',
+    { bodyLimit: NOVEL_IMPORT_BODY_LIMIT_BYTES },
     async (request, reply) => {
       try {
         const result = await importService.organizeIntoProject(

@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { runWithClientId } from '../services/client/clientScope.js';
 import { CachingModelProxy } from './CachingModelProxy.js';
 import type { ModelProxy, StreamCompletionOptions } from './ModelProxy.js';
 import type { StreamDelta } from './sseParser.js';
@@ -68,6 +69,22 @@ describe('CachingModelProxy', () => {
     expect(stats.localCache.misses).toBe(1);
     expect(stats.localCache.hits).toBe(1);
     expect(stats.localCache.hitRatePct).toBe(50);
+  });
+
+  it('does not share cached completions across clients', async () => {
+    const inner = new CountingProxy('租户正文');
+    const proxy = new CachingModelProxy(inner, { dir });
+    const clientA = 'a'.repeat(64);
+    const clientB = 'b'.repeat(64);
+
+    await runWithClientId(clientA, () =>
+      collect(proxy.streamCompletion(realConfig, messages, new AbortController().signal)),
+    );
+    await runWithClientId(clientB, () =>
+      collect(proxy.streamCompletion(realConfig, messages, new AbortController().signal)),
+    );
+
+    expect(inner.calls).toBe(2);
   });
 
   it('uses a different cache key for different messages', async () => {

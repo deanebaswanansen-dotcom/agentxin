@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 import { ServiceError } from '../../ServiceError.js';
@@ -43,6 +43,7 @@ const DEDUPLICATED_SCRIPT_TASKS = new Set<AgentRunRequest['task']>([
   'script_bible',
   'script_episode_batch',
 ]);
+const LONG_FORM_NOVEL_TASKS = new Set<AgentRunRequest['task']>(['full_novel', 'long_novel']);
 const ACTIVE_STATUSES = new Set<AgentRunStatus>([
   'queued',
   'running',
@@ -71,11 +72,11 @@ function batchRange(request: AgentRunRequest): { start: number; end: number } | 
 }
 
 function requestsConflict(existing: AgentRunRequest, candidate: AgentRunRequest): boolean {
-  if (
-    !DEDUPLICATED_SCRIPT_TASKS.has(candidate.task) ||
-    existing.task !== candidate.task ||
-    existing.projectId !== candidate.projectId
-  ) {
+  if (existing.projectId !== candidate.projectId) return false;
+  if (LONG_FORM_NOVEL_TASKS.has(candidate.task)) {
+    return LONG_FORM_NOVEL_TASKS.has(existing.task);
+  }
+  if (!DEDUPLICATED_SCRIPT_TASKS.has(candidate.task) || existing.task !== candidate.task) {
     return false;
   }
   if (candidate.task !== 'script_episode_batch') return true;
@@ -87,6 +88,16 @@ function requestsConflict(existing: AgentRunRequest, candidate: AgentRunRequest)
     existingRange.start <= candidateRange.end &&
     candidateRange.start <= existingRange.end,
   );
+}
+
+function conflictMessage(request: AgentRunRequest): string {
+  if (request.task === 'script_episode_batch') {
+    return '同一项目已有集数范围重叠的短剧批次正在执行或等待恢复。';
+  }
+  if (LONG_FORM_NOVEL_TASKS.has(request.task)) {
+    return '同一项目已有整本或长篇任务正在执行或等待恢复。';
+  }
+  return '同一项目已有相同短剧任务正在执行或等待恢复。';
 }
 
 function clone<T>(value: T): T {
@@ -135,12 +146,7 @@ export class AgentRunStore {
       requestsConflict(run.request, request),
     );
     if (conflict) {
-      throw new AgentRunConflictError(
-        conflict.id,
-        request.task === 'script_episode_batch'
-          ? '同一项目已有集数范围重叠的短剧批次正在执行或等待恢复。'
-          : '同一项目已有相同短剧任务正在执行或等待恢复。',
-      );
+      throw new AgentRunConflictError(conflict.id, conflictMessage(request));
     }
 
     const now = new Date().toISOString();
@@ -220,6 +226,14 @@ export class AgentRunStore {
     });
   }
 
+  async bindRequestProjectId(id: string, projectId: string): Promise<StoredAgentRun> {
+    const trimmed = projectId.trim();
+    return this.update(id, (run) => {
+      if (!trimmed || run.request.projectId === trimmed) return;
+      run.request = { ...run.request, projectId: trimmed };
+    });
+  }
+
   async complete(id: string, result: AgentRunResult): Promise<StoredAgentRun> {
     return this.update(id, (run) => {
       if (run.status === 'cancelled') return;
@@ -253,12 +267,18 @@ export class AgentRunStore {
   }
 
   private async persist(): Promise<void> {
-    this.writeQueue = this.writeQueue.then(async () => {
+    const run = async (): Promise<void> => {
       await mkdir(dirname(this.filePath), { recursive: true });
       const temporaryPath = `${this.filePath}.${randomUUID()}.tmp`;
-      await writeFile(temporaryPath, JSON.stringify(this.data, null, 2), 'utf8');
-      await rename(temporaryPath, this.filePath);
-    });
+      try {
+        await writeFile(temporaryPath, JSON.stringify(this.data, null, 2), 'utf8');
+        await rename(temporaryPath, this.filePath);
+      } catch (error) {
+        await unlink(temporaryPath).catch(() => undefined);
+        throw error;
+      }
+    };
+    this.writeQueue = this.writeQueue.then(run, run);
     return this.writeQueue;
   }
 }

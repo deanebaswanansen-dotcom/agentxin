@@ -35,6 +35,7 @@ function toClientRun(run: StoredAgentRun): StoredAgentRun & {
     .map((event) => (event as typeof event & { scriptCheckpoint?: unknown }).scriptCheckpoint)
     .find((value) => value !== undefined);
   const isScriptTask = run.request.task.startsWith('script_');
+  const isLongFormNovel = run.request.task === 'full_novel' || run.request.task === 'long_novel';
   return {
     ...run,
     projectId: run.request.projectId,
@@ -42,7 +43,7 @@ function toClientRun(run: StoredAgentRun): StoredAgentRun & {
     ...(run.request.scriptBatchOptions ? { scriptBatchOptions: run.request.scriptBatchOptions } : {}),
     ...(checkpoint !== undefined ? { checkpoint } : {}),
     continuable:
-      isScriptTask &&
+      (isScriptTask || isLongFormNovel) &&
       (run.status === 'failed' || run.status === 'waiting_user' || run.status === 'cancelled'),
   };
 }

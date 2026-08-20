@@ -1089,6 +1089,11 @@ export class AgentOrchestrator {
       projectId,
       projectSeed,
     );
+    emit({
+      phase: 'setup',
+      message: projectCreated ? `已创建项目「${projectTitle}」。` : `已复用项目「${projectTitle}」。`,
+      projectId: pid,
+    });
     await this.purgeEmptyChapterShells(pid);
     const existing = await this.store.listChapters(pid);
     const completedBefore = existing.filter(
@@ -1516,10 +1521,12 @@ export class AgentOrchestrator {
     // 计划规模优先于 options 默认值（用户在计划模式里确认过的章数/字数）
     const planChapters = planSummary?.chapterCount;
     const planWords = planSummary?.wordsPerChapter;
-    const { chapterCount, wordsPerChapter } = normalizeFullNovelOptions(
+    const normalized = normalizeFullNovelOptions(
       planChapters ?? chapters,
       planWords ?? targetWords,
     );
+    let chapterCount = normalized.chapterCount;
+    const wordsPerChapter = normalized.wordsPerChapter;
     const plannedTotalChapters = clampInteger(
       planSummary?.chapterCount ?? totalChapters ?? chapterCount,
       FULL_NOVEL_LIMITS.minChapters,
@@ -1537,6 +1544,11 @@ export class AgentOrchestrator {
       projectId,
       projectSeedName,
     );
+    emit({
+      phase: 'setup',
+      message: projectCreated ? `已创建项目「${projectTitle}」。` : `已复用项目「${projectTitle}」。`,
+      projectId: pid,
+    });
     steps.push(projectCreated ? '已自动创建小说项目。' : '已复用当前小说项目。');
     steps.push(
       `长篇参数：本批 ${chapterCount} 章 x ${wordsPerChapter} 字；总计划 ${plannedTotalChapters} 章，约 ${plannedWords.toLocaleString()} 字。`,
@@ -1590,6 +1602,17 @@ export class AgentOrchestrator {
     const completedBefore = existing.filter(
       (ch) => ch.content.trim().length > 0 && !this.memory.isChapterRejected(pid, ch.id),
     ).length;
+    if (planSummary?.chapterCount !== undefined || totalChapters !== undefined) {
+      const requestedChapterCount = chapterCount;
+      chapterCount = remainingLongNovelBatch(
+        requestedChapterCount,
+        completedBefore,
+        plannedTotalChapters,
+      );
+      if (chapterCount < requestedChapterCount) {
+        steps.push(`检测到已完成 ${completedBefore} 章，本批按剩余总计划裁剪为 ${chapterCount} 章。`);
+      }
+    }
     const plannedFinalChapter = Math.max(completedBefore + chapterCount, plannedTotalChapters);
     pack = await this.ensureFullNovelControlOutline(
       config,

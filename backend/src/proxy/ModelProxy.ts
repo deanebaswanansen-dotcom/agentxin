@@ -52,7 +52,38 @@ export interface ModelProxy {
   ): AsyncIterable<StreamDelta>;
 }
 
+const PRIVATE_IPV4 = /^(?:127\.|10\.|192\.168\.|169\.254\.|0\.)/;
+const PRIVATE_IPV4_172 = /^172\.(?:1[6-9]|2\d|3[0-1])\./;
+
+function isBlockedModelHostname(hostname: string): boolean {
+  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (host === 'localhost' || host.endsWith('.localhost') || host === '::1' || host === '0.0.0.0') {
+    return true;
+  }
+  if (host.includes(':') && (host.startsWith('fc') || host.startsWith('fd') || host.startsWith('fe80'))) {
+    return true;
+  }
+  return PRIVATE_IPV4.test(host) || PRIVATE_IPV4_172.test(host);
+}
+
+export function assertPublicModelBaseUrl(baseUrl: string): void {
+  if (process.env.ALLOW_PRIVATE_MODEL_URLS === '1') return;
+  let parsed: URL;
+  try {
+    parsed = new URL(baseUrl.includes('://') ? baseUrl : `https://${baseUrl}`);
+  } catch {
+    throw new ProxyError('模型服务地址无效。', { status: 400 });
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    throw new ProxyError('模型服务地址必须是 http 或 https。', { status: 400 });
+  }
+  if (isBlockedModelHostname(parsed.hostname)) {
+    throw new ProxyError('模型服务地址不能指向本机、内网或链路本地地址。', { status: 400 });
+  }
+}
+
 function buildCompletionsUrl(baseUrl: string): string {
+  assertPublicModelBaseUrl(baseUrl);
   const trimmed = baseUrl.replace(/\/+$/, '');
   return `${trimmed}/chat/completions`;
 }

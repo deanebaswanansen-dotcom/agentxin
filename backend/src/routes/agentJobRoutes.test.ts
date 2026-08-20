@@ -125,6 +125,47 @@ describe('agent job routes', () => {
     await app.close();
   });
 
+  it('marks interrupted long-form novel jobs as continuable', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-job-route-novel-resume-'));
+    const file = join(directory, 'runs.json');
+    const beforeRestart = await AgentRunStore.create(file);
+    const interrupted = await beforeRestart.create(CLIENT_A, {
+      task: 'long_novel',
+      mode: 'draft',
+      prompt: '写十章',
+      projectId: 'project-a',
+    });
+    await beforeRestart.markRunning(interrupted.id);
+
+    const store = await AgentRunStore.create(file);
+    const runner = new AgentJobRunner(store, {
+      run: async (request) => ({
+        task: request.task,
+        mode: request.mode,
+        projectId: request.projectId ?? 'project-a',
+        summary: '继续完成',
+        steps: [],
+        artifacts: [],
+      }),
+    });
+    const app = Fastify();
+    registerClientScope(app);
+    registerRequestModelConfig(app);
+    registerAgentJobRoutes(app, store, runner);
+
+    const polled = await app.inject({
+      method: 'GET',
+      url: `/api/agent/jobs/${interrupted.id}`,
+      headers: { 'x-agentxin-client-id': CLIENT_A },
+    });
+    expect(polled.json()).toMatchObject({
+      task: 'long_novel',
+      status: 'waiting_user',
+      continuable: true,
+    });
+    await app.close();
+  });
+
   it('does not expose unexpected storage or runtime errors', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'agentxin-job-route-error-'));
     const store = await AgentRunStore.create(join(directory, 'runs.json'));

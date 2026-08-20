@@ -51,6 +51,15 @@ describe('ModelConfigService.save', () => {
     expect(await service.getInternalConfig()).toEqual(validConfig);
   });
 
+  it('does not write API keys when stored config is disabled', async () => {
+    const store = makeFakeStore();
+    const service = new ModelConfigService(store, { allowStoredConfig: false });
+    const view = await service.save(validConfig);
+    expect(view.apiKeyMasked).toBeTruthy();
+    expect(await store.getModelConfig()).toBeUndefined();
+    expect(await service.getInternalConfig()).toBeUndefined();
+  });
+
   it('persists fields verbatim without trimming', async () => {
     const service = new ModelConfigService(makeFakeStore());
     const padded: ModelConfig = {

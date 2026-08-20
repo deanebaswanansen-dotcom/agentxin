@@ -19,7 +19,7 @@
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
 
-import { OpenAiCompatibleModelProxy } from './ModelProxy.js';
+import { OpenAiCompatibleModelProxy, assertPublicModelBaseUrl } from './ModelProxy.js';
 import { ProxyError, isProxyError } from './ProxyError.js';
 import type { StreamDelta } from './sseParser.js';
 import type { ChatMessage, ModelConfig } from '../types/index.js';
@@ -74,6 +74,18 @@ async function collect(iterable: AsyncIterable<StreamDelta>): Promise<string[]> 
 
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+describe('assertPublicModelBaseUrl', () => {
+  it('rejects loopback and link-local model endpoints', () => {
+    expect(() => assertPublicModelBaseUrl('http://127.0.0.1:11434')).toThrow(/本机|内网/);
+    expect(() => assertPublicModelBaseUrl('http://169.254.169.254/latest')).toThrow(/本机|内网/);
+    expect(() => assertPublicModelBaseUrl('http://localhost:3000')).toThrow(/本机|内网/);
+  });
+
+  it('allows public https providers', () => {
+    expect(() => assertPublicModelBaseUrl('https://api.deepseek.com')).not.toThrow();
+  });
 });
 
 describe('OpenAiCompatibleModelProxy request shape', () => {

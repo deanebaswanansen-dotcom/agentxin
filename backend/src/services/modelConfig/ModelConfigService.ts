@@ -66,7 +66,11 @@ export class ModelConfigService {
 
     // Persist verbatim only after all fields pass validation, so a rejected
     // save never mutates the stored config (Requirement 4.4 / Property 16).
-    await this.store.saveModelConfig(config);
+    // Public deployments keep the key request-scoped and must not write it
+    // into the client project file.
+    if (this.options.allowStoredConfig === true) {
+      await this.store.saveModelConfig(config);
+    }
     return toView(config);
   }
 

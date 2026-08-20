@@ -84,6 +84,33 @@ describe('useWorkspaceSelection', () => {
     expect(result.current.selectedProjectName).toBe('新项目');
   });
 
+  it('does not replace the chapter the user is editing when an agent job finishes', async () => {
+    vi.mocked(apiClient.chapters.list).mockResolvedValue([
+      { id: 'ch-open', projectId: 'p-1', title: '正在编辑', content: '手头正文', position: 0 },
+      { id: 'ch-new', projectId: 'p-1', title: '新生成', content: '生成正文', position: 1 },
+    ]);
+    const { result } = renderHook(() => useWorkspaceSelection({ reportError: vi.fn() }));
+
+    await act(async () => {
+      await result.current.loadChapter('p-1', 'ch-open');
+    });
+    act(() => result.current.setEditorContent('尚未保存的正文'));
+    await act(async () => {
+      result.current.applyAgentResult({
+        task: 'auto_next',
+        mode: 'draft',
+        projectId: 'p-1',
+        chapterId: 'ch-new',
+        summary: '已写下一章',
+        steps: [],
+        artifacts: [],
+      }, 'p-1');
+    });
+
+    expect(result.current.selectedChapterId).toBe('ch-open');
+    expect(result.current.editorContent).toBe('尚未保存的正文');
+  });
+
   it('updates the selected project name and ignores an older lookup response', async () => {
     const pending = deferred<Array<{ id: string; name: string; kind: 'short_drama' }>>();
     vi.mocked(apiClient.projects.list).mockReturnValueOnce(pending.promise);

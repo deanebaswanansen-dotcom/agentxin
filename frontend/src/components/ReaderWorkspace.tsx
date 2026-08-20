@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import apiClient from '../api/apiClient.js';
+import { downloadBlobFile } from '../lib/projectExport.js';
 import {
   buildReaderBook,
   countReaderWords,
@@ -820,14 +821,7 @@ export function ReaderWorkspace({
         setStatus(`已生成到 ${outputDirectoryHandle.name}/${fileName}`);
         return;
       }
-      const url = URL.createObjectURL(new Blob([content], { type }));
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = fileName;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+      downloadBlobFile(new Blob([content], { type }), fileName);
       setStatus('浏览器未授权输出目录，已改为下载。');
     } catch (error) {
       onError?.(error);

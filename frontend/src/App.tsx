@@ -23,6 +23,7 @@ import { useDialogFocusTrap } from './components/useDialogFocusTrap.js';
 import {
   buildProjectDocxBlob,
   buildProjectTextExport,
+  downloadBlobFile,
   sanitizeDownloadName,
   type ProjectExportFormat,
 } from './lib/projectExport.js';
@@ -68,7 +69,6 @@ function Workbench(): JSX.Element {
   // —— 抽屉控制 ——
   const [drawer, setDrawer] = useState<DrawerKind>('none');
   const [appMode, setAppMode] = useState<AppMode>('agent');
-  const [selectedProjectKind, setSelectedProjectKind] = useState<ProjectKind>('novel');
   const openChapterTools = useCallback(() => setDrawer('chapterTools'), []);
   const clearChapterTools = useCallback(() => {
     setDrawer((current) => (current === 'chapterTools' ? 'none' : current));
@@ -76,6 +76,7 @@ function Workbench(): JSX.Element {
   const {
     selectedProjectId,
     selectedProjectName,
+    selectedProjectKind,
     selectedChapterId,
     selectedChapter,
     projectListVersion,
@@ -152,15 +153,17 @@ function Workbench(): JSX.Element {
   const [selectionRequest, setSelectionRequest] = useState<EditorSelectionRequest | null>(null);
 
   const handleSelectProject = useCallback((projectId: Id, kind: ProjectKind) => {
-    setSelectedProjectKind(kind);
     setDrawer('none');
     setStreamingState({ streaming: false, content: '', thinking: '' });
-    selectProject(projectId);
+    selectProject(projectId, kind);
   }, [selectProject]);
   const handleProjectDeleted = useCallback((projectId: Id) => {
-    setSelectedProjectKind('novel');
     clearSelectedProject(projectId);
   }, [clearSelectedProject]);
+
+  useEffect(() => {
+    window.dispatchEvent(new Event('nwa:app-started'));
+  }, []);
 
   useEffect(() => {
     try {
@@ -169,17 +172,6 @@ function Workbench(): JSX.Element {
       // Theme persistence is optional.
     }
   }, [themeMode]);
-
-  const downloadBlob = useCallback((blob: Blob, filename: string) => {
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    window.setTimeout(() => URL.revokeObjectURL(url), 0);
-  }, []);
 
   const handleExportProject = useCallback(
     async (format: ProjectExportFormat | 'docx') => {
@@ -191,17 +183,22 @@ function Workbench(): JSX.Element {
           apiClient.settings.worldSettings.list(selectedProjectId),
           apiClient.settings.outlines.list(selectedProjectId),
         ]);
+        const exportChapters = chapters.map((chapter) =>
+          chapter.id === selectedChapterId
+            ? { ...chapter, content: editorContent }
+            : chapter,
+        );
         const resources = { characters, worldSettings, outlines };
         const projectName = selectedProjectName ?? '小说项目';
         if (format === 'docx') {
-          downloadBlob(
-            buildProjectDocxBlob(projectName, chapters, resources),
+          downloadBlobFile(
+            buildProjectDocxBlob(projectName, exportChapters, resources),
             `${sanitizeDownloadName(projectName)}.docx`,
           );
           return;
         }
-        const content = buildProjectTextExport(projectName, chapters, format, resources);
-        downloadBlob(
+        const content = buildProjectTextExport(projectName, exportChapters, format, resources);
+        downloadBlobFile(
           new Blob([content], {
             type: format === 'markdown' ? 'text/markdown;charset=utf-8' : 'text/plain;charset=utf-8',
           }),
@@ -211,7 +208,7 @@ function Workbench(): JSX.Element {
         reportError(error);
       }
     },
-    [downloadBlob, selectedProjectId, selectedProjectName, reportError],
+    [editorContent, reportError, selectedChapterId, selectedProjectId, selectedProjectName],
   );
 
   // —— 选中章节（进入写作模式 + 中间编辑器） ——
@@ -675,8 +672,9 @@ function Workbench(): JSX.Element {
                 onError={reportError}
                 onProjectCreated={(projectId) => {
                   bumpProjectList();
-                  setSelectedProjectKind('novel');
-                  selectProject(projectId);
+                  if (selectedProjectId !== projectId) {
+                    selectProject(projectId, 'novel');
+                  }
                 }}
                 onChapterUpdated={handleSaved}
                 onSendToReferenceAnalysis={handleSendToReferenceAnalysis}
