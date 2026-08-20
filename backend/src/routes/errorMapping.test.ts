@@ -17,6 +17,11 @@ import { describe, expect, it } from 'vitest';
 
 import { ProxyError } from '../proxy/ProxyError.js';
 import { ServiceError } from '../services/ServiceError.js';
+import { ScriptStructuredNeedsReviewError } from '../services/script/agents/ScriptDirector.js';
+import { ScriptModelOutputError } from '../services/script/agents/structuredOutput.js';
+import { StructuredGenerationError } from '../services/script/agents/generateStructured.js';
+import { ScriptServiceError } from '../services/script/ScriptServiceError.js';
+import { ScriptConflictError } from '../services/script/ScriptStore.js';
 import { StoreError } from '../store/StoreError.js';
 import type { ErrorCode } from '../types/index.js';
 import { errorCodeToStatus, toErrorResponse } from './errorMapping.js';
@@ -72,6 +77,33 @@ describe('toErrorResponse', () => {
     expect(status).toBe(502);
     expect(body.error.code).toBe('PROVIDER_ERROR');
     expect(body.error.message).toBe('提供商返回错误状态。');
+  });
+
+  it('maps script structured-output failures to PROVIDER_ERROR instead of a generic store error', () => {
+    const structured = toErrorResponse(new ScriptStructuredNeedsReviewError(
+      'plan',
+      new StructuredGenerationError('script_plan', 1, [], []),
+    ));
+    expect(structured.status).toBe(502);
+    expect(structured.body.error.code).toBe('PROVIDER_ERROR');
+    expect(structured.body.error.message).toContain('plan');
+
+    const invalid = toErrorResponse(new ScriptModelOutputError('模型未返回 JSON 对象。'));
+    expect(invalid.status).toBe(502);
+    expect(invalid.body).toEqual({
+      error: { code: 'PROVIDER_ERROR', message: '模型未返回 JSON 对象。' },
+    });
+  });
+
+  it('maps script validation and revision conflicts without calling them store errors', () => {
+    const validation = toErrorResponse(ScriptServiceError.validation('title 不能为空'));
+    expect(validation.status).toBe(400);
+    expect(validation.body).toEqual({
+      error: { code: 'VALIDATION_ERROR', message: 'title 不能为空' },
+    });
+    const conflict = toErrorResponse(new ScriptConflictError(1, 2));
+    expect(conflict.status).toBe(409);
+    expect(conflict.body.error.code).toBe('CONFLICT');
   });
 
   it('maps an unknown error → 500 with a generic, detail-free message', () => {

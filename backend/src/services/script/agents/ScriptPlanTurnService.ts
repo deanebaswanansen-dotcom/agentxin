@@ -1,12 +1,15 @@
 import { randomUUID } from 'node:crypto';
 
 import type { Project } from '../../../types/index.js';
+import { ERROR_CODES } from '../../../types/index.js';
 import { ServiceError } from '../../ServiceError.js';
-import type {
-  ScriptCheckpointStore,
-  ScriptDirector,
-  ScriptPipelineCheckpointWrite,
+import {
+  ScriptStructuredNeedsReviewError,
+  type ScriptCheckpointStore,
+  type ScriptDirector,
+  type ScriptPipelineCheckpointWrite,
 } from './ScriptDirector.js';
+import { ScriptModelOutputError } from './structuredOutput.js';
 import {
   latestScriptCheckpoint,
   nextScriptCheckpointArtifactRevision,
@@ -71,6 +74,19 @@ interface ScriptProjectLookup {
 }
 
 const SESSION_RUN_KEY = 'script_plan_session';
+const PLAN_GENERATION_ATTEMPTS = 3;
+
+function isRetryablePlanGeneration(error: unknown): boolean {
+  return error instanceof ScriptStructuredNeedsReviewError ||
+    error instanceof ScriptModelOutputError;
+}
+
+function rethrowPlanGeneration(error: unknown): never {
+  if (error instanceof ScriptStructuredNeedsReviewError || error instanceof ScriptModelOutputError) {
+    throw new ServiceError(ERROR_CODES.PROVIDER_ERROR, error.message, { cause: error });
+  }
+  throw error;
+}
 
 function isPlanningField(value: string): value is ScriptPlanningField {
   return (SCRIPT_PLANNING_FIELDS as readonly string[]).includes(value);
@@ -216,13 +232,24 @@ export class ScriptPlanTurnService {
     session.round += 1;
     session.updatedAt = now;
 
-    const result = await this.director.run({
-      task: 'script_plan',
-      projectId: request.projectId,
-      seedPrompt: session.seedPrompt,
-      planningSession: session,
-      signal,
-    });
+    let result: Awaited<ReturnType<ScriptDirector['run']>> | undefined;
+    for (let attempt = 1; attempt <= PLAN_GENERATION_ATTEMPTS; attempt += 1) {
+      try {
+        result = await this.director.run({
+          task: 'script_plan',
+          projectId: request.projectId,
+          seedPrompt: session.seedPrompt,
+          planningSession: session,
+          signal,
+        });
+        break;
+      } catch (error) {
+        if (!isRetryablePlanGeneration(error) || attempt >= PLAN_GENERATION_ATTEMPTS) {
+          rethrowPlanGeneration(error);
+        }
+      }
+    }
+    if (!result) rethrowPlanGeneration(new ScriptModelOutputError('短剧策划未返回结果。'));
     if (result.kind === 'planning_questions') {
       session.askedFields = result.askedFields;
       session.questionCount = result.questionCount;

@@ -1,7 +1,8 @@
 import Fastify from 'fastify';
 import { describe, expect, it, vi } from 'vitest';
 
-import { InMemoryScriptCheckpointStore } from '../services/script/agents/ScriptDirector.js';
+import { InMemoryScriptCheckpointStore, ScriptStructuredNeedsReviewError } from '../services/script/agents/ScriptDirector.js';
+import { StructuredGenerationError } from '../services/script/agents/generateStructured.js';
 import { ScriptPlanTurnService } from '../services/script/agents/ScriptPlanTurnService.js';
 import type { ScriptPlan } from '../services/script/domain.js';
 import { registerScriptPlanRoutes } from './scriptPlanRoutes.js';
@@ -73,6 +74,68 @@ describe('script plan routes', () => {
     expect(history).toHaveLength(2);
     expect(history.map((item) => item.artifactRevision)).toEqual([0, 1]);
     expect(history.map((item) => item.status)).toEqual(['running', 'succeeded']);
+    await app.close();
+  });
+
+  it('retries a structured plan failure and then surfaces PROVIDER_ERROR', async () => {
+    const run = vi.fn()
+      .mockRejectedValueOnce(new ScriptStructuredNeedsReviewError(
+        'plan',
+        new StructuredGenerationError('script_plan', 1, [], []),
+      ))
+      .mockResolvedValueOnce({ kind: 'plan_draft' as const, plan: plan() });
+    const checkpoints = new InMemoryScriptCheckpointStore();
+    const service = new ScriptPlanTurnService(
+      { run } as never,
+      checkpoints,
+      async (id) => ({
+        id, name: '短剧', kind: 'short_drama',
+        createdAt: '2026-08-15T00:00:00.000Z', updatedAt: '2026-08-15T00:00:00.000Z',
+      }),
+    );
+    const app = Fastify();
+    registerScriptPlanRoutes(app, service);
+
+    const first = await app.inject({
+      method: 'POST', url: '/api/plan/script/turn',
+      payload: {
+        projectId: 'project-1',
+        seedPrompt: '修车铺赛车手',
+        answers: [
+          { field: 'genres', delegate: true },
+          { field: 'coreConflict', delegate: true },
+          { field: 'audience', delegate: true },
+          { field: 'totalEpisodes', delegate: true },
+          { field: 'episodeDurationSeconds', delegate: true },
+          { field: 'targetCharsPerEpisode', delegate: true },
+          { field: 'maxScenesPerEpisode', delegate: true },
+          { field: 'dialogueDensityPercent', delegate: true },
+          { field: 'endingDirection', delegate: true },
+        ],
+      },
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toMatchObject({ status: 'ready', plan: { title: '她不再道歉' } });
+    expect(run).toHaveBeenCalledTimes(2);
+
+    run.mockReset();
+    run.mockRejectedValue(new ScriptStructuredNeedsReviewError(
+      'plan',
+      new StructuredGenerationError('script_plan', 1, [], []),
+    ));
+    const failed = await app.inject({
+      method: 'POST', url: '/api/plan/script/turn',
+      payload: {
+        projectId: 'project-1',
+        reset: true,
+        seedPrompt: '修车铺赛车手',
+        answers: [{ field: 'endingDirection', delegate: true }],
+      },
+    });
+    expect(failed.statusCode).toBe(502);
+    expect(failed.json().error.code).toBe('PROVIDER_ERROR');
+    expect(failed.json().error.message).not.toBe('服务器内部错误。');
+    expect(run).toHaveBeenCalledTimes(3);
     await app.close();
   });
 
