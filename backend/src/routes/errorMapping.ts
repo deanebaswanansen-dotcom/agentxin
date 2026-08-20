@@ -28,9 +28,16 @@
  */
 import { isProxyError } from '../proxy/ProxyError.js';
 import { isServiceError } from '../services/ServiceError.js';
+import { ScriptServiceError } from '../services/script/ScriptServiceError.js';
 import { isStoreError } from '../store/StoreError.js';
 import type { ApiError, ErrorCode } from '../types/index.js';
 import { ERROR_CODES } from '../types/index.js';
+
+function errorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === 'string' ? code : undefined;
+}
 
 /** Map a unified {@link ErrorCode} to its HTTP status code. */
 export function errorCodeToStatus(code: ErrorCode): number {
@@ -83,6 +90,30 @@ export function toErrorResponse(error: unknown): MappedError {
   }
 
   if (isProxyError(error)) {
+    return {
+      status: errorCodeToStatus(ERROR_CODES.PROVIDER_ERROR),
+      body: { error: { code: ERROR_CODES.PROVIDER_ERROR, message: error.message } },
+    };
+  }
+
+  if (error instanceof ScriptServiceError) {
+    return {
+      status: errorCodeToStatus(error.code),
+      body: { error: { code: error.code, message: error.message } },
+    };
+  }
+
+  const code = errorCode(error);
+  if (error instanceof Error && code === 'CONFLICT') {
+    return {
+      status: errorCodeToStatus(ERROR_CODES.CONFLICT),
+      body: { error: { code: ERROR_CODES.CONFLICT, message: error.message } },
+    };
+  }
+  if (
+    error instanceof Error &&
+    (code === 'SCRIPT_STRUCTURED_NEEDS_REVIEW' || code === 'SCRIPT_MODEL_OUTPUT_INVALID')
+  ) {
     return {
       status: errorCodeToStatus(ERROR_CODES.PROVIDER_ERROR),
       body: { error: { code: ERROR_CODES.PROVIDER_ERROR, message: error.message } },
