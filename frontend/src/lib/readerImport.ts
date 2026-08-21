@@ -6,6 +6,7 @@ export interface ReaderChapter {
   content: string;
   position: number;
   backendChapterId?: string;
+  backendRevision?: number;
 }
 
 export interface ReaderPage {

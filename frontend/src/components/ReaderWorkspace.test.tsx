@@ -10,6 +10,7 @@ function chapter(overrides: Partial<Chapter>): Chapter {
     title: '章节',
     content: '正文',
     position: 0,
+    revision: 0,
     ...overrides,
   };
 }
@@ -19,7 +20,9 @@ function makeClient(overrides: Partial<ReaderClient> = {}): ReaderClient {
     chapters: {
       list: vi.fn().mockResolvedValue([]),
       create: vi.fn(),
-      updateContent: vi.fn().mockResolvedValue(undefined),
+      updateContent: vi.fn(async (id: string, content: string, expectedRevision = 0) => (
+        chapter({ id, content, revision: expectedRevision + 1 })
+      )),
       rename: vi.fn(),
       remove: vi.fn(),
       reorder: vi.fn(),
@@ -209,7 +212,9 @@ describe('ReaderWorkspace', () => {
         list: vi.fn().mockResolvedValue([
           chapter({ id: 'c-1', title: '第一章', content: '原文需要修改。保留。', position: 0 }),
         ]),
-        updateContent: vi.fn().mockResolvedValue(undefined),
+        updateContent: vi.fn(async (id: string, content: string, expectedRevision = 0) => (
+          chapter({ id, content, revision: expectedRevision + 1 })
+        )),
       },
     });
 
@@ -232,7 +237,7 @@ describe('ReaderWorkspace', () => {
     fireEvent.click(screen.getByRole('button', { name: '应用改写' }));
 
     await waitFor(() => {
-      expect(client.chapters.updateContent).toHaveBeenCalledWith('c-1', '改写后的文字。保留。');
+      expect(client.chapters.updateContent).toHaveBeenCalledWith('c-1', '改写后的文字。保留。', 0);
     });
     expect(screen.getByText('改写后的文字。保留。')).toBeInTheDocument();
   });

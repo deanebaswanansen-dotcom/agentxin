@@ -56,6 +56,7 @@ import type {
   WorldSetting,
 } from '../types/index.js';
 import type { DataStore } from './DataStore.js';
+import { ChapterRevisionConflictError } from './ChapterRevisionConflictError.js';
 import { StoreError } from './StoreError.js';
 
 /**
@@ -116,6 +117,9 @@ export class FileDataStore implements DataStore {
   /** True when an older on-disk project needs its default workspace kind persisted. */
   private needsProjectKindMigration = false;
 
+  /** True when legacy chapters need their initial content revision persisted. */
+  private needsChapterRevisionMigration = false;
+
   /**
    * Prefer {@link FileDataStore.create} which also loads existing data. The
    * constructor only records the path and starts from an empty state so that
@@ -138,7 +142,12 @@ export class FileDataStore implements DataStore {
   ): Promise<FileDataStore> {
     const store = new FileDataStore(filePath);
     await store.load();
-    if (store.needsProjectKindMigration || store.migrateLegacyAgentMaterials()) {
+    const needsAgentMaterialMigration = store.migrateLegacyAgentMaterials();
+    if (
+      store.needsProjectKindMigration ||
+      store.needsChapterRevisionMigration ||
+      needsAgentMaterialMigration
+    ) {
       await store.persist();
     }
     return store;
@@ -221,6 +230,10 @@ export class FileDataStore implements DataStore {
       const parsed = JSON.parse(raw) as Partial<FileDataStoreState> | null;
       this.needsProjectKindMigration = Array.isArray(parsed?.projects) &&
         parsed.projects.some((project) => project.kind !== 'novel' && project.kind !== 'short_drama');
+      this.needsChapterRevisionMigration = Array.isArray(parsed?.chapters) &&
+        parsed.chapters.some((chapter) => (
+          !Number.isInteger(chapter.revision) || (chapter.revision ?? -1) < 0
+        ));
       this.state = normalizeState(parsed);
     } catch (error) {
       throw new StoreError(
@@ -421,6 +434,7 @@ export class FileDataStore implements DataStore {
       title,
       content: '',
       position: nextPosition,
+      revision: 0,
     };
     this.state.chapters.push(chapter);
     await this.persist();
@@ -457,14 +471,23 @@ export class FileDataStore implements DataStore {
    * {@link StoreError}) to avoid masking a programming error as a storage I/O
    * failure.
    */
-  async updateChapterContent(id: Id, content: string): Promise<Chapter> {
+  async updateChapterContent(
+    id: Id,
+    content: string,
+    expectedRevision?: number,
+  ): Promise<Chapter> {
     const chapter = this.state.chapters.find((c) => c.id === id);
     if (!chapter) {
       throw new Error(
         `updateChapterContent 调用了不存在的章节 id：${id}（应由服务层先校验存在性）`,
       );
     }
+    const actualRevision = chapter.revision ?? 0;
+    if (expectedRevision !== undefined && expectedRevision !== actualRevision) {
+      throw new ChapterRevisionConflictError(expectedRevision, actualRevision);
+    }
     chapter.content = content;
+    chapter.revision = actualRevision + 1;
     await this.persist();
     return { ...chapter };
   }
@@ -1060,7 +1083,14 @@ function normalizeState(
           kind: project.kind === 'short_drama' ? 'short_drama' : 'novel',
         }))
       : base.projects,
-    chapters: Array.isArray(parsed.chapters) ? parsed.chapters : base.chapters,
+    chapters: Array.isArray(parsed.chapters)
+      ? parsed.chapters.map((chapter) => ({
+          ...chapter,
+          revision: Number.isInteger(chapter.revision) && (chapter.revision ?? -1) >= 0
+            ? chapter.revision
+            : 0,
+        }))
+      : base.chapters,
     characters: Array.isArray(parsed.characters)
       ? parsed.characters
       : base.characters,

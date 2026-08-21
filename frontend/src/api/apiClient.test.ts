@@ -528,6 +528,24 @@ describe('apiClient request building', () => {
     await expect(client().chapters.list('p1')).resolves.toEqual(chapters);
   });
 
+  it('sends expectedRevision and returns the updated chapter when saving content', async () => {
+    const saved = {
+      id: 'c1',
+      projectId: 'p1',
+      title: 'T',
+      content: '新正文',
+      position: 0,
+      revision: 4,
+    };
+    const mock = installFetch(() => jsonResponse(saved));
+
+    await expect(client().chapters.updateContent('c1', '新正文', 3)).resolves.toEqual(saved);
+    const [url, init] = mock.mock.calls[0];
+    expect(url).toBe('/api/chapters/c1/content');
+    expect(init?.method).toBe('PATCH');
+    expect(JSON.parse(String(init?.body))).toEqual({ content: '新正文', expectedRevision: 3 });
+  });
+
   it('rejects HTML fallback responses from static hosting', async () => {
     installFetch(() => htmlResponse());
     const err: ApiClientError = await client().projects.list().catch((e) => e);

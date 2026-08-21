@@ -37,7 +37,7 @@ export interface DataStore {
   createChapter(projectId: Id, title: string): Promise<Chapter>;
   listChapters(projectId: Id): Promise<Chapter[]>; // 按 position 升序
   getChapter(id: Id): Promise<Chapter | undefined>;
-  updateChapterContent(id: Id, content: string): Promise<Chapter>;
+  updateChapterContent(id: Id, content: string, expectedRevision?: number): Promise<Chapter>;
   renameChapter(id: Id, title: string): Promise<Chapter>;
   reorderChapters(projectId: Id, orderedIds: Id[]): Promise<void>;
   deleteChapter(id: Id): Promise<void>;

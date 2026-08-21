@@ -15,6 +15,7 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState, type CSSPrope
 import apiClient from './api/apiClient.js';
 import { ChatWorkspace, type PendingReferenceImport } from './components/ChatWorkspace.js';
 import { ChapterEditor, type ChapterEditorHandle } from './components/ChapterEditor.js';
+import { AdoptionPreviewDialog } from './components/AdoptionPreviewDialog.js';
 import { ChapterToolsDrawer } from './components/ChapterToolsDrawer.js';
 import { ProjectTree } from './components/ProjectTree.js';
 import { ErrorProvider, useErrorReporter } from './components/ErrorToast.js';
@@ -46,6 +47,12 @@ const SettingsPanel = lazy(() => import('./components/SettingsPanel.js'));
 type DrawerKind = 'none' | 'chapterTools' | 'resource';
 type AppMode = 'agent' | 'reader';
 type ThemeMode = 'tavern' | 'midnight' | 'paper';
+interface PendingAdoption {
+  projectId: Id;
+  targetChapter: Chapter;
+  nextContent: string;
+  mode: 'replace' | 'append';
+}
 const THEME_STORAGE_KEY = 'nwa:theme-mode';
 function isThemeMode(value: unknown): value is ThemeMode {
   return value === 'tavern' || value === 'midnight' || value === 'paper';
@@ -165,6 +172,8 @@ function Workbench(): JSX.Element {
     thinking: string;
   }>({ streaming: false, content: '', thinking: '' });
   const [selectionRequest, setSelectionRequest] = useState<EditorSelectionRequest | null>(null);
+  const [pendingAdoption, setPendingAdoption] = useState<PendingAdoption | null>(null);
+  const [adoptionSaving, setAdoptionSaving] = useState(false);
 
   const handleSelectProject = useCallback((projectId: Id, kind: ProjectKind) => {
     void flushEditor().then(() => {
@@ -244,38 +253,97 @@ function Workbench(): JSX.Element {
   // —— 采用写作内容到中间编辑器 ——
   const handleAdoptContent = useCallback(
     async (content: string, targetChapterId?: Id) => {
-      let adopted = content;
-      let chapterId = selectedChapterId;
-      if (targetChapterId && selectedProjectId && targetChapterId !== selectedChapterId) {
-        let loaded: Chapter | null | undefined;
+      if (selectedProjectId === null || selectedChapter === null) {
+        setEditorContent(content);
+        return;
+      }
+      try {
+        await flushEditor();
+      } catch {
+        return;
+      }
+
+      const crossChapter = targetChapterId !== undefined && targetChapterId !== selectedChapterId;
+      let targetChapter: Chapter;
+      if (crossChapter) {
         try {
-          loaded = await loadChapterSafely(selectedProjectId, targetChapterId);
-        } catch {
+          const chapters = await apiClient.chapters.list(selectedProjectId);
+          const found = chapters.find((chapter) => chapter.id === targetChapterId);
+          if (!found) throw new Error('目标章节不存在，未采用内容。');
+          targetChapter = found;
+        } catch (error) {
+          reportError(error);
           return;
         }
-        // A failed or superseded load must never be treated as an empty
-        // chapter, otherwise adoption could overwrite existing server data.
-        if (!loaded || loaded.id !== targetChapterId) return;
-        const base = loaded.content;
-        adopted = applyAdoption(base, content, { mode: 'insert', position: base.length });
-        chapterId = targetChapterId;
+      } else {
+        targetChapter = {
+          ...selectedChapter,
+          content: editorRef.current?.getContent() ?? editorContent,
+        };
       }
-      setEditorContent(adopted);
-      const len = adopted.length;
+
+      const nextContent = crossChapter
+        ? applyAdoption(targetChapter.content, content, {
+            mode: 'insert',
+            position: targetChapter.content.length,
+          })
+        : content;
+      if (nextContent === targetChapter.content) return;
+      setPendingAdoption({
+        projectId: selectedProjectId,
+        targetChapter,
+        nextContent,
+        mode: crossChapter ? 'append' : 'replace',
+      });
+    },
+    [editorContent, flushEditor, reportError, selectedChapter, selectedChapterId, selectedProjectId, setEditorContent],
+  );
+
+  const confirmAdoption = useCallback(async () => {
+    if (pendingAdoption === null || adoptionSaving) return;
+    if (selectedProjectId !== pendingAdoption.projectId) {
+      reportError(new Error('项目已经切换，请重新选择采用内容。'));
+      setPendingAdoption(null);
+      return;
+    }
+    setAdoptionSaving(true);
+    try {
+      const { targetChapter, nextContent, projectId } = pendingAdoption;
+      if (selectedChapterId === targetChapter.id && editorRef.current !== null) {
+        editorRef.current.setContent(nextContent);
+        await editorRef.current.saveIfDirty();
+      } else {
+        await flushEditor();
+        const saved = await apiClient.chapters.updateContent(
+          targetChapter.id,
+          nextContent,
+          targetChapter.revision ?? 0,
+        );
+        handleSaved(targetChapter.id, nextContent, saved.revision);
+        await loadChapter(projectId, targetChapter.id);
+      }
+      const len = nextContent.length;
       setSelectionRequest((current) => ({
         start: len,
         end: len,
         revision: (current?.revision ?? 0) + 1,
       }));
-      if (chapterId) {
-        apiClient.chapters
-          .updateContent(chapterId, adopted)
-          .then(() => handleSaved(chapterId, adopted))
-          .catch((e) => reportError(e));
-      }
-    },
-    [handleSaved, loadChapterSafely, reportError, selectedChapterId, selectedProjectId, setEditorContent],
-  );
+      setPendingAdoption(null);
+    } catch (error) {
+      reportError(error);
+    } finally {
+      setAdoptionSaving(false);
+    }
+  }, [
+    adoptionSaving,
+    flushEditor,
+    handleSaved,
+    loadChapter,
+    pendingAdoption,
+    reportError,
+    selectedChapterId,
+    selectedProjectId,
+  ]);
 
   // —— 蓝图模块"采用整章" ——
   const handleAdoptChapterContent = useCallback(
@@ -791,6 +859,18 @@ function Workbench(): JSX.Element {
             </div>
           </div>
         </div>
+      ) : null}
+
+      {pendingAdoption !== null ? (
+        <AdoptionPreviewDialog
+          mode={pendingAdoption.mode}
+          chapterTitle={pendingAdoption.targetChapter.title}
+          before={pendingAdoption.targetChapter.content}
+          after={pendingAdoption.nextContent}
+          busy={adoptionSaving}
+          onCancel={() => setPendingAdoption(null)}
+          onConfirm={() => void confirmAdoption()}
+        />
       ) : null}
 
     </div>

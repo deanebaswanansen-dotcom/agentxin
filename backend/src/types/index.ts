@@ -32,6 +32,8 @@ export interface Chapter {
   title: string;
   content: string; // 正文
   position: number; // 排序位置, 升序
+  /** 正文乐观锁版本；旧数据缺失时按 0 处理。 */
+  revision?: number;
 }
 
 export interface Character {

@@ -4438,6 +4438,56 @@
     grid-template-columns: 1fr;
   }
 }
+
+.nwa-adoption-preview {
+  width: min(94vw, 980px);
+}
+
+.nwa-adoption-preview__subtitle {
+  margin: 0.25rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.nwa-adoption-preview__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.nwa-adoption-preview__grid section {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.nwa-adoption-preview__grid pre {
+  min-height: 16rem;
+  max-height: 46vh;
+  margin: 0;
+  padding: 0.85rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--bg-inset, var(--bg-surface-hover));
+  color: var(--text-primary);
+  font: inherit;
+  line-height: 1.65;
+}
+
+@media (max-width: 720px) {
+  .nwa-adoption-preview__grid {
+    grid-template-columns: 1fr;
+  }
+
+  .nwa-adoption-preview__grid pre {
+    min-height: 10rem;
+    max-height: 28vh;
+  }
+}
 .nwa-reference-breakdown {
   display: grid;
   gap: 0.8rem;

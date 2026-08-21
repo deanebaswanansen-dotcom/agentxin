@@ -143,10 +143,10 @@ export function useWorkspaceSelection({
     [bumpProjectList, loadChapter, selectProjectNameFromServer, selectedChapterId, selectedProjectId],
   );
 
-  const handleSaved = useCallback((chapterId: Id, content: string) => {
+  const handleSaved = useCallback((chapterId: Id, content: string, revision?: number) => {
     setSelectedChapter((prev) => {
       if (prev && prev.id === chapterId) {
-        return { ...prev, content };
+        return { ...prev, content, revision: revision ?? prev.revision };
       }
       return prev;
     });
