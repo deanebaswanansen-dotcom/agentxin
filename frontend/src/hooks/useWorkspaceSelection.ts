@@ -58,20 +58,22 @@ export function useWorkspaceSelection({
     async (projectId: Id, chapterId: Id, opts?: { openTools?: boolean }) => {
       const requestId = ++chapterRequestRef.current;
       setSelectedProjectId(projectId);
-      setSelectedChapterId(chapterId);
       try {
         const chapters = await apiClient.chapters.list(projectId);
-        if (requestId !== chapterRequestRef.current) return;
+        if (requestId !== chapterRequestRef.current) return undefined;
         const found = chapters.find((chapter) => chapter.id === chapterId) ?? null;
+        setSelectedChapterId(chapterId);
         setSelectedChapter(found);
         setEditorContent(found?.content ?? '');
         setSelection(undefined);
         if (opts?.openTools === true) {
           onOpenChapterTools?.();
         }
+        return found;
       } catch (error) {
-        if (requestId !== chapterRequestRef.current) return;
+        if (requestId !== chapterRequestRef.current) return undefined;
         reportError(error);
+        return undefined;
       }
     },
     [onOpenChapterTools, reportError],

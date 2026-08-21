@@ -61,6 +61,9 @@ const DEPTH_MODEL_SAMPLE: Record<ReferenceAnalysisDepth, number> = {
   deep: 80,
 };
 
+/** 拆解项目章节只保留占位，禁止把参考原文拷进 DataStore 供写作/Agent 吞掉。 */
+const ANALYSIS_CHAPTER_PLACEHOLDER = '原文已保存在参考库';
+
 const DIMENSION_LABELS: Record<ReferenceTransferDimension, string> = {
   pacing: '剧情节奏',
   chapter_structure: '章节结构',
@@ -154,6 +157,16 @@ export class ReferenceAnalysisService {
     request: ReferenceAnalyzeRequest = {},
   ): Promise<ReferenceAnalyzeResult> {
     const novel = this.requireNovel(id);
+    const selected = resolveSelectedChapters(novel, request);
+    if (selected.length === 0) {
+      throw ServiceError.validation('请至少选择 1 章进行分析。');
+    }
+    if (selected.length > MAX_CHAPTERS_SELECT) {
+      throw ServiceError.validation(`单次最多分析 ${MAX_CHAPTERS_SELECT} 章，请缩小选择范围。`);
+    }
+
+    const previousStatus = novel.status;
+    const previousErrorMessage = novel.errorMessage;
     if (request.depth) {
       novel.depth = normalizeDepth(request.depth);
     }
@@ -162,14 +175,6 @@ export class ReferenceAnalysisService {
     await this.refStore.saveNovel(novel);
 
     try {
-      const selected = resolveSelectedChapters(novel, request);
-      if (selected.length === 0) {
-        throw ServiceError.validation('请至少选择 1 章进行分析。');
-      }
-      if (selected.length > MAX_CHAPTERS_SELECT) {
-        throw ServiceError.validation(`单次最多分析 ${MAX_CHAPTERS_SELECT} 章，请缩小选择范围。`);
-      }
-
       const metrics = selected.map((c) => c.metrics);
       const style = aggregateStyleProfile(metrics);
       const pacing = aggregatePacingProfile(metrics);
@@ -240,6 +245,12 @@ export class ReferenceAnalysisService {
           : `已生成《${novel.title}》本地基础拆解（统计 ${selected.length} 章）。左侧项目「${analysisProject.projectName}」已按原顺序写入 ${novel.chapters.length} 章；点击“资料”可查看当前提取结果，配置真实模型后可获得更完整的人物、冲突、爽点、世界观、大纲与分章人物服装。`,
       };
     } catch (error) {
+      if (isAbortError(error, signal)) {
+        novel.status = previousStatus;
+        novel.errorMessage = previousErrorMessage;
+        await this.refStore.saveNovel(novel);
+        throw error;
+      }
       novel.status = 'failed';
       novel.errorMessage = error instanceof Error ? error.message : String(error);
       await this.refStore.saveNovel(novel);
@@ -251,17 +262,13 @@ export class ReferenceAnalysisService {
     novel: StoredReferenceNovel,
     profile: ReferenceCreativeProfile,
   ): Promise<{ projectId: Id; projectName: string; artifacts: AgentArtifact[] }> {
-    const projectName = `小说拆解 · ${novel.title}`.slice(0, 96);
+    const projectName = uniqueAnalysisProjectName(novel.title, novel.id);
     let project = novel.analysisProjectId
       ? await this.dataStore.getProject(novel.analysisProjectId)
       : undefined;
 
     if (!project) {
-      const projects = await this.dataStore.listProjects();
-      const matched = projects.find((item) => item.name === projectName);
-      project = matched
-        ? await this.dataStore.getProject(matched.id)
-        : await this.dataStore.createProject(projectName);
+      project = await this.dataStore.createProject(projectName);
     }
     if (!project) {
       throw new Error(`无法创建或读取拆解项目：${projectName}`);
@@ -289,14 +296,6 @@ export class ReferenceAnalysisService {
       if (!savedChapter) {
         savedChapter = existingChapters.find(
           (chapter) =>
-            !usedChapterIds.has(chapter.id) &&
-            chapter.title === referenceChapter.title &&
-            chapter.content === referenceChapter.content,
-        );
-      }
-      if (!savedChapter) {
-        savedChapter = existingChapters.find(
-          (chapter) =>
             !usedChapterIds.has(chapter.id) && chapter.title === referenceChapter.title,
         );
       }
@@ -309,10 +308,10 @@ export class ReferenceAnalysisService {
         );
       }
 
-      if (referenceChapter.content && savedChapter.content !== referenceChapter.content) {
+      if (savedChapter.content !== ANALYSIS_CHAPTER_PLACEHOLDER) {
         savedChapter = await this.dataStore.updateChapterContent(
           savedChapter.id,
-          referenceChapter.content,
+          ANALYSIS_CHAPTER_PLACEHOLDER,
         );
       }
 
@@ -328,15 +327,16 @@ export class ReferenceAnalysisService {
         await this.dataStore.deleteChapter(oldProjectChapterId);
       }
     }
-    const referenceChapterSignatures = new Set(
-      novel.chapters.map((chapter) => `${chapter.title}\u0000${chapter.content}`),
+    const referenceRawContents = new Set(
+      novel.chapters.map((chapter) => chapter.content).filter((content) => content.trim().length > 0),
     );
     const duplicateChapterIds = new Set(
       existingChapters
         .filter(
           (chapter) =>
             !generatedChapterSet.has(chapter.id) &&
-            referenceChapterSignatures.has(`${chapter.title}\u0000${chapter.content}`),
+            chapter.content.trim().length > 0 &&
+            referenceRawContents.has(chapter.content),
         )
         .map((chapter) => chapter.id),
     );
@@ -507,10 +507,12 @@ export class ReferenceAnalysisService {
   ): Promise<SimilarityCheckResult> {
     const novel = this.requireNovel(request.referenceId);
     let text = request.text?.trim() ?? '';
-    if (!text && request.chapterId) {
+    if (request.chapterId) {
       const chapter = await this.dataStore.getChapter(request.chapterId);
-      if (!chapter) throw ServiceError.notFound(`章节不存在：${request.chapterId}`);
-      text = chapter.content;
+      if (!chapter || (projectId !== undefined && chapter.projectId !== projectId)) {
+        throw ServiceError.notFound(`章节不存在：${request.chapterId}`);
+      }
+      if (!text) text = chapter.content;
     }
     if (!text) throw ServiceError.validation('请提供待检文本或 chapterId。');
 
@@ -532,13 +534,38 @@ export class ReferenceAnalysisService {
     const novel = this.requireNovel(id);
     novel.chapters = novel.chapters.map((c) => ({ ...c, content: '' }));
     novel.rawPurged = true;
+    await this.blankAnalysisProjectChapters(novel);
     await this.refStore.saveNovel(novel);
     return toSummary(novel);
   }
 
   async remove(id: Id): Promise<void> {
+    const novel = this.refStore.getNovel(id);
+    if (!novel) throw ServiceError.notFound(`参考小说不存在：${id}`);
+    await this.blankAnalysisProjectChapters(novel);
     const ok = await this.refStore.deleteNovel(id);
     if (!ok) throw ServiceError.notFound(`参考小说不存在：${id}`);
+  }
+
+  /** 清空拆解项目中对应章节正文，避免参考原文残留在可写作 DataStore。 */
+  private async blankAnalysisProjectChapters(novel: StoredReferenceNovel): Promise<void> {
+    const projectId = novel.analysisProjectId;
+    if (!projectId) return;
+    const project = await this.dataStore.getProject(projectId);
+    if (!project) return;
+
+    const mappedIds = Object.values(novel.analysisChapterMap ?? {});
+    const chapterIds =
+      mappedIds.length > 0
+        ? mappedIds
+        : (await this.dataStore.listChapters(projectId)).map((chapter) => chapter.id);
+
+    for (const chapterId of chapterIds) {
+      const chapter = await this.dataStore.getChapter(chapterId);
+      if (!chapter || chapter.projectId !== projectId) continue;
+      if (chapter.content.length === 0) continue;
+      await this.dataStore.updateChapterContent(chapterId, '');
+    }
   }
 
   /**
@@ -1040,6 +1067,17 @@ function filterMethods(
 ): ReferenceTransferableMethod[] {
   const set = new Set(dimensions);
   return methods.filter((m) => set.has(m.dimension));
+}
+
+function uniqueAnalysisProjectName(title: string, novelId: string): string {
+  const suffix = ` · ${novelId.replace(/-/g, '').slice(0, 8)}`;
+  const prefix = `小说拆解 · ${title}`.slice(0, Math.max(8, 96 - suffix.length));
+  return `${prefix}${suffix}`;
+}
+
+function isAbortError(error: unknown, signal: AbortSignal): boolean {
+  if (signal.aborted) return true;
+  return error instanceof Error && error.name === 'AbortError';
 }
 
 function toSummary(novel: StoredReferenceNovel): ReferenceNovelSummary {

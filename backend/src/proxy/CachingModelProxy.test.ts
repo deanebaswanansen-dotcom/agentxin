@@ -107,6 +107,32 @@ describe('CachingModelProxy', () => {
     expect(getCacheStatsSummary().localCache.hits).toBe(0);
   });
 
+  it('misses cache when the same messages use a different baseUrl', async () => {
+    const inner = new CountingProxy('X');
+    const proxy = new CachingModelProxy(inner, { dir });
+    await collect(proxy.streamCompletion(realConfig, messages, new AbortController().signal));
+    await collect(
+      proxy.streamCompletion(
+        { ...realConfig, baseUrl: 'https://other-provider.example.com/v1' },
+        messages,
+        new AbortController().signal,
+      ),
+    );
+    expect(inner.calls).toBe(2);
+    expect(getCacheStatsSummary().localCache.hits).toBe(0);
+  });
+
+  it('uses a different cache key for maxTokens and disableThinking', async () => {
+    const inner = new CountingProxy('X');
+    const proxy = new CachingModelProxy(inner, { dir });
+    const signal = () => new AbortController().signal;
+    await collect(proxy.streamCompletion(realConfig, messages, signal(), { maxTokens: 256 }));
+    await collect(proxy.streamCompletion(realConfig, messages, signal(), { maxTokens: 1024 }));
+    await collect(proxy.streamCompletion(realConfig, messages, signal(), { disableThinking: true }));
+    expect(inner.calls).toBe(3);
+    expect(getCacheStatsSummary().localCache.hits).toBe(0);
+  });
+
   it('does not cache mock provider', async () => {
     const inner = new CountingProxy('mock 输出');
     const proxy = new CachingModelProxy(inner, { dir });

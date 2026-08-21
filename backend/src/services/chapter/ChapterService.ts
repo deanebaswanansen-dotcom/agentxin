@@ -22,11 +22,18 @@ import type { DataStore } from '../../store/DataStore.js';
 import type { Chapter, Id } from '../../types/index.js';
 import { ServiceError } from '../ServiceError.js';
 
+export interface ChapterServiceOptions {
+  afterRemove?: (chapter: Chapter) => Promise<void>;
+}
+
 export class ChapterService {
   /**
    * @param store 持久化抽象。通过依赖注入传入，使领域逻辑与具体存储实现解耦。
    */
-  constructor(private readonly store: DataStore) {}
+  constructor(
+    private readonly store: DataStore,
+    private readonly options: ChapterServiceOptions = {},
+  ) {}
 
   /**
    * 在某项目下创建章节（Requirement 2.1）。
@@ -84,8 +91,12 @@ export class ChapterService {
    * 章节不存在时返回 `NOT_FOUND`（Requirement 2.6）。
    */
   async remove(id: Id): Promise<void> {
-    await this.ensureChapterExists(id);
+    const chapter = await this.store.getChapter(id);
+    if (!chapter) {
+      throw ServiceError.notFound(`章节不存在：${id}`);
+    }
     await this.store.deleteChapter(id);
+    await this.options.afterRemove?.(chapter);
   }
 
   /**

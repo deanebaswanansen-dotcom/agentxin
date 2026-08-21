@@ -209,6 +209,7 @@ export function parseChineseShortDramaText(
   const scenes: ScriptScene[] = [];
   const usedSceneOrdinals = new Set<number>();
   let currentScene: ScriptScene | undefined;
+  let skippingForeignScene = false;
   const lines = rawText.replace(/^\uFEFF/u, '').replace(/\r\n?/gu, '\n').split('\n');
 
   const warn = (
@@ -237,10 +238,15 @@ export function parseChineseShortDramaText(
         warn(
           lineNumber,
           'SCENE_EPISODE_NUMBER_REPAIRED',
-          `场景头集号 ${heading.episodeNumber} 已按当前第 ${options.episodeNumber} 集修正。`,
+          `场景头集号 ${heading.episodeNumber} 不属于当前第 ${options.episodeNumber} 集，已拒绝纳入。`,
           line,
+          true,
         );
+        currentScene = undefined;
+        skippingForeignScene = true;
+        continue;
       }
+      skippingForeignScene = false;
       let ordinal = heading.originalOrdinal;
       while (usedSceneOrdinals.has(ordinal)) ordinal += 1;
       if (ordinal !== heading.originalOrdinal) {
@@ -262,6 +268,11 @@ export function parseChineseShortDramaText(
         blocks: [],
       };
       scenes.push(currentScene);
+      continue;
+    }
+
+    if (skippingForeignScene) {
+      warn(lineNumber, 'UNPARSED_LINE', '无法识别该剧本行。', line, true);
       continue;
     }
 

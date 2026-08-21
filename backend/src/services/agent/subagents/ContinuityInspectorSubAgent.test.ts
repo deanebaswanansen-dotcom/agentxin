@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { ModelProxy } from '../../../proxy/ModelProxy.js';
 import type { StreamDelta } from '../../../proxy/sseParser.js';
 import type { ModelConfig } from '../../../types/index.js';
-import { ContinuityInspectorSubAgent } from './ContinuityInspectorSubAgent.js';
+import { ContinuityInspectorSubAgent, InspectorParseError } from './ContinuityInspectorSubAgent.js';
 
 function mockProxy(response: string): ModelProxy {
   return {
@@ -53,6 +53,54 @@ describe('ContinuityInspectorSubAgent', () => {
     expect(report.recommendRevision).toBe(true);
     expect(report.fatalIssues).toContain('主角性别被改写');
     expect(report.structuralChecks[0]?.pass).toBe(true);
+  });
+
+  it('does not treat malformed or non-JSON inspector output as a score-80 pass', async () => {
+    const input = {
+      projectId: 'p1',
+      atChapter: 2,
+      chapterTitle: '第2章',
+      chapterContent: '沈砚秋在雨中奔跑。',
+      earlyChapterSamples: [{ title: '第1章', excerpt: '沈砚秋醒来' }],
+      recentChapterSamples: [{ title: '第1章', excerpt: '沈砚秋' }],
+      injectedMemory: '沈砚秋是女主',
+      injectedMemoryOptions: { maxSummaries: 8 },
+    };
+    for (const response of ['这不是 JSON', '好的，审查通过。', '{"verdict":"pass","fatalIssues":[]}']) {
+      const agent = new ContinuityInspectorSubAgent(mockProxy(response));
+      await expect(agent.inspectChapter(CONFIG, input, new AbortController().signal)).rejects.toBeInstanceOf(
+        InspectorParseError,
+      );
+    }
+  });
+
+  it('keeps usable fatalIssues when score0to100 is missing instead of defaulting to 80', async () => {
+    const agent = new ContinuityInspectorSubAgent(
+      mockProxy(
+        JSON.stringify({
+          verdict: 'needs_revision',
+          fatalIssues: ['主角性别被改写'],
+          recommendRevision: true,
+        }),
+      ),
+    );
+    const report = await agent.inspectChapter(
+      CONFIG,
+      {
+        projectId: 'p1',
+        atChapter: 12,
+        chapterTitle: '第12章',
+        chapterContent: '沈砚秋在雨中奔跑。',
+        earlyChapterSamples: [{ title: '第1章', excerpt: '沈砚秋醒来' }],
+        recentChapterSamples: [{ title: '第11章', excerpt: '沈砚秋' }],
+        injectedMemory: '沈砚秋是女主',
+        injectedMemoryOptions: { maxSummaries: 8 },
+      },
+      new AbortController().signal,
+    );
+    expect(report.fatalIssues).toContain('主角性别被改写');
+    expect(report.score0to100).not.toBe(80);
+    expect(report.recommendRevision).toBe(true);
   });
 
   it('runs reflection and inspection helpers in parallel', async () => {

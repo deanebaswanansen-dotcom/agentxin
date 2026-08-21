@@ -101,9 +101,9 @@ export class SceneRewriter {
       throw ServiceError.notFound(`场景不存在：${sceneId}`);
     }
 
-    // 4) 读取目标场景当前已持久化正文（需求 12.6）。
+    // 4) 读取目标场景当前已持久化正文（需求 12.6）。空白草稿视为尚未写作。
     const draft = await this.store.getSceneDraft(chapterId, sceneId);
-    if (!draft) {
+    if (!draft || draft.content.trim().length === 0) {
       throw ServiceError.validation(`该场景尚未写作，无法重写：${sceneId}`);
     }
 

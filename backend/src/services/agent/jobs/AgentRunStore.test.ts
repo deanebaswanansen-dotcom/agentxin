@@ -215,4 +215,46 @@ describe('AgentRunStore', () => {
     });
     await expect(store.create(CLIENT_A, novelRequest)).resolves.toMatchObject({ status: 'queued' });
   });
+
+  it('does not overwrite completed, failed, or cancelled jobs via cancel or fail', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-runs-terminal-noop-'));
+    const store = await AgentRunStore.create(join(directory, 'runs.json'));
+    const novelRequest: AgentRunRequest = {
+      task: 'long_novel', mode: 'draft', prompt: '写一章', projectId: 'project-a',
+    };
+
+    const completed = await store.create(CLIENT_A, novelRequest);
+    await store.complete(completed.id, {
+      task: 'long_novel', mode: 'draft', projectId: 'project-a',
+      summary: '完成', steps: [], artifacts: [],
+    });
+    await store.cancel(completed.id);
+    expect(store.get(completed.id)?.status).toBe('completed');
+    await store.fail(completed.id, { message: '不应覆盖完成态' });
+    expect(store.get(completed.id)).toMatchObject({
+      status: 'completed',
+      result: { summary: '完成' },
+    });
+
+    const failed = await store.create(CLIENT_A, {
+      ...novelRequest, projectId: 'project-b',
+    });
+    await store.fail(failed.id, { message: '失败' });
+    await store.cancel(failed.id);
+    expect(store.get(failed.id)?.status).toBe('failed');
+    await store.fail(failed.id, { message: '另一条失败' });
+    expect(store.get(failed.id)).toMatchObject({
+      status: 'failed',
+      error: { message: '失败' },
+    });
+
+    const cancelled = await store.create(CLIENT_A, {
+      ...novelRequest, projectId: 'project-c',
+    });
+    await store.cancel(cancelled.id);
+    await store.fail(cancelled.id, { message: '不应覆盖取消态' });
+    expect(store.get(cancelled.id)?.status).toBe('cancelled');
+    await store.cancel(cancelled.id);
+    expect(store.get(cancelled.id)?.status).toBe('cancelled');
+  });
 });

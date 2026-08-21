@@ -9,6 +9,7 @@ import {
   runAgentBackgroundJob,
   runPersistentAgentJob,
   runPlanBackgroundJob,
+  watchPersistentAgentJob,
   type SseEvent,
 } from './apiClient.js';
 import type {
@@ -791,6 +792,65 @@ describe('persistent backend Agent jobs', () => {
       '后台仍在生成，页面连接较慢，正在自动重连…',
       '已恢复连接，任务继续运行。',
     ]);
+  });
+
+  it('keeps polling waiting_user jobs instead of throwing', async () => {
+    vi.useFakeTimers();
+    const progress = vi.fn();
+    const result: AgentRunResult = {
+      task: 'long_novel', mode: 'draft', projectId: 'p1', summary: '完成', steps: [], artifacts: [],
+    };
+    let polls = 0;
+    installFetch((url, init) => {
+      if (String(url).endsWith('/agent/jobs') && init?.method === 'POST') {
+        return jsonResponse({ id: 'job-1', status: 'queued', events: [] }, { status: 202 });
+      }
+      polls += 1;
+      if (polls === 1) {
+        return jsonResponse({
+          id: 'job-1',
+          status: 'waiting_user',
+          events: [],
+          error: { code: 'NEEDS_REVIEW', message: '请确认大纲后再继续。' },
+        });
+      }
+      return jsonResponse({ id: 'job-1', status: 'completed', events: [], result });
+    });
+
+    const pending = runPersistentAgentJob('/api', {
+      task: 'long_novel', mode: 'draft', prompt: '写一章', projectId: 'p1',
+    }, { onProgress: progress });
+    await vi.advanceTimersByTimeAsync(800);
+
+    await expect(pending).resolves.toEqual(result);
+    expect(progress).toHaveBeenCalledWith(expect.objectContaining({
+      phase: 'info',
+      message: '请确认大纲后再继续。',
+    }));
+  });
+
+  it('skips already delivered persistent job events', async () => {
+    const progress = vi.fn();
+    const result: AgentRunResult = {
+      task: 'long_novel', mode: 'draft', projectId: 'p1', summary: '完成', steps: [], artifacts: [],
+    };
+    let polls = 0;
+    installFetch(() => {
+      polls += 1;
+      const events = [
+        { phase: 'chapter', message: '第1章完成' },
+        { phase: 'chapter', message: '第2章完成' },
+      ];
+      return jsonResponse(polls === 1
+        ? { id: 'job-1', status: 'running', events }
+        : { id: 'job-1', status: 'completed', events, result });
+    });
+
+    await expect(watchPersistentAgentJob('/api', 'job-1', {
+      onProgress: progress,
+      deliveredEvents: 1,
+    })).resolves.toEqual(result);
+    expect(progress.mock.calls.map(([event]) => event.message)).toEqual(['第2章完成']);
   });
 });
 

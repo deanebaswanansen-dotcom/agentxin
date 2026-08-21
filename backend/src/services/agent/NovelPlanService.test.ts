@@ -833,6 +833,30 @@ describe('NovelPlanService goal-driven agent', () => {
     ).rejects.toThrow('provider unavailable');
   });
 
+  it('does not treat the structured-plan fallback seed as a core story', async () => {
+    const proxy = new QueueProxy([readyDecision(), readyDecision()]);
+    const service = new NovelPlanService(mockConfigService(), proxy);
+    const result = await service.turn(
+      {
+        seedPrompt: '请根据结构化计划配置自动生成小说计划',
+        planConfig: {
+          targetTotalWords: 100_000,
+          targetTotalChapters: 40,
+          targetWordsPerChapter: { min: 2000, max: 2500 },
+          targetVolumeCount: 5,
+          genres: ['西方玄幻'],
+          coreStory: '',
+          endingDirection: '苦尽甘来',
+          writingRequirements: '慢热、群像、不后宫',
+        },
+      },
+      new AbortController().signal,
+    );
+
+    expect(result.status).toBe('asking');
+    expect(result.questions?.some((question) => question.id === 'core_story')).toBe(true);
+  });
+
   it('rejects an empty seed', async () => {
     const service = new NovelPlanService(mockConfigService(), new QueueProxy([]));
     await expect(

@@ -126,6 +126,7 @@ describe('long novel quality gates', () => {
     '主角提前知道尚未公开的核心秘密',
     '能力已被封印，本章却直接发动并恢复可用',
     '人物上一章重伤濒死，本章却伤势消失并满状态战斗',
+    '主角性别被改写',
   ])('hard-fails an explicit story-breaking continuity issue: %s', (fatalIssue) => {
     const result = runChapterQualityGates({
       content: '林远冲进雨里，却发现地图是假的。他说：“我们被骗了。”下一秒警报响起。'.repeat(30),

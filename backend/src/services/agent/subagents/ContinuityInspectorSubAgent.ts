@@ -7,6 +7,16 @@ import type { ChatMessage, ModelConfig } from '../../../types/index.js';
 import { stripReasoningArtifacts } from '../../text/reasoningSanitizer.js';
 import type { CanonLock, InspectChapterInput, InspectorReport } from './types.js';
 
+export class InspectorParseError extends Error {
+  readonly raw: string;
+
+  constructor(message: string, raw = '') {
+    super(message);
+    this.name = 'InspectorParseError';
+    this.raw = raw;
+  }
+}
+
 function parseJsonObject(raw: string): unknown {
   const start = raw.indexOf('{');
   const end = raw.lastIndexOf('}');
@@ -21,6 +31,12 @@ function parseJsonObject(raw: string): unknown {
       raw: raw.slice(0, 2000),
     };
   }
+}
+
+function parsedFatalIssues(obj: Record<string, unknown>): string[] {
+  return Array.isArray(obj.fatalIssues)
+    ? obj.fatalIssues.filter((x): x is string => typeof x === 'string' && x.trim().length > 0)
+    : [];
 }
 
 function runStructuralChecks(
@@ -57,9 +73,15 @@ function normalizeReport(
   structuralChecks: InspectorReport['structuralChecks'],
 ): InspectorReport {
   const obj = (typeof parsed === 'object' && parsed !== null ? parsed : {}) as Record<string, unknown>;
-  const fatalIssues = Array.isArray(obj.fatalIssues)
-    ? obj.fatalIssues.filter((x): x is string => typeof x === 'string' && x.trim().length > 0)
-    : [];
+  const parseError = typeof obj.parseError === 'string' ? obj.parseError.trim() : '';
+  const fatalIssues = parsedFatalIssues(obj);
+  const hasNumericScore = typeof obj.score0to100 === 'number' && Number.isFinite(obj.score0to100);
+  if (parseError || (!hasNumericScore && fatalIssues.length === 0)) {
+    throw new InspectorParseError(
+      parseError || 'inspector output missing score0to100',
+      typeof obj.raw === 'string' ? obj.raw : '',
+    );
+  }
   const earlyCharacterStatus = Array.isArray(obj.earlyCharacterStatus)
     ? obj.earlyCharacterStatus
         .filter((x): x is Record<string, unknown> => typeof x === 'object' && x !== null)
@@ -72,12 +94,9 @@ function normalizeReport(
   const revisionHints = Array.isArray(obj.revisionHints)
     ? obj.revisionHints.filter((x): x is string => typeof x === 'string' && x.trim().length > 0)
     : fatalIssues.slice(0, 3).map((issue) => `修复：${issue}`);
-  const score0to100 =
-    typeof obj.score0to100 === 'number' && Number.isFinite(obj.score0to100)
-      ? Math.max(0, Math.min(100, Math.round(obj.score0to100)))
-      : structuralChecks.every((c) => c.pass) && fatalIssues.length === 0
-        ? 80
-        : 50;
+  const score0to100 = hasNumericScore
+    ? Math.max(0, Math.min(100, Math.round(obj.score0to100 as number)))
+    : 50;
   const structuralFails = structuralChecks.filter((c) => !c.pass).length;
   const recommendRevision =
     obj.recommendRevision === true || score0to100 < 70 || structuralFails > 0 || fatalIssues.length > 0;

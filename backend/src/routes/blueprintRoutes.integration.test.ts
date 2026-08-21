@@ -283,6 +283,23 @@ describe('blueprintRoutes 集成（buildServer + app.inject）', () => {
     expect(res.json().error.code).toBe('VALIDATION_ERROR');
   });
 
+  it('POST blueprint：chapter 不属于路径中的 project → 404 NOT_FOUND', async () => {
+    await store.saveModelConfig(MODEL_CONFIG);
+    const chapterId = await seedChapter();
+    const other = await store.createProject('另一个项目');
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${other.id}/chapters/${chapterId}/blueprint`,
+      headers: modelConfigHeaders(),
+      payload: { targetWords: 300, requirement: '任意需求。' },
+    });
+
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error.code).toBe('NOT_FOUND');
+    expect(await store.getChapterBlueprintByChapter(chapterId)).toBeUndefined();
+  });
+
   // =========================================================================
   // 4. merge 路由（需求 8.2 / 8.4）
   // =========================================================================
@@ -326,6 +343,30 @@ describe('blueprintRoutes 集成（buildServer + app.inject）', () => {
     // 合并后的整章正文已写回章节（需求 8.3）。
     const chapter = await store.getChapter(chapterId);
     expect(chapter?.content).toBe('A\n\nB\n\nC');
+  });
+
+  it('POST merge：按 blueprint.scenes 数组顺序拼接，不按 scene_id 再排序', async () => {
+    const chapterId = await seedChapter();
+    await store.saveChapterBlueprint({
+      ...makeValidBlueprint(chapterId),
+      scenes: [
+        makeScene('scene-3', 100),
+        makeScene('scene-2', 100),
+        makeScene('scene-1', 100),
+      ],
+    });
+    const now = new Date().toISOString();
+    await store.saveSceneDraft({ chapterId, sceneId: 'scene-1', content: 'A', updatedAt: now });
+    await store.saveSceneDraft({ chapterId, sceneId: 'scene-2', content: 'B', updatedAt: now });
+    await store.saveSceneDraft({ chapterId, sceneId: 'scene-3', content: 'C', updatedAt: now });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/chapters/${chapterId}/merge`,
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().content).toBe('C\n\nB\n\nA');
   });
 
   // =========================================================================
@@ -451,6 +492,81 @@ describe('blueprintRoutes 集成（buildServer + app.inject）', () => {
     expect(res.statusCode).toBe(200);
     expect(res.headers['content-type']).toContain('text/event-stream');
     expect(parseErrorEvent(res.body)?.error.code).toBe('NOT_FOUND');
+    expect(res.body).not.toContain('event: done');
+  });
+
+  it('POST scenes/:sceneId/write：空正文 → event: error 且不持久化空草稿', async () => {
+    await app.close();
+    app = buildServer(
+      store,
+      fakeModelProxy({
+        blueprintJson: JSON.stringify(makeValidBlueprint('placeholder')),
+        sceneChunks: ['   ', '\n\t'],
+      }),
+    );
+    await app.ready();
+
+    await store.saveModelConfig(MODEL_CONFIG);
+    const chapterId = await seedChapter();
+    await store.saveChapterBlueprint(makeValidBlueprint(chapterId));
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/chapters/${chapterId}/scenes/scene-1/write`,
+      headers: modelConfigHeaders(),
+      payload: {},
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toContain('text/event-stream');
+    expect(parseErrorEvent(res.body)?.error.code).toBe('VALIDATION_ERROR');
+    expect(res.body).not.toContain('event: done');
+    expect(await store.getSceneDraft(chapterId, 'scene-1')).toBeUndefined();
+  });
+
+  it('POST scenes/:sceneId/expand：空白草稿视为尚未写作', async () => {
+    await store.saveModelConfig(MODEL_CONFIG);
+    const chapterId = await seedChapter();
+    await store.saveChapterBlueprint(makeValidBlueprint(chapterId));
+    await store.saveSceneDraft({
+      chapterId,
+      sceneId: 'scene-1',
+      content: '   \n',
+      updatedAt: new Date().toISOString(),
+    });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/chapters/${chapterId}/scenes/scene-1/expand`,
+      headers: modelConfigHeaders(),
+      payload: { addWords: 100 },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(parseErrorEvent(res.body)?.error.code).toBe('VALIDATION_ERROR');
+    expect(res.body).not.toContain('event: done');
+  });
+
+  it('POST scenes/:sceneId/rewrite：空白草稿视为尚未写作', async () => {
+    await store.saveModelConfig(MODEL_CONFIG);
+    const chapterId = await seedChapter();
+    await store.saveChapterBlueprint(makeValidBlueprint(chapterId));
+    await store.saveSceneDraft({
+      chapterId,
+      sceneId: 'scene-1',
+      content: '\t  ',
+      updatedAt: new Date().toISOString(),
+    });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/chapters/${chapterId}/scenes/scene-1/rewrite`,
+      headers: modelConfigHeaders(),
+      payload: { instruction: '让节奏更紧凑' },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(parseErrorEvent(res.body)?.error.code).toBe('VALIDATION_ERROR');
     expect(res.body).not.toContain('event: done');
   });
 

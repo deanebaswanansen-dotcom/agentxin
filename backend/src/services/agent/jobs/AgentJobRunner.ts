@@ -7,7 +7,14 @@ import type {
 } from '../../../types/index.js';
 import { runWithClientId } from '../../client/clientScope.js';
 import { runWithRequestModelConfig } from '../../modelConfig/requestModelConfig.js';
-import type { AgentRunError, AgentRunStore, StoredAgentRun } from './AgentRunStore.js';
+import {
+  AgentRunConflictError,
+  conflictMessage,
+  requestsConflict,
+  type AgentRunError,
+  type AgentRunStore,
+  type StoredAgentRun,
+} from './AgentRunStore.js';
 
 interface AgentExecutor {
   run(
@@ -100,6 +107,13 @@ export class AgentJobRunner {
     request: AgentRunRequest,
     modelConfig: ModelConfig | undefined,
   ): Promise<StoredAgentRun> {
+    for (const [id] of this.active) {
+      const existing = this.store.get(id);
+      if (!existing || existing.clientId !== clientId) continue;
+      if (requestsConflict(existing.request, request)) {
+        throw new AgentRunConflictError(id, conflictMessage(request));
+      }
+    }
     const run = await this.store.create(clientId, request);
     this.launch(run.id, clientId, request, modelConfig);
     return run;

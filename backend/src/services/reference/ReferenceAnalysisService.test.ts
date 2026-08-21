@@ -7,6 +7,7 @@ import { FileDataStore } from '../../store/FileDataStore.js';
 import { MemoryService } from '../memory/MemoryService.js';
 import { MemoryStore } from '../memory/MemoryStore.js';
 import { ModelConfigService } from '../modelConfig/ModelConfigService.js';
+import { isServiceError } from '../ServiceError.js';
 import { parseProfileJson, ReferenceAnalysisService } from './ReferenceAnalysisService.js';
 import { ReferenceStore } from './ReferenceStore.js';
 import { detectChapters } from './chapterDetect.js';
@@ -272,11 +273,12 @@ describe('ReferenceAnalysisService MVP', () => {
       ).toBe(true);
       expect(analyzed.profile.transferableMethods.length).toBeGreaterThan(0);
       expect(analyzed.profile.markdownReport).not.toContain('求收藏');
-      expect(analyzed.analysisProjectName).toBe('小说拆解 · 样例参考');
+      expect(analyzed.analysisProjectName.startsWith('小说拆解 · 样例参考')).toBe(true);
+      expect(analyzed.analysisProjectName).not.toBe('小说拆解 · 样例参考');
       expect(analyzed.message).toContain('按原顺序写入');
 
       const analysisProject = await store.getProject(analyzed.analysisProjectId);
-      expect(analysisProject?.name).toBe('小说拆解 · 样例参考');
+      expect(analysisProject?.name).toBe(analyzed.analysisProjectName);
       const analysisChapters = await store.listChapters(analyzed.analysisProjectId);
       const analysisCharacters = await store.listCharacters(analyzed.analysisProjectId);
       const analysisWorlds = await store.listWorldSettings(analyzed.analysisProjectId);
@@ -291,7 +293,10 @@ describe('ReferenceAnalysisService MVP', () => {
       expect(analysisChapters.map((chapter) => chapter.title)).toEqual(
         imported.chapters.map((chapter) => chapter.title),
       );
-      expect(analysisChapters[0]?.content).toContain('林远走进废弃车站');
+      expect(analysisChapters[0]?.content).toBe('原文已保存在参考库');
+      expect(analysisChapters.map((chapter) => chapter.content).join('\n')).not.toContain(
+        '林远走进废弃车站',
+      );
       expect(
         analyzed.artifacts.filter((artifact) => artifact.kind === 'chapter'),
       ).toHaveLength(imported.chaptersDetected);
@@ -349,9 +354,13 @@ describe('ReferenceAnalysisService MVP', () => {
           depth: 'quick',
         },
       );
-      expect(duplicateAnalysis.analysisProjectId).toBe(analyzed.analysisProjectId);
+      expect(duplicateAnalysis.analysisProjectId).not.toBe(analyzed.analysisProjectId);
+      expect(duplicateAnalysis.analysisProjectName).not.toBe(analyzed.analysisProjectName);
       expect(await store.listChapters(analyzed.analysisProjectId)).toHaveLength(
         imported.chaptersDetected,
+      );
+      expect(await store.listChapters(duplicateAnalysis.analysisProjectId)).toHaveLength(
+        duplicateImport.chaptersDetected,
       );
 
       const project = await store.createProject('原创项目');
@@ -375,6 +384,117 @@ describe('ReferenceAnalysisService MVP', () => {
         text: '这是一段完全原创的废土科幻描写，主角在锈蚀管道中寻找水源与同盟。'.repeat(3),
       });
       expect(sim.riskLevel).toBe('ok');
+
+      const foreign = await store.createProject('他人项目');
+      const foreignChapter = await store.createChapter(foreign.id, '外人章节');
+      await store.updateChapterContent(foreignChapter.id, '这段正文不应被其他项目拿去查重。'.repeat(3));
+      await expect(
+        service.checkSimilarity(project.id, {
+          referenceId: imported.reference.id,
+          chapterId: foreignChapter.id,
+        }),
+      ).rejects.toSatisfy((error: unknown) => isServiceError(error) && error.code === 'NOT_FOUND');
+
+      const purged = await service.purgeRawText(imported.reference.id);
+      expect(purged.status).toBe('ready');
+      const purgedAnalysisChapters = await store.listChapters(analyzed.analysisProjectId);
+      expect(purgedAnalysisChapters.every((chapter) => chapter.content === '')).toBe(true);
+      expect(service.get(imported.reference.id).hasRawText).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects invalid chapter selection before marking analyzing', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ref-novel-validate-'));
+    try {
+      const store = await FileDataStore.create(join(dir, 'store.json'));
+      const service = new ReferenceAnalysisService(
+        ReferenceStore.ephemeral(),
+        store,
+        new ModelConfigService(store),
+        new SilentProxy(),
+        new MemoryService(MemoryStore.ephemeral()),
+      );
+      const imported = await service.importText({
+        title: '校验参考',
+        text: SAMPLE_NOVEL,
+        depth: 'quick',
+      });
+      await expect(
+        service.analyze(imported.reference.id, new AbortController().signal, {
+          chapterIds: ['does-not-exist'],
+        }),
+      ).rejects.toSatisfy(
+        (error: unknown) => isServiceError(error) && error.code === 'VALIDATION_ERROR',
+      );
+      expect(service.get(imported.reference.id).status).toBe('imported');
+      expect(service.get(imported.reference.id).errorMessage).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('restores previous status when analysis is aborted', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ref-novel-abort-'));
+    try {
+      const store = await FileDataStore.create(join(dir, 'store.json'));
+      await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock' });
+      const abortingProxy: ModelProxy = {
+        streamCompletion(): AsyncIterable<StreamDelta> {
+          const error = Object.assign(new Error('aborted'), { name: 'AbortError' });
+          throw error;
+        },
+      };
+      const service = new ReferenceAnalysisService(
+        ReferenceStore.ephemeral(),
+        store,
+        new ModelConfigService(store),
+        abortingProxy,
+        new MemoryService(MemoryStore.ephemeral()),
+      );
+      const imported = await service.importText({
+        title: '中止参考',
+        text: SAMPLE_NOVEL,
+        depth: 'quick',
+      });
+      await expect(
+        service.analyze(imported.reference.id, new AbortController().signal, {
+          chapterIds: imported.chapters.slice(0, 1).map((chapter) => chapter.id),
+        }),
+      ).rejects.toMatchObject({ name: 'AbortError' });
+      expect(service.get(imported.reference.id).status).toBe('imported');
+      expect(service.get(imported.reference.id).errorMessage).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('blanks analysis-project chapters when the reference novel is removed', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ref-novel-remove-'));
+    try {
+      const store = await FileDataStore.create(join(dir, 'store.json'));
+      await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock' });
+      const service = new ReferenceAnalysisService(
+        ReferenceStore.ephemeral(),
+        store,
+        new ModelConfigService(store),
+        new SilentProxy(),
+        new MemoryService(MemoryStore.ephemeral()),
+      );
+      const imported = await service.importText({
+        title: '删除参考',
+        text: SAMPLE_NOVEL,
+        depth: 'quick',
+      });
+      const analyzed = await service.analyze(imported.reference.id, new AbortController().signal, {
+        chapterIds: imported.chapters.slice(0, 2).map((chapter) => chapter.id),
+      });
+      const analysisChapters = await store.listChapters(analyzed.analysisProjectId);
+      expect(analysisChapters[0]?.content).toBe('原文已保存在参考库');
+      await service.remove(imported.reference.id);
+      const leftover = await store.listChapters(analyzed.analysisProjectId);
+      expect(leftover.every((chapter) => chapter.content === '')).toBe(true);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

@@ -109,9 +109,9 @@ export class SceneExpander {
       throw ServiceError.notFound(`场景不存在：${sceneId}`);
     }
 
-    // 4) 读取目标场景当前正文；尚无正文 → 提示该场景尚未写作（需求 11.7）。
+    // 4) 读取目标场景当前正文；尚无正文或仅空白 → 提示该场景尚未写作（需求 11.7）。
     const draft = await this.store.getSceneDraft(chapterId, sceneId);
-    if (!draft) {
+    if (!draft || draft.content.trim().length === 0) {
       throw ServiceError.validation(
         `该场景尚未写作，无法扩写：${sceneId}。请先完成该场景的写作。`,
       );

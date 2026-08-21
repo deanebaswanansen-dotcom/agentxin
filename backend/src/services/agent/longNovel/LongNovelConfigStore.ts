@@ -18,6 +18,7 @@ export const DEFAULT_LONG_NOVEL_CONFIG_FILE = 'data/long-novel-configs.json';
 export interface LongNovelConfigStorePort {
   get(projectId: Id): LongNovelModeConfig;
   save(projectId: Id, config: LongNovelModeConfig): Promise<LongNovelModeConfig>;
+  delete(projectId: Id): Promise<void>;
 }
 
 export class LongNovelConfigStore implements LongNovelConfigStorePort {
@@ -75,5 +76,11 @@ export class LongNovelConfigStore implements LongNovelConfigStorePort {
     await this.persist();
     const { updatedAt: _u, ...cfg } = next;
     return cfg;
+  }
+
+  async delete(projectId: Id): Promise<void> {
+    if (this.data.byProject[projectId] === undefined) return;
+    delete this.data.byProject[projectId];
+    await this.persist();
   }
 }

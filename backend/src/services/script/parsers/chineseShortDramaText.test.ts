@@ -106,7 +106,7 @@ describe('parseChineseShortDramaText', () => {
     ]);
   });
 
-  it('repairs copied scene episode prefixes instead of discarding an otherwise valid episode', () => {
+  it('rejects copied scene episode prefixes instead of silently keeping them in the current episode', () => {
     const result = parseChineseShortDramaText([
       '第3集 公开挑战',
       '1-1 修车厂 日/内',
@@ -118,12 +118,62 @@ describe('parseChineseShortDramaText', () => {
       '周野：十年前的记录，今天必须重见天日。',
     ].join('\n'), options());
 
-    expect(result.episode?.episodeNumber).toBe(3);
-    expect(result.episode?.scenes.map((scene) => scene.ordinal)).toEqual([1, 2]);
-    expect(result.unparsedLines).toEqual([]);
+    expect(result.episode).toBeUndefined();
+    expect(result.unparsedLines.map((item) => item.text)).toEqual([
+      '1-1 修车厂 日/内',
+      '人物：周野 林秋',
+      '△周野把旧赛车服铺在工作台上。',
+      '林秋：记者已经到了，我们现在就公开证据。',
+      '1-2 赛车场媒体中心 日/内',
+      '人物：周野',
+      '周野：十年前的记录，今天必须重见天日。',
+    ]);
     expect(result.warnings.map((item) => item.code)).toEqual([
       'SCENE_EPISODE_NUMBER_REPAIRED',
+      'UNPARSED_LINE',
+      'UNPARSED_LINE',
+      'UNPARSED_LINE',
       'SCENE_EPISODE_NUMBER_REPAIRED',
+      'UNPARSED_LINE',
+      'UNPARSED_LINE',
+    ]);
+  });
+
+  it('does not keep 2-1 or 3-1 scenes inside episode 1', () => {
+    const result = parseChineseShortDramaText([
+      '第1集',
+      '1-1 修车厂 日/内',
+      '人物：周野',
+      '△周野把数据卡锁进工具柜。',
+      '2-1 篮球场 日/外',
+      '人物：周野',
+      '△周野投进压哨三分。',
+      '3-1 颁奖台 夜/外',
+      '人物：周野',
+      '周野：冠军是我的。',
+    ].join('\n'), { ...options(), episodeNumber: 1, title: '第一集', outlineId: 'outline-1' });
+
+    expect(result.episode?.episodeNumber).toBe(1);
+    expect(result.episode?.scenes).toHaveLength(1);
+    expect(result.episode?.scenes[0]).toMatchObject({
+      ordinal: 1,
+      location: '修车厂',
+    });
+    expect(result.unparsedLines.map((item) => item.text)).toEqual([
+      '2-1 篮球场 日/外',
+      '人物：周野',
+      '△周野投进压哨三分。',
+      '3-1 颁奖台 夜/外',
+      '人物：周野',
+      '周野：冠军是我的。',
+    ]);
+    expect(result.warnings.map((item) => item.code)).toEqual([
+      'SCENE_EPISODE_NUMBER_REPAIRED',
+      'UNPARSED_LINE',
+      'UNPARSED_LINE',
+      'SCENE_EPISODE_NUMBER_REPAIRED',
+      'UNPARSED_LINE',
+      'UNPARSED_LINE',
     ]);
   });
 

@@ -6,6 +6,7 @@ import {
   countReaderWords,
   createStableReaderId,
   filePathOf,
+  isAllowedReaderRasterDataUrl,
   isImageFile,
   isSupportedReaderFileName,
   parseReaderFile,
@@ -267,24 +268,30 @@ function clampChapterIndex(book: ReaderBook, index: number): number {
   return Math.min(Math.max(0, index), Math.max(0, book.chapters.length - 1));
 }
 
-function sanitizeReaderInlineHtml(value: string): string {
+export function sanitizeReaderInlineHtml(value: string): string {
   if (typeof DOMParser === 'undefined') return '';
   const doc = new DOMParser().parseFromString(`<div>${value}</div>`, 'text/html');
-  doc.querySelectorAll('script,style,iframe,object,embed').forEach((node) => node.remove());
-  doc.querySelectorAll('*').forEach((element) => {
+  const root = doc.body?.firstElementChild;
+  if (!root) return '';
+  root.querySelectorAll('script,style,iframe,object,embed').forEach((node) => node.remove());
+  root.querySelectorAll('*').forEach((element) => {
     const tag = element.tagName.toLowerCase();
     if (!['figure', 'img', 'h3'].includes(tag)) {
-      element.replaceWith(document.createTextNode(element.textContent ?? ''));
+      element.replaceWith(doc.createTextNode(element.textContent ?? ''));
+      return;
+    }
+    if (tag === 'img' && !isAllowedReaderRasterDataUrl(element.getAttribute('src') ?? '')) {
+      element.remove();
       return;
     }
     Array.from(element.attributes).forEach((attr) => {
-      if (tag === 'img' && attr.name === 'src' && attr.value.startsWith('data:image/')) return;
+      if (tag === 'img' && attr.name === 'src') return;
       if (tag === 'img' && attr.name === 'alt') return;
       if (attr.name === 'class' && /^(nwa-reader-inline-image|nwa-reader-subheading)$/u.test(attr.value)) return;
       element.removeAttribute(attr.name);
     });
   });
-  return doc.body.firstElementChild?.innerHTML ?? '';
+  return root.innerHTML;
 }
 
 function escapeHtml(text: string): string {

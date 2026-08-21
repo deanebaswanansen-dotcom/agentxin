@@ -34,7 +34,7 @@ import { describe, it, expect } from 'vitest';
 import fc from 'fast-check';
 
 import { FileDataStore } from './FileDataStore.js';
-import type { SceneDraft } from '../types/index.js';
+import type { ChapterBlueprint, Scene, SceneDraft } from '../types/index.js';
 
 // File I/O per run -> keep runs modest (design.md Testing Strategy: 文件 IO 取 30-50).
 const NUM_RUNS = 40;
@@ -168,4 +168,129 @@ describe('FileDataStore scene-draft write isolation property test', () => {
       { numRuns: NUM_RUNS },
     );
   }, 120_000);
+
+  it('replacing a chapter blueprint wipes that chapter\'s drafts and isolates other chapters', async () => {
+    await fc.assert(
+      fc.asyncProperty(
+        fc.record({
+          targetScenes: fc.uniqueArray(sceneSpecArb, {
+            minLength: 2,
+            maxLength: 6,
+            selector: (s) => s.sceneId,
+          }),
+          otherScenes: fc.uniqueArray(sceneSpecArb, {
+            minLength: 1,
+            maxLength: 4,
+            selector: (s) => s.sceneId,
+          }),
+          replacementIds: fc.uniqueArray(sceneIdArb, {
+            minLength: 1,
+            maxLength: 4,
+            selector: (id) => id,
+          }),
+        }),
+        async ({ targetScenes, otherScenes, replacementIds }) => {
+          const dir = await mkdtemp(join(tmpdir(), 'fds-bp-wipe-'));
+          const file = join(dir, 'store.json');
+          try {
+            const store = await FileDataStore.create(file);
+            const project = await store.createProject('p');
+            const target = await store.createChapter(project.id, 'target');
+            const other = await store.createChapter(project.id, 'other');
+
+            await store.saveChapterBlueprint(
+              makeIsolationBlueprint(
+                target.id,
+                targetScenes.map((s) => s.sceneId),
+              ),
+            );
+            await store.saveChapterBlueprint(
+              makeIsolationBlueprint(
+                other.id,
+                otherScenes.map((s) => s.sceneId),
+              ),
+            );
+
+            const otherExpected = new Map<string, SceneDraft>();
+            for (const spec of targetScenes) {
+              await store.saveSceneDraft({
+                chapterId: target.id,
+                sceneId: spec.sceneId,
+                content: spec.content,
+                updatedAt: spec.updatedAt,
+              });
+            }
+            for (const spec of otherScenes) {
+              const draft: SceneDraft = {
+                chapterId: other.id,
+                sceneId: spec.sceneId,
+                content: spec.content,
+                updatedAt: spec.updatedAt,
+              };
+              await store.saveSceneDraft(draft);
+              otherExpected.set(spec.sceneId, draft);
+            }
+
+            const replacement = makeIsolationBlueprint(target.id, replacementIds);
+            await store.saveChapterBlueprint(replacement);
+
+            expect(await store.listSceneDrafts(target.id)).toEqual([]);
+            for (const spec of targetScenes) {
+              expect(await store.getSceneDraft(target.id, spec.sceneId)).toBeUndefined();
+            }
+            expect(await store.getChapterBlueprintByChapter(target.id)).toEqual(
+              replacement,
+            );
+
+            for (const [sceneId, draft] of otherExpected) {
+              expect(await store.getSceneDraft(other.id, sceneId)).toEqual(draft);
+            }
+            const listedOther = await store.listSceneDrafts(other.id);
+            expect(listedOther).toHaveLength(otherExpected.size);
+            const listedById = new Map(listedOther.map((d) => [d.sceneId, d]));
+            for (const [sceneId, draft] of otherExpected) {
+              expect(listedById.get(sceneId)).toEqual(draft);
+            }
+          } finally {
+            await rm(dir, { recursive: true, force: true });
+          }
+        },
+      ),
+      { numRuns: NUM_RUNS },
+    );
+  }, 120_000);
 });
+
+function makeIsolationScene(sceneId: string): Scene {
+  return {
+    scene_id: sceneId,
+    name: sceneId,
+    target_words: 100,
+    location: 'l',
+    characters: [],
+    purpose: 'p',
+    emotion: 'e',
+    pacing: 'p',
+    must_include: [],
+    ending_state: 'e',
+  };
+}
+
+function makeIsolationBlueprint(
+  chapterId: string,
+  sceneIds: string[],
+): ChapterBlueprint {
+  return {
+    chapter_id: chapterId,
+    title: 't',
+    target_words: Math.max(1, sceneIds.length) * 100,
+    main_goal: 'g',
+    tone: 't',
+    pacing: 'p',
+    required_plot_points: [],
+    forbidden_points: [],
+    emotional_curve: 'e',
+    scenes: sceneIds.map(makeIsolationScene),
+    ending_hook: 'h',
+  };
+}

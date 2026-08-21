@@ -876,9 +876,22 @@ function missingCoreRequirements(text: string): CoreRequirement[] {
   return missing;
 }
 
+const STRUCTURED_PLAN_FALLBACK_SEED = '请根据结构化计划配置自动生成小说计划';
+const CORE_STORY_NOISE = new RegExp(
+  `${STRUCTURED_PLAN_FALLBACK_SEED}|原始需求：|写本小说|请开始计划|计划模式|结构化计划配置（用户明确填写的字段优先级最高）：`,
+  'gu',
+);
+const STRUCTURED_PLAN_FIELD_LINE =
+  /^- (?:全文目标字数|总章节数|单章目标字数|目标卷数|小说类型|核心剧情|结局方向|额外要求)：.*$/gmu;
+
+function hasCoreStorySignal(text: string, config: NovelPlanConfig | undefined): boolean {
+  if (config?.coreStory?.trim()) return true;
+  return text.replace(CORE_STORY_NOISE, '').replace(STRUCTURED_PLAN_FIELD_LINE, '').trim().length >= 18;
+}
+
 function missingPlanRequirements(text: string, config: NovelPlanConfig | undefined, scale: Scale): PlanRequirement[] {
   const missing: PlanRequirement[] = [...missingCoreRequirements(text)];
-  const hasCoreStory = Boolean(config?.coreStory?.trim()) || text.replace(/原始需求：|写本小说|请开始计划|计划模式/gu, '').trim().length >= 18;
+  const hasCoreStory = hasCoreStorySignal(text, config);
   if (!scale.totalWords) missing.push('target_total_words');
   if (!scale.chapterCount) missing.push('target_total_chapters');
   if (!scale.wordsPerChapter) missing.push('target_words_per_chapter');

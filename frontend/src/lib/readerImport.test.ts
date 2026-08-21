@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import JSZip from 'jszip';
 import {
+  isAllowedReaderRasterDataUrl,
   parseReaderFile,
   parseReaderFolder,
   readerBookToReferenceText,
@@ -93,5 +94,41 @@ describe('readerImport', () => {
   it('replaces the first exact selected segment', () => {
     expect(replaceFirstSelection('甲乙甲乙', '甲乙', '丙')).toBe('丙甲乙');
     expect(replaceFirstSelection('甲乙', '丁', '丙')).toBeNull();
+  });
+
+  it('allows only raster base64 image data URLs', () => {
+    expect(isAllowedReaderRasterDataUrl('data:image/png;base64,QQ==')).toBe(true);
+    expect(isAllowedReaderRasterDataUrl('data:image/jpeg;charset=utf-8;base64,QQ==')).toBe(true);
+    expect(isAllowedReaderRasterDataUrl('data:image/jpg;base64,QQ==')).toBe(true);
+    expect(isAllowedReaderRasterDataUrl('data:image/gif;base64,QQ==')).toBe(true);
+    expect(isAllowedReaderRasterDataUrl('data:image/webp;base64,QQ==')).toBe(true);
+    expect(isAllowedReaderRasterDataUrl('data:image/svg+xml;base64,PHN2Zz4=')).toBe(false);
+    expect(isAllowedReaderRasterDataUrl('data:image/png,QQ==')).toBe(false);
+    expect(isAllowedReaderRasterDataUrl('https://example.com/a.png')).toBe(false);
+  });
+
+  it('does not inline SVG data URLs from EPUB images', async () => {
+    const zip = new JSZip();
+    zip.file('META-INF/container.xml', '<container><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>');
+    zip.file('OEBPS/content.opf', [
+      '<package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/"><metadata><dc:title>EPUB 图</dc:title></metadata><manifest>',
+      '<item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/>',
+      '</manifest><spine><itemref idref="c1"/></spine></package>',
+    ].join(''));
+    zip.file(
+      'OEBPS/ch1.xhtml',
+      [
+        '<html xmlns="http://www.w3.org/1999/xhtml"><body><h1>第1章 图</h1>',
+        '<p>EPUB 正文用于参考分析，这里写得稍长一点以满足最短字数要求，方便联调。</p>',
+        '<img src="data:image/svg+xml;base64,PHN2Zz4=" alt="bad"/>',
+        '<img src="data:image/png;base64,QQ==" alt="ok"/>',
+        '</body></html>',
+      ].join(''),
+    );
+    const blob = await zip.generateAsync({ type: 'blob', mimeType: 'application/epub+zip' });
+    const book = await parseReaderFile(new File([blob], 'demo.epub', { type: 'application/epub+zip' }));
+    const html = book.chapters.map((chapter) => chapter.content).join('\n');
+    expect(html).toContain('data:image/png;base64,QQ==');
+    expect(html).not.toContain('svg+xml');
   });
 });

@@ -159,4 +159,16 @@ describe('SettingService NOT_FOUND scoping', () => {
       service.worldSettings.update(character.id, { title: 'x' }),
     ).rejects.toSatisfy((e) => isServiceError(e) && e.code === 'NOT_FOUND');
   });
+
+  it('throws NOT_FOUND when creating settings under a missing project', async () => {
+    await expect(
+      service.characters.create('missing-project', '林夜', '描述'),
+    ).rejects.toSatisfy((e) => isServiceError(e) && e.code === 'NOT_FOUND');
+    await expect(
+      service.worldSettings.create('missing-project', '世界', '内容'),
+    ).rejects.toSatisfy((e) => isServiceError(e) && e.code === 'NOT_FOUND');
+    await expect(
+      service.outlines.create('missing-project', '大纲', '内容'),
+    ).rejects.toSatisfy((e) => isServiceError(e) && e.code === 'NOT_FOUND');
+  });
 });

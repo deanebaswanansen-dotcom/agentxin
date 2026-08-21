@@ -74,7 +74,7 @@ export class WritingService {
 
     // 2) 加载章节正文（续写上下文，Requirement 6.1）。
     const chapter = await this.store.getChapter(chapterId);
-    if (!chapter) {
+    if (!chapter || chapter.projectId !== projectId) {
       throw ServiceError.notFound(`章节不存在：${chapterId}`);
     }
 

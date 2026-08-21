@@ -146,7 +146,7 @@ export interface ChatWorkspaceProps {
   /** 流式状态变化（供中央实时预览，与旧架构兼容）。 */
   onStreamingChange?: (state: { streaming: boolean; content: string; thinking: string }) => void;
   /** 写作模式生成文本被"采用"时触发（写回抽屉内的编辑器）。 */
-  onAdoptContent?: (content: string) => void;
+  onAdoptContent?: (content: string, targetChapterId?: Id) => void;
   /** Agent 任务完成（刷新项目树/加载章节）。第二个参数是任务启动时的项目。 */
   onAgentCompleted?: (result: AgentRunResult, sourceProjectId?: Id | null) => void;
   /** 点击 artifact 跳转（切资源抽屉 tab / 加载章节）。 */
@@ -179,11 +179,15 @@ export function ChatWorkspace({
 
   // —— 采用回调：把章节预览的生成内容写回抽屉编辑器 ——
   const handleAdoptChapter = useCallback(
-    (_messageId: string, generated: string) => {
+    (_messageId: string, generated: string, previewChapterId?: string) => {
+      if (previewChapterId && previewChapterId !== (chapterId ?? '')) {
+        onAdoptContent?.(generated, previewChapterId);
+        return;
+      }
       const target = resolveAdoptionTarget(editorContent, selection);
       onAdoptContent?.(applyAdoption(editorContent, generated, target));
     },
-    [editorContent, selection, onAdoptContent],
+    [chapterId, editorContent, selection, onAdoptContent],
   );
 
   const chat = useChatEngine({
@@ -961,15 +965,8 @@ export function ChatWorkspace({
 
   const doClear = useCallback(() => {
     chat.clear();
-    if (projectId !== null) {
-      void apiClient.agent.clearPlanSession(projectId).catch(onError);
-    }
-    setPlanSeed('');
-    setPlanHistory([]);
-    setActivePlanQuestions([]);
-    setActivePlanConfig(undefined);
     setConfirmClearOpen(false);
-  }, [chat, onError, projectId]);
+  }, [chat]);
 
   // —— 键盘 ——
   const handleKeyDown = useCallback(

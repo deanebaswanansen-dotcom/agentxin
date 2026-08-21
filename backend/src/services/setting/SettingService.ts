@@ -84,8 +84,10 @@ export class SettingService {
 
   constructor(private readonly store: DataStore) {
     this.characters = {
-      create: (projectId, name, description) =>
-        this.store.createCharacter(projectId, name, description),
+      create: async (projectId, name, description) => {
+        await this.requireProject(projectId);
+        return this.store.createCharacter(projectId, name, description);
+      },
       list: (projectId) => this.store.listCharacters(projectId),
       update: async (id, fields) => {
         await this.assertExists(
@@ -106,8 +108,10 @@ export class SettingService {
     };
 
     this.worldSettings = {
-      create: (projectId, title, content) =>
-        this.store.createWorldSetting(projectId, title, content),
+      create: async (projectId, title, content) => {
+        await this.requireProject(projectId);
+        return this.store.createWorldSetting(projectId, title, content);
+      },
       list: (projectId) => this.store.listWorldSettings(projectId),
       update: async (id, fields) => {
         await this.assertExists(
@@ -128,8 +132,10 @@ export class SettingService {
     };
 
     this.outlines = {
-      create: (projectId, title, content) =>
-        this.store.createOutline(projectId, title, content),
+      create: async (projectId, title, content) => {
+        await this.requireProject(projectId);
+        return this.store.createOutline(projectId, title, content);
+      },
       list: (projectId) => this.store.listOutlines(projectId),
       update: async (id, fields) => {
         await this.assertExists(
@@ -148,6 +154,14 @@ export class SettingService {
         return this.store.deleteOutline(id);
       },
     };
+  }
+
+  /** 创建前确认项目存在，避免在缺失 projectId 下写入孤立设定。 */
+  private async requireProject(projectId: Id): Promise<void> {
+    const project = await this.store.getProject(projectId);
+    if (!project) {
+      throw ServiceError.notFound(`项目不存在：${projectId}`);
+    }
   }
 
   /**

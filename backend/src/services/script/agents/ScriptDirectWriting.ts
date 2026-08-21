@@ -11,6 +11,7 @@ import type {
 } from '../domain.js';
 import { projectScriptContinuity } from '../ScriptContinuityCommit.js';
 import type { ScriptTextParseWarning } from '../parsers/chineseShortDramaText.js';
+import { ScriptModelOutputError } from './structuredOutput.js';
 
 export const SCRIPT_DIRECT_ISSUE_CODES = [
   'OFF_OUTLINE',
@@ -296,7 +297,15 @@ function unique(values: readonly string[]): string[] {
 }
 
 export function decodeDirectHandoffReview(value: Record<string, unknown>): ScriptDirectHandoffReview {
+  const verdict = value.verdict;
+  if (verdict !== 'pass' && verdict !== 'major_issue') {
+    throw new ScriptModelOutputError('模型结果字段 verdict 的值无效。');
+  }
   const rawIssues = Array.isArray(value.issues) ? value.issues : [];
+  const rawHandoff = value.handoff;
+  const handoff = rawHandoff && typeof rawHandoff === 'object' && !Array.isArray(rawHandoff)
+    ? rawHandoff as Record<string, unknown>
+    : {};
   const issues = rawIssues.flatMap((candidate): ScriptDirectReviewIssue[] => {
     if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return [];
     const issue = candidate as Record<string, unknown>;
@@ -315,10 +324,9 @@ export function decodeDirectHandoffReview(value: Record<string, unknown>): Scrip
       expected,
     }];
   }).slice(0, 3);
-  const rawHandoff = value.handoff;
-  const handoff = rawHandoff && typeof rawHandoff === 'object' && !Array.isArray(rawHandoff)
-    ? rawHandoff as Record<string, unknown>
-    : {};
+  if (verdict === 'major_issue' && issues.length === 0) {
+    throw new ScriptModelOutputError('模型结果 verdict 为 major_issue，但没有可识别的问题条目。');
+  }
   const characterStates = Array.isArray(handoff.characterStates)
     ? handoff.characterStates.flatMap((candidate) => {
         if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return [];
@@ -345,7 +353,7 @@ export function decodeDirectHandoffReview(value: Record<string, unknown>): Scrip
   const summary = stringValue(handoff.summary);
   const ending = stringValue(handoff.ending);
   return {
-    verdict: value.verdict === 'major_issue' && issues.length > 0 ? 'major_issue' : 'pass',
+    verdict,
     issues,
     handoff: {
       summary,

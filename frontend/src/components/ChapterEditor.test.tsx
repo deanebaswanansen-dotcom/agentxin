@@ -7,10 +7,15 @@
  *  - Reloading content when a different chapter is selected.
  *  - Surfacing backend errors via `onError` (Requirement 8.6).
  */
+import { createRef } from 'react';
 import { beforeEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { act, render, screen, fireEvent, waitFor } from '@testing-library/react';
 import type { Chapter, Id } from '../types/index.js';
-import { ChapterEditor, type ChapterEditorClient } from './ChapterEditor.js';
+import {
+  ChapterEditor,
+  type ChapterEditorClient,
+  type ChapterEditorHandle,
+} from './ChapterEditor.js';
 
 function makeChapter(overrides: Partial<Chapter> = {}): Chapter {
   return {
@@ -110,6 +115,63 @@ describe('ChapterEditor', () => {
     await waitFor(() => {
       expect(onError).toHaveBeenCalledWith(failure);
     });
+  });
+
+  it('rejects saveIfDirty when persistence fails so navigation can stay put', async () => {
+    const failure = new Error('存储失败');
+    const client = makeClient(() => Promise.reject(failure));
+    const onError = vi.fn();
+    const ref = createRef<ChapterEditorHandle>();
+    render(<ChapterEditor ref={ref} chapter={makeChapter()} client={client} onError={onError} />);
+
+    fireEvent.change(screen.getByRole('textbox', { name: '章节正文' }), {
+      target: { value: '不能丢失的修改' },
+    });
+
+    await act(async () => {
+      await expect(ref.current!.saveIfDirty()).rejects.toBe(failure);
+    });
+    expect(onError).toHaveBeenCalledWith(failure);
+    expect(screen.getByText('未保存')).toBeInTheDocument();
+  });
+
+  it('waits for an in-flight save and then persists edits made during it', async () => {
+    let resolveFirst!: () => void;
+    const firstRequest = new Promise<void>((resolve) => {
+      resolveFirst = resolve;
+    });
+    const updateContent = vi.fn((_id: Id, content: string) => (
+      content === '第一版' ? firstRequest : Promise.resolve()
+    ));
+    const client = makeClient(updateContent);
+    const ref = createRef<ChapterEditorHandle>();
+    render(<ChapterEditor ref={ref} chapter={makeChapter()} client={client} />);
+
+    const textarea = screen.getByRole('textbox', { name: '章节正文' });
+    fireEvent.change(textarea, { target: { value: '第一版' } });
+    let firstSave!: Promise<void>;
+    act(() => {
+      firstSave = ref.current!.saveIfDirty();
+    });
+    await waitFor(() => {
+      expect(updateContent).toHaveBeenCalledWith('ch-1', '第一版');
+    });
+
+    fireEvent.change(textarea, { target: { value: '保存期间写下的最新版' } });
+    let navigationFlush!: Promise<void>;
+    act(() => {
+      navigationFlush = ref.current!.saveIfDirty();
+    });
+    await act(async () => {
+      resolveFirst();
+      await Promise.all([firstSave, navigationFlush]);
+    });
+
+    expect(updateContent.mock.calls).toEqual([
+      ['ch-1', '第一版'],
+      ['ch-1', '保存期间写下的最新版'],
+    ]);
+    expect(screen.queryByText('未保存')).not.toBeInTheDocument();
   });
 
   it('mirrors edits through onContentChange for composition', () => {

@@ -37,7 +37,7 @@ export interface UseChatEngineOptions {
   /** 流式状态变化（供中央预览）。 */
   onStreamingChange?: (state: { streaming: boolean; content: string; thinking: string }) => void;
   /** 写作模式生成可采用的章节预览时触发。 */
-  onAdoptChapter?: (messageId: string, generated: string) => void;
+  onAdoptChapter?: (messageId: string, generated: string, chapterId?: string) => void;
 }
 
 export interface ChatEngineState {
@@ -378,7 +378,7 @@ export function useChatEngine(options: UseChatEngineOptions): ChatEngineState & 
     (messageId: string) => {
       const target = messages.find((m) => m.id === messageId);
       if (!target || target.kind !== 'chapter-preview') return;
-      onAdoptChapter?.(messageId, target.content);
+      onAdoptChapter?.(messageId, target.content, target.chapterId);
       // 标记为已采用
       commitMessages((prev) =>
         prev.map((m) =>

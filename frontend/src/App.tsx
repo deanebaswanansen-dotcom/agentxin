@@ -14,7 +14,7 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
 import apiClient from './api/apiClient.js';
 import { ChatWorkspace, type PendingReferenceImport } from './components/ChatWorkspace.js';
-import { ChapterEditor } from './components/ChapterEditor.js';
+import { ChapterEditor, type ChapterEditorHandle } from './components/ChapterEditor.js';
 import { ChapterToolsDrawer } from './components/ChapterToolsDrawer.js';
 import { ProjectTree } from './components/ProjectTree.js';
 import { ErrorProvider, useErrorReporter } from './components/ErrorToast.js';
@@ -30,7 +30,8 @@ import {
 import { useWorkspaceSelection } from './hooks/useWorkspaceSelection.js';
 import { usePaneLayout } from './hooks/usePaneLayout.js';
 import { useNovelImportDrop } from './hooks/useNovelImportDrop.js';
-import type { AgentArtifact, Id, ProjectKind } from './types/index.js';
+import applyAdoption from './lib/applyAdoption.js';
+import type { AgentArtifact, Chapter, Id, ProjectKind } from './types/index.js';
 import type { WorkspaceTab } from './components/ProjectWorkspaceView.js';
 import type { EditorSelectionRequest } from './components/ChapterEditor.js';
 import { LazyLoadBoundary } from './components/LazyLoadBoundary.js';
@@ -46,7 +47,6 @@ type DrawerKind = 'none' | 'chapterTools' | 'resource';
 type AppMode = 'agent' | 'reader';
 type ThemeMode = 'tavern' | 'midnight' | 'paper';
 const THEME_STORAGE_KEY = 'nwa:theme-mode';
-
 function isThemeMode(value: unknown): value is ThemeMode {
   return value === 'tavern' || value === 'midnight' || value === 'paper';
 }
@@ -99,7 +99,19 @@ function Workbench(): JSX.Element {
     onOpenChapterTools: openChapterTools,
     onClearChapterTools: clearChapterTools,
   });
-  const isScriptProject = selectedProjectId !== null && selectedProjectKind === 'short_drama';
+  const isScriptProject = selectedProjectId !== null
+    && selectedProjectKind === 'short_drama';
+  const editorRef = useRef<ChapterEditorHandle>(null);
+  const flushEditor = useCallback(async () => {
+    await editorRef.current?.saveIfDirty();
+  }, []);
+  const loadChapterSafely = useCallback(
+    async (projectId: Id, chapterId: Id, opts?: { openTools?: boolean }) => {
+      await flushEditor();
+      return loadChapter(projectId, chapterId, opts);
+    },
+    [flushEditor, loadChapter],
+  );
   const {
     sidebarCollapsed,
     setSidebarCollapsed,
@@ -129,7 +141,9 @@ function Workbench(): JSX.Element {
     selectedProjectId,
     reportError,
     bumpProjectList,
-    loadChapter,
+    loadChapter: async (projectId, chapterId) => {
+      await loadChapterSafely(projectId, chapterId);
+    },
     selectProject,
     selectCreatedProject,
     openChaptersTab,
@@ -153,10 +167,12 @@ function Workbench(): JSX.Element {
   const [selectionRequest, setSelectionRequest] = useState<EditorSelectionRequest | null>(null);
 
   const handleSelectProject = useCallback((projectId: Id, kind: ProjectKind) => {
-    setDrawer('none');
-    setStreamingState({ streaming: false, content: '', thinking: '' });
-    selectProject(projectId, kind);
-  }, [selectProject]);
+    void flushEditor().then(() => {
+      setDrawer('none');
+      setStreamingState({ streaming: false, content: '', thinking: '' });
+      selectProject(projectId, kind);
+    }).catch(() => undefined);
+  }, [flushEditor, selectProject]);
   const handleProjectDeleted = useCallback((projectId: Id) => {
     clearSelectedProject(projectId);
   }, [clearSelectedProject]);
@@ -215,29 +231,50 @@ function Workbench(): JSX.Element {
   const handleSelectChapter = useCallback(
     async (chapterId: Id) => {
       if (selectedProjectId === null) return;
-      await loadChapter(selectedProjectId, chapterId);
+      try {
+        await loadChapterSafely(selectedProjectId, chapterId);
+      } catch {
+        // ChapterEditor has already surfaced the save failure. Staying on the
+        // current chapter preserves the unsaved text for a retry.
+      }
     },
-    [loadChapter, selectedProjectId],
+    [loadChapterSafely, selectedProjectId],
   );
 
   // —— 采用写作内容到中间编辑器 ——
   const handleAdoptContent = useCallback(
-    (content: string) => {
-      setEditorContent(content);
-      const len = content.length;
+    async (content: string, targetChapterId?: Id) => {
+      let adopted = content;
+      let chapterId = selectedChapterId;
+      if (targetChapterId && selectedProjectId && targetChapterId !== selectedChapterId) {
+        let loaded: Chapter | null | undefined;
+        try {
+          loaded = await loadChapterSafely(selectedProjectId, targetChapterId);
+        } catch {
+          return;
+        }
+        // A failed or superseded load must never be treated as an empty
+        // chapter, otherwise adoption could overwrite existing server data.
+        if (!loaded || loaded.id !== targetChapterId) return;
+        const base = loaded.content;
+        adopted = applyAdoption(base, content, { mode: 'insert', position: base.length });
+        chapterId = targetChapterId;
+      }
+      setEditorContent(adopted);
+      const len = adopted.length;
       setSelectionRequest((current) => ({
         start: len,
         end: len,
         revision: (current?.revision ?? 0) + 1,
       }));
-      if (selectedChapterId) {
+      if (chapterId) {
         apiClient.chapters
-          .updateContent(selectedChapterId, content)
-          .then(() => handleSaved(selectedChapterId, content))
+          .updateContent(chapterId, adopted)
+          .then(() => handleSaved(chapterId, adopted))
           .catch((e) => reportError(e));
       }
     },
-    [handleSaved, reportError, selectedChapterId, setEditorContent],
+    [handleSaved, loadChapterSafely, reportError, selectedChapterId, selectedProjectId, setEditorContent],
   );
 
   // —— 蓝图模块"采用整章" ——
@@ -263,10 +300,10 @@ function Workbench(): JSX.Element {
       setDrawer('resource');
       // 章节 artifact：加载到中间编辑器
       if (artifact.kind === 'chapter' && selectedProjectId) {
-        void loadChapter(selectedProjectId, artifact.id);
+        void loadChapterSafely(selectedProjectId, artifact.id).catch(() => undefined);
       }
     },
-    [loadChapter, selectedProjectId],
+    [loadChapterSafely, selectedProjectId],
   );
 
   // —— 关闭抽屉 ——
@@ -280,9 +317,11 @@ function Workbench(): JSX.Element {
   }, [setChatCollapsed]);
 
   const openReaderMode = useCallback(() => {
-    setDrawer('none');
-    setAppMode('reader');
-  }, []);
+    void flushEditor().then(() => {
+      setDrawer('none');
+      setAppMode('reader');
+    }).catch(() => undefined);
+  }, [flushEditor]);
 
   const [pendingReferenceImport, setPendingReferenceImport] =
     useState<PendingReferenceImport | null>(null);
@@ -562,6 +601,7 @@ function Workbench(): JSX.Element {
             <div className="nwa-editor-board__content">
               {/* 编辑器始终保留；流式状态用可关闭浮层，避免卡在「生成中」整页遮罩。 */}
               <ChapterEditor
+                ref={editorRef}
                 chapter={selectedChapter}
                 contentOverride={editorContent}
                 selectionRequest={selectionRequest}
@@ -651,7 +691,7 @@ function Workbench(): JSX.Element {
             onJumpToArtifact={handleJumpToArtifact}
             onOpenChapter={(chapterId) => {
               if (selectedProjectId) {
-                void loadChapter(selectedProjectId, chapterId);
+                void loadChapterSafely(selectedProjectId, chapterId).catch(() => undefined);
               }
             }}
             pendingReferenceImport={pendingReferenceImport}
