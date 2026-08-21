@@ -44,6 +44,7 @@ interface CreateChapterBody {
 
 interface UpdateContentBody {
   content?: unknown;
+  expectedRevision?: unknown;
 }
 
 interface ReorderBody {
@@ -101,11 +102,21 @@ export function registerChapterRoutes(
     '/api/chapters/:id/content',
     async (request, reply) => {
       try {
-        const { content } = request.body ?? {};
+        const { content, expectedRevision } = request.body ?? {};
         if (typeof content !== 'string') {
           throw ServiceError.validation('章节正文必须为字符串。');
         }
-        const chapter = await chapterService.updateContent(request.params.id, content);
+        if (
+          expectedRevision !== undefined &&
+          (!Number.isInteger(expectedRevision) || (expectedRevision as number) < 0)
+        ) {
+          throw ServiceError.validation('expectedRevision 必须为非负整数。');
+        }
+        const chapter = await chapterService.updateContent(
+          request.params.id,
+          content,
+          expectedRevision as number | undefined,
+        );
         return await reply.code(200).send(chapter);
       } catch (err) {
         const { status, body } = toErrorResponse(err);

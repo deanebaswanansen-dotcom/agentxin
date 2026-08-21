@@ -19,6 +19,7 @@
  * 并在缺失时抛出 `NOT_FOUND`，避免触达存储层的前置条件守卫。
  */
 import type { DataStore } from '../../store/DataStore.js';
+import { ChapterRevisionConflictError } from '../../store/ChapterRevisionConflictError.js';
 import type { Chapter, Id } from '../../types/index.js';
 import { ServiceError } from '../ServiceError.js';
 
@@ -69,9 +70,18 @@ export class ChapterService {
    * 更新某章节的正文内容并持久化（Requirement 2.3）。
    * 章节不存在时返回 `NOT_FOUND`（Requirement 2.6）。
    */
-  async updateContent(id: Id, content: string): Promise<Chapter> {
+  async updateContent(id: Id, content: string, expectedRevision?: number): Promise<Chapter> {
     await this.ensureChapterExists(id);
-    return this.store.updateChapterContent(id, content);
+    try {
+      return await this.store.updateChapterContent(id, content, expectedRevision);
+    } catch (error) {
+      if (error instanceof ChapterRevisionConflictError) {
+        throw ServiceError.conflict(
+          '章节已在别处更新，请重新打开章节后再保存；当前未保存正文仍保留在编辑器中。',
+        );
+      }
+      throw error;
+    }
   }
 
   /**

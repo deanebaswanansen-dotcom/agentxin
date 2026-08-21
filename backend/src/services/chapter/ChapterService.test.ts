@@ -76,6 +76,14 @@ describe('ChapterService', () => {
     expect(reread[0].content).toBe('正文内容');
   });
 
+  it('maps stale chapter revisions to a CONFLICT service error', async () => {
+    const chapter = await service.create(projectId, '第一章');
+    await service.updateContent(chapter.id, '第一版', 0);
+    await expect(service.updateContent(chapter.id, '过期覆盖', 0)).rejects.toMatchObject({
+      code: 'CONFLICT',
+    });
+  });
+
   it('returns NOT_FOUND when updating content of a missing chapter (Req 2.6)', async () => {
     await expect(
       service.updateContent('missing-chapter', 'x'),

@@ -24,13 +24,20 @@ function makeChapter(overrides: Partial<Chapter> = {}): Chapter {
     title: '第一章',
     content: '初始正文内容',
     position: 0,
+    revision: 0,
     ...overrides,
   };
 }
 
 /** Build a mock client whose `updateContent` records calls. */
 function makeClient(
-  updateContent: (id: Id, content: string) => Promise<void> = () => Promise.resolve(),
+  updateContent: (
+    id: Id,
+    content: string,
+    expectedRevision?: number,
+  ) => Promise<Chapter> = (id, content, expectedRevision = 0) => Promise.resolve(
+    makeChapter({ id, content, revision: expectedRevision + 1 }),
+  ),
 ): ChapterEditorClient {
   return {
     chapters: {
@@ -73,9 +80,9 @@ describe('ChapterEditor', () => {
     fireEvent.click(screen.getByRole('button', { name: '保存' }));
 
     await waitFor(() => {
-      expect(client.chapters.updateContent).toHaveBeenCalledWith('ch-1', '修改后的正文');
+      expect(client.chapters.updateContent).toHaveBeenCalledWith('ch-1', '修改后的正文', 0);
     });
-    expect(onSaved).toHaveBeenCalledWith('ch-1', '修改后的正文');
+    expect(onSaved).toHaveBeenCalledWith('ch-1', '修改后的正文', 1);
   });
 
   it('saves via Ctrl+S keyboard shortcut', async () => {
@@ -87,7 +94,7 @@ describe('ChapterEditor', () => {
     fireEvent.keyDown(textarea, { key: 's', ctrlKey: true });
 
     await waitFor(() => {
-      expect(client.chapters.updateContent).toHaveBeenCalledWith('ch-1', '快捷键保存');
+      expect(client.chapters.updateContent).toHaveBeenCalledWith('ch-1', '快捷键保存', 0);
     });
   });
 
@@ -135,13 +142,42 @@ describe('ChapterEditor', () => {
     expect(screen.getByText('未保存')).toBeInTheDocument();
   });
 
+  it('keeps the same revision and unsaved text after a conflict so retry is safe', async () => {
+    const conflict = Object.assign(new Error('版本冲突'), { code: 'CONFLICT' });
+    const updateContent = vi.fn()
+      .mockRejectedValueOnce(conflict)
+      .mockResolvedValueOnce(makeChapter({ content: '不能丢失的修改', revision: 1 }));
+    const client = makeClient(updateContent);
+    const ref = createRef<ChapterEditorHandle>();
+    render(<ChapterEditor ref={ref} chapter={makeChapter()} client={client} />);
+
+    fireEvent.change(screen.getByRole('textbox', { name: '章节正文' }), {
+      target: { value: '不能丢失的修改' },
+    });
+    await act(async () => {
+      await expect(ref.current!.saveIfDirty()).rejects.toBe(conflict);
+    });
+    expect(screen.getByRole('textbox', { name: '章节正文' })).toHaveValue('不能丢失的修改');
+    expect(screen.getByText('未保存')).toBeInTheDocument();
+
+    await act(async () => {
+      await ref.current!.saveIfDirty();
+    });
+    expect(updateContent.mock.calls).toEqual([
+      ['ch-1', '不能丢失的修改', 0],
+      ['ch-1', '不能丢失的修改', 0],
+    ]);
+  });
+
   it('waits for an in-flight save and then persists edits made during it', async () => {
-    let resolveFirst!: () => void;
-    const firstRequest = new Promise<void>((resolve) => {
+    let resolveFirst!: (chapter: Chapter) => void;
+    const firstRequest = new Promise<Chapter>((resolve) => {
       resolveFirst = resolve;
     });
-    const updateContent = vi.fn((_id: Id, content: string) => (
-      content === '第一版' ? firstRequest : Promise.resolve()
+    const updateContent = vi.fn((id: Id, content: string, expectedRevision = 0) => (
+      content === '第一版'
+        ? firstRequest
+        : Promise.resolve(makeChapter({ id, content, revision: expectedRevision + 1 }))
     ));
     const client = makeClient(updateContent);
     const ref = createRef<ChapterEditorHandle>();
@@ -154,7 +190,7 @@ describe('ChapterEditor', () => {
       firstSave = ref.current!.saveIfDirty();
     });
     await waitFor(() => {
-      expect(updateContent).toHaveBeenCalledWith('ch-1', '第一版');
+      expect(updateContent).toHaveBeenCalledWith('ch-1', '第一版', 0);
     });
 
     fireEvent.change(textarea, { target: { value: '保存期间写下的最新版' } });
@@ -163,13 +199,13 @@ describe('ChapterEditor', () => {
       navigationFlush = ref.current!.saveIfDirty();
     });
     await act(async () => {
-      resolveFirst();
+      resolveFirst(makeChapter({ content: '第一版', revision: 1 }));
       await Promise.all([firstSave, navigationFlush]);
     });
 
     expect(updateContent.mock.calls).toEqual([
-      ['ch-1', '第一版'],
-      ['ch-1', '保存期间写下的最新版'],
+      ['ch-1', '第一版', 0],
+      ['ch-1', '保存期间写下的最新版', 1],
     ]);
     expect(screen.queryByText('未保存')).not.toBeInTheDocument();
   });

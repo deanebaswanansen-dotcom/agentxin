@@ -77,8 +77,8 @@ export interface ChapterEditorProps {
    * state. A change in `chapter.id` reloads the editor content (Requirement 8.3).
    */
   chapter: Chapter | null;
-  /** Invoked after a successful save with the saved chapter id and content. */
-  onSaved?: (chapterId: Id, content: string) => void;
+  /** Invoked after a successful save with the saved chapter id, content and revision. */
+  onSaved?: (chapterId: Id, content: string, revision?: number) => void;
   /** Invoked when the user clicks the close (X) button. */
   onClose?: () => void;
   /** Invoked with the next content on each edit (for mirroring/composition). */
@@ -335,6 +335,7 @@ function ChapterEditorInner(
   const contentRef = useRef(content);
   const historyRef = useRef<EditorHistory>({ past: [], future: [] });
   const lastSavedContentRef = useRef(chapter?.content ?? '');
+  const lastSavedRevisionRef = useRef(chapter?.revision ?? 0);
   const saveInFlightRef = useRef<Promise<void> | null>(null);
   // Set when the selected chapter changes, so the layout effect below knows to
   // reset scroll/caret to the top *after* the new content is committed to the
@@ -357,6 +358,7 @@ function ChapterEditorInner(
     const next = chapter?.content ?? '';
     contentRef.current = next;
     lastSavedContentRef.current = next;
+    lastSavedRevisionRef.current = chapter?.revision ?? 0;
     setContentState(next);
     setDirty(false);
     setSnapshotModalOpen(false);
@@ -608,7 +610,15 @@ function ChapterEditorInner(
 
       const selectedChapter = chapter?.id === targetChapterId ? chapter : null;
       const request = (async () => {
-        await client.chapters.updateContent(targetChapterId, current);
+        const expectedRevision = lastSavedRevisionRef.current;
+        const saved = await client.chapters.updateContent(
+          targetChapterId,
+          current,
+          expectedRevision,
+        );
+        // Real API responses always include the incremented revision. The
+        // fallback keeps lightweight injected/legacy clients usable in tests.
+        const savedRevision = saved?.revision ?? expectedRevision;
         if (selectedChapter !== null && previousSavedContent !== current) {
           saveChapterSnapshot(
             { id: selectedChapter.id, title: selectedChapter.title, content: previousSavedContent },
@@ -618,9 +628,10 @@ function ChapterEditorInner(
         }
         if (chapterIdRef.current === targetChapterId) {
           lastSavedContentRef.current = current;
+          lastSavedRevisionRef.current = savedRevision;
           setDirty(contentRef.current !== current);
         }
-        onSaved?.(targetChapterId, current);
+        onSaved?.(targetChapterId, current, savedRevision);
       })();
 
       saveInFlightRef.current = request;

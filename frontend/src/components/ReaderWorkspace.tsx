@@ -54,7 +54,7 @@ export interface ReaderWorkspaceProps {
   onOpenAgentMode: () => void;
   onError?: (error: unknown) => void;
   onProjectCreated?: (projectId: Id) => void;
-  onChapterUpdated?: (chapterId: Id, content: string) => void;
+  onChapterUpdated?: (chapterId: Id, content: string, revision?: number) => void;
   /**
    * 将文本书送去 Agent 对话做「参考小说分析」：
    * 父组件应切到 agent 模式并把 text 交给 ChatWorkspace 导入。
@@ -121,6 +121,7 @@ function buildProjectBook(projectId: Id, projectName: string | undefined, chapte
     chapters: sorted.map((chapter, index) => ({
       id: `project-chapter-${chapter.id}`,
       backendChapterId: chapter.id,
+      backendRevision: chapter.revision ?? 0,
       title: chapter.title,
       content: chapter.content,
       position: index,
@@ -133,12 +134,19 @@ function currentChapterOf(book: ReaderBook | null, index: number): ReaderChapter
   return book.chapters[Math.min(Math.max(0, index), book.chapters.length - 1)] ?? null;
 }
 
-function replaceChapter(book: ReaderBook, chapterId: string, content: string): ReaderBook {
+function replaceChapter(
+  book: ReaderBook,
+  chapterId: string,
+  content: string,
+  backendRevision?: number,
+): ReaderBook {
   return {
     ...book,
     updatedAt: new Date().toISOString(),
     chapters: book.chapters.map((chapter) => (
-      chapter.id === chapterId ? { ...chapter, content } : chapter
+      chapter.id === chapterId
+        ? { ...chapter, content, backendRevision: backendRevision ?? chapter.backendRevision }
+        : chapter
     )),
   };
 }
@@ -737,11 +745,18 @@ export function ReaderWorkspace({
 
     try {
       if (activeSource?.kind === 'project' && activeChapter.backendChapterId) {
-        await client.chapters.updateContent(activeChapter.backendChapterId, nextContent);
-        onChapterUpdated?.(activeChapter.backendChapterId, nextContent);
+        const saved = await client.chapters.updateContent(
+          activeChapter.backendChapterId,
+          nextContent,
+          activeChapter.backendRevision ?? 0,
+        );
+        onChapterUpdated?.(activeChapter.backendChapterId, nextContent, saved.revision);
+        const nextBook = replaceChapter(activeBook, activeChapter.id, nextContent, saved.revision);
+        await updateActiveBook(nextBook);
+      } else {
+        const nextBook = replaceChapter(activeBook, activeChapter.id, nextContent);
+        await updateActiveBook(nextBook);
       }
-      const nextBook = replaceChapter(activeBook, activeChapter.id, nextContent);
-      await updateActiveBook(nextBook);
       setSelectedText('');
       setRewriteCandidate('');
       setStatus('已应用到当前书。');

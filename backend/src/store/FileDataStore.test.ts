@@ -115,7 +115,7 @@ describe('FileDataStore project operations', () => {
     const persisted = JSON.parse(await readFile(file, 'utf8'));
     expect(persisted.projects.map((p: { id: string }) => p.id)).toEqual([keep.id]);
     expect(persisted.chapters).toEqual([
-      { id: 'c2', projectId: keep.id, title: 't', content: '', position: 0 },
+      { id: 'c2', projectId: keep.id, title: 't', content: '', position: 0, revision: 0 },
     ]);
     expect(persisted.characters).toEqual([]);
     expect(persisted.worldSettings).toEqual([]);
@@ -138,6 +138,7 @@ describe('FileDataStore chapter operations', () => {
     expect(c1.title).toBe('第一章');
     expect(c1.content).toBe('');
     expect(c1.position).toBe(0);
+    expect(c1.revision).toBe(0);
     expect(c2.position).toBe(1);
     expect(c1.id).not.toBe(c2.id);
   });
@@ -196,11 +197,31 @@ describe('FileDataStore chapter operations', () => {
     const content = '第一行\n  含空白与特殊字符 <>&"\t末尾';
     const updated = await store.updateChapterContent(created.id, content);
     expect(updated.content).toBe(content);
+    expect(updated.revision).toBe(1);
 
     // Reload from disk to confirm persistence.
     const reloaded = await FileDataStore.create(file);
     const fetched = await reloaded.getChapter(created.id);
     expect(fetched?.content).toBe(content);
+    expect(fetched?.revision).toBe(1);
+  });
+
+  it('rejects stale expected revisions without changing persisted content', async () => {
+    const store = await FileDataStore.create(file);
+    const project = await store.createProject('p');
+    const created = await store.createChapter(project.id, 't');
+
+    const first = await store.updateChapterContent(created.id, '第一版', 0);
+    expect(first.revision).toBe(1);
+    await expect(store.updateChapterContent(created.id, '过期覆盖', 0)).rejects.toMatchObject({
+      name: 'ChapterRevisionConflictError',
+      expectedRevision: 0,
+      actualRevision: 1,
+    });
+    await expect(store.getChapter(created.id)).resolves.toMatchObject({
+      content: '第一版',
+      revision: 1,
+    });
   });
 
   it('updateChapterContent throws (defensive guard) for a non-existent id', async () => {
@@ -277,6 +298,17 @@ describe('FileDataStore storage engine', () => {
     await expect(store.getProject('legacy')).resolves.toMatchObject({ kind: 'novel' });
     const migrated = JSON.parse(await readFile(file, 'utf8'));
     expect(migrated.projects[0].kind).toBe('novel');
+  });
+
+  it('migrates legacy chapters without revisions to revision zero on load', async () => {
+    await writeFile(file, JSON.stringify({
+      chapters: [{ id: 'legacy-c', projectId: 'p', title: '旧章', content: '正文', position: 0 }],
+    }), 'utf8');
+
+    const store = await FileDataStore.create(file);
+    await expect(store.getChapter('legacy-c')).resolves.toMatchObject({ revision: 0 });
+    const migrated = JSON.parse(await readFile(file, 'utf8'));
+    expect(migrated.chapters[0].revision).toBe(0);
   });
 
   it('throws StoreError when the data file contains invalid JSON', async () => {

@@ -1579,7 +1579,12 @@ export interface ApiClient {
   chapters: {
     list(projectId: Id, signal?: AbortSignal): Promise<Chapter[]>;
     create(projectId: Id, title: string, signal?: AbortSignal): Promise<{ id: Id }>;
-    updateContent(id: Id, content: string, signal?: AbortSignal): Promise<void>;
+    updateContent(
+      id: Id,
+      content: string,
+      expectedRevision?: number,
+      signal?: AbortSignal,
+    ): Promise<Chapter>;
     rename(id: Id, title: string, signal?: AbortSignal): Promise<Chapter>;
     remove(id: Id, signal?: AbortSignal): Promise<void>;
     reorder(projectId: Id, orderedIds: Id[], signal?: AbortSignal): Promise<void>;
@@ -1858,8 +1863,14 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
         request(b, 'GET', `/projects/${seg(projectId)}/chapters`, undefined, { signal }),
       create: (projectId, title, signal) =>
         request(b, 'POST', `/projects/${seg(projectId)}/chapters`, { title }, { signal }),
-      updateContent: (id, content, signal) =>
-        request(b, 'PATCH', `/chapters/${seg(id)}/content`, { content }, { signal }),
+      updateContent: (id, content, expectedRevision, signal) =>
+        request(
+          b,
+          'PATCH',
+          `/chapters/${seg(id)}/content`,
+          expectedRevision === undefined ? { content } : { content, expectedRevision },
+          { signal },
+        ),
       rename: (id, title, signal) =>
         request(b, 'PATCH', `/chapters/${seg(id)}`, { title }, { signal }),
       remove: (id, signal) => request(b, 'DELETE', `/chapters/${seg(id)}`, undefined, { signal }),

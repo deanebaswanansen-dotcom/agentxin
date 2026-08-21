@@ -107,6 +107,31 @@ describe('chapterRoutes', () => {
     });
     expect(res.statusCode).toBe(200);
     expect(res.json<Chapter>().content).toBe('正文内容');
+    expect(res.json<Chapter>().revision).toBe(1);
+  });
+
+  it('PATCH rejects a stale expectedRevision with 409 without overwriting content', async () => {
+    const created = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${projectId}/chapters`,
+      payload: { title: '第一章' },
+    });
+    const { id } = created.json<Chapter>();
+    await app.inject({
+      method: 'PATCH',
+      url: `/api/chapters/${id}/content`,
+      payload: { content: '第一版', expectedRevision: 0 },
+    });
+
+    const stale = await app.inject({
+      method: 'PATCH',
+      url: `/api/chapters/${id}/content`,
+      payload: { content: '过期覆盖', expectedRevision: 0 },
+    });
+    expect(stale.statusCode).toBe(409);
+    expect(stale.json().error.code).toBe('CONFLICT');
+    const chapters = await store.listChapters(projectId);
+    expect(chapters[0]).toMatchObject({ content: '第一版', revision: 1 });
   });
 
   it('PATCH content of a missing chapter returns 404 (Req 2.6)', async () => {
@@ -117,6 +142,16 @@ describe('chapterRoutes', () => {
     });
     expect(res.statusCode).toBe(404);
     expect(res.json().error.code).toBe('NOT_FOUND');
+  });
+
+  it('PATCH rejects an invalid expectedRevision with 400', async () => {
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/api/chapters/anything/content',
+      payload: { content: 'x', expectedRevision: -1 },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe('VALIDATION_ERROR');
   });
 
   it('DELETE removes a chapter and returns 204 (Req 2.4)', async () => {
