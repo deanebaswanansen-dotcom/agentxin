@@ -79,20 +79,18 @@ export class ModelConfigService {
    * (Requirement 4.2). The API key is always masked — its raw value is never
    * present in the result (Requirement 5.6 / Property 15).
    *
-   * When no configuration has been saved, returns an empty view
-   * (`baseUrl`/`modelName`/`apiKeyMasked` all empty) so the settings UI has a
-   * well-formed object to render.
+   * When no configuration has been saved, or stored config is disabled
+   * (`allowStoredConfig !== true`), returns an empty view
+   * (`baseUrl`/`modelName`/`apiKeyMasked` all empty) so leftover disk keys are
+   * never exposed.
    */
   async getView(): Promise<ModelConfigView> {
+    if (this.options.allowStoredConfig !== true) {
+      return emptyModelConfigView();
+    }
     const config = await this.store.getModelConfig();
     if (config === undefined) {
-      return {
-        baseUrl: '',
-        modelName: '',
-        apiKeyMasked: '',
-        temperature: DEFAULT_TEMPERATURE,
-        topP: DEFAULT_TOP_P,
-      };
+      return emptyModelConfigView();
     }
     return toView(config);
   }
@@ -137,6 +135,16 @@ function assertOptionalNumberRange(
   if (!Number.isFinite(value) || value < min || value > max) {
     throw ServiceError.validation(`模型配置的 ${label} 必须在 ${min} 到 ${max} 之间`);
   }
+}
+
+function emptyModelConfigView(): ModelConfigView {
+  return {
+    baseUrl: '',
+    modelName: '',
+    apiKeyMasked: '',
+    temperature: DEFAULT_TEMPERATURE,
+    topP: DEFAULT_TOP_P,
+  };
 }
 
 /** Build the masked outward-facing view from a full config. */

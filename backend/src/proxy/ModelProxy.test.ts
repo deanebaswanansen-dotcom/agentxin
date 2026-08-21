@@ -17,7 +17,7 @@
  *   thrown `ProxyError`'s `message`/`stack`.
  */
 
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 
 import { OpenAiCompatibleModelProxy, assertPublicModelBaseUrl } from './ModelProxy.js';
 import { ProxyError, isProxyError } from './ProxyError.js';
@@ -77,14 +77,52 @@ afterEach(() => {
 });
 
 describe('assertPublicModelBaseUrl', () => {
+  const previousAllowPrivate = process.env.ALLOW_PRIVATE_MODEL_URLS;
+
+  beforeEach(() => {
+    delete process.env.ALLOW_PRIVATE_MODEL_URLS;
+  });
+
+  afterEach(() => {
+    if (previousAllowPrivate === undefined) {
+      delete process.env.ALLOW_PRIVATE_MODEL_URLS;
+    } else {
+      process.env.ALLOW_PRIVATE_MODEL_URLS = previousAllowPrivate;
+    }
+  });
+
   it('rejects loopback and link-local model endpoints', () => {
     expect(() => assertPublicModelBaseUrl('http://127.0.0.1:11434')).toThrow(/本机|内网/);
     expect(() => assertPublicModelBaseUrl('http://169.254.169.254/latest')).toThrow(/本机|内网/);
     expect(() => assertPublicModelBaseUrl('http://localhost:3000')).toThrow(/本机|内网/);
+    expect(() => assertPublicModelBaseUrl('http://10.1.2.3')).toThrow(/本机|内网/);
+    expect(() => assertPublicModelBaseUrl('http://192.168.0.10')).toThrow(/本机|内网/);
+    expect(() => assertPublicModelBaseUrl('http://172.16.0.1')).toThrow(/本机|内网/);
+    expect(() => assertPublicModelBaseUrl('http://[::1]')).toThrow(/本机|内网/);
+  });
+
+  it('rejects IPv4-mapped IPv6 loopback', () => {
+    expect(() => assertPublicModelBaseUrl('http://[::ffff:127.0.0.1]')).toThrow(/本机|内网/);
+    expect(() => assertPublicModelBaseUrl('http://[::ffff:7f00:1]')).toThrow(/本机|内网/);
+    expect(() => assertPublicModelBaseUrl('http://::ffff:127.0.0.1')).toThrow(/本机|内网/);
+  });
+
+  it('rejects CGNAT, Aliyun metadata, and cloud metadata hostnames', () => {
+    expect(() => assertPublicModelBaseUrl('http://100.100.100.200')).toThrow(/本机|内网/);
+    expect(() => assertPublicModelBaseUrl('http://100.64.0.1')).toThrow(/本机|内网/);
+    expect(() => assertPublicModelBaseUrl('http://metadata.google.internal')).toThrow(/本机|内网/);
+    expect(() => assertPublicModelBaseUrl('http://metadata.internal')).toThrow(/本机|内网/);
+    expect(() => assertPublicModelBaseUrl('http://instance-data')).toThrow(/本机|内网/);
   });
 
   it('allows public https providers', () => {
     expect(() => assertPublicModelBaseUrl('https://api.deepseek.com')).not.toThrow();
+    expect(() => assertPublicModelBaseUrl('https://api.openai.com/v1')).not.toThrow();
+  });
+
+  it('allows private URLs when ALLOW_PRIVATE_MODEL_URLS=1', () => {
+    process.env.ALLOW_PRIVATE_MODEL_URLS = '1';
+    expect(() => assertPublicModelBaseUrl('http://127.0.0.1:11434')).not.toThrow();
   });
 });
 
@@ -101,6 +139,7 @@ describe('OpenAiCompatibleModelProxy request shape', () => {
 
     expect(url).toBe('https://provider.example.com/v1/chat/completions');
     expect(init.method).toBe('POST');
+    expect(init.redirect).toBe('error');
 
     const headers = init.headers as Record<string, string>;
     expect(headers.Authorization).toBe(`Bearer ${API_KEY}`);

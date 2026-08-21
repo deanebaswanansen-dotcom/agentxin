@@ -169,6 +169,26 @@ function parseRewriteBody(raw: unknown): RewriteSceneBody {
 }
 
 /**
+ * Routes that carry both `:id` (project) and `:chapterId` must not operate on a
+ * chapter that belongs to another project. The frontend currently posts
+ * `/projects/_/chapters/:chapterId/blueprint`; `_` is the documented placeholder
+ * and is not treated as a project id.
+ */
+async function assertChapterBelongsToProject(
+  store: DataStore,
+  projectId: Id,
+  chapterId: Id,
+): Promise<void> {
+  if (projectId === '_') {
+    return;
+  }
+  const chapter = await store.getChapter(chapterId);
+  if (!chapter || chapter.projectId !== projectId) {
+    throw ServiceError.notFound(`章节不存在：${chapterId}`);
+  }
+}
+
+/**
  * 单场景流式 SSE 处理器（分场景写作 / 扩写 / 重写共用，需求 6 / 11 / 12）。
  *
  * 严格沿用 `writingRoutes.ts` 的 SSE 模式：
@@ -240,7 +260,11 @@ async function runSceneStream(
     }
 
     // 仅当流正常结束且未被中止时持久化完整场景正文（需求 6.8 / 11.5 / 12.3）。
+    // 空 / 纯空白正文不得落盘空草稿，改为 error 帧，不发 done。
     if (!controller.signal.aborted) {
+      if (fullText.trim().length === 0) {
+        throw ServiceError.validation('场景正文为空，未写入草稿。');
+      }
       await finalize(fullText);
     }
 
@@ -310,6 +334,11 @@ export function registerBlueprintRoutes(
       };
       reply.raw.on('close', onClose);
       try {
+        await assertChapterBelongsToProject(
+          store,
+          request.params.id,
+          request.params.chapterId,
+        );
         const blueprint = await blueprintService.generate(
           request.params.chapterId,
           request.body as GenerateBlueprintBody,

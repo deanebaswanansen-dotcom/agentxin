@@ -138,6 +138,27 @@ describe('MemoryService', () => {
     expect(svc.get('p2').facts).toHaveLength(0);
   });
 
+  it('clearProject drops all memory for that project only', async () => {
+    const { svc } = await service();
+    await svc.recordFacts('p1', [{ kind: 'plot', text: 'A 项目剧情' }]);
+    await svc.appendChapterSummary('p1', { chapterId: 'c1', title: '第1章', summary: '开端' });
+    await svc.recordFacts('p2', [{ kind: 'plot', text: 'B 项目剧情' }]);
+    await svc.clearProject('p1');
+    expect(svc.get('p1').facts).toHaveLength(0);
+    expect(svc.get('p1').summaries).toHaveLength(0);
+    expect(svc.get('p2').facts).toHaveLength(1);
+  });
+
+  it('removeChapterSummary drops only that chapter summary', async () => {
+    const { svc } = await service();
+    await svc.appendChapterSummary('p1', { chapterId: 'c1', title: '第1章', summary: '开端' });
+    await svc.appendChapterSummary('p1', { chapterId: 'c2', title: '第2章', summary: '发展' });
+    await svc.recordFacts('p1', [{ kind: 'plot', text: '主线推进' }]);
+    await svc.removeChapterSummary('p1', 'c1');
+    expect(svc.get('p1').summaries.map((item) => item.chapterId)).toEqual(['c2']);
+    expect(svc.get('p1').facts).toHaveLength(1);
+  });
+
   it('ephemeral store does not write to disk', async () => {
     const svc = new MemoryService(MemoryStore.ephemeral());
     await svc.recordFacts('p1', [{ kind: 'world', text: '内存态' }]);

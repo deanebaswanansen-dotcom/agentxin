@@ -13,6 +13,9 @@ import {
   normalizeLongNovelTotalWords,
   longNovelBatchLimit,
   remainingLongNovelBatch,
+  nextLongNovelChapterNumber,
+  countCompletedLongNovelChapters,
+  parseLongNovelChapterNumber,
   parseCharacterProfiles,
   parseReflection,
   revisionDoesNotWorsenWordRange,
@@ -111,6 +114,16 @@ class CaptureProxy implements ModelProxy {
     } else if (system.includes('正文写作子 Agent')) {
       this.chapterSystems.push(system);
       text = '# 正文\n\n洛言继续推进代码御剑主线。';
+    } else if (system.includes('「检测子 Agent」')) {
+      text = JSON.stringify({
+        score0to100: 90,
+        verdict: 'pass',
+        plotCoherence: '连续',
+        fatalIssues: [],
+        earlyCharacterStatus: [],
+        recommendRevision: false,
+        revisionHints: [],
+      });
     } else if (system.includes('反思子 Agent')) {
       text = JSON.stringify({
         summary: '洛言推进代码御剑主线',
@@ -171,6 +184,45 @@ describe('normalizeFullNovelOptions', () => {
     expect(remainingLongNovelBatch(3, 2, 3)).toBe(1);
     expect(remainingLongNovelBatch(3, 3, 3)).toBe(0);
     expect(remainingLongNovelBatch(3, 1, 10)).toBe(3);
+  });
+
+  it('numbers the next chapter from max 第N章, not from completed count', () => {
+    const chapters = [
+      { id: 'c1', title: '第1章 开篇', content: '正文一' },
+      { id: 'c2', title: '第2章', content: '正文二' },
+      { id: 'c5', title: '第5章 跃迁', content: '正文五' },
+    ];
+    const flagsOf = () => ({ rejected: false, hasSummary: true });
+    expect(parseLongNovelChapterNumber('第5章 跃迁')).toBe(5);
+    expect(countCompletedLongNovelChapters(chapters, flagsOf)).toBe(3);
+    expect(nextLongNovelChapterNumber(chapters, flagsOf)).toBe(6);
+  });
+
+  it('retries the lowest rejected chapter instead of skipping it as a numbering hole', () => {
+    const chapters = [
+      { id: 'c1', title: '第1章', content: '正文一' },
+      { id: 'c2', title: '第2章', content: '旧稿' },
+      { id: 'c3', title: '第3章', content: '正文三' },
+    ];
+    const flagsOf = (chapter: { id: string }) => ({
+      rejected: chapter.id === 'c2',
+      hasSummary: chapter.id !== 'c2',
+    });
+    expect(countCompletedLongNovelChapters(chapters, flagsOf)).toBe(2);
+    expect(nextLongNovelChapterNumber(chapters, flagsOf)).toBe(2);
+  });
+
+  it('does not treat uninspected content as completed', () => {
+    const chapters = [
+      { id: 'c1', title: '第1章', content: '正文一' },
+      { id: 'c2', title: '第2章', content: '待审查正文' },
+    ];
+    const flagsOf = (chapter: { id: string }) => ({
+      rejected: false,
+      hasSummary: chapter.id === 'c1',
+    });
+    expect(countCompletedLongNovelChapters(chapters, flagsOf)).toBe(1);
+    expect(nextLongNovelChapterNumber(chapters, flagsOf)).toBe(2);
   });
 
   it('caps every autonomous long-novel batch at five chapters', () => {
@@ -1279,6 +1331,168 @@ describe('normalizeFullNovelOptions', () => {
     // 第 2 章写作时应回灌第 1 章埋下的伏笔
     expect(proxy.chapterSystems[1]).toContain('伏笔台账');
     expect(proxy.chapterSystems[1]).toContain('热数据坟场');
+  });
+
+  it('resumes after 第1/第2/第5章 by writing 第6章 instead of filling a count-based hole', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-number-max-'));
+    const store = await FileDataStore.create(join(tempDir, 'store.json'));
+    await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock-model' });
+    const memory = new MemoryService(await MemoryStore.create(join(tempDir, 'memory.json')));
+    const project = await store.createProject('编号续写', 'novel');
+    for (const title of ['第1章', '第2章', '第5章']) {
+      const chapter = await store.createChapter(project.id, title);
+      await store.updateChapterContent(chapter.id, `${title}已完成正文。他说：“继续。”真正的危险才刚刚开始。`.repeat(8));
+      await memory.appendChapterSummary(project.id, {
+        chapterId: chapter.id,
+        title,
+        summary: `${title}已完成。`,
+      });
+    }
+    const proxy = new CaptureProxy();
+    const orchestrator = new AgentOrchestrator(
+      store,
+      new ModelConfigService(store),
+      proxy,
+      undefined as never,
+      undefined as never,
+      memory,
+    );
+
+    await orchestrator.run(
+      {
+        task: 'long_novel',
+        mode: 'draft',
+        prompt: '代码御剑长篇',
+        projectId: project.id,
+        options: { chapters: 1, totalChapters: 10, targetWords: 500, automationLevel: 'semi_auto' },
+      },
+      new AbortController().signal,
+    );
+
+    const titles = (await store.listChapters(project.id)).map((chapter) => chapter.title);
+    expect(titles).toContain('第6章');
+    expect(titles.filter((title) => title === '第5章')).toHaveLength(1);
+    expect(titles.some((title) => title === '第3章' || title === '第4章')).toBe(false);
+  });
+
+  it('rewrites a rejected chapter in place instead of duplicating a later title', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-rejected-hole-'));
+    const store = await FileDataStore.create(join(tempDir, 'store.json'));
+    await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock-model' });
+    const memory = new MemoryService(await MemoryStore.create(join(tempDir, 'memory.json')));
+    const project = await store.createProject('拦截续写', 'novel');
+    const first = await store.createChapter(project.id, '第1章');
+    await store.updateChapterContent(first.id, '第一章正文。他说：“跟我来。”真正的危险才刚刚开始。'.repeat(8));
+    await memory.appendChapterSummary(project.id, {
+      chapterId: first.id,
+      title: '第1章',
+      summary: '开篇完成。',
+    });
+    const rejected = await store.createChapter(project.id, '第2章');
+    await store.updateChapterContent(rejected.id, 'OLD REJECTED DRAFT 不得复用。');
+    await memory.markChapterRejected(project.id, rejected.id);
+    const third = await store.createChapter(project.id, '第3章');
+    await store.updateChapterContent(third.id, '第三章正文。他说：“结束了。”真正的危险才刚刚开始。'.repeat(8));
+    await memory.appendChapterSummary(project.id, {
+      chapterId: third.id,
+      title: '第3章',
+      summary: '收束完成。',
+    });
+    const proxy = new CaptureProxy();
+    const orchestrator = new AgentOrchestrator(
+      store,
+      new ModelConfigService(store),
+      proxy,
+      undefined as never,
+      undefined as never,
+      memory,
+    );
+
+    await orchestrator.run(
+      {
+        task: 'long_novel',
+        mode: 'draft',
+        prompt: '代码御剑长篇',
+        projectId: project.id,
+        options: { chapters: 5, totalChapters: 3, targetWords: 500, automationLevel: 'semi_auto' },
+      },
+      new AbortController().signal,
+    );
+
+    const chapters = await store.listChapters(project.id);
+    expect(chapters.map((chapter) => chapter.title)).toEqual(['第1章', '第2章', '第3章']);
+    expect(chapters[1]?.content).not.toContain('OLD REJECTED DRAFT');
+    expect(chapters[1]?.content).toContain('洛言继续推进代码御剑主线');
+    expect(memory.isChapterRejected(project.id, rejected.id)).toBe(false);
+  });
+
+  it('does not commit a chapter when inspector output is unusable, then re-inspects it', async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-inspect-unavailable-'));
+    const store = await FileDataStore.create(join(tempDir, 'store.json'));
+    await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock-model' });
+    const memory = new MemoryService(await MemoryStore.create(join(tempDir, 'memory.json')));
+    const proxy = new CaptureProxy();
+    const original = proxy.streamCompletion.bind(proxy);
+    let inspectWithJson = false;
+    let writerCalls = 0;
+    let inspectorCalls = 0;
+    proxy.streamCompletion = (config, messages, signal, options) => {
+      const system = messages[0]?.content ?? '';
+      if (system.includes('正文写作子 Agent')) writerCalls += 1;
+      if (system.includes('检测子 Agent')) {
+        inspectorCalls += 1;
+        if (!inspectWithJson) {
+          return (async function* () {
+            yield { kind: 'content' as const, text: '这不是 JSON，也没有分数。' };
+          })();
+        }
+      }
+      return original(config, messages, signal, options);
+    };
+    const orchestrator = new AgentOrchestrator(
+      store,
+      new ModelConfigService(store),
+      proxy,
+      undefined as never,
+      undefined as never,
+      memory,
+    );
+
+    const first = await orchestrator.run(
+      {
+        task: 'long_novel',
+        mode: 'draft',
+        prompt: '旧城悬疑长篇',
+        options: { chapters: 2, totalChapters: 2, targetWords: 500, automationLevel: 'semi_auto' },
+      },
+      new AbortController().signal,
+    );
+    const afterFirst = await store.listChapters(first.projectId);
+    expect(first.summary).toContain('审校暂不可用');
+    expect(afterFirst).toHaveLength(1);
+    expect(afterFirst[0]?.content.trim().length).toBeGreaterThan(0);
+    expect(memory.get(first.projectId).summaries).toEqual([]);
+    expect(memory.get(first.projectId).rejectedChapterIds).toEqual([]);
+    expect(writerCalls).toBe(1);
+    expect(inspectorCalls).toBe(1);
+
+    inspectWithJson = true;
+    const resumed = await orchestrator.run(
+      {
+        task: 'long_novel',
+        mode: 'draft',
+        prompt: '旧城悬疑长篇',
+        projectId: first.projectId,
+        options: { chapters: 2, totalChapters: 2, targetWords: 500, automationLevel: 'semi_auto' },
+      },
+      new AbortController().signal,
+    );
+    const afterResume = await store.listChapters(first.projectId);
+    expect(writerCalls).toBe(2);
+    expect(inspectorCalls).toBeGreaterThan(1);
+    expect(memory.get(first.projectId).summaries.map((item) => item.title)).toContain('第1章');
+    expect(afterResume.map((chapter) => chapter.title)).toEqual(['第1章', '第2章']);
+    expect(resumed.summary).not.toContain('审校暂不可用');
   });
 });
 

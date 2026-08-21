@@ -811,10 +811,13 @@ export class FileDataStore implements DataStore {
    * Persist a chapter blueprint, keeping at most one per chapter
    * (Requirements 5.1, 5.3). Any existing blueprint for the same
    * `chapter_id` is removed before the new one is appended, so a re-generation
-   * replaces the prior blueprint entirely. A deep copy is stored so later
-   * mutations of the caller's object (including its nested `scenes` array)
-   * cannot alter persisted state; a deep copy is also returned so callers
-   * cannot mutate the in-memory state.
+   * replaces the prior blueprint entirely. Scene drafts for that chapter are
+   * deleted in the same mutation — a replaced blueprint invalidates prior
+   * scene text — then the store is persisted once. Drafts of other chapters
+   * are left untouched. A deep copy is stored so later mutations of the
+   * caller's object (including its nested `scenes` array) cannot alter
+   * persisted state; a deep copy is also returned so callers cannot mutate
+   * the in-memory state.
    */
   async saveChapterBlueprint(
     blueprint: ChapterBlueprint,
@@ -824,6 +827,9 @@ export class FileDataStore implements DataStore {
     );
     const stored = structuredClone(blueprint);
     this.state.chapterBlueprints.push(stored);
+    this.state.sceneDrafts = this.state.sceneDrafts.filter(
+      (d) => d.chapterId !== blueprint.chapter_id,
+    );
     await this.persist();
     return structuredClone(stored);
   }

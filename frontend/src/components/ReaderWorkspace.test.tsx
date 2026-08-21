@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Chapter } from '../types/index.js';
-import { ReaderWorkspace, type ReaderClient } from './ReaderWorkspace.js';
+import { ReaderWorkspace, sanitizeReaderInlineHtml, type ReaderClient } from './ReaderWorkspace.js';
 
 function chapter(overrides: Partial<Chapter>): Chapter {
   return {
@@ -272,5 +272,15 @@ describe('ReaderWorkspace', () => {
     await waitFor(() => {
       expect(client.settings.characters.create).toHaveBeenCalled();
     });
+  });
+
+  it('keeps raster data URLs and strips SVG or scripted HTML', () => {
+    const png = 'data:image/png;base64,QQ==';
+    expect(sanitizeReaderInlineHtml(`<figure class="nwa-reader-inline-image"><img src="${png}" alt="ok" onerror="alert(1)"></figure>`))
+      .toContain(png);
+    expect(sanitizeReaderInlineHtml('<img src="data:image/svg+xml;base64,PHN2ZyBvbmxvYWQ9YWxlcnQoMSk+" alt="x">'))
+      .not.toContain('svg');
+    expect(sanitizeReaderInlineHtml('<img src="javascript:alert(1)"><script>window.bad=1</script>'))
+      .not.toContain('javascript');
   });
 });

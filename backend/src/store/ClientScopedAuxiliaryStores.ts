@@ -90,6 +90,7 @@ export async function createClientScopedLongNovelConfigStore(
   return {
     get: (projectId) => current().get(projectId),
     save: (projectId, config) => current().save(projectId, config),
+    delete: (projectId) => current().delete(projectId),
   };
 }
 

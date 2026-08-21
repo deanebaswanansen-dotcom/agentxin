@@ -83,8 +83,13 @@ export function ProjectTree({
         if (!Array.isArray(list)) {
           throw new Error('项目列表接口返回格式错误：期望数组。');
         }
+        // The feature flag only controls whether users can create new short
+        // dramas. Existing projects must remain visible and openable even when
+        // that entry is disabled for a build.
+        const visible = list
+          .map((project) => ({ ...project, kind: project.kind ?? 'novel' }));
         // 新项目在上，方便管理
-        setProjects(list.map((project) => ({ ...project, kind: project.kind ?? 'novel' })).reverse());
+        setProjects(visible.reverse());
       } catch (error) {
         handleError(error);
       } finally {
@@ -130,14 +135,15 @@ export function ProjectTree({
   const handleCreate = useCallback(async () => {
     const name = newName.trim();
     if (name.length === 0 || busy) return;
+    const kind = SCRIPT_MODE_ENABLED ? newKind : 'novel';
     setBusy(true);
     try {
-      const { id } = await client.projects.create(name, newKind);
-      setProjects((current) => [{ id, name, kind: newKind }, ...current]);
+      const { id } = await client.projects.create(name, kind);
+      setProjects((current) => [{ id, name, kind }, ...current]);
       setChaptersByProject((current) => ({ ...current, [id]: [] }));
       setNewName('');
       setQuery('');
-      onSelectProject(id, newKind);
+      onSelectProject(id, kind);
     } catch (error) {
       handleError(error);
     } finally {

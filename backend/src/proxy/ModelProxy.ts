@@ -18,6 +18,7 @@
  */
 
 import crypto from 'node:crypto';
+import { BlockList, isIP } from 'node:net';
 import type { ChatMessage, ModelConfig } from '../types/index.js';
 import { ProxyError } from './ProxyError.js';
 import { SseDeltaParser, type StreamDelta } from './sseParser.js';
@@ -52,28 +53,66 @@ export interface ModelProxy {
   ): AsyncIterable<StreamDelta>;
 }
 
-const PRIVATE_IPV4 = /^(?:127\.|10\.|192\.168\.|169\.254\.|0\.)/;
-const PRIVATE_IPV4_172 = /^172\.(?:1[6-9]|2\d|3[0-1])\./;
+const BLOCKED_MODEL_NETS = (() => {
+  const list = new BlockList();
+  list.addSubnet('0.0.0.0', 8, 'ipv4');
+  list.addSubnet('10.0.0.0', 8, 'ipv4');
+  list.addSubnet('127.0.0.0', 8, 'ipv4');
+  list.addSubnet('169.254.0.0', 16, 'ipv4');
+  list.addSubnet('172.16.0.0', 12, 'ipv4');
+  list.addSubnet('192.168.0.0', 16, 'ipv4');
+  // CGNAT / Aliyun metadata (100.100.100.200 lives in 100.64.0.0/10).
+  list.addSubnet('100.64.0.0', 10, 'ipv4');
+  list.addAddress('::', 'ipv6');
+  list.addAddress('::1', 'ipv6');
+  list.addSubnet('fc00::', 7, 'ipv6');
+  list.addSubnet('fe80::', 10, 'ipv6');
+  return list;
+})();
 
 function isBlockedModelHostname(hostname: string): boolean {
   const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
-  if (host === 'localhost' || host.endsWith('.localhost') || host === '::1' || host === '0.0.0.0') {
+  if (
+    host === 'localhost' ||
+    host.endsWith('.localhost') ||
+    host === 'metadata.google.internal' ||
+    host === 'metadata.internal' ||
+    host.endsWith('instance-data')
+  ) {
     return true;
   }
-  if (host.includes(':') && (host.startsWith('fc') || host.startsWith('fd') || host.startsWith('fe80'))) {
-    return true;
+  const version = isIP(host);
+  if (version === 4) return BLOCKED_MODEL_NETS.check(host, 'ipv4');
+  if (version === 6) return BLOCKED_MODEL_NETS.check(host, 'ipv6');
+  return false;
+}
+
+/** WHATWG URL requires brackets around IPv6; recover dotted `::ffff:a.b.c.d`. */
+function recoverUnbracketedIpv4MappedUrl(raw: string): URL | undefined {
+  const match = /^(https?):\/\/(::ffff:\d{1,3}(?:\.\d{1,3}){3})(?::(\d+))?(\/.*)?$/i.exec(raw);
+  if (!match) return undefined;
+  try {
+    const port = match[3] ? `:${match[3]}` : '';
+    return new URL(`${match[1]}://[${match[2]}]${port}${match[4] ?? ''}`);
+  } catch {
+    return undefined;
   }
-  return PRIVATE_IPV4.test(host) || PRIVATE_IPV4_172.test(host);
+}
+
+function parseModelBaseUrl(baseUrl: string): URL {
+  const raw = baseUrl.includes('://') ? baseUrl : `https://${baseUrl}`;
+  try {
+    return new URL(raw);
+  } catch {
+    const recovered = recoverUnbracketedIpv4MappedUrl(raw);
+    if (recovered) return recovered;
+    throw new ProxyError('模型服务地址无效。', { status: 400 });
+  }
 }
 
 export function assertPublicModelBaseUrl(baseUrl: string): void {
   if (process.env.ALLOW_PRIVATE_MODEL_URLS === '1') return;
-  let parsed: URL;
-  try {
-    parsed = new URL(baseUrl.includes('://') ? baseUrl : `https://${baseUrl}`);
-  } catch {
-    throw new ProxyError('模型服务地址无效。', { status: 400 });
-  }
+  const parsed = parseModelBaseUrl(baseUrl);
   if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
     throw new ProxyError('模型服务地址必须是 http 或 https。', { status: 400 });
   }
@@ -182,30 +221,30 @@ export class OpenAiCompatibleModelProxy implements ModelProxy {
       // Extract last user prompt for canned response
       const lastUser = [...messages].reverse().find((m) => m.role === 'user');
       const promptText = typeof lastUser?.content === 'string' ? lastUser.content : JSON.stringify(lastUser?.content || '');
-      yield* mockGenerate(promptText, signal);
+      yield* mockGenerate(promptText, signal, options);
       return;
     }
 
     const url = buildCompletionsUrl(config.baseUrl);
 
-    // Prompt Debug Logging (Requirement 1 & 3)
     console.log(`\n--- [ModelProxy] Requesting ${config.modelName} ---`);
     const promptJson = JSON.stringify(messages);
-    const prefix = promptJson.slice(0, 4000); // First ~1000 tokens
+    const prefix = promptJson.slice(0, 4000);
     const prefixHash = crypto.createHash('sha256').update(prefix).digest('hex').slice(0, 8);
     console.log(`[ModelProxy] Prefix Hash (first 4000 chars): ${prefixHash}`);
-    // Log system message stability for cache debugging
-    const systemMsg = messages.find(m => m.role === 'system');
+    const systemMsg = messages.find((m) => m.role === 'system');
     if (systemMsg) {
       const sysHash = crypto.createHash('sha256').update(systemMsg.content).digest('hex').slice(0, 8);
       console.log(`[ModelProxy] System Msg Hash: ${sysHash} (${systemMsg.content.length} chars)`);
     }
-    console.log(`[ModelProxy] Prompt Structure:`);
-    messages.forEach((m, i) => {
-      const typeStr = Array.isArray(m.content) ? 'Array' : 'String';
-      const preview = typeof m.content === 'string' ? m.content.slice(0, 80).replace(/\n/g, '\\n') : '';
-      console.log(`  [${i}] ${m.role} (${typeStr}): ${preview}${preview.length === 80 ? '...' : ''}`);
-    });
+    if (process.env.DEBUG_MODEL_PROMPTS === '1') {
+      console.log(`[ModelProxy] Prompt Structure:`);
+      messages.forEach((m, i) => {
+        const typeStr = Array.isArray(m.content) ? 'Array' : 'String';
+        const preview = typeof m.content === 'string' ? m.content.slice(0, 80).replace(/\n/g, '\\n') : '';
+        console.log(`  [${i}] ${m.role} (${typeStr}): ${preview}${preview.length === 80 ? '...' : ''}`);
+      });
+    }
     console.log(`--------------------------------------------------\n`);
 
     const requestBody: Record<string, unknown> = {
@@ -239,6 +278,7 @@ export class OpenAiCompatibleModelProxy implements ModelProxy {
           },
           body: JSON.stringify(requestBody),
           signal,
+          redirect: 'error',
         });
       } catch (error: unknown) {
         if (isAbortError(error) || signal.aborted) {
@@ -360,7 +400,38 @@ function isDeepSeekOfficialBaseUrl(baseUrl: string): boolean {
 }
 
 /** Simple local mock for demo / offline use. Yields StreamDelta chunks with small delay. */
-async function* mockGenerate(prompt: string, signal?: AbortSignal): AsyncGenerator<StreamDelta> {
+async function* mockGenerate(
+  prompt: string,
+  signal?: AbortSignal,
+  options?: StreamCompletionOptions,
+): AsyncGenerator<StreamDelta> {
+  if (prompt.includes('inspector_only') || prompt.includes('「检测子 Agent」')) {
+    yield {
+      kind: 'content',
+      text: JSON.stringify({
+        score0to100: 88,
+        verdict: 'pass',
+        plotCoherence: '本地 mock 审校通过。',
+        fatalIssues: [],
+        earlyCharacterStatus: [],
+        recommendRevision: false,
+        revisionHints: [],
+      }),
+    };
+    return;
+  }
+  if (options?.jsonMode === true && /"summary"|反思子 Agent/.test(prompt)) {
+    yield {
+      kind: 'content',
+      text: JSON.stringify({
+        summary: '本地 mock 章节摘要。',
+        facts: [],
+        learning: '',
+        foreshadows: [],
+      }),
+    };
+    return;
+  }
   const p = (prompt || '默认主题').slice(0, 80);
   const canned = [
     `【MOCK DEMO】根据需求「${p}...」`,

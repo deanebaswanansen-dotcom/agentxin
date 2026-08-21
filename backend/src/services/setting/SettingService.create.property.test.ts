@@ -41,6 +41,7 @@ import { describe, it, expect } from 'vitest';
 import fc from 'fast-check';
 
 import { FileDataStore } from '../../store/FileDataStore.js';
+import { isServiceError } from '../ServiceError.js';
 import { SettingService } from './SettingService.js';
 
 const NUM_RUNS = 100;
@@ -186,4 +187,41 @@ describe('SettingService create field-consistency (property)', () => {
   // per created entry) across all three setting kinds, so allow a generous
   // timeout well beyond the 5s vitest default.
   30000);
+
+  it('throws NOT_FOUND when creating settings under a missing project', async () => {
+    const missingProjectIdArb = fc.oneof(
+      fc.uuid(),
+      fc.constantFrom('', 'missing-project', '00000000-0000-0000-0000-000000000000'),
+    );
+    await fc.assert(
+      fc.asyncProperty(
+        missingProjectIdArb,
+        fieldValueArb,
+        fieldValueArb,
+        async (missingProjectId, a, b) => {
+          const dir = await mkdtemp(join(tmpdir(), 'setting-create-orphan-'));
+          try {
+            const store = await FileDataStore.create(join(dir, 'store.json'));
+            const service = new SettingService(store);
+
+            const expectNotFound = async (op: () => Promise<unknown>): Promise<void> => {
+              await expect(op()).rejects.toSatisfy(
+                (error: unknown) => isServiceError(error) && error.code === 'NOT_FOUND',
+              );
+            };
+
+            await expectNotFound(() => service.characters.create(missingProjectId, a, b));
+            await expectNotFound(() => service.worldSettings.create(missingProjectId, a, b));
+            await expectNotFound(() => service.outlines.create(missingProjectId, a, b));
+            expect(await store.listCharacters(missingProjectId)).toEqual([]);
+            expect(await store.listWorldSettings(missingProjectId)).toEqual([]);
+            expect(await store.listOutlines(missingProjectId)).toEqual([]);
+          } finally {
+            await rm(dir, { recursive: true, force: true });
+          }
+        },
+      ),
+      { numRuns: NUM_RUNS },
+    );
+  }, 30000);
 });

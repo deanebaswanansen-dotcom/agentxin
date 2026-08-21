@@ -35,10 +35,11 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ModelProxy } from '../../proxy/ModelProxy.js';
 import { ProxyError, isProxyError } from '../../proxy/ProxyError.js';
+import { pythonBridge } from '../../proxy/PythonBridge.js';
 import { FileDataStore } from '../../store/FileDataStore.js';
 import type {
   BlueprintCore,
@@ -546,5 +547,119 @@ describe('BlueprintService — security (Req 15.3)', () => {
       seeded.chapterId,
     );
     expect(JSON.stringify(persisted)).not.toContain(VALID_CONFIG.apiKey);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 9) Python path — Node parse + validate before persist.
+// ---------------------------------------------------------------------------
+
+describe('BlueprintService.generate — Python path validation', () => {
+  const previousUsePython = process.env.USE_PYTHON_CORE;
+
+  afterEach(() => {
+    if (previousUsePython === undefined) {
+      delete process.env.USE_PYTHON_CORE;
+    } else {
+      process.env.USE_PYTHON_CORE = previousUsePython;
+    }
+    vi.restoreAllMocks();
+  });
+
+  it('persists a Python blueprint after Node parse/validate and stringifying numeric ids', async () => {
+    process.env.USE_PYTHON_CORE = '1';
+    const seeded = await seed();
+    const core = makeValidBlueprintCore();
+    const pythonBlueprint = {
+      ...core,
+      chapter_id: 99,
+      scenes: core.scenes.map((scene, index) => ({
+        ...scene,
+        scene_id: index + 1,
+      })),
+    };
+    vi.spyOn(pythonBridge, 'call').mockResolvedValue({
+      ok: true,
+      task: 'plan_blueprint',
+      summary: 'ok',
+      chapterId: seeded.chapterId,
+      projectDir: '.',
+      blueprint: pythonBlueprint as never,
+    });
+    const { proxy, calls } = makeFakeProxy({
+      chunks: chunkString(blueprintAsModelOutput(core), 4),
+    });
+    const service = new BlueprintService(
+      seeded.store,
+      seeded.modelConfigService,
+      proxy,
+    );
+
+    const result = await service.generate(seeded.chapterId, VALID_BODY, signal());
+
+    expect(calls).toHaveLength(0);
+    expect(result.chapter_id).toBe(seeded.chapterId);
+    expect(result.scenes.map((s) => s.scene_id)).toEqual(['1', '2', '3']);
+    const persisted = await seeded.store.getChapterBlueprintByChapter(
+      seeded.chapterId,
+    );
+    expect(persisted?.scenes.map((s) => s.scene_id)).toEqual(['1', '2', '3']);
+  });
+
+  it('does not save template/int Python objects and falls through to Node generation', async () => {
+    process.env.USE_PYTHON_CORE = '1';
+    const seeded = await seed();
+    const core = makeValidBlueprintCore();
+    vi.spyOn(pythonBridge, 'call').mockResolvedValue({
+      ok: true,
+      task: 'plan_blueprint',
+      summary: 'template',
+      chapterId: seeded.chapterId,
+      projectDir: '.',
+      blueprint: {
+        chapter_id: 1,
+        title: '模板',
+        target_words: 3000,
+        main_goal: 'g',
+        tone: ['苍凉'],
+        pacing: '中',
+        required_plot_points: [],
+        forbidden_points: [],
+        emotional_curve: ['平'],
+        scenes: [
+          { scene_id: 1, name: '开场' },
+          { scene_id: 2, name: '冲突' },
+          { scene_id: 3, name: '收束' },
+        ],
+        ending_hook: '钩子',
+      } as never,
+    });
+    const { proxy, calls } = makeFakeProxy({
+      chunks: chunkString(blueprintAsModelOutput(core), 4),
+    });
+    const service = new BlueprintService(
+      seeded.store,
+      seeded.modelConfigService,
+      proxy,
+    );
+
+    const result = await service.generate(seeded.chapterId, VALID_BODY, signal());
+
+    expect(calls).toHaveLength(1);
+    expect(result.chapter_id).toBe(seeded.chapterId);
+    expect(result.scenes.map((s) => s.scene_id)).toEqual([
+      'scene-1',
+      'scene-2',
+      'scene-3',
+    ]);
+    const persisted = await seeded.store.getChapterBlueprintByChapter(
+      seeded.chapterId,
+    );
+    expect(persisted?.scenes.every((s) => typeof s.scene_id === 'string')).toBe(
+      true,
+    );
+    expect(persisted?.scenes.some((s) => typeof (s as { scene_id: unknown }).scene_id === 'number')).toBe(
+      false,
+    );
   });
 });

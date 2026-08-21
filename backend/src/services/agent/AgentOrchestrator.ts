@@ -151,6 +151,41 @@ export function remainingLongNovelBatch(
   return Math.min(requestedBatch, Math.max(0, plannedTotalChapters - completedChapters));
 }
 
+export function parseLongNovelChapterNumber(title: string): number | undefined {
+  const match = title.trim().match(/^第(\d+)章/u);
+  if (!match) return undefined;
+  const value = Number(match[1]);
+  return Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+export function countCompletedLongNovelChapters(
+  chapters: Array<{ id: string; title: string; content: string }>,
+  flagsOf: (chapter: { id: string }) => { rejected: boolean; hasSummary: boolean },
+): number {
+  return chapters.reduce((count, chapter) => {
+    const flags = flagsOf(chapter);
+    if (chapter.content.trim().length > 0 && flags.hasSummary && !flags.rejected) return count + 1;
+    return count;
+  }, 0);
+}
+
+export function nextLongNovelChapterNumber(
+  chapters: Array<{ id: string; title: string; content: string }>,
+  flagsOf: (chapter: { id: string }) => { rejected: boolean; hasSummary: boolean },
+): number {
+  let maxParsed = 0;
+  let retryAt: number | undefined;
+  for (const chapter of chapters) {
+    const num = parseLongNovelChapterNumber(chapter.title);
+    if (num === undefined) continue;
+    if (num > maxParsed) maxParsed = num;
+    const flags = flagsOf(chapter);
+    const completed = chapter.content.trim().length > 0 && flags.hasSummary && !flags.rejected;
+    if (!completed && (retryAt === undefined || num < retryAt)) retryAt = num;
+  }
+  return retryAt ?? maxParsed + 1;
+}
+
 export function longNovelBatchLimit(level: LongNovelAutomationLevel): number {
   return level === 'assistant' ? 1 : 5;
 }
@@ -1096,9 +1131,8 @@ export class AgentOrchestrator {
     });
     await this.purgeEmptyChapterShells(pid);
     const existing = await this.store.listChapters(pid);
-    const completedBefore = existing.filter(
-      (ch) => ch.content.trim().length > 0 && !this.memory.isChapterRejected(pid, ch.id),
-    ).length;
+    const chapterFlags = this.longNovelChapterFlags(pid);
+    const completedBefore = countCompletedLongNovelChapters(existing, chapterFlags);
     const requestedChapterCount = chapterCount;
     chapterCount = remainingLongNovelBatch(
       requestedChapterCount,
@@ -1267,7 +1301,8 @@ export class AgentOrchestrator {
         stoppedReason = '用户中止';
         break;
       }
-      const num = completedBefore + i + 1;
+      const currentChapters = await this.store.listChapters(pid);
+      const num = nextLongNovelChapterNumber(currentChapters, this.longNovelChapterFlags(pid));
       const planChapter = outlineByNumber.get(num);
       const title = planChapter?.title?.trim()
         ? `第${num}章 ${planChapter.title.trim()}`
@@ -1280,37 +1315,47 @@ export class AgentOrchestrator {
         total: chapterCount,
       });
       const chapter = await this.getOrCreateLongNovelChapter(pid, title);
+      const reuseUninspectedDraft = this.shouldReuseUninspectedChapterDraft(
+        pid,
+        chapter.id,
+        chapter.content,
+      );
       let content: string;
-      try {
-        content = await this.writeLongNovelChapter(
-          config,
-          pid,
-          chapter.id,
-          pack,
-          num,
-          plannedFinalChapter,
-          title,
-          planChapter?.goal,
-          directorBrief,
-          perChapter,
-          signal,
-          emit,
-          { current: i + 1, total: chapterCount },
-          steps,
-        );
-      } catch (error) {
-        if (signal.aborted) throw error;
-        await this.discardEmptyChapterUnlessCheckpoint(chapter.id);
-        const detail = error instanceof Error ? error.message.slice(0, 120) : '未知模型错误';
-        stoppedReason = `第${num}章生成失败，检查点已保留，可从本章继续（${detail}）`;
-        steps.push(`【ChapterAgent】「${title}」生成失败；前序章节与当前场景检查点均已保留。`);
-        emit({
-          phase: 'info',
-          message: `【主 Agent】${stoppedReason}`,
-          current: i + 1,
-          total: chapterCount,
-        });
-        break;
+      if (reuseUninspectedDraft) {
+        content = chapter.content.trim();
+        steps.push(`【ContinuityAgent】「${title}」已有未提交正文，重新审查。`);
+      } else {
+        try {
+          content = await this.writeLongNovelChapter(
+            config,
+            pid,
+            chapter.id,
+            pack,
+            num,
+            plannedFinalChapter,
+            title,
+            planChapter?.goal,
+            directorBrief,
+            perChapter,
+            signal,
+            emit,
+            { current: i + 1, total: chapterCount },
+            steps,
+          );
+        } catch (error) {
+          if (signal.aborted) throw error;
+          await this.discardEmptyChapterUnlessCheckpoint(chapter.id);
+          const detail = error instanceof Error ? error.message.slice(0, 120) : '未知模型错误';
+          stoppedReason = `第${num}章生成失败，检查点已保留，可从本章继续（${detail}）`;
+          steps.push(`【ChapterAgent】「${title}」生成失败；前序章节与当前场景检查点均已保留。`);
+          emit({
+            phase: 'info',
+            message: `【主 Agent】${stoppedReason}`,
+            current: i + 1,
+            total: chapterCount,
+          });
+          break;
+        }
       }
 
       // Empty prose is a writer failure, not a continuity conflict. Never send
@@ -1343,7 +1388,7 @@ export class AgentOrchestrator {
       // Slight word-count drift is advisory and must not discard a complete
       // scene pipeline draft. Re-run the expensive whole-chapter writer only
       // for hard format failures such as empty/meta output.
-      const formatNeedsRewrite = gates.hardFail;
+      const formatNeedsRewrite = !reuseUninspectedDraft && gates.hardFail;
       if (modeConfig.autoRevisionEnabled && formatNeedsRewrite) {
         emit({
           phase: 'chapter',
@@ -1391,11 +1436,12 @@ export class AgentOrchestrator {
         emit,
         {
           autoRevisionEnabled: modeConfig.autoRevisionEnabled,
-          inspectChapter: shouldInspectLongNovelChapter(
-            num,
-            modeConfig.checkpointInterval,
-            gates,
-          ),
+          inspectChapter: reuseUninspectedDraft
+            || shouldInspectLongNovelChapter(
+              num,
+              modeConfig.checkpointInterval,
+              gates,
+            ),
           qualityGates: {
             minWords: modeConfig.minWordsPerChapter,
             maxWords: modeConfig.maxWordsPerChapter,
@@ -1414,6 +1460,17 @@ export class AgentOrchestrator {
       gates = processed.gates ?? gates;
       if (processed.revised) {
         steps.push(`【ReviewAgent】已修订「${title}」。`);
+      }
+      if (finalInspection.verdict === 'inspection_unavailable') {
+        stoppedReason = `审校暂不可用，已保留「${title}」正文待重新审查`;
+        steps.push(`【ContinuityAgent】「${title}」审校失败，未提交记忆，下一批将重新审查。`);
+        emit({
+          phase: 'info',
+          message: `【主 Agent】${stoppedReason}`,
+          current: i + 1,
+          total: chapterCount,
+        });
+        break;
       }
 
       // 检查点大纲（每 N 章）
@@ -1599,9 +1656,10 @@ export class AgentOrchestrator {
 
     await this.purgeEmptyChapterShells(pid);
     const existing = await this.store.listChapters(pid);
-    const completedBefore = existing.filter(
-      (ch) => ch.content.trim().length > 0 && !this.memory.isChapterRejected(pid, ch.id),
-    ).length;
+    const completedBefore = countCompletedLongNovelChapters(
+      existing,
+      this.longNovelChapterFlags(pid),
+    );
     if (planSummary?.chapterCount !== undefined || totalChapters !== undefined) {
       const requestedChapterCount = chapterCount;
       chapterCount = remainingLongNovelBatch(
@@ -1640,9 +1698,11 @@ export class AgentOrchestrator {
     let lastChapterId: Id | undefined;
     let completedChapters = 0;
     let stoppedOnP0Title: string | undefined;
+    let inspectionUnavailableTitle: string | undefined;
     for (let i = 0; i < chapterCount; i += 1) {
       if (signal.aborted) break;
-      const num = completedBefore + i + 1;
+      const currentChapters = await this.store.listChapters(pid);
+      const num = nextLongNovelChapterNumber(currentChapters, this.longNovelChapterFlags(pid));
       const planChapter = outlineByNumber.get(num);
       const title = planChapter?.title?.trim()
         ? `第${num}章 ${planChapter.title.trim()}`
@@ -1652,22 +1712,32 @@ export class AgentOrchestrator {
       artifacts.push({ kind: 'chapter', id: chapter.id, title });
       lastChapterId = chapter.id;
 
-      const content = await this.writeLongNovelChapter(
-        config,
+      const reuseUninspectedDraft = this.shouldReuseUninspectedChapterDraft(
         pid,
         chapter.id,
-        pack,
-        num,
-        plannedFinalChapter,
-        title,
-        planChapter?.goal,
-        packPrompt,
-        wordsPerChapter,
-        signal,
-        emit,
-        { current: i + 1, total: chapterCount },
-        steps,
+        chapter.content,
       );
+      const content = reuseUninspectedDraft
+        ? chapter.content.trim()
+        : await this.writeLongNovelChapter(
+          config,
+          pid,
+          chapter.id,
+          pack,
+          num,
+          plannedFinalChapter,
+          title,
+          planChapter?.goal,
+          packPrompt,
+          wordsPerChapter,
+          signal,
+          emit,
+          { current: i + 1, total: chapterCount },
+          steps,
+        );
+      if (reuseUninspectedDraft) {
+        steps.push(`检测子 Agent 将重新审查「${title}」未提交正文。`);
+      }
       if (content.trim().length === 0) {
         await this.discardEmptyChapterUnlessCheckpoint(chapter.id);
         steps.push(`【ChapterAgent】「${title}」未生成正文，已保留项目状态供重试。`);
@@ -1702,6 +1772,17 @@ export class AgentOrchestrator {
       if (processed.revised) {
         steps.push(`检测子 Agent 已触发修订「${title}」。`);
       }
+      if (finalInspection.verdict === 'inspection_unavailable') {
+        steps.push(`检测子 Agent 审校「${title}」失败，正文已保留，未提交记忆。`);
+        emit({
+          phase: 'info',
+          message: `【主 Agent】审校暂不可用；「${title}」保留为待审查稿，未提交到后续记忆。`,
+          current: i + 1,
+          total: chapterCount,
+        });
+        inspectionUnavailableTitle = title;
+        break;
+      }
       if (processed.gates?.hardFail) {
         steps.push(
           `【Gate】「${title}」P0 硬冲突：${processed.gates.findings
@@ -1732,16 +1813,20 @@ export class AgentOrchestrator {
 
     emit({
       phase: 'info',
-      message: stoppedOnP0Title
-        ? `整本草稿已暂停：请先确认并修复「${stoppedOnP0Title}」。`
-        : '整本草稿生成完成。',
+      message: inspectionUnavailableTitle
+        ? `整本草稿已暂停：请重新审查「${inspectionUnavailableTitle}」。`
+        : stoppedOnP0Title
+          ? `整本草稿已暂停：请先确认并修复「${stoppedOnP0Title}」。`
+          : '整本草稿生成完成。',
     });
     return {
       task: 'full_novel',
       mode: 'draft',
       projectId: pid,
       chapterId: lastChapterId,
-      summary: stoppedOnP0Title
+      summary: inspectionUnavailableTitle
+        ? `整本草稿因审校暂不可用暂停：完成 ${completedChapters}/${chapterCount} 章；「${inspectionUnavailableTitle}」正文已保留，未提交记忆。`
+        : stoppedOnP0Title
         ? `整本草稿因 P0 大 Bug 暂停：完成 ${completedChapters}/${chapterCount} 章；「${stoppedOnP0Title}」保留为待确认稿，未提交记忆。`
         : planSummary
           ? `已按计划生成整本草稿：完成 ${completedChapters}/${chapterCount} 章（分章大纲与创作规则已采纳），全程带长期记忆与逐章反思。`
@@ -1789,14 +1874,6 @@ export class AgentOrchestrator {
     progress: { current: number; total: number },
     steps: string[],
   ): Promise<string> {
-    const existingRejectedDraft = await this.store.getChapter(chapterId);
-    if (
-      existingRejectedDraft?.content.trim() &&
-      this.memory.isChapterRejected(projectId, chapterId)
-    ) {
-      steps.push(`【ChapterAgent】复用「${chapterTitle}」待确认稿，重新执行 P0 检查。`);
-      return existingRejectedDraft.content.trim();
-    }
     const memoryContext = this.memory.buildContext(projectId, scaledMemoryOptions(chapterNumber));
     const requirement = buildChapterBlueprintRequirement({
       chapterNumber,
@@ -2440,6 +2517,7 @@ export class AgentOrchestrator {
         inspection = await this.inspectChapterDraft(
           config,
           projectId,
+          chapterId,
           chapterNumber,
           chapterTitle,
           content,
@@ -2447,27 +2525,33 @@ export class AgentOrchestrator {
         );
       } catch (error) {
         if (signal.aborted) throw error;
-        // Review is an auxiliary worker.  A provider 502/timeout must not erase
-        // a valid chapter or abort the whole novel; the next run can inspect it.
         emit({
           phase: 'info',
-          message: `【ContinuityAgent】审校请求失败，已保留「${chapterTitle}」正文并继续。`,
+          message: `【ContinuityAgent】审校请求失败，已保留「${chapterTitle}」正文，本章未提交，待重新审查。`,
           current: progress?.current,
           total: progress?.total,
         });
         inspection = {
-          score0to100: 70,
+          score0to100: 0,
           verdict: 'inspection_unavailable',
-          plotCoherence: '审校服务暂不可用，正文已保存。',
+          plotCoherence: '审校服务暂不可用，正文已保存，待重新审查。',
           fatalIssues: [],
           earlyCharacterStatus: [],
-          recommendRevision: false,
+          recommendRevision: true,
           revisionHints: [],
           structuralChecks: [],
           injectedMemoryChars: 0,
           injectedMemoryOptions: scaledMemoryOptions(chapterNumber),
         };
       }
+    }
+
+    if (inspection.verdict === 'inspection_unavailable') {
+      return {
+        finalContent: content,
+        finalInspection: inspection,
+        revised: false,
+      };
     }
 
     let gates: GateResult | undefined;
@@ -2574,6 +2658,7 @@ export class AgentOrchestrator {
           finalInspection = await this.inspectChapterDraft(
             config,
             projectId,
+            chapterId,
             chapterNumber,
             chapterTitle,
             finalContent,
@@ -2808,12 +2893,37 @@ export class AgentOrchestrator {
    * long run must not create a second "第 N 章" after a provider timeout: the
    * first chapter owns the scene drafts that make the run resumable.
    */
+  private longNovelChapterFlags(projectId: Id): (chapter: { id: string }) => {
+    rejected: boolean;
+    hasSummary: boolean;
+  } {
+    return (chapter) => ({
+      rejected: this.memory.isChapterRejected(projectId, chapter.id),
+      hasSummary: this.memory.hasChapterSummary(projectId, chapter.id),
+    });
+  }
+
+  private shouldReuseUninspectedChapterDraft(
+    projectId: Id,
+    chapterId: Id,
+    content: string,
+  ): boolean {
+    return (
+      content.trim().length > 0 &&
+      !this.memory.isChapterRejected(projectId, chapterId) &&
+      !this.memory.hasChapterSummary(projectId, chapterId)
+    );
+  }
+
   private async getOrCreateLongNovelChapter(projectId: Id, title: string) {
     const chapters = await this.store.listChapters(projectId);
     for (const chapter of chapters) {
       if (chapter.title !== title) continue;
       if (this.memory.isChapterRejected(projectId, chapter.id)) return chapter;
-      if (chapter.content.trim().length > 0) continue;
+      if (chapter.content.trim().length > 0) {
+        if (this.memory.hasChapterSummary(projectId, chapter.id)) continue;
+        return chapter;
+      }
       const [blueprint, drafts] = await Promise.all([
         this.store.getChapterBlueprintByChapter(chapter.id),
         this.store.listSceneDrafts(chapter.id),
@@ -2857,6 +2967,7 @@ export class AgentOrchestrator {
   private async inspectChapterDraft(
     config: ModelConfig,
     projectId: Id,
+    chapterId: Id,
     chapterNumber: number,
     chapterTitle: string,
     content: string,
@@ -2865,8 +2976,14 @@ export class AgentOrchestrator {
     const chapters = await this.store.listChapters(projectId);
     const memoryOptions = scaledMemoryOptions(chapterNumber);
     const injectedMemory = this.memory.buildContext(projectId, memoryOptions);
-    const early = chapters.slice(0, 3);
-    const recent = chapters.slice(-3);
+    const samples = chapters.filter(
+      (ch) =>
+        ch.id !== chapterId &&
+        !this.memory.isChapterRejected(projectId, ch.id) &&
+        ch.content.trim().length > 0,
+    );
+    const early = samples.slice(0, 3);
+    const recent = samples.slice(-3);
     return this.inspector.inspectChapter(
       config,
       {

@@ -7,14 +7,15 @@
  * 历史完整响应满足，跳过模型调用。
  *
  * 行为约定：
- * - 缓存键 = sha256(modelName + 全部 messages + jsonMode)。任何输入变化都会换键，
+ * - 缓存键 = sha256(clientId + modelName + baseUrl + sampling + jsonMode +
+ *   maxTokens + disableThinking + messages)。任何输入变化都会换键，
  *   因此不会让本应「常写常新」的章节正文意外复用——只有逐字节相同的请求才命中。
  * - Mock 提供商（baseUrl='mock' 或 model='mock-model'）不缓存：它本就免费且本地。
  * - 仅在流式**完整正常结束**后才写缓存；被 AbortSignal 中止或出错时不写，避免缓存半截。
  * - 命中/未命中计入 {@link cacheStats}，在 /api/cache-stats 的 localCache 字段可见。
  * - 缓存读写失败一律降级为「不缓存、走真实调用」，绝不让缓存问题影响主流程。
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import type { ChatMessage, ModelConfig } from '../types/index.js';
@@ -71,9 +72,12 @@ export class CachingModelProxy implements ModelProxy {
     const payload = JSON.stringify({
       clientId: getCurrentClientId(),
       model: config.modelName,
+      baseUrl: config.baseUrl,
       temperature: config.temperature ?? null,
       topP: config.topP ?? null,
       jsonMode: options?.jsonMode === true,
+      maxTokens: options?.maxTokens ?? null,
+      disableThinking: options?.disableThinking === true,
       messages,
     });
     return createHash('sha256').update(payload).digest('hex');
@@ -99,9 +103,10 @@ export class CachingModelProxy implements ModelProxy {
   private async writeCache(key: string, entry: CacheEntry): Promise<void> {
     try {
       await mkdir(this.dir, { recursive: true });
-      const tempPath = `${this.pathFor(key)}.tmp`;
+      const destPath = this.pathFor(key);
+      const tempPath = `${destPath}.${randomUUID()}.tmp`;
       await writeFile(tempPath, JSON.stringify(entry), 'utf8');
-      await rename(tempPath, this.pathFor(key));
+      await rename(tempPath, destPath);
     } catch {
       // 写缓存失败不影响主流程：静默降级。
     }

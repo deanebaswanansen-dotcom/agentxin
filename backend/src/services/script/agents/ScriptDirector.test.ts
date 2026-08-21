@@ -3348,7 +3348,7 @@ describe('ScriptDirector', () => {
     expect(store.atomicCommitCalls).toHaveLength(1);
   });
 
-  it('keeps the original candidate when both rewrite responses are unparseable', async () => {
+  it('pauses when first-pass major_issue rewrite responses are unparseable', async () => {
     const state = readySingleEpisodeState();
     const store = new MemoryScriptStore(state);
     const calls: string[] = [];
@@ -3377,17 +3377,108 @@ describe('ScriptDirector', () => {
       },
     });
 
-    const result = await director.run({
+    await expect(director.run({
       task: 'script_episode_batch', projectId: 'project-1',
       startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
       draftMode: 'direct_text',
-    });
+    })).rejects.toBeInstanceOf(ScriptBatchPausedError);
 
-    expect(result.kind).toBe('episode_batch');
     expect(calls).toEqual(['draft', 'review', 'revision', 'revision']);
     expect(reviewCalls).toBe(1);
-    expect(store.state.episodes[0]?.scenes[0]?.location).toBe('校报社');
-    expect(store.atomicCommitCalls).toHaveLength(1);
+    expect(store.atomicCommitCalls).toHaveLength(0);
+    expect(store.state.episodes).toHaveLength(0);
+    expect(store.state.reviewIssues.map((item) => item.code)).toEqual(
+      expect.arrayContaining(['DIRECT_OFF_OUTLINE']),
+    );
+  });
+
+  it('pauses instead of synthesizing a passing handoff review from an invalid verdict', async () => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    const checkpoints = new InMemoryScriptCheckpointStore();
+    const director = new ScriptDirector({
+      store,
+      checkpoints,
+      model: {
+        async complete(request) {
+          if (request.node === 'draft') return directScriptText();
+          return JSON.stringify({ verdict: 'looks_good' });
+        },
+        async getModelConfigFingerprint() { return 'direct-model-v1'; },
+      },
+    });
+
+    await expect(director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    })).rejects.toBeInstanceOf(ScriptBatchPausedError);
+
+    expect(store.atomicCommitCalls).toHaveLength(0);
+    expect(store.state.episodes).toHaveLength(0);
+    const savedCheckpoints = await checkpoints.list('project-1', 'script_episode_batch:1:1');
+    expect(savedCheckpoints.filter((item) =>
+      item.node === 'handoff_review' && item.status === 'succeeded',
+    )).toHaveLength(0);
+    expect(store.state.reviewIssues.map((item) => item.code)).toContain('DIRECT_REVIEW_UNPARSEABLE');
+  });
+
+  it('pauses when the post-rewrite handoff review is unparseable', async () => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    const checkpoints = new InMemoryScriptCheckpointStore();
+    let reviewCalls = 0;
+    const director = new ScriptDirector({
+      store,
+      checkpoints,
+      model: {
+        async complete(request) {
+          if (request.node === 'draft') {
+            return directScriptText({
+              location: '市体育馆篮球场',
+              dialogue: '这场篮球赛我们一定要赢。'.repeat(14),
+            });
+          }
+          if (request.node === 'revision') {
+            return directScriptText({
+              location: '校报社',
+              dialogue: '时间戳和采访记录能够相互印证。'.repeat(14),
+            });
+          }
+          reviewCalls += 1;
+          if (reviewCalls === 1) {
+            return directReviewJson({
+              verdict: 'major_issue',
+              issues: [{
+                code: 'WRONG_GENRE_OR_SETTING',
+                sceneNumber: 1,
+                evidence: '正文写成篮球比赛。',
+                expected: '本集应在校报社调查证据。',
+              }],
+            });
+          }
+          return '这不是可解析的复核 JSON。';
+        },
+        async getModelConfigFingerprint() { return 'direct-model-v1'; },
+      },
+    });
+
+    await expect(director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    })).rejects.toBeInstanceOf(ScriptBatchPausedError);
+
+    expect(reviewCalls).toBe(2);
+    expect(store.atomicCommitCalls).toHaveLength(0);
+    expect(store.state.episodes).toHaveLength(0);
+    const savedCheckpoints = await checkpoints.list('project-1', 'script_episode_batch:1:1');
+    expect(savedCheckpoints.filter((item) =>
+      item.node === 'handoff_review' && item.status === 'succeeded',
+    )).toHaveLength(1);
+    expect(store.state.reviewIssues.map((item) => item.code)).toEqual(
+      expect.arrayContaining(['DIRECT_REVIEW_UNPARSEABLE', 'DIRECT_WRONG_GENRE_OR_SETTING']),
+    );
   });
 
   it('accepts up to five scenes in direct mode even when the planning preference is three', async () => {

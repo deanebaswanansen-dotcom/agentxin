@@ -64,6 +64,8 @@ export interface ChapterEditorHandle {
   getContent(): string;
   /** Replace the editable content (e.g. after a ChatPanel "采用" action). */
   setContent(next: string): void;
+  /** Persist unsaved edits before the parent navigates away. */
+  saveIfDirty(): Promise<void>;
 }
 
 /** Minimal client surface this editor depends on (eases testing). */
@@ -333,12 +335,15 @@ function ChapterEditorInner(
   const contentRef = useRef(content);
   const historyRef = useRef<EditorHistory>({ past: [], future: [] });
   const lastSavedContentRef = useRef(chapter?.content ?? '');
+  const saveInFlightRef = useRef<Promise<void> | null>(null);
   // Set when the selected chapter changes, so the layout effect below knows to
   // reset scroll/caret to the top *after* the new content is committed to the
   // DOM (a textarea value change otherwise pushes the caret to the end).
   const justSwitchedChapter = useRef(false);
 
   const chapterId = chapter?.id ?? null;
+  const chapterIdRef = useRef<Id | null>(chapterId);
+  chapterIdRef.current = chapterId;
 
   const updateHistory = useCallback((next: EditorHistory) => {
     historyRef.current = next;
@@ -570,12 +575,89 @@ function ChapterEditorInner(
     [applyContent],
   );
 
+  const reportSelection = useCallback(() => {
+    const el = textareaRef.current;
+        if (el === null || onSelectionChange === undefined) return;
+    onSelectionChange({ start: el.selectionStart, end: el.selectionEnd });
+  }, [onSelectionChange]);
+
+  // Serialize saves and keep flushing until the latest edit is persisted. This
+  // matters when navigation is requested while an autosave is still running:
+  // the in-flight version is awaited first, then any text typed after it is
+  // saved in a second request before navigation may continue.
+  const persistLatest = useCallback(async (force = false) => {
+    if (chapterId === null) return;
+    const targetChapterId = chapterId;
+    let forceNextSave = force;
+
+    while (chapterIdRef.current === targetChapterId) {
+      const existingSave = saveInFlightRef.current;
+      if (existingSave !== null) {
+        await existingSave;
+        forceNextSave = false;
+        continue;
+      }
+
+      const current = contentRef.current;
+      const previousSavedContent = lastSavedContentRef.current;
+      if (!forceNextSave && current === previousSavedContent) {
+        setDirty(false);
+        return;
+      }
+      forceNextSave = false;
+
+      const selectedChapter = chapter?.id === targetChapterId ? chapter : null;
+      const request = (async () => {
+        await client.chapters.updateContent(targetChapterId, current);
+        if (selectedChapter !== null && previousSavedContent !== current) {
+          saveChapterSnapshot(
+            { id: selectedChapter.id, title: selectedChapter.title, content: previousSavedContent },
+            '保存前',
+          );
+          setSnapshots(listChapterSnapshots(targetChapterId));
+        }
+        if (chapterIdRef.current === targetChapterId) {
+          lastSavedContentRef.current = current;
+          setDirty(contentRef.current !== current);
+        }
+        onSaved?.(targetChapterId, current);
+      })();
+
+      saveInFlightRef.current = request;
+      setSaving(true);
+      try {
+        await request;
+      } catch (error) {
+        if (!isAbort(error)) onError?.(error);
+        throw error;
+      } finally {
+        if (saveInFlightRef.current === request) {
+          saveInFlightRef.current = null;
+          setSaving(false);
+        }
+      }
+    }
+  }, [chapter, chapterId, client, onSaved, onError]);
+
+  // Explicit saves report errors in the editor but do not create unhandled
+  // promise rejections in click/keyboard/autosave event handlers.
+  const save = useCallback(async () => {
+    try {
+      await persistLatest(true);
+    } catch {
+      // persistLatest already reported the error; keep the editor dirty.
+    }
+  }, [persistLatest]);
+
   useImperativeHandle(
     ref,
     (): ChapterEditorHandle => ({
       getSelection() {
         const el = textareaRef.current;
-        if (el === null) return { start: content.length, end: content.length };
+        if (el === null) {
+          const length = contentRef.current.length;
+          return { start: length, end: length };
+        }
         return { start: el.selectionStart, end: el.selectionEnd };
       },
       setSelection(start, end) {
@@ -593,39 +675,12 @@ function ChapterEditorInner(
       setContent(next) {
         applyContent(next);
       },
+      async saveIfDirty() {
+        await persistLatest();
+      },
     }),
-    [applyContent],
+    [applyContent, persistLatest],
   );
-
-  const reportSelection = useCallback(() => {
-    const el = textareaRef.current;
-        if (el === null || onSelectionChange === undefined) return;
-    onSelectionChange({ start: el.selectionStart, end: el.selectionEnd });
-  }, [onSelectionChange]);
-
-  // Submit the content update request to the backend (Requirement 8.4).
-  const save = useCallback(async () => {
-    if (chapterId === null || saving) return;
-    setSaving(true);
-    try {
-      const previousSavedContent = lastSavedContentRef.current;
-      await client.chapters.updateContent(chapterId, content);
-      if (chapter !== null && previousSavedContent !== content) {
-        saveChapterSnapshot(
-          { id: chapter.id, title: chapter.title, content: previousSavedContent },
-          '保存前',
-        );
-        setSnapshots(listChapterSnapshots(chapterId));
-        lastSavedContentRef.current = content;
-      }
-      setDirty(false);
-      onSaved?.(chapterId, content);
-    } catch (error) {
-      if (!isAbort(error)) onError?.(error);
-    } finally {
-      setSaving(false);
-    }
-  }, [chapter, chapterId, saving, client, content, onSaved, onError]);
 
   // Optional debounced autosave for unsaved changes.
   useEffect(() => {

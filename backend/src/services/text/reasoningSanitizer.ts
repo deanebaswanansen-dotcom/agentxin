@@ -11,10 +11,28 @@ const FINAL_BODY_LABEL_RE =
 const REASONING_LINE_RE =
   /^\s*(?:思考过程|思考内容|我的思考|推理过程|reasoning|thinking)\s*[:：].*$/gim;
 
-export function stripReasoningArtifacts(input: string): string {
-  return input
-    .replace(COMPLETE_TAG_BLOCK_RE, '')
-    .replace(DANGLING_TAG_BLOCK_RE, '')
+export interface StripReasoningOptions {
+  /**
+   * When true (default), an unclosed `<think>` / `<thinking>` / `<reasoning>`
+   * tag eats through end-of-string. Live model streams want that so a truncated
+   * reasoning block cannot leak. Persisted scene drafts must pass
+   * `{ danglingToEof: false }`: otherwise a dangling tag in an early scene
+   * would wipe every subsequent scene when the merger sanitizes concatenated
+   * text.
+   */
+  danglingToEof?: boolean;
+}
+
+export function stripReasoningArtifacts(
+  input: string,
+  options?: StripReasoningOptions,
+): string {
+  const danglingToEof = options?.danglingToEof ?? true;
+  let text = input.replace(COMPLETE_TAG_BLOCK_RE, '');
+  if (danglingToEof) {
+    text = text.replace(DANGLING_TAG_BLOCK_RE, '');
+  }
+  return text
     .replace(BRACKETED_BLOCK_RE, '')
     .replace(REASONING_LINE_RE, '')
     .replace(FINAL_BODY_LABEL_RE, '')

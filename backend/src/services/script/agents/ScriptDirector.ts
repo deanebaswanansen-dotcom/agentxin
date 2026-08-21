@@ -3836,17 +3836,35 @@ export class ScriptDirector {
       episodeUpstreamRefs.push(currentCandidateRef);
     }
 
-    const fallbackReview = (): ScriptDirectHandoffReview => ({
-      verdict: 'pass',
-      issues: [],
-      handoff: {
-        summary: outline.goal,
-        characterStates: [],
-        props: [],
-        openThreads: outline.endingHook ? [outline.endingHook] : [],
-        ending: outline.endingHook,
-      },
-    });
+    const pauseUnparseableReview = async (
+      error: ScriptModelOutputError,
+      contractName: string,
+      extraAiIssues: readonly ScriptGateIssue[] = [],
+    ): Promise<never> => {
+      recordCall('review', contractName, 1, 'needs_review');
+      const reviewFailure: ScriptEvaluatedGateIssue = {
+        code: 'DIRECT_REVIEW_UNPARSEABLE',
+        severity: 'hard',
+        source: 'deterministic',
+        blocking: true,
+        message: error.message,
+        path: 'review',
+      };
+      await this.persistReviewIssues(
+        request.projectId,
+        episodeNumber,
+        [reviewFailure],
+        extraAiIssues,
+      );
+      throw new ScriptBatchPausedError(episodeNumber, {
+        hardFailed: true,
+        issues: [reviewFailure],
+        blockingIssues: [reviewFailure],
+        advisoryIssues: [],
+        visibleChars: draft ? scriptVisibleChars(draft) : 0,
+        dialogueDensityPercent: 0,
+      });
+    };
     const reviewPromptVersion = 'direct-handoff-review-v3';
     const reviewFingerprint = computeScriptCheckpointInputFingerprint({
       node: 'handoff_review',
@@ -3896,8 +3914,10 @@ export class ScriptDirector {
         recordCall('review', 'ScriptDirectHandoffReview@v1', 1);
       } catch (error) {
         if (!(error instanceof ScriptModelOutputError)) throw error;
-        review = fallbackReview();
-        recordCall('review', 'ScriptDirectHandoffReview@v1', 1, 'needs_review');
+        await pauseUnparseableReview(error, 'ScriptDirectHandoffReview@v1');
+      }
+      if (!review) {
+        throw new ScriptModelOutputError(`第 ${episodeNumber} 集审校结果无效。`);
       }
       reviewRevision = await this.nextCheckpointArtifactRevision(
         request.projectId,
@@ -3928,6 +3948,9 @@ export class ScriptDirector {
         validationErrors: [],
         updatedAt: this.now(),
       }, `第 ${episodeNumber} 集明显错误检查与连续性交接已完成。`);
+    }
+    if (!review) {
+      throw new ScriptModelOutputError(`第 ${episodeNumber} 集审校结果无效。`);
     }
     review = reconcileDirectReviewBoundary(context, review);
     const reviewRef = buildScriptUpstreamArtifactRef('handoff_review', reviewRevision!, review);
@@ -4056,7 +4079,7 @@ export class ScriptDirector {
           rewriteCallsUsed += 1;
           rewritten = parseCandidate(rewrittenText);
         }
-        if (!rewritten.episode) {
+        if (!rewritten.episode || rewritten.unparsedLines.length > 0) {
           recordCall('revision', 'ChineseShortDramaDirectRewrite@v1', rewriteCallsUsed, 'needs_review');
         } else {
           recordCall('revision', 'ChineseShortDramaDirectRewrite@v1', rewriteCallsUsed);
@@ -4159,8 +4182,14 @@ export class ScriptDirector {
           recordCall('review', 'ScriptDirectHandoffReviewAfterRewrite@v1', 1);
         } catch (error) {
           if (!(error instanceof ScriptModelOutputError)) throw error;
-          postRewriteReview = fallbackReview();
-          recordCall('review', 'ScriptDirectHandoffReviewAfterRewrite@v1', 1, 'needs_review');
+          await pauseUnparseableReview(
+            error,
+            'ScriptDirectHandoffReviewAfterRewrite@v1',
+            aiIssues,
+          );
+        }
+        if (!postRewriteReview) {
+          throw new ScriptModelOutputError(`第 ${episodeNumber} 集重写后审校结果无效。`);
         }
         postRewriteReviewRevision = await this.nextCheckpointArtifactRevision(
           request.projectId,
@@ -4191,6 +4220,9 @@ export class ScriptDirector {
           validationErrors: [],
           updatedAt: this.now(),
         }, `第 ${episodeNumber} 集重写后复核已完成。`);
+      }
+      if (!postRewriteReview) {
+        throw new ScriptModelOutputError(`第 ${episodeNumber} 集重写后审校结果无效。`);
       }
       review = reconcileDirectReviewBoundary(context, postRewriteReview);
       const postRewriteReviewRef = buildScriptUpstreamArtifactRef(
@@ -4226,11 +4258,20 @@ export class ScriptDirector {
       }
     }
 
+    if (rewriteIssues.length > 0 && !rewriteApplied) {
+      deterministicReport = validateDraft(draft, aiIssues.map((issue) => ({
+        ...issue,
+        severity: 'hard',
+        source: 'deterministic',
+      })));
+      report = deterministicReport;
+    }
+
     const persistedReview = await this.persistReviewIssues(
       request.projectId,
       episodeNumber,
       deterministicReport.issues,
-      rewriteApplied ? [] : aiIssues,
+      rewriteApplied && review.verdict === 'pass' ? [] : aiIssues,
     );
     if (report.hardFailed) {
       const completedCheckpointRevision = await this.nextCheckpointArtifactRevision(

@@ -33,7 +33,6 @@ import {
   buildScenePrompt,
   type CharacterContext,
 } from './buildBlueprintPrompts.js';
-import { compareSceneId } from './mergeScenes.js';
 import { stripReasoningArtifacts } from '../text/reasoningSanitizer.js';
 import { tokenBudgetForCharacterTarget } from './wordCount.js';
 
@@ -59,8 +58,8 @@ export class SceneWriter {
    *    定位目标场景；不存在 → `NOT_FOUND`（需求 6.6）。
    * 3. 解析出场角色设定：取该章节所属项目的人物列表，筛选 `scene.characters` 中列出的
    *    角色（按 name 匹配）并映射为 `{ name, description }[]`（需求 6.2）。
-   * 4. 读取上一场景已持久化正文（若存在）：按 `scene_id` 升序定位目标场景的前一个场景，
-   *    若其有已持久化正文则作为衔接上下文（需求 6.3）。
+   * 4. 读取上一场景已持久化正文（若存在）：按 `blueprint.scenes` 数组顺序定位目标
+   *    场景的前一个场景，若其有已持久化正文则作为衔接上下文（需求 6.3）。
    * 5. 调用 {@link buildScenePrompt} 组装消息（注入场景约束，需求 6.1）。
    * 6. 调用 {@link ModelProxy.streamCompletion} 并返回其增量序列（需求 6.4）。
    *
@@ -192,18 +191,15 @@ export class SceneWriter {
   /**
    * 读取目标场景在蓝图顺序中的上一场景已持久化正文（需求 6.3）。
    *
-   * 实现：以 {@link compareSceneId}（与 {@link mergeScenes} 一致的全序口径）对蓝图
-   * 场景按 `scene_id` 升序排序，定位目标场景的前一个场景；若存在且其已有已持久化正文，
-   * 则返回该正文作为衔接上下文，否则返回 `undefined`。
+   * 实现：按 `blueprint.scenes` 数组顺序定位目标场景的前一个场景；若存在且其已有
+   * 已持久化正文，则返回该正文作为衔接上下文，否则返回 `undefined`。
    */
   private async loadPreviousSceneContent(
     chapterId: Id,
     blueprint: ChapterBlueprint,
     sceneId: string,
   ): Promise<string | undefined> {
-    const orderedSceneIds = blueprint.scenes
-      .map((s) => s.scene_id)
-      .sort(compareSceneId);
+    const orderedSceneIds = blueprint.scenes.map((s) => s.scene_id);
 
     const index = orderedSceneIds.indexOf(sceneId);
     if (index <= 0) {

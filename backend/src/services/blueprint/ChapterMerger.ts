@@ -6,20 +6,21 @@
  * 2. 加载该章节全部已持久化的场景正文（需求 8.1）。
  * 3. 校验蓝图声明的每个场景都已写作（存在对应 draft）；存在缺失 →
  *    抛出 `VALIDATION_ERROR` 且不修改章节正文（需求 8.4）。
- * 4. 调用纯函数 {@link mergeScenes} 按 scene_id 升序拼接为整章正文（需求 8.2），
+ * 4. 按 `blueprint.scenes` 数组顺序以双换行拼接为整章正文（需求 8.2），
  *    经 {@link DataStore.updateChapterContent} 写入章节正文（需求 8.3）后返回。
  *
  * 设计要点：
  * - 领域层仅依赖抽象（{@link DataStore}），通过依赖注入传入，便于替换与测试。
- * - 纯合并逻辑（排序 + 拼接）全部委托给纯函数 {@link mergeScenes}（可属性测试），
- *   本服务只负责 IO 编排、缺失校验与「全有才写入」的事务性语义。
+ * - 拼接顺序与蓝图声明顺序一致，不按 `scene_id` 再排序。
  * - 不调用模型：合并全程在本地完成。
  */
 import type { DataStore } from '../../store/DataStore.js';
 import type { Id } from '../../types/index.js';
 import { ServiceError } from '../ServiceError.js';
-import { mergeScenes } from './mergeScenes.js';
 import { stripReasoningArtifacts } from '../text/reasoningSanitizer.js';
+
+/** 场景之间的拼接分隔符：双换行（需求 8.2）。 */
+const SCENE_SEPARATOR = '\n\n';
 
 export class ChapterMerger {
   /**
@@ -35,7 +36,7 @@ export class ChapterMerger {
    * 2. 读取该章节全部已持久化的场景正文（需求 8.1）。
    * 3. 校验蓝图声明的每个 `scene_id` 都有对应 draft；存在缺失 → 抛出
    *    `VALIDATION_ERROR`，并且不修改章节正文（需求 8.4）。
-   * 4. 调用纯函数 {@link mergeScenes} 按 scene_id 升序拼接（需求 8.2）。
+   * 4. 按 `blueprint.scenes` 数组顺序以双换行拼接（需求 8.2）。
    * 5. 写入章节正文（需求 8.3）并返回合并结果。
    *
    * 不调用模型：纯本地合并。
@@ -55,9 +56,13 @@ export class ChapterMerger {
     // 2) 读取该章节全部已持久化的场景正文（需求 8.1）。
     const drafts = await this.store.listSceneDrafts(chapterId);
 
-    // 判定口径：必须存在可见正文；空白或仅思维痕迹的残留草稿仍视为未写作。
+    // 判定口径：必须存在可见正文；空白或仅闭合思维痕迹的残留草稿仍视为未写作。
+    // 不对已落盘草稿做「未闭合标签吃到 EOF」——那会把后续场景一并抹掉。
     const draftsBySceneId = new Map<string, string>(
-      drafts.map((draft) => [draft.sceneId, stripReasoningArtifacts(draft.content)]),
+      drafts.map((draft) => [
+        draft.sceneId,
+        stripReasoningArtifacts(draft.content, { danglingToEof: false }),
+      ]),
     );
 
     // 3) 校验蓝图声明的每个场景都已写作；存在缺失 → VALIDATION_ERROR，
@@ -76,16 +81,13 @@ export class ChapterMerger {
       );
     }
 
-    // 4) 按 scene_id 升序拼接为整章正文（需求 8.2）。
-    const merged = mergeScenes(
-      blueprint.scenes.map((scene) => ({
-        scene_id: scene.scene_id,
-        content: draftsBySceneId.get(scene.scene_id) ?? '',
-      })),
-    );
+    // 4) 按 blueprint.scenes 数组顺序拼接为整章正文（需求 8.2）。
+    const merged = blueprint.scenes
+      .map((scene) => draftsBySceneId.get(scene.scene_id) ?? '')
+      .join(SCENE_SEPARATOR);
 
     // 5) 写入章节正文（需求 8.3）并返回合并结果。
-    const cleanMerged = stripReasoningArtifacts(merged);
+    const cleanMerged = stripReasoningArtifacts(merged, { danglingToEof: false });
     await this.store.updateChapterContent(chapterId, cleanMerged);
     return cleanMerged;
   }

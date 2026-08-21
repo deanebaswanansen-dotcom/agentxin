@@ -50,6 +50,7 @@ const ACTIVE_STATUSES = new Set<AgentRunStatus>([
   'retrying',
   'waiting_user',
 ]);
+const TERMINAL_STATUSES = new Set<AgentRunStatus>(['completed', 'failed', 'cancelled']);
 
 export class AgentRunConflictError extends ServiceError {
   constructor(
@@ -71,7 +72,7 @@ function batchRange(request: AgentRunRequest): { start: number; end: number } | 
   };
 }
 
-function requestsConflict(existing: AgentRunRequest, candidate: AgentRunRequest): boolean {
+export function requestsConflict(existing: AgentRunRequest, candidate: AgentRunRequest): boolean {
   if (existing.projectId !== candidate.projectId) return false;
   if (LONG_FORM_NOVEL_TASKS.has(candidate.task)) {
     return LONG_FORM_NOVEL_TASKS.has(existing.task);
@@ -90,7 +91,7 @@ function requestsConflict(existing: AgentRunRequest, candidate: AgentRunRequest)
   );
 }
 
-function conflictMessage(request: AgentRunRequest): string {
+export function conflictMessage(request: AgentRunRequest): string {
   if (request.task === 'script_episode_batch') {
     return '同一项目已有集数范围重叠的短剧批次正在执行或等待恢复。';
   }
@@ -245,6 +246,7 @@ export class AgentRunStore {
 
   async fail(id: string, error: AgentRunError): Promise<StoredAgentRun> {
     return this.update(id, (run) => {
+      if (TERMINAL_STATUSES.has(run.status)) return;
       run.status = 'failed';
       run.error = clone(error);
     });
@@ -252,6 +254,7 @@ export class AgentRunStore {
 
   async cancel(id: string): Promise<StoredAgentRun> {
     return this.update(id, (run) => {
+      if (TERMINAL_STATUSES.has(run.status)) return;
       run.status = 'cancelled';
       run.error = { code: 'RUN_CANCELLED', message: '任务已停止。' };
     });

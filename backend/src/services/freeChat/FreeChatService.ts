@@ -31,6 +31,9 @@ const SYSTEM_PROMPTS: Record<string, string> = {
 const DEFAULT_SYSTEM_PROMPT =
   '你是一名资深小说创作顾问。根据用户提供的项目资料，就小说创作的任何问题提供专业建议和讨论。';
 
+/** 会话历史只保留最近若干轮 user/assistant，避免注入过长或 system 角色。 */
+const MAX_SESSION_HISTORY_TURNS = 40;
+
 export class FreeChatService {
   constructor(
     private readonly store: DataStore,
@@ -46,6 +49,11 @@ export class FreeChatService {
     body: FreeChatRequestBody,
     signal: AbortSignal,
   ): Promise<AsyncIterable<StreamDelta>> {
+    const project = await this.store.getProject(projectId);
+    if (!project) {
+      throw ServiceError.notFound(`项目不存在：${projectId}`);
+    }
+
     // 1) 模型配置存在性检查
     const config = await this.modelConfigService.getInternalConfig();
     if (config === undefined) {
@@ -65,10 +73,13 @@ export class FreeChatService {
       }
     }
 
-    // 加载章节内容
+    // 加载章节内容（必须属于当前项目，避免跨项目读正文）
     if (body.chapterId) {
       const chapter = await this.store.getChapter(body.chapterId);
-      if (chapter && chapter.content) {
+      if (!chapter || chapter.projectId !== projectId) {
+        throw ServiceError.notFound(`章节不存在：${body.chapterId}`);
+      }
+      if (chapter.content) {
         contextSnippets.push(
           `【当前章节：${chapter.title}】\n${chapter.content}`,
         );
@@ -91,11 +102,10 @@ export class FreeChatService {
       { role: 'system', content: systemContent },
     ];
 
-    // 追加会话历史
-    if (body.sessionHistory && body.sessionHistory.length > 0) {
-      for (const turn of body.sessionHistory) {
-        messages.push({ role: turn.role, content: turn.content });
-      }
+    // 追加会话历史：丢弃 system，只保留最近若干轮 user/assistant。
+    const history = sanitizeSessionHistory(body.sessionHistory);
+    for (const turn of history) {
+      messages.push({ role: turn.role, content: turn.content });
     }
 
     // 追加当前用户消息
@@ -140,4 +150,17 @@ export class FreeChatService {
 
     return snippets;
   }
+}
+
+function sanitizeSessionHistory(
+  history: FreeChatRequestBody['sessionHistory'],
+): Array<{ role: 'user' | 'assistant'; content: string }> {
+  if (!history || history.length === 0) return [];
+  const allowed: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+  for (const turn of history) {
+    if (!turn || typeof turn.content !== 'string') continue;
+    if (turn.role !== 'user' && turn.role !== 'assistant') continue;
+    allowed.push({ role: turn.role, content: turn.content });
+  }
+  return allowed.slice(-MAX_SESSION_HISTORY_TURNS);
 }

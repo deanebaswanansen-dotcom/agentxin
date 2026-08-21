@@ -114,6 +114,20 @@ describe('ModelConfigService.getView', () => {
     });
   });
 
+  it('returns an empty view when stored config is disabled even if disk has leftovers', async () => {
+    const store = makeFakeStore();
+    await store.saveModelConfig(validConfig);
+    const service = new ModelConfigService(store, { allowStoredConfig: false });
+    expect(await service.getView()).toEqual({
+      baseUrl: '',
+      modelName: '',
+      apiKeyMasked: '',
+      temperature: 1,
+      topP: 1,
+    });
+    expect(await service.getInternalConfig()).toBeUndefined();
+  });
+
   it('returns baseUrl + modelName in the clear and a masked key (Req 4.2)', async () => {
     const service = new ModelConfigService(makeFakeStore());
     await service.save(validConfig);

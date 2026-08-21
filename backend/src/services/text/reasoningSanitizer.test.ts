@@ -10,6 +10,19 @@ describe('reasoningSanitizer', () => {
     expect(stripReasoningArtifacts('正文之前\n<think>没有闭合')).toBe('正文之前');
   });
 
+  it('does not eat through EOF when danglingToEof is false', () => {
+    const withDangling = '场景一\n<think>未闭合\n\n场景二';
+    expect(stripReasoningArtifacts(withDangling)).toBe('场景一');
+    expect(stripReasoningArtifacts(withDangling, { danglingToEof: false })).toBe(
+      withDangling,
+    );
+    expect(
+      stripReasoningArtifacts('开头\n<think>内部推理</think>\n正文', {
+        danglingToEof: false,
+      }),
+    ).toBe('开头\n正文');
+  });
+
   it('keeps streaming content outside split reasoning tags', () => {
     const filter = new ReasoningArtifactFilter();
     const output = [

@@ -9,8 +9,8 @@
  *    虽然 {@link SceneWriter.streamScene} 内部也会做同样检查，但整章入口先行检查可保证
  *    「未配置即不发起任何生成」的整体语义。
  * 2. 读取章节蓝图（需求 7.x）；缺失 → `NOT_FOUND`。
- * 3. 按 `scene_id` 升序（与 {@link mergeScenes} 一致的 {@link compareSceneId} 全序口径）
- *    依次处理每个场景（需求 7.1）：先广播 `scene` 事件标记场景边界，再透传该场景的文本
+ * 3. 按 `blueprint.scenes` 数组顺序依次处理每个场景（需求 7.1）：先广播 `scene`
+ *    事件标记场景边界，再透传该场景的文本
  *    增量（`delta` 事件），同时就地累加完整正文；该场景流 **正常结束** 后调用
  *    {@link SceneWriter.finalizeDraft} 持久化整段正文，再进入下一个场景（需求 7.2）。
  * 4. 某场景生成失败 → 直接向上抛出错误，停止后续场景生成；此前已持久化的场景正文保留
@@ -33,7 +33,6 @@ import { ServiceError } from '../ServiceError.js';
 import type { ModelConfigService } from '../modelConfig/ModelConfigService.js';
 import type { ChapterMerger } from './ChapterMerger.js';
 import type { SceneWriter } from './SceneWriter.js';
-import { compareSceneId } from './mergeScenes.js';
 import { ReasoningArtifactFilter, stripReasoningArtifacts } from '../text/reasoningSanitizer.js';
 
 const MAX_EMPTY_SCENE_ATTEMPTS = 3;
@@ -64,12 +63,12 @@ export class ChapterWriter {
   ) {}
 
   /**
-   * 编排整章生成：按 `scene_id` 升序逐场景流式生成、逐场景持久化，最后合并为整章正文（需求 7）。
+   * 编排整章生成：按 `blueprint.scenes` 数组顺序逐场景流式生成、逐场景持久化，最后合并为整章正文（需求 7）。
    *
    * 步骤（顺序至关重要）：
    * 1. 读取内部模型配置；缺失 → 抛出 `MODEL_NOT_CONFIGURED`，且不发起任何场景生成（需求 7.5）。
    * 2. 读取章节蓝图；缺失 → `NOT_FOUND`。
-   * 3. 以 {@link compareSceneId} 对蓝图场景按 `scene_id` 升序排序（需求 7.1），依次处理每个场景：
+   * 3. 按 `blueprint.scenes` 数组顺序依次处理每个场景（需求 7.1）：
    *    - `yield { type: 'scene', sceneId }` 标记场景边界。
    *    - 调用 {@link SceneWriter.streamScene} 取得增量流，`for await` 透传增量
    *      （`yield { type: 'delta', sceneId, text }`）并累加完整正文。
@@ -105,12 +104,9 @@ export class ChapterWriter {
       throw ServiceError.notFound(`章节蓝图不存在：${chapterId}`);
     }
 
-    // 3) 按 scene_id 升序依次处理每个场景（需求 7.1）。先复制再排序，不修改蓝图原数组。
-    const orderedScenes = [...blueprint.scenes].sort((a, b) =>
-      compareSceneId(a.scene_id, b.scene_id),
-    );
-
-    for (const scene of orderedScenes) {
+    // 3) 按 blueprint.scenes 数组顺序依次处理每个场景（需求 7.1）。
+    //    已有非空草稿则跳过（崩溃续写）；替换蓝图会清掉该章草稿，故跳过不会沿用旧蓝图正文。
+    for (const scene of blueprint.scenes) {
       const sceneId = scene.scene_id;
 
       // A chapter is a resumable unit.  A previous successful scene draft is

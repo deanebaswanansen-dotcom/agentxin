@@ -28,11 +28,10 @@
  *   content-type parser is registered here.
  * - The SSE writing route hijacks the reply and writes directly to
  *   `reply.raw`; no special wiring is required for it here.
- * - No CORS handling is added: the frontend `apiClient` targets a relative
- *   `/api` base (same-origin / dev proxy — a frontend concern, task 13.2).
+ * - CORS is registered in `buildServer` (`CORS_ORIGIN`, default `*`).
  */
 import Fastify from 'fastify';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -112,6 +111,19 @@ import { ProxyScriptModelAdapter } from './services/script/agents/ProxyScriptMod
 import { ScriptPlanTurnService } from './services/script/agents/ScriptPlanTurnService.js';
 import { ScriptConceptService } from './services/script/agents/ScriptConceptService.js';
 import { registerScriptPlanRoutes } from './routes/scriptPlanRoutes.js';
+
+function isLoopbackAddress(value: string | undefined): boolean {
+  if (!value) return false;
+  const ip = value.replace(/^\[|\]$/g, '');
+  if (ip === '::1' || ip === 'localhost') return true;
+  const v4 = ip.replace(/^::ffff:/i, '');
+  return v4 === '127.0.0.1' || v4 === '::1';
+}
+
+function allowCacheStats(request: FastifyRequest): boolean {
+  if (process.env.ALLOW_CACHE_STATS === '1') return true;
+  return isLoopbackAddress(request.ip) || isLoopbackAddress(request.socket?.remoteAddress);
+}
 
 /**
  * Build a fully wired Fastify application from an already-constructed
@@ -196,9 +208,16 @@ export function buildServer(
       if (agentRunStore) {
         await agentRunStore.deleteForProject(clientId, projectId);
       }
+      await memory.clearProject(projectId);
+      await refs.clearProjectConfig(projectId);
+      await longNovelConfigs.delete(projectId);
     },
   });
-  const chapterService = new ChapterService(store);
+  const chapterService = new ChapterService(store, {
+    afterRemove: async (chapter) => {
+      await memory.removeChapterSummary(chapter.projectId, chapter.id);
+    },
+  });
   const settingService = new SettingService(store);
   const modelConfigService = new ModelConfigService(store, { allowStoredConfig: false });
   const scriptModelAdapter = scriptStore
@@ -271,8 +290,16 @@ export function buildServer(
 
   registerRequestModelConfig(app);
 
-  app.get('/api/cache-stats', async () => getCacheStatsSummary());
-  app.post('/api/cache-stats/reset', async () => {
+  app.get('/api/cache-stats', async (request, reply) => {
+    if (!allowCacheStats(request)) {
+      return reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'Not found' } });
+    }
+    return getCacheStatsSummary();
+  });
+  app.post('/api/cache-stats/reset', async (request, reply) => {
+    if (!allowCacheStats(request)) {
+      return reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'Not found' } });
+    }
     resetCacheStats();
     return { ok: true };
   });
@@ -322,6 +349,10 @@ export function buildServer(
 export async function start(): Promise<FastifyInstance> {
   // Startup recovery: load persisted data before serving requests (Req 7.3).
   const clientRoot = process.env.CLIENT_DATA_DIR;
+  const requireClientId = process.env.REQUIRE_CLIENT_ID === '1' || process.env.NETLIFY === 'true';
+  if (requireClientId && !clientRoot) {
+    throw new Error('REQUIRE_CLIENT_ID=1 时必须同时设置 CLIENT_DATA_DIR，否则多浏览器会共用同一份 store。');
+  }
   const store = clientRoot
     ? createClientScopedDataStore(join(clientRoot, 'projects'))
     : await FileDataStore.create(process.env.DATA_FILE ?? undefined);
@@ -362,7 +393,8 @@ export async function start(): Promise<FastifyInstance> {
   );
 
   const port = Number(process.env.PORT ?? 3000);
-  const address = await app.listen({ port, host: '0.0.0.0' });
+  const host = process.env.HOST?.trim() || '127.0.0.1';
+  const address = await app.listen({ port, host });
   // eslint-disable-next-line no-console
   console.log(`Backend listening at ${address}`);
   return app;

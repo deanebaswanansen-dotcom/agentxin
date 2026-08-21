@@ -996,6 +996,8 @@ export interface AgentRunStreamOptions {
   signal?: AbortSignal;
   onProgress?: (event: AgentProgressEvent) => void;
   onJobCreated?: (jobId: string) => void;
+  /** Persisted events already shown in the UI; watchJob skips them on replay. */
+  deliveredEvents?: number;
 }
 
 interface AgentJobSnapshot {
@@ -1290,10 +1292,12 @@ export async function watchPersistentAgentJob(
   baseUrl: string,
   jobId: string,
   options?: AgentRunStreamOptions,
+  deliveredEvents?: number,
 ): Promise<AgentRunResult> {
-  let deliveredEvents = 0;
+  let delivered = deliveredEvents ?? options?.deliveredEvents ?? 0;
   let reconnecting = false;
   let resumedInterrupted = false;
+  let lastWaitingKey: string | null = null;
   for (;;) {
     let snapshot: PersistentAgentJobSnapshot;
     try {
@@ -1320,8 +1324,8 @@ export async function watchPersistentAgentJob(
       reconnecting = false;
       options?.onProgress?.({ phase: 'info', message: '已恢复连接，任务继续运行。' });
     }
-    for (const event of snapshot.events.slice(deliveredEvents)) options?.onProgress?.(event);
-    deliveredEvents = snapshot.events.length;
+    for (const event of snapshot.events.slice(delivered)) options?.onProgress?.(event);
+    delivered = snapshot.events.length;
     if (snapshot.status === 'completed' && snapshot.result) return snapshot.result;
     if (snapshot.status === 'failed' || snapshot.status === 'cancelled') {
       throw new ApiClientError({
@@ -1334,6 +1338,7 @@ export async function watchPersistentAgentJob(
     if (snapshot.status === 'waiting_user') {
       if (snapshot.error?.code === 'RUN_INTERRUPTED' && !resumedInterrupted) {
         resumedInterrupted = true;
+        lastWaitingKey = null;
         options?.onProgress?.({
           phase: 'info',
           message: snapshot.error.message || '服务已重启，正在自动继续任务…',
@@ -1344,13 +1349,16 @@ export async function watchPersistentAgentJob(
         });
         continue;
       }
-      throw new ApiClientError({
-        error: {
-          code: snapshot.error?.code === 'PROVIDER_ERROR' ? 'PROVIDER_ERROR' : 'STORE_ERROR',
-          message: snapshot.error?.message ?? '任务等待确认后才能继续。',
-        },
-      });
+      const waitingMessage = snapshot.error?.message ?? '任务等待确认后才能继续。';
+      const waitingKey = `${snapshot.error?.code ?? ''}:${waitingMessage}`;
+      if (lastWaitingKey !== waitingKey) {
+        lastWaitingKey = waitingKey;
+        options?.onProgress?.({ phase: 'info', message: waitingMessage });
+      }
+      await waitForPoll(750, options?.signal);
+      continue;
     }
+    lastWaitingKey = null;
     await waitForPoll(750, options?.signal);
   }
 }
@@ -1737,7 +1745,8 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
         request(b, 'DELETE', `/projects/${seg(projectId)}/plan-session`, undefined, { signal }),
       listJobs: (projectId, signal) =>
         request(b, 'GET', `/projects/${seg(projectId)}/agent-jobs`, undefined, { signal }),
-      watchJob: (jobId, options) => watchPersistentAgentJob(b, jobId, options),
+      watchJob: (jobId, options) =>
+        watchPersistentAgentJob(b, jobId, options, options?.deliveredEvents ?? 0),
       cancelJob: (jobId, signal) =>
         request(b, 'POST', `/agent/jobs/${seg(jobId)}/cancel`, {}, { signal }),
     },

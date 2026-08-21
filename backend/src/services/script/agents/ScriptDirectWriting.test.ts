@@ -13,6 +13,7 @@ import {
   mergeDirectHandoffContinuity,
   reconcileDirectReviewBoundary,
 } from './ScriptDirectWriting.js';
+import { ScriptModelOutputError } from './structuredOutput.js';
 
 const character = {
   id: 'character-zhou',
@@ -176,5 +177,30 @@ describe('ScriptDirectWriting', () => {
       evidenceBlockIds: ['block-1'],
     }));
     expect(merged.nextEpisodeMustInherit).toContain('门外传来陌生赛车的引擎声');
+  });
+
+  it('tolerates omitted empty fields in a pass-only payload', () => {
+    expect(decodeDirectHandoffReview({ verdict: 'pass' })).toEqual({
+      verdict: 'pass',
+      issues: [],
+      handoff: {
+        summary: '',
+        characterStates: [],
+        props: [],
+        openThreads: [],
+        ending: '',
+      },
+    });
+  });
+
+  it('does not coerce major_issue into pass after dropping unrecognised issues', () => {
+    expect(() => decodeDirectHandoffReview({
+      verdict: 'major_issue',
+      issues: [
+        { code: 'LITERARY_STYLE', evidence: '不够优美', expected: '加修辞' },
+        { code: 'UNKNOWN_STYLE', evidence: '太口语', expected: '更文学' },
+      ],
+      handoff: { summary: '本集完成复出准备', openThreads: ['谁篡改了数据'] },
+    })).toThrow(ScriptModelOutputError);
   });
 });

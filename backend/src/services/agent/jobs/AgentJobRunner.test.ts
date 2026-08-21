@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { getCurrentClientId } from '../../client/clientScope.js';
 import { getRequestModelConfig } from '../../modelConfig/requestModelConfig.js';
 import { AgentJobRunner } from './AgentJobRunner.js';
-import { AgentRunStore } from './AgentRunStore.js';
+import { AgentRunConflictError, AgentRunStore } from './AgentRunStore.js';
 
 const CLIENT_ID = 'a'.repeat(64);
 
@@ -442,6 +442,48 @@ describe('AgentJobRunner', () => {
     }));
     await runner.waitUntilIdle(created.id);
 
+    expect(store.get(created.id)?.status).toBe('cancelled');
+  });
+
+  it('rejects an overlapping long-form start while a cancelled job is still settling', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-cancel-overlap-'));
+    const store = await AgentRunStore.create(join(directory, 'runs.json'));
+    let finish!: () => void;
+    const runner = new AgentJobRunner(store, {
+      run: (request) => new Promise((resolve) => {
+        finish = () => resolve({
+          task: request.task, mode: request.mode, projectId: request.projectId ?? 'project-a',
+          summary: '迟到的完成结果', steps: [], artifacts: [],
+        });
+      }),
+    });
+
+    const created = await runner.start(
+      CLIENT_ID,
+      { task: 'long_novel', mode: 'draft', prompt: '写两章', projectId: 'project-a' },
+      undefined,
+    );
+    await vi.waitFor(() => expect(store.get(created.id)?.status).toBe('running'));
+    await runner.cancel(CLIENT_ID, created.id);
+    expect(store.get(created.id)?.status).toBe('cancelled');
+
+    await expect(runner.start(
+      CLIENT_ID,
+      { task: 'full_novel', mode: 'draft', prompt: '再写十章', projectId: 'project-a' },
+      undefined,
+    )).rejects.toBeInstanceOf(AgentRunConflictError);
+    await expect(runner.start(
+      CLIENT_ID,
+      { task: 'full_novel', mode: 'draft', prompt: '再写十章', projectId: 'project-a' },
+      undefined,
+    )).rejects.toMatchObject({
+      code: 'CONFLICT',
+      existingJobId: created.id,
+    });
+    expect(store.get(created.id)?.status).toBe('cancelled');
+
+    finish();
+    await runner.waitUntilIdle(created.id);
     expect(store.get(created.id)?.status).toBe('cancelled');
   });
 });

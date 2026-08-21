@@ -130,7 +130,7 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
     const rememberedJob = loadActiveAgentJob();
     const recoverRememberedJob = rememberedJob &&
       isRunnableAgentTask(rememberedJob.task) &&
-      rememberedJob.sourceProjectId === (projectId ?? null)
+      (projectId == null || rememberedJob.sourceProjectId === projectId)
       ? rememberedJob
       : null;
     if (!projectId && !recoverRememberedJob) return;
@@ -164,15 +164,20 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
       activeJobIdRef.current = jobId;
       setRunning(true);
       setRunningTask(task);
+      const existingEvents = job?.events ?? [];
       appendMessage({
-        id: progressId, role: 'assistant', kind: 'agent-progress', task, taskTitle, events: job?.events ?? [],
+        id: progressId, role: 'assistant', kind: 'agent-progress', task, taskTitle, events: existingEvents,
       });
       try {
         const result = await apiClient.agent.watchJob(jobId, {
           signal: controller.signal,
-          onProgress: (event) => updateMessage(progressId, (previous) => previous.kind === 'agent-progress'
-            ? { ...previous, events: [...previous.events, event] }
-            : previous),
+          deliveredEvents: existingEvents.length,
+          onProgress: (event) => updateMessage(progressId, (previous) => {
+            if (previous.kind !== 'agent-progress') return previous;
+            const last = previous.events[previous.events.length - 1];
+            if (last && JSON.stringify(last) === JSON.stringify(event)) return previous;
+            return { ...previous, events: [...previous.events, event] };
+          }),
         });
         if (disposed) return;
         removeMessage(progressId);
@@ -215,7 +220,7 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
       const { task, prompt } = params;
       if (running) return;
       if (!isRunnableAgentTask(task)) {
-        onError?.(new Error('计划模式请使用对话区的选项提交，不要直接当 Agent 任务执行。'));
+        onErrorRef.current?.(new Error('计划模式请使用对话区的选项提交，不要直接当 Agent 任务执行。'));
         return;
       }
       // auto_next/workspace_review/chapter_diagnosis 允许空 prompt
@@ -357,7 +362,7 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
           chapterPreview,
         });
 
-        onCompleted?.(next, projectId);
+        onCompletedRef.current?.(next, projectId);
       } catch (error) {
         if (isAbort(error)) {
           progressLines.push('任务已停止。');
@@ -397,7 +402,7 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
             ],
           };
         });
-        if (!isAbort(error)) onError?.(error);
+        if (!isAbort(error)) onErrorRef.current?.(error);
       } finally {
         if (abortRef.current === controller) {
           setRunning(false);
@@ -415,8 +420,6 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
       appendMessage,
       updateMessage,
       removeMessage,
-      onCompleted,
-      onError,
       onStreamingChange,
     ],
   );

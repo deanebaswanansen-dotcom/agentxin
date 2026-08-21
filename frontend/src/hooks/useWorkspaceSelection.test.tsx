@@ -44,6 +44,24 @@ describe('useWorkspaceSelection', () => {
     expect(result.current.selectedProjectName).toBe('新项目');
   });
 
+  it('does not select a chapter until the chapter list returns', async () => {
+    const pending = deferred<Awaited<ReturnType<typeof apiClient.chapters.list>>>();
+    vi.mocked(apiClient.chapters.list).mockReturnValueOnce(pending.promise);
+    const { result } = renderHook(() => useWorkspaceSelection({ reportError: vi.fn() }));
+
+    act(() => void result.current.loadChapter('p-1', 'ch-1'));
+    expect(result.current.selectedChapterId).toBe(null);
+    expect(result.current.selectedChapter).toBe(null);
+
+    await act(async () => pending.resolve([
+      { id: 'ch-1', projectId: 'p-1', title: '新章节', content: '新正文', position: 0 },
+    ]));
+
+    expect(result.current.selectedChapterId).toBe('ch-1');
+    expect(result.current.selectedChapter?.id).toBe('ch-1');
+    expect(result.current.editorContent).toBe('新正文');
+  });
+
   it('ignores a slower chapter response after the user opens another chapter', async () => {
     const first = deferred<Awaited<ReturnType<typeof apiClient.chapters.list>>>();
     const second = deferred<Awaited<ReturnType<typeof apiClient.chapters.list>>>();

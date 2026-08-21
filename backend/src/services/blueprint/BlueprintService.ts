@@ -62,6 +62,57 @@ function isPositiveInteger(value: number): boolean {
 }
 
 /**
+ * Coerce Python/template `chapter_id` / `scene_id` numbers to strings so
+ * {@link parseBlueprintFromText} can accept them. Other fields are left as-is;
+ * invalid shapes still fail parse/validate and must not be saved.
+ */
+function stringifyBlueprintIds(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(stringifyBlueprintIds);
+  }
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+      if (
+        (key === 'scene_id' || key === 'chapter_id') &&
+        (typeof nested === 'number' || typeof nested === 'bigint')
+      ) {
+        out[key] = String(nested);
+      } else {
+        out[key] = stringifyBlueprintIds(nested);
+      }
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Run the Node parse + structure-validate pipeline on a Python blueprint.
+ * Returns `null` on `VALIDATION_ERROR` so the caller can fall through to Node
+ * generation instead of persisting template / int-id objects.
+ */
+function parseAndValidatePythonBlueprint(
+  raw: unknown,
+  chapterId: Id,
+  targetWords: number,
+): ChapterBlueprint | null {
+  try {
+    const core = normalizeBlueprintWordTargets(
+      parseBlueprintFromText(JSON.stringify(stringifyBlueprintIds(raw))),
+      targetWords,
+    );
+    validateBlueprint(core);
+    return { ...core, chapter_id: chapterId };
+  } catch (error) {
+    if (error instanceof ServiceError && error.code === 'VALIDATION_ERROR') {
+      return null;
+    }
+    throw error;
+  }
+}
+
+/**
  * Models often round each short scene independently (for example 3×250 for a
  * 900-character chapter). Preserve their relative pacing while making the
  * allocation sum exactly to the user-confirmed chapter target.
@@ -164,7 +215,11 @@ export class BlueprintService {
           // projectDir inferred by workspace + bridge
         });
         if (py.blueprint) {
-          bpFromPy = { ...py.blueprint, chapter_id: chapterId } as ChapterBlueprint;
+          bpFromPy = parseAndValidatePythonBlueprint(
+            py.blueprint,
+            chapterId,
+            body.targetWords,
+          );
         }
       } catch (e) {
         // fallthrough to legacy Node path
@@ -172,7 +227,6 @@ export class BlueprintService {
     }
 
     if (bpFromPy) {
-      // persist & return python result (single engine)
       return this.store.saveChapterBlueprint(bpFromPy);
     }
 

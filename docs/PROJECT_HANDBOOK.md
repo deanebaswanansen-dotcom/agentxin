@@ -174,7 +174,7 @@ npm run build
 
 cd /root/agentxin/frontend
 npm ci
-VITE_AGENT_BACKGROUND_JOBS=false VITE_SCRIPT_MODE_ENABLED=false npm run build
+VITE_AGENT_BACKGROUND_JOBS=false VITE_SCRIPT_MODE_ENABLED=true npm run build
 
 mkdir -p /var/www/agentxin /var/lib/agentxin
 cp -a /root/agentxin/frontend/dist/. /var/www/agentxin/
@@ -292,7 +292,7 @@ npm run build
 
 cd ../frontend
 npm ci
-VITE_AGENT_BACKGROUND_JOBS=false VITE_SCRIPT_MODE_ENABLED=false npm run build
+VITE_AGENT_BACKGROUND_JOBS=false VITE_SCRIPT_MODE_ENABLED=true npm run build
 cp -a dist/. /var/www/agentxin/
 
 systemctl restart agentxin
@@ -412,7 +412,7 @@ systemctl status agentxin --no-pager
 
 ## 13. 短剧模式本地验收
 
-短剧入口由前端构建变量 `VITE_SCRIPT_MODE_ENABLED` 控制；生产环境未显式开启时默认隐藏，关闭入口不会删除已有短剧资料。
+短剧新建入口由前端构建变量 `VITE_SCRIPT_MODE_ENABLED` 控制；当前生产构建应显式设为 `true`。设为 `false` 时只禁止新建短剧，已有短剧项目仍会显示并可正常打开，不会删除资料。
 
 真实模型验收脚本会创建独立临时项目，依次执行策划、总纲、圣经、单集正文、质量门和 TXT/Markdown/Fountain 导出。密钥只允许通过当前进程的 `SHORT_DRAMA_E2E_API_KEY` 提供，不要写入仓库、命令历史、日志或测试夹具。运行方式：
 

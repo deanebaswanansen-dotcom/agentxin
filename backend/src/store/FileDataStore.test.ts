@@ -12,6 +12,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import type { ChapterBlueprint, Scene } from '../types/index.js';
 import { FileDataStore } from './FileDataStore.js';
 import { isStoreError } from './StoreError.js';
 
@@ -597,5 +598,98 @@ describe('FileDataStore model config operations', () => {
     read!.apiKey = 'sk-tampered-2';
     const reread = await store.getModelConfig();
     expect(reread?.apiKey).toBe('sk-secret');
+  });
+});
+
+function makeScene(sceneId: string): Scene {
+  return {
+    scene_id: sceneId,
+    name: `场景 ${sceneId}`,
+    target_words: 100,
+    location: '某地',
+    characters: [],
+    purpose: '推进剧情',
+    emotion: '平静',
+    pacing: '中速',
+    must_include: [],
+    ending_state: '过渡',
+  };
+}
+
+function makeBlueprint(chapterId: string, sceneIds: string[]): ChapterBlueprint {
+  return {
+    chapter_id: chapterId,
+    title: '测试章节',
+    target_words: sceneIds.length * 100,
+    main_goal: '主目标',
+    tone: '基调',
+    pacing: '章节节奏',
+    required_plot_points: [],
+    forbidden_points: [],
+    emotional_curve: '情绪曲线',
+    scenes: sceneIds.map(makeScene),
+    ending_hook: '钩子',
+  };
+}
+
+describe('FileDataStore chapter blueprint replace invalidates scene drafts', () => {
+  it('deletes same-chapter drafts on blueprint replace and persists once', async () => {
+    const store = await FileDataStore.create(file);
+    const project = await store.createProject('p');
+    const chapter = await store.createChapter(project.id, 'c');
+    const other = await store.createChapter(project.id, 'other');
+
+    await store.saveChapterBlueprint(makeBlueprint(chapter.id, ['scene-1', 'scene-2']));
+    const now = new Date().toISOString();
+    await store.saveSceneDraft({
+      chapterId: chapter.id,
+      sceneId: 'scene-1',
+      content: '本章草稿A',
+      updatedAt: now,
+    });
+    await store.saveSceneDraft({
+      chapterId: chapter.id,
+      sceneId: 'scene-2',
+      content: '本章草稿B',
+      updatedAt: now,
+    });
+    const otherDraft = await store.saveSceneDraft({
+      chapterId: other.id,
+      sceneId: 'scene-1',
+      content: '他章草稿',
+      updatedAt: now,
+    });
+
+    const replaced = makeBlueprint(chapter.id, ['scene-9']);
+    await store.saveChapterBlueprint(replaced);
+
+    expect(await store.listSceneDrafts(chapter.id)).toEqual([]);
+    expect(await store.getSceneDraft(chapter.id, 'scene-1')).toBeUndefined();
+    expect(await store.getSceneDraft(other.id, 'scene-1')).toEqual(otherDraft);
+    expect(await store.getChapterBlueprintByChapter(chapter.id)).toEqual(replaced);
+
+    const reloaded = await FileDataStore.create(file);
+    expect(await reloaded.listSceneDrafts(chapter.id)).toEqual([]);
+    expect(await reloaded.getSceneDraft(other.id, 'scene-1')).toEqual(otherDraft);
+    expect(await reloaded.getChapterBlueprintByChapter(chapter.id)).toEqual(replaced);
+  });
+
+  it('leaves other-chapter drafts intact when a chapter first receives a blueprint', async () => {
+    const store = await FileDataStore.create(file);
+    const project = await store.createProject('p');
+    const a = await store.createChapter(project.id, 'a');
+    const b = await store.createChapter(project.id, 'b');
+    const now = new Date().toISOString();
+    const kept = await store.saveSceneDraft({
+      chapterId: b.id,
+      sceneId: 'keep',
+      content: '保留',
+      updatedAt: now,
+    });
+
+    await store.saveChapterBlueprint(makeBlueprint(a.id, ['scene-1']));
+
+    expect(await store.getSceneDraft(b.id, 'keep')).toEqual(kept);
+    expect(await store.listSceneDrafts(a.id)).toEqual([]);
   });
 });

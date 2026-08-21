@@ -144,6 +144,17 @@ describe('WritingService.streamWriting model config check', () => {
       service.streamWriting('proj-1', 'missing', body, new AbortController().signal),
     ).rejects.toSatisfy((e: unknown) => isServiceError(e) && e.code === 'NOT_FOUND');
   });
+
+  it('throws NOT_FOUND when the chapter belongs to a different project', async () => {
+    const { service, calls } = makeService({ chapters: [chapter], modelConfig: VALID_CONFIG });
+
+    const body: WritingRequestBody = { operation: 'continue', instruction: '继续' };
+
+    await expect(
+      service.streamWriting('proj-other', 'chap-1', body, new AbortController().signal),
+    ).rejects.toSatisfy((e: unknown) => isServiceError(e) && e.code === 'NOT_FOUND');
+    expect(calls).toHaveLength(0);
+  });
 });
 
 describe('WritingService.streamWriting context assembly', () => {

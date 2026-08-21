@@ -37,6 +37,14 @@ describe('buildServer wiring', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  it('exposes cache-stats only on the loopback probe', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/cache-stats' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().localCache).toEqual(
+      expect.objectContaining({ hits: expect.any(Number), misses: expect.any(Number) }),
+    );
+  });
+
   it('keeps the /health probe', async () => {
     const res = await app.inject({ method: 'GET', url: '/health' });
     expect(res.statusCode).toBe(200);

@@ -47,6 +47,14 @@ const EN_TEXT_CHAPTER_PATTERN = /^(chapter|part|episode|prologue|epilogue)\s+[\w
 const SUPPORTED_TEXT_EXTENSIONS = new Set(['txt', 'md', 'markdown', 'html', 'htm', 'json', 'epub']);
 const IMAGE_FILE_PATTERN = /\.(avif|bmp|gif|jpe?g|png|webp)$/iu;
 export const SUPPORTED_READER_FILE_PATTERN = /\.(txt|md|markdown|html|htm|json|epub|pdf|cbz|avif|bmp|gif|jpe?g|png|webp)$/iu;
+/** Raster data URLs only: png/jpeg/jpg/gif/webp, optional charset, base64 payload. */
+const READER_RASTER_DATA_URL_PATTERN =
+  /^data:image\/(?:png|jpe?g|gif|webp)(?:;charset=[^;,]+)?;base64,/iu;
+
+/** True for inline reader images that cannot execute as SVG/HTML. */
+export function isAllowedReaderRasterDataUrl(src: string): boolean {
+  return READER_RASTER_DATA_URL_PATTERN.test(String(src).trim());
+}
 
 interface ParsedHtmlDocument {
   title: string;
@@ -706,7 +714,7 @@ function extractEpubParagraphs(root: Element | null): string[] {
     const tag = node.tagName.toLowerCase();
     if (tag === 'img' || tag === 'image') {
       const src = node.getAttribute('src') || node.getAttribute('href') || node.getAttribute('xlink:href') || '';
-      if (src.startsWith('data:image/')) paragraphs.push(`<figure class="nwa-reader-inline-image"><img src="${escapeAttr(src)}" alt="${escapeAttr(node.getAttribute('alt') || '')}"></figure>`);
+      if (isAllowedReaderRasterDataUrl(src)) paragraphs.push(`<figure class="nwa-reader-inline-image"><img src="${escapeAttr(src)}" alt="${escapeAttr(node.getAttribute('alt') || '')}"></figure>`);
       continue;
     }
     const text = normalizeDomText(node.textContent);

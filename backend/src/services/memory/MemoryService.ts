@@ -359,6 +359,20 @@ export class MemoryService {
     return this.store.read(projectId);
   }
 
+  /** 项目删除时清掉该项目全部记忆，避免摘要/事实泄漏进后续作品。 */
+  async clearProject(projectId: string): Promise<void> {
+    await this.store.clearProject(projectId);
+  }
+
+  /** 章节删除时丢掉该章摘要，避免续写仍把已删章节当前情。 */
+  async removeChapterSummary(projectId: string, chapterId: string): Promise<void> {
+    const id = normalize(chapterId);
+    if (!id) return;
+    await this.store.update(projectId, (memory) => {
+      memory.summaries = memory.summaries.filter((summary) => summary.chapterId !== id);
+    });
+  }
+
   /** 追加一条章节摘要（同 chapterId 覆盖，保证一章一条最新摘要）。 */
   async appendChapterSummary(
     projectId: string,
@@ -517,6 +531,12 @@ export class MemoryService {
 
   isChapterRejected(projectId: string, chapterId: string): boolean {
     return this.store.read(projectId).rejectedChapterIds.includes(chapterId);
+  }
+
+  hasChapterSummary(projectId: string, chapterId: string): boolean {
+    const id = normalize(chapterId);
+    if (!id) return false;
+    return this.store.read(projectId).summaries.some((entry) => entry.chapterId === id);
   }
 
   formatCriticalStateLedger(projectId: string, maxEntries = 80): string {
