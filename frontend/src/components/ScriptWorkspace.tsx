@@ -392,7 +392,13 @@ function OutlineEditor({
       <header className="script-stage-heading"><div><span>第二阶段</span><h2 id="script-outline-heading">剧本大纲</h2></div><div className="script-stage-heading__actions"><div className="script-view-switch" role="group" aria-label="大纲查看模式"><button type="button" aria-pressed={mode === 'read'} onClick={() => setMode('read')}>阅读模式</button><button type="button" aria-pressed={mode === 'edit'} onClick={() => setMode('edit')}>编辑模式</button></div><span className="script-status-chip">{value.episodeCards.length} 张分集卡</span></div></header>
       {mode === 'read' ? <ScriptOutlineReadView value={value} /> : <>
       <div className="script-form-grid">
-        <label className="script-field script-field--wide">全剧梗概<textarea rows={8} value={value.synopsis} onChange={(e) => patch('synopsis', e.target.value)} /></label>
+        <label className="script-field script-field--wide">
+          <span className="script-field-heading">
+            <span>全剧梗概</span>
+            <small className={value.synopsis.trim().length < 350 ? 'is-warning' : ''}>建议约 500 字 · 当前 {value.synopsis.trim().length} 字</small>
+          </span>
+          <textarea aria-label="全剧梗概" rows={12} value={value.synopsis} onChange={(e) => patch('synopsis', e.target.value)} />
+        </label>
         <label className="script-field">开局状态<textarea value={value.openingState} onChange={(e) => patch('openingState', e.target.value)} /></label>
         <label className="script-field">中点转折<textarea value={value.midpointTurn} onChange={(e) => patch('midpointTurn', e.target.value)} /></label>
         <label className="script-field">高潮<textarea value={value.climax} onChange={(e) => patch('climax', e.target.value)} /></label>
@@ -405,12 +411,29 @@ function OutlineEditor({
           'episodeCards',
           value.episodeCards.map((item, itemIndex) => itemIndex === index ? { ...item, ...changes } : item),
         );
-        return <article key={card.episodeNumber}>
-          <strong>第 {card.episodeNumber} 集</strong>
-          <input aria-label={`第 ${card.episodeNumber} 集标题`} value={card.title} onChange={(e) => updateCard({ title: e.target.value })} />
-          <textarea aria-label={`第 ${card.episodeNumber} 集梗概`} value={card.logline} onChange={(e) => updateCard({ logline: e.target.value })} />
-          <textarea aria-label={`第 ${card.episodeNumber} 集主要事件`} value={card.mainEvent} onChange={(e) => updateCard({ mainEvent: e.target.value })} />
-          <textarea aria-label={`第 ${card.episodeNumber} 集结尾卡点`} value={card.endingHook} onChange={(e) => updateCard({ endingHook: e.target.value })} />
+        return <article className="script-outline-edit-card" key={card.episodeNumber}>
+          <header className="script-outline-edit-card__heading">
+            <strong>第 {card.episodeNumber} 集</strong>
+            <span>分集卡</span>
+          </header>
+          <div className="script-outline-edit-card__fields">
+            <label className="script-outline-edit-field">
+              <span>标题</span>
+              <input aria-label={`第 ${card.episodeNumber} 集标题`} value={card.title} onChange={(e) => updateCard({ title: e.target.value })} />
+            </label>
+            <label className="script-outline-edit-field">
+              <span>本集梗概</span>
+              <textarea rows={3} aria-label={`第 ${card.episodeNumber} 集梗概`} value={card.logline} onChange={(e) => updateCard({ logline: e.target.value })} />
+            </label>
+            <label className="script-outline-edit-field">
+              <span>主要事件</span>
+              <textarea rows={3} aria-label={`第 ${card.episodeNumber} 集主要事件`} value={card.mainEvent} onChange={(e) => updateCard({ mainEvent: e.target.value })} />
+            </label>
+            <label className="script-outline-edit-field">
+              <span>结尾卡点</span>
+              <textarea rows={3} aria-label={`第 ${card.episodeNumber} 集结尾卡点`} value={card.endingHook} onChange={(e) => updateCard({ endingHook: e.target.value })} />
+            </label>
+          </div>
         </article>;
       })}</div> : <p className="script-muted">保存策划后，可让 Agent 生成全剧总纲与连续分集卡。</p>}
       </>}

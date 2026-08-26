@@ -817,6 +817,8 @@ describe('ScriptDirector', () => {
     expect(result.kind).toBe('series_outline');
     expect(chunkStarts).toEqual([1, 11]);
     expect(prompts[0]).not.toContain('上一段最后两集');
+    expect(prompts[0]).toContain('450—650 个汉字的全剧大纲');
+    expect(prompts[0]).toContain('不要只写“调查真相”“冲突升级”这类空话');
     expect(prompts[1]).toContain('上一段最后两集');
     expect(prompts[1]).toContain('第9步');
     expect(prompts[1]).toContain('第10步');
@@ -824,6 +826,7 @@ describe('ScriptDirector', () => {
     expect(store.state.seriesOutline?.episodeCards.map((card) => card.episodeNumber)).toEqual(
       Array.from({ length: 12 }, (_, index) => index + 1),
     );
+    expect(store.state.seriesOutline?.synopsis.length).toBeGreaterThanOrEqual(450);
 
     const firstRevision = store.state.seriesOutline?.revision;
     const callsBeforeRegenerate = chunkStarts.length;

@@ -116,6 +116,8 @@ describe('ScriptDirector series outline resilience', () => {
     );
     expect(result.outline.episodeCards[0]?.logline).toContain('物资');
     expect(result.outline.episodeCards.at(-1)?.endingHook).toContain('公开分配制度');
+    expect(result.outline.synopsis.length).toBeGreaterThanOrEqual(450);
+    expect(result.outline.synopsis.length).toBeLessThan(800);
     const persistedState = await store.getProjectState('project-1');
     expect(persistedState?.seriesOutline?.episodeCards).toHaveLength(60);
 
