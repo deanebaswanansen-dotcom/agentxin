@@ -1818,7 +1818,7 @@ describe('ScriptDirector', () => {
     }
   });
 
-  it('stales an episode-draft-v3 checkpoint after the lightweight v6 prompt upgrade', async () => {
+  it('stales an episode-draft-v3 checkpoint after the lightweight v7 prompt upgrade', async () => {
     const state = readySingleEpisodeState();
     let draftCalls = 0;
     const store = new MemoryScriptStore(state);
@@ -1912,7 +1912,7 @@ describe('ScriptDirector', () => {
         artifactRevision: 0, promptVersion: 'episode-draft-v3', status: 'stale',
       }),
       expect.objectContaining({
-        artifactRevision: 1, promptVersion: 'episode-draft-v6', status: 'succeeded',
+        artifactRevision: 1, promptVersion: 'episode-draft-v7', status: 'succeeded',
       }),
     ]));
   });
@@ -2169,7 +2169,7 @@ describe('ScriptDirector', () => {
       expect.objectContaining({
         artifactRevision: 1,
         status: 'succeeded',
-        promptVersion: 'episode-draft-v6',
+        promptVersion: 'episode-draft-v7',
       }),
     ]));
   });
@@ -3248,6 +3248,53 @@ describe('ScriptDirector', () => {
       expect.objectContaining({ node: 'handoff_review', status: 'succeeded' }),
       expect.objectContaining({ node: 'completed', status: 'succeeded' }),
     ]));
+  });
+
+  it('caps a generated direct-text episode within 1200 plus 400 characters without another model call', async () => {
+    const state = readySingleEpisodeState();
+    state.plan = { ...state.plan!, targetCharsPerEpisode: 1_200 };
+    const store = new MemoryScriptStore(state);
+    const calls: Array<{ node: string; prompt: string }> = [];
+    const overlongDraft = [
+      '第1集',
+      '1-1 校报社 日/内',
+      '人物：沈清',
+      `△${'沈清核对桌上的采访记录。'.repeat(40)}`,
+      `沈清：${'证据还差最后一环，现在不能停。'.repeat(100)}`,
+      `△${'门外的新证人敲响玻璃门。'.repeat(35)}`,
+    ].join('\n');
+    const director = new ScriptDirector({
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+      model: {
+        async complete(request) {
+          calls.push({ node: request.node, prompt: request.prompt });
+          return request.node === 'review' ? directReviewJson() : overlongDraft;
+        },
+      },
+    });
+
+    const result = await director.run({
+      task: 'script_episode_batch',
+      projectId: 'project-1',
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    });
+
+    expect(result.kind).toBe('episode_batch');
+    const saved = store.state.episodes[0]!;
+    const visibleChars = saved.scenes
+      .flatMap((scene) => scene.blocks)
+      .map((block) => block.text)
+      .join('')
+      .replace(/\s/gu, '').length;
+    expect(visibleChars).toBeGreaterThanOrEqual(800);
+    expect(visibleChars).toBeLessThanOrEqual(1_600);
+    expect(saved.scenes.at(-1)?.blocks.at(-1)?.text).toContain('门外的新证人敲响玻璃门');
+    expect(calls.map((call) => call.node)).toEqual(['draft', 'review']);
+    expect(calls[0]?.prompt).toContain('800—1600 字');
   });
 
   it('repairs duplicate scene ordinals and saves the direct draft without a format-repair call', async () => {
