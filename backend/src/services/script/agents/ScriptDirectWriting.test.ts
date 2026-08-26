@@ -77,6 +77,29 @@ describe('ScriptDirectWriting', () => {
     expect(prompt).toContain('OFF_OUTLINE');
   });
 
+  it('keeps custom quality checks advisory and separate from rewrite issues', () => {
+    const prompt = buildDirectReviewPrompt({
+      project: {
+        creativeRules: {
+          qualityMode: 'custom',
+          qualityInstructions: '重点检查人物动机与情绪兑现',
+        },
+      },
+      episode: { endingHook: '公开挑战正式成立' },
+    }, '主角拿出证据。');
+    expect(prompt).toContain('qualityNotes');
+    expect(prompt).toContain('重点检查人物动机与情绪兑现');
+    expect(prompt).toContain('不得据此判 major_issue');
+
+    const review = decodeDirectHandoffReview({
+      verdict: 'pass',
+      issues: [],
+      qualityNotes: ['人物动机可以更明确', '情绪兑现可以更具体', '第三条应被截断'],
+    });
+    expect(review.qualityNotes).toEqual(['人物动机可以更明确', '情绪兑现可以更具体']);
+    expect(review).toMatchObject({ verdict: 'pass', issues: [] });
+  });
+
   it('tells an off-outline rewrite to delete later evidence instead of paraphrasing it', () => {
     const prompt = buildDirectRewritePrompt({
       episode: { endingHook: '只拍到半张维修记录' },
@@ -185,6 +208,7 @@ describe('ScriptDirectWriting', () => {
     expect(decodeDirectHandoffReview({ verdict: 'pass' })).toEqual({
       verdict: 'pass',
       issues: [],
+      qualityNotes: [],
       handoff: {
         summary: '',
         characterStates: [],

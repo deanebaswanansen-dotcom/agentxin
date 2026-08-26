@@ -1049,12 +1049,28 @@ export interface FreeChatRequestBody {
 
 export type ScriptPlanStatus = 'draft' | 'approved' | 'locked';
 export type ScriptOutlineStatus = 'card' | 'expanded' | 'approved';
+export type ScriptCreativeRulePreset = 'light' | 'hongguo' | 'custom' | 'agent';
+export type ScriptQualityRuleMode = 'light' | 'hongguo' | 'custom';
 export type ScriptEpisodeStatus =
   | 'planned'
   | 'generating'
   | 'reviewing'
   | 'completed'
   | 'failed';
+
+export interface ScriptCreativeRules {
+  preset: ScriptCreativeRulePreset;
+  fiveEpisodeArc: boolean;
+  openingHook: boolean;
+  endingHook: boolean;
+  goldenLine: boolean;
+  firstAppearanceDetails: boolean;
+  productionLabels: boolean;
+  writingInstructions: string;
+  formatInstructions: string;
+  qualityMode: ScriptQualityRuleMode;
+  qualityInstructions: string;
+}
 
 export interface ScriptPlan {
   id: Id;
@@ -1081,6 +1097,7 @@ export interface ScriptPlan {
   coreRequirements: string;
   forbiddenElements: string[];
   endingDirection: string;
+  creativeRules?: ScriptCreativeRules;
   coverPrompt?: string;
   createdAt: string;
   updatedAt: string;

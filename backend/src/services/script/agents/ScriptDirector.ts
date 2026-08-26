@@ -128,6 +128,11 @@ import {
   capGeneratedEpisodeLength,
   scriptEpisodeLengthRange,
 } from './ScriptEpisodeLength.js';
+import {
+  scriptCreativeWritingInstruction,
+  scriptQualityNoteIssues,
+  scriptQualityReviewInstruction,
+} from './ScriptCreativeRules.js';
 import { parseStructuredModelOutput, ScriptModelOutputError } from './structuredOutput.js';
 
 export { InMemoryScriptCheckpointStore } from './ScriptCheckpoint.js';
@@ -228,6 +233,8 @@ export type ScriptDirectorRequest =
       /** User explicitly requested a fresh candidate instead of checkpoint reuse. */
       regenerate?: boolean;
       regenerationRunId?: string;
+      /** Optional user-authored synopsis/outline JSON to preserve while filling gaps. */
+      sourceOutline?: string;
       signal?: AbortSignal;
       onProgress?: (event: ScriptProgressEvent) => void | Promise<void>;
     }
@@ -943,6 +950,112 @@ function synopsisFragment(value: string): string {
   return /[。！？]$/u.test(normalized) ? normalized : `${normalized}。`;
 }
 
+type ScriptOutlineCompletionSeed = Partial<Pick<
+  ScriptSeriesOutline,
+  | 'synopsis'
+  | 'openingState'
+  | 'midpointTurn'
+  | 'climax'
+  | 'endingState'
+  | 'mainArc'
+  | 'subplotArcs'
+  | 'episodeCards'
+>>;
+
+function parseOutlineCompletionSeed(raw?: string): ScriptOutlineCompletionSeed | undefined {
+  const source = raw?.trim();
+  if (!source) return undefined;
+  let value: unknown = source;
+  try {
+    value = JSON.parse(source);
+  } catch {
+    return { synopsis: source.slice(0, 20_000) };
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return { synopsis: source.slice(0, 20_000) };
+  }
+  const record = value as Record<string, unknown>;
+  const text = (field: string, max: number): string | undefined => {
+    const candidate = record[field];
+    return typeof candidate === 'string' && candidate.trim()
+      ? candidate.trim().slice(0, max)
+      : undefined;
+  };
+  const list = (field: string): string[] | undefined => {
+    const candidate = record[field];
+    if (!Array.isArray(candidate)) return undefined;
+    const items = [...new Set(candidate.filter((item): item is string => typeof item === 'string')
+      .map((item) => item.trim()).filter(Boolean))].slice(0, 100);
+    return items.length > 0 ? items : undefined;
+  };
+  const episodeCards = Array.isArray(record.episodeCards)
+    ? record.episodeCards.flatMap((candidate): ScriptEpisodeCard[] => {
+        if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return [];
+        const card = candidate as Record<string, unknown>;
+        const episodeNumber = typeof card.episodeNumber === 'number' && Number.isInteger(card.episodeNumber)
+          ? card.episodeNumber
+          : Number.NaN;
+        if (episodeNumber < 1 || episodeNumber > 200) return [];
+        const field = (name: string): string => typeof card[name] === 'string'
+          ? (card[name] as string).trim().slice(0, 2_000)
+          : '';
+        return [{
+          episodeNumber,
+          title: field('title'),
+          logline: field('logline'),
+          mainEvent: field('mainEvent'),
+          endingHook: field('endingHook'),
+        }];
+      })
+    : [];
+  const synopsis = text('synopsis', 20_000);
+  const openingState = text('openingState', 4_000);
+  const midpointTurn = text('midpointTurn', 4_000);
+  const climax = text('climax', 4_000);
+  const endingState = text('endingState', 4_000);
+  const mainArc = list('mainArc');
+  const subplotArcs = list('subplotArcs');
+  return {
+    ...(synopsis ? { synopsis } : {}),
+    ...(openingState ? { openingState } : {}),
+    ...(midpointTurn ? { midpointTurn } : {}),
+    ...(climax ? { climax } : {}),
+    ...(endingState ? { endingState } : {}),
+    ...(mainArc ? { mainArc } : {}),
+    ...(subplotArcs ? { subplotArcs } : {}),
+    ...(episodeCards.length > 0 ? { episodeCards } : {}),
+  };
+}
+
+function mergeOutlineCompletionSeed(
+  generated: ScriptSeriesOutline,
+  seed?: ScriptOutlineCompletionSeed,
+): ScriptSeriesOutline {
+  if (!seed) return generated;
+  const seedCards = new Map(seed.episodeCards?.map((card) => [card.episodeNumber, card]) ?? []);
+  const prefer = (source: string | undefined, fallback: string): string => source?.trim() || fallback;
+  return {
+    ...generated,
+    synopsis: prefer(seed.synopsis, generated.synopsis),
+    openingState: prefer(seed.openingState, generated.openingState),
+    midpointTurn: prefer(seed.midpointTurn, generated.midpointTurn),
+    climax: prefer(seed.climax, generated.climax),
+    endingState: prefer(seed.endingState, generated.endingState),
+    mainArc: seed.mainArc?.length ? [...seed.mainArc] : generated.mainArc,
+    subplotArcs: seed.subplotArcs?.length ? [...seed.subplotArcs] : generated.subplotArcs,
+    episodeCards: generated.episodeCards.map((card) => {
+      const source = seedCards.get(card.episodeNumber);
+      return source ? {
+        ...card,
+        title: prefer(source.title, card.title),
+        logline: prefer(source.logline, card.logline),
+        mainEvent: prefer(source.mainEvent, card.mainEvent),
+        endingHook: prefer(source.endingHook, card.endingHook),
+      } : card;
+    }),
+  };
+}
+
 /**
  * Keeps a useful model-written synopsis intact, but expands a one-line result
  * locally from the approved plan and generated cards. This does not make an
@@ -1065,6 +1178,7 @@ export class ScriptDirector {
         request.onProgress,
         request.regenerate === true,
         request.regenerationRunId,
+        request.sourceOutline,
       );
     }
     if (request.task === 'script_bible') {
@@ -1193,13 +1307,15 @@ export class ScriptDirector {
     onProgress?: (event: ScriptProgressEvent) => void | Promise<void>,
     regenerate = false,
     regenerationRunId?: string,
+    sourceOutline?: string,
   ): Promise<ScriptDirectorResult> {
     const state = await this.dependencies.store.getProjectState(projectId);
     const plan = state?.plan;
     if (!plan || (plan.status !== 'approved' && plan.status !== 'locked')) {
       throw new ScriptModelOutputError('生成全剧大纲前必须先确认策划。');
     }
-    if (!regenerate && state?.seriesOutline?.episodeCards.length === plan.totalEpisodes) {
+    const completionSeed = !regenerate ? parseOutlineCompletionSeed(sourceOutline) : undefined;
+    if (!regenerate && !completionSeed && state?.seriesOutline?.episodeCards.length === plan.totalEpisodes) {
       return { kind: 'series_outline', outline: state.seriesOutline };
     }
 
@@ -1263,6 +1379,18 @@ export class ScriptDirector {
             };
           })
         : [];
+      const completionSeedForChunk = completionSeed
+        ? {
+            ...completionSeed,
+            ...(completionSeed.episodeCards
+              ? {
+                  episodeCards: completionSeed.episodeCards.filter((card) => (
+                    card.episodeNumber >= start && card.episodeNumber <= end
+                  )),
+                }
+              : {}),
+          }
+        : undefined;
       const upstreamArtifactRefs = [buildScriptUpstreamArtifactRef(
         'series_outline_range',
         start,
@@ -1271,10 +1399,12 @@ export class ScriptDirector {
         ? [buildScriptUpstreamArtifactRef(
             'series_outline_previous_boundary',
             start,
-            previousBoundary,
-          )]
+             previousBoundary,
+           )]
+        : []), ...(completionSeedForChunk
+        ? [buildScriptUpstreamArtifactRef('series_outline_user_seed', start, completionSeedForChunk)]
         : [])];
-      const promptVersion = 'series-outline-chunk-v4';
+      const promptVersion = 'series-outline-chunk-v5';
       const inputFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'series_outline',
         inputRevisionRefs,
@@ -1334,6 +1464,10 @@ export class ScriptDirector {
         previousBoundary.length > 0
           ? `上一段最后两集：${JSON.stringify(previousBoundary)}。本段第 ${start} 集必须直接承接上一集 endingHook；已经发生、取得或发现的关键事件不得重新当作首次发生。`
           : '',
+        completionSeedForChunk
+          ? `用户已经提供了大纲内容：${JSON.stringify(completionSeedForChunk)}。必须以这些内容为事实来源，识别并补齐空缺字段；用户已填写的文字和分集卡字段不得擅自覆盖。`
+          : '用户没有提供现成大纲，请根据策划完成全部字段。',
+        scriptCreativeWritingInstruction(plan),
         `已锁定策划：${JSON.stringify(plan)}`,
       ].filter(Boolean).join('\n');
       const artifactRevision = await this.nextCheckpointArtifactRevision(
@@ -1474,7 +1608,7 @@ export class ScriptDirector {
     const endingState = stringField(first.endingState, 'endingState');
     const mainArc = stringsField(first.mainArc, 'mainArc');
     const subplotArcs = stringsField(first.subplotArcs, 'subplotArcs');
-    const candidateOutline: ScriptSeriesOutline = {
+    const generatedOutline: ScriptSeriesOutline = {
       projectId,
       synopsis: completeSeriesSynopsis(stringField(first.synopsis, 'synopsis'), plan, cards, {
         openingState,
@@ -1493,6 +1627,7 @@ export class ScriptDirector {
       episodeCards: cards,
       revision: state?.seriesOutline?.revision ?? 0,
     };
+    const candidateOutline = mergeOutlineCompletionSeed(generatedOutline, completionSeed);
     const canonicalOutline = canonicalModelCandidate(() => {
       const parsed = decodeScriptSeriesOutlineInput(candidateOutline);
       validateScriptSeriesOutlineInput(parsed, { totalEpisodes: plan.totalEpisodes });
@@ -2249,7 +2384,7 @@ export class ScriptDirector {
           continuity: projectScriptContinuity(state, request.startEpisode),
         },
       )];
-      const episodeOutlinePromptVersion = 'episode-outline-batch-v3';
+      const episodeOutlinePromptVersion = 'episode-outline-batch-v4';
       const episodeOutlineInputFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'episode_outline',
         inputRevisionRefs: episodeOutlineInputRevisionRefs,
@@ -2264,6 +2399,7 @@ export class ScriptDirector {
         '每项严格模板：{"episodeNumber":"对应上述集号的整数","title":"字符串","goal":"字符串","conflict":"字符串","beats":["字符串"],"characterIds":["人物id"],"plannedScenes":[],"reveal":"可选字符串","reversal":"可选字符串","endingHook":"字符串","requiredFacts":["字符串"],"forbiddenFacts":["字符串"]}。plannedScenes 必须原样返回空数组 []，场景由下一节点规划；不得改名任何键。',
         `characterIds 只能从以下人物 ID 白名单选择：${JSON.stringify([...registeredCharacterIds])}。`,
         `需要集号：${range.join('、')}`,
+        scriptCreativeWritingInstruction(plan),
         `策划：${JSON.stringify(plan)}`,
         `分集卡：${JSON.stringify(batchCards)}`,
         `当前连续性：${JSON.stringify({
@@ -2454,7 +2590,7 @@ export class ScriptDirector {
           (episode) => episode.episodeNumber === episodeNumber,
         )?.revision ?? 0;
         const inputRevisionRefs = buildScriptInputRevisionRefs(state, episodeNumber);
-        const promptVersion = 'scene-plan-v2';
+        const promptVersion = 'scene-plan-v3';
         const inputFingerprint = computeScriptCheckpointInputFingerprint({
           node: 'scene_plan',
           inputRevisionRefs,
@@ -2493,6 +2629,7 @@ export class ScriptDirector {
           '每个场景必须承担不同的戏剧任务，依次完成开场抓人、冲突升级、反转或结尾卡点；地点要具体且可拍摄，禁止用“某处”“未知地点”等占位词。',
           '优先复用人物与世界圣经已有地点，控制换景成本；结尾卡点必须落实在最后一个场景的 purpose 中。',
           `场景上限：${plan.maxScenesPerEpisode}`,
+          scriptCreativeWritingInstruction(plan),
           `大纲：${JSON.stringify(outline)}`,
         ].join('\n');
         if (!plannedScenes) {
@@ -2658,7 +2795,7 @@ export class ScriptDirector {
       );
       episodeUpstreamRefs.push(scenePlanRef);
       const draftInputRevisionRefs = buildScriptInputRevisionRefs(state, episodeNumber);
-      const draftPromptVersion = 'episode-draft-v7';
+      const draftPromptVersion = 'episode-draft-v8';
       const currentEpisodeRevision = state.episodes.find(
         (episode) => episode.episodeNumber === episodeNumber,
       )?.revision ?? 0;
@@ -2737,6 +2874,7 @@ export class ScriptDirector {
             plan.dialogueDensityPercent,
           ),
           `所有 blocks.text 去除空白后的总字符数以 ${plan.targetCharsPerEpisode} 为目标，允许上下浮动约 400 字，但不得超过 ${scriptEpisodeLengthRange(plan.targetCharsPerEpisode).maximum}；优先保留关键冲突、行动过程与结尾卡点。`,
+          scriptCreativeWritingInstruction(plan),
           `对白只能使用这些已登记人物：${JSON.stringify(state.characters.map((character) => ({ id: character.id, name: character.name })))}`,
           this.assembleEpisodeContext(state, plan, outline, episodeNumber),
         ].join('\n');
@@ -3164,7 +3302,7 @@ export class ScriptDirector {
       }> => {
         const inputRevisionRefs = buildScriptInputRevisionRefs(reviewState, episodeNumber);
         const upstreamArtifactRefs = [candidateRef];
-        const promptVersion = 'script-sanity-review-v1';
+        const promptVersion = 'script-sanity-review-v2';
         const inputFingerprint = computeScriptCheckpointInputFingerprint({
           node: 'review',
           inputRevisionRefs,
@@ -3174,11 +3312,12 @@ export class ScriptDirector {
         });
         const prompt = [
           '你是 ScriptSanityReviewAgent。只检查会让观众明显困惑的剧情、人物和连续性错误，并返回记忆写回。',
-          '只返回 JSON，字段：issues, summary, newFacts, openedThreads, closedThreads, wardrobe。',
-          '严格模板：{"issues":[{"code":"CHARACTER_PRESENCE|SPEAKER_ATTRIBUTION|PROP_CUSTODY|KNOWLEDGE_TIMING|CAUSAL_ORDER|CONTINUITY_CONTRADICTION|REPEATED_ACTION","severity":"hard|soft","message":"字符串","sceneId":"可选","blockId":"可选","path":"可选"}],"summary":"150—300字摘要","newFacts":["字符串"],"openedThreads":["字符串"],"closedThreads":["字符串"],"wardrobe":[{"characterId":"人物id","outfit":"服装"}]}。没有问题时 issues 返回空数组，不得改名任何键。',
+          '只返回 JSON，字段：issues, qualityNotes, summary, newFacts, openedThreads, closedThreads, wardrobe。',
+          '严格模板：{"issues":[{"code":"CHARACTER_PRESENCE|SPEAKER_ATTRIBUTION|PROP_CUSTODY|KNOWLEDGE_TIMING|CAUSAL_ORDER|CONTINUITY_CONTRADICTION|REPEATED_ACTION","severity":"hard|soft","message":"字符串","sceneId":"可选","blockId":"可选","path":"可选"}],"qualityNotes":["可选优化建议"],"summary":"150—300字摘要","newFacts":["字符串"],"openedThreads":["字符串"],"closedThreads":["字符串"],"wardrobe":[{"characterId":"人物id","outfit":"服装"}]}。没有明显错误时 issues 返回空数组，不得改名任何键。',
           'issues 最多返回 3 条，只保留高置信度且能指出正文证据的明显问题：人物未在场却行动或说话、说话人错配、道具归属前后矛盾、角色提前知道信息、因果或行动顺序矛盾、与前集状态直接冲突、同一动作被当成新事件重复发生。',
           '不要评价文风、措辞、节奏、爽点强弱、对白密度、字数、服装审美、反转力度或是否足够精彩；这些不是明显逻辑错误。每条问题必须尽量给出 sceneId 和精确 path。',
           '只有能由正文与连续性材料直接证明的矛盾才标 hard；hard 必须给 sceneId，能定位到正文块时必须给 blockId；拿不准或无法定位就不报。',
+          scriptQualityReviewInstruction(plan),
           attempt > 1 ? '这是修订后复检。不得假设上一轮问题已解决，必须以当前正文重新判断。' : '',
           `策划：${JSON.stringify(plan)}`,
           `大纲：${JSON.stringify(outline)}`,
@@ -3681,7 +3820,7 @@ export class ScriptDirector {
           request.projectId,
           episodeNumber,
           deterministicReport.issues,
-          review.issues,
+          [...review.issues, ...scriptQualityNoteIssues(review.qualityNotes)],
         );
         const validationErrors = report.blockingIssues.map((issue) => ({
           ...(issue.path ? { path: issue.path } : {}),
@@ -3725,7 +3864,7 @@ export class ScriptDirector {
         request.projectId,
         episodeNumber,
         deterministicReport.issues,
-        review.issues,
+        [...review.issues, ...scriptQualityNoteIssues(review.qualityNotes)],
       );
       const replacedReviewSources = new Set(reviewUpdate.sources);
       const retainedOpenHard = reviewState.reviewIssues.filter(
@@ -3905,7 +4044,7 @@ export class ScriptDirector {
       );
     const canonicalDirectCandidate = (value: ScriptEpisode): ScriptEpisode =>
       reconcileDirectSceneCast(canonicalStoredDirectCandidate(value));
-    const promptVersion = 'direct-draft-v3';
+    const promptVersion = 'direct-draft-v4';
     const draftFingerprint = computeScriptCheckpointInputFingerprint({
       node: 'direct_draft',
       inputRevisionRefs,
@@ -4291,7 +4430,7 @@ export class ScriptDirector {
       episodeUpstreamRefs.push(currentCandidateRef);
     }
 
-    const reviewPromptVersion = 'direct-handoff-review-v3';
+    const reviewPromptVersion = 'direct-handoff-review-v4';
     const reviewFingerprint = computeScriptCheckpointInputFingerprint({
       node: 'handoff_review',
       inputRevisionRefs,
@@ -4417,16 +4556,19 @@ export class ScriptDirector {
       });
     };
     const draftForReview = draft;
-    const aiIssues: ScriptGateIssue[] = review.issues.map((issue) => ({
-      code: `DIRECT_${issue.code}`,
-      severity: 'soft',
-      source: 'ai',
-      message: `${issue.evidence}；应为：${issue.expected}`,
-      ...(issue.sceneNumber
-        ? { sceneId: draftForReview.scenes.find((scene) => scene.ordinal === issue.sceneNumber)?.id }
-        : {}),
-      path: 'scenes',
-    }));
+    const aiIssues: ScriptGateIssue[] = [
+      ...review.issues.map((issue) => ({
+        code: `DIRECT_${issue.code}`,
+        severity: 'soft' as const,
+        source: 'ai' as const,
+        message: `${issue.evidence}；应为：${issue.expected}`,
+        ...(issue.sceneNumber
+          ? { sceneId: draftForReview.scenes.find((scene) => scene.ordinal === issue.sceneNumber)?.id }
+          : {}),
+        path: 'scenes',
+      })),
+      ...scriptQualityNoteIssues(review.qualityNotes ?? []),
+    ];
     let deterministicReport = validateDraft(draft);
     let report = validateDraft(draft, aiIssues);
     const rewriteIssues: ScriptDirectReviewIssue[] = [
@@ -4543,7 +4685,7 @@ export class ScriptDirector {
         rewriteArtifact,
       );
       episodeUpstreamRefs.push(currentCandidateRef);
-      const postRewriteReviewPromptVersion = 'direct-handoff-review-after-rewrite-v3';
+      const postRewriteReviewPromptVersion = 'direct-handoff-review-after-rewrite-v4';
       const postRewriteReviewFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'handoff_review',
         inputRevisionRefs,
@@ -4858,6 +5000,7 @@ export class ScriptDirector {
 
   private parseReview(value: Record<string, unknown>): {
     issues: ScriptGateIssue[];
+    qualityNotes: string[];
     summary: string;
     newFacts: string[];
     openedThreads: string[];
@@ -4909,6 +5052,7 @@ export class ScriptDirector {
       : [];
     return {
       issues,
+      qualityNotes: looseStrings(value.qualityNotes).slice(0, 2),
       summary: optionalStringField(value.summary) ?? '',
       newFacts: looseStrings(value.newFacts),
       openedThreads: looseStrings(value.openedThreads),

@@ -6,6 +6,7 @@ import type {
   ScriptEpisodeInput,
   ScriptEpisodeOutlineInput,
   ScriptPlanInput,
+  ScriptCreativeRules,
   ScriptScene,
   ScriptSeriesOutlineInput,
   ScriptWorldBibleInput,
@@ -19,6 +20,8 @@ const OUTLINE_STATUSES = ['card', 'expanded', 'approved'] as const;
 const EPISODE_STATUSES = ['planned', 'generating', 'reviewing', 'completed', 'failed'] as const;
 const TIMES = ['day', 'night', 'dawn', 'dusk'] as const;
 const IN_OUT = ['interior', 'exterior'] as const;
+const CREATIVE_RULE_PRESETS = ['light', 'hongguo', 'custom', 'agent'] as const;
+const QUALITY_RULE_MODES = ['light', 'hongguo', 'custom'] as const;
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -84,6 +87,29 @@ function optionalId(value: unknown): string | undefined {
   return idValue(value, 'id');
 }
 
+function booleanValue(value: unknown, label: string): boolean {
+  if (typeof value !== 'boolean') throw ScriptServiceError.validation(`${label}必须是布尔值`);
+  return value;
+}
+
+function optionalCreativeRules(value: unknown): ScriptCreativeRules | undefined {
+  if (value === undefined) return undefined;
+  const input = record(value, '创作规则');
+  return {
+    preset: enumValue(input.preset ?? 'light', '创作规则模板', CREATIVE_RULE_PRESETS),
+    fiveEpisodeArc: booleanValue(input.fiveEpisodeArc ?? false, '五集单元节奏'),
+    openingHook: booleanValue(input.openingHook ?? true, '开场钩子'),
+    endingHook: booleanValue(input.endingHook ?? true, '结尾卡点'),
+    goldenLine: booleanValue(input.goldenLine ?? false, '传播台词'),
+    firstAppearanceDetails: booleanValue(input.firstAppearanceDetails ?? true, '首次出场说明'),
+    productionLabels: booleanValue(input.productionLabels ?? false, '制作标注'),
+    writingInstructions: optionalString(input.writingInstructions, '自定义创作要求', 4_000) ?? '',
+    formatInstructions: optionalString(input.formatInstructions, '自定义格式要求', 4_000) ?? '',
+    qualityMode: enumValue(input.qualityMode ?? 'light', '质检模式', QUALITY_RULE_MODES),
+    qualityInstructions: optionalString(input.qualityInstructions, '自定义质检标准', 4_000) ?? '',
+  };
+}
+
 function idValue(value: unknown, label: string): string {
   if (typeof value !== 'string' || !SAFE_ID.test(value)) {
     throw ScriptServiceError.validation(`${label}格式无效`);
@@ -101,6 +127,7 @@ export function decodeScriptPlanInput(value: unknown): ScriptPlanInput {
   }
   const id = optionalId(input.id);
   const coverPrompt = optionalString(input.coverPrompt, '封面提示词', 4_000);
+  const creativeRules = optionalCreativeRules(input.creativeRules);
   return {
     ...(id ? { id } : {}),
     status: enumValue(input.status ?? 'draft', '策划状态', PLAN_STATUSES),
@@ -124,6 +151,7 @@ export function decodeScriptPlanInput(value: unknown): ScriptPlanInput {
     coreRequirements: optionalString(input.coreRequirements, '核心要求', 4_000) ?? '',
     forbiddenElements: stringArray(input.forbiddenElements, '禁止元素', { max: 30 }),
     endingDirection: stringValue(input.endingDirection, '结局方向', 2_000),
+    ...(creativeRules ? { creativeRules } : {}),
     ...(coverPrompt !== undefined ? { coverPrompt } : {}),
   };
 }

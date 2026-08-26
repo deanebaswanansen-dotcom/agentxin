@@ -453,6 +453,7 @@ describe('screenplay leniency matrix: machine-fixable output never pauses the wo
   it('case 13 — review: drops malformed and unknown issues and defaults every optional ledger', async () => {
     type ReviewValue = {
       issues: Array<{ code: string; severity: 'hard' | 'soft'; message: string }>;
+      qualityNotes: string[];
       summary: string;
       newFacts: string[];
       openedThreads: string[];
@@ -483,6 +484,7 @@ describe('screenplay leniency matrix: machine-fixable output never pauses the wo
 
     expect(completed).toEqual({
       issues: [],
+      qualityNotes: [],
       summary: '',
       newFacts: [],
       openedThreads: [],

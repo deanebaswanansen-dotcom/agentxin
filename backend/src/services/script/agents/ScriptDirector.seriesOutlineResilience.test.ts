@@ -187,4 +187,55 @@ describe('ScriptDirector series outline resilience', () => {
     expect(completed.every((checkpoint) => checkpoint.status === 'succeeded')).toBe(true);
     expect(progress.at(-1)).toMatchObject({ current: 12, total: 12 });
   });
+
+  it('fills missing outline fields from pasted user material without overwriting it', async () => {
+    const { store, checkpoints } = await setup(3);
+    const prompts: string[] = [];
+    const director = new ScriptDirector({
+      store,
+      checkpoints,
+      model: {
+        async complete(request) {
+          prompts.push(request.prompt);
+          return modelChunk(request);
+        },
+      },
+    });
+    const sourceOutline = {
+      synopsis: '这是用户自己写好的完整故事大纲，原文必须保留。',
+      openingState: '用户指定：寒潮第一夜，仓库已经被围。',
+      midpointTurn: '',
+      climax: '',
+      endingState: '',
+      mainArc: [],
+      subplotArcs: [],
+      episodeCards: [{
+        episodeNumber: 1,
+        title: '用户第一集标题',
+        logline: '',
+        mainEvent: '用户指定的仓库冲突。',
+        endingHook: '',
+      }],
+    };
+
+    const result = await director.run({
+      task: 'script_series_outline',
+      projectId: 'project-1',
+      sourceOutline: JSON.stringify(sourceOutline),
+    });
+
+    expect(result.kind).toBe('series_outline');
+    if (result.kind !== 'series_outline') throw new Error('expected series outline');
+    expect(result.outline.synopsis).toBe(sourceOutline.synopsis);
+    expect(result.outline.openingState).toBe(sourceOutline.openingState);
+    expect(result.outline.midpointTurn).toBe('关键账本曝光。');
+    expect(result.outline.episodeCards).toHaveLength(3);
+    expect(result.outline.episodeCards[0]).toMatchObject({
+      title: '用户第一集标题',
+      mainEvent: '用户指定的仓库冲突。',
+      logline: '第1集推进物资攻防。',
+    });
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('用户已填写的文字和分集卡字段不得擅自覆盖');
+  });
 });
