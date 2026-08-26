@@ -1569,9 +1569,13 @@ export interface ApiClient {
     jobs: {
       create(body: ScriptAgentJobRequest, signal?: AbortSignal): Promise<ScriptAgentJobSnapshot>;
       list(projectId: Id, signal?: AbortSignal): Promise<ScriptAgentJobSnapshot[]>;
+      listTrash?(projectId: Id, signal?: AbortSignal): Promise<ScriptAgentJobSnapshot[]>;
       get(jobId: string, signal?: AbortSignal): Promise<ScriptAgentJobSnapshot>;
       resume(jobId: string, signal?: AbortSignal): Promise<ScriptAgentJobSnapshot>;
       cancel(jobId: string, signal?: AbortSignal): Promise<ScriptAgentJobSnapshot>;
+      trash?(jobId: string, signal?: AbortSignal): Promise<ScriptAgentJobSnapshot>;
+      restore?(jobId: string, signal?: AbortSignal): Promise<ScriptAgentJobSnapshot>;
+      removePermanently?(jobId: string, signal?: AbortSignal): Promise<void>;
     };
     export(projectId: Id, format: ScriptExportFormat, range?: ScriptExportRange, signal?: AbortSignal): Promise<string>;
     exportFile(projectId: Id, format: ScriptExportFormat, range?: ScriptExportRange, signal?: AbortSignal): Promise<ScriptExportFile>;
@@ -1838,6 +1842,11 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
             signal,
             includeModelConfig: true,
           }),
+        listTrash: (projectId, signal) =>
+          request(b, 'GET', `/projects/${seg(projectId)}/agent-jobs?trashed=true`, undefined, {
+            signal,
+            includeModelConfig: true,
+          }),
         get: (jobId, signal) =>
           request(b, 'GET', `/agent/jobs/${seg(jobId)}`, undefined, {
             signal,
@@ -1847,6 +1856,12 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
           request(b, 'POST', `/agent/jobs/${seg(jobId)}/resume`, {}, { signal, includeModelConfig: true }),
         cancel: (jobId, signal) =>
           request(b, 'POST', `/agent/jobs/${seg(jobId)}/cancel`, {}, { signal }),
+        trash: (jobId, signal) =>
+          request(b, 'DELETE', `/agent/jobs/${seg(jobId)}`, undefined, { signal }),
+        restore: (jobId, signal) =>
+          request(b, 'POST', `/agent/jobs/${seg(jobId)}/restore`, {}, { signal }),
+        removePermanently: (jobId, signal) =>
+          request(b, 'DELETE', `/agent/jobs/${seg(jobId)}/permanent`, undefined, { signal }),
       },
       export: (projectId, format, range, signal) =>
         requestText(b, scriptExportPath(projectId, format, range), signal),

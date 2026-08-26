@@ -1519,6 +1519,7 @@ export interface ScriptAgentJobSnapshot {
   error?: { code?: string; message: string };
   continuable?: boolean;
   updatedAt?: string;
+  trashedAt?: string;
   scriptBatchOptions?: ScriptBatchOptions;
 }
 

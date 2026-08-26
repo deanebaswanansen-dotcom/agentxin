@@ -30,6 +30,8 @@ export interface StoredAgentRun {
   attempts: number;
   createdAt: string;
   updatedAt: string;
+  /** Soft-deleted task records stay recoverable until explicitly removed forever. */
+  trashedAt?: string;
 }
 
 interface AgentRunFile {
@@ -178,16 +180,52 @@ export class AgentRunStore {
     return run ? clone(run) : undefined;
   }
 
-  getForClient(clientId: string, id: string): StoredAgentRun | undefined {
+  getForClient(clientId: string, id: string, includeTrashed = false): StoredAgentRun | undefined {
     const run = this.data.runs[id];
-    return run?.clientId === clientId ? clone(run) : undefined;
+    return run?.clientId === clientId && (includeTrashed || !run.trashedAt) ? clone(run) : undefined;
   }
 
-  listForClient(clientId: string, projectId?: string): StoredAgentRun[] {
+  listForClient(
+    clientId: string,
+    projectId?: string,
+    options: { trashed?: boolean } = {},
+  ): StoredAgentRun[] {
+    const trashed = options.trashed === true;
     return Object.values(this.data.runs)
-      .filter((run) => run.clientId === clientId && (!projectId || run.request.projectId === projectId))
+      .filter((run) => (
+        run.clientId === clientId &&
+        (!projectId || run.request.projectId === projectId) &&
+        Boolean(run.trashedAt) === trashed
+      ))
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       .map(clone);
+  }
+
+  async moveToTrash(clientId: string, id: string): Promise<StoredAgentRun | undefined> {
+    const run = this.data.runs[id];
+    if (!run || run.clientId !== clientId || run.trashedAt) return undefined;
+    if (!TERMINAL_STATUSES.has(run.status)) {
+      throw new AgentRunConflictError(id, '正在运行或等待继续的任务不能删除，请先取消任务。');
+    }
+    return this.update(id, (stored) => {
+      stored.trashedAt = new Date().toISOString();
+    });
+  }
+
+  async restoreFromTrash(clientId: string, id: string): Promise<StoredAgentRun | undefined> {
+    const run = this.data.runs[id];
+    if (!run || run.clientId !== clientId || !run.trashedAt) return undefined;
+    return this.update(id, (stored) => {
+      delete stored.trashedAt;
+    });
+  }
+
+  async deletePermanently(clientId: string, id: string): Promise<boolean> {
+    const run = this.data.runs[id];
+    if (!run || run.clientId !== clientId || !run.trashedAt) return false;
+    delete this.data.runs[id];
+    await this.persist();
+    return true;
   }
 
   async deleteForProject(clientId: string, projectId: string): Promise<void> {

@@ -180,6 +180,48 @@ describe('ScriptWorkspace', () => {
     expect(client.script.plan.get).toHaveBeenCalledWith('project-1', expect.any(AbortSignal));
   });
 
+  it('moves completed task records to trash, restores them, and permanently deletes them', async () => {
+    const completedJob: ScriptAgentJobSnapshot = {
+      id: 'job-completed',
+      projectId: 'project-1',
+      task: 'script_episode_batch',
+      status: 'completed',
+      updatedAt: '2026-08-26T10:00:00.000Z',
+      scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 2 },
+    };
+    const trashedJob = { ...completedJob, trashedAt: '2026-08-26T10:05:00.000Z' };
+    const client = createClient();
+    client.script.jobs.list = vi.fn().mockResolvedValue([completedJob]);
+    client.script.jobs.listTrash = vi.fn().mockResolvedValue([trashedJob]);
+    client.script.jobs.trash = vi.fn().mockResolvedValue(trashedJob);
+    client.script.jobs.restore = vi.fn().mockResolvedValue(completedJob);
+    client.script.jobs.removePermanently = vi.fn().mockResolvedValue(undefined);
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '任务记录 1' }));
+    expect(screen.getByRole('region', { name: '任务记录' })).toHaveTextContent('第 1–5 集正文');
+    fireEvent.click(screen.getByRole('button', { name: '删除' }));
+    await waitFor(() => expect(client.script.jobs.trash).toHaveBeenCalledWith('job-completed'));
+    expect(await screen.findByRole('status')).toHaveTextContent('任务已移入回收站');
+
+    fireEvent.click(screen.getByRole('button', { name: '回收站 1' }));
+    expect(await screen.findByRole('region', { name: '任务回收站' })).toHaveTextContent('第 1–5 集正文');
+    fireEvent.click(screen.getByRole('button', { name: '恢复' }));
+    await waitFor(() => expect(client.script.jobs.restore).toHaveBeenCalledWith('job-completed'));
+    expect(await screen.findByRole('status')).toHaveTextContent('任务记录已恢复');
+
+    fireEvent.click(screen.getByRole('button', { name: '任务记录 1' }));
+    fireEvent.click(screen.getByRole('button', { name: '删除' }));
+    await waitFor(() => expect(client.script.jobs.trash).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole('button', { name: '回收站 1' }));
+    fireEvent.click(await screen.findByRole('button', { name: '永久删除' }));
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('只会删除任务记录'));
+    await waitFor(() => expect(client.script.jobs.removePermanently).toHaveBeenCalledWith('job-completed'));
+    expect(await screen.findByRole('status')).toHaveTextContent('剧本内容仍然保留');
+  });
+
   it('preserves unsaved screenplay edits when the selected project is renamed', async () => {
     const client = createClient();
     const view = render(
