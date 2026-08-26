@@ -127,6 +127,25 @@ describe('agent routes', () => {
     });
   });
 
+  it('preserves an explicit regenerate request only for short-drama tasks', () => {
+    expect(parseAgentBody({
+      task: 'script_series_outline',
+      projectId: 'script-project',
+      regenerate: true,
+    })).toMatchObject({ regenerate: true });
+    expect(parseAgentBody({
+      task: 'script_series_outline',
+      projectId: 'script-project',
+      regenerate: 'true',
+    })).not.toHaveProperty('regenerate');
+    expect(parseAgentBody({
+      task: 'novel',
+      mode: 'draft',
+      prompt: '重新写一章',
+      regenerate: true,
+    })).not.toHaveProperty('regenerate');
+  });
+
   it('rejects a short-drama batch that does not start on a fixed five-episode boundary', () => {
     expect(() => parseAgentBody({
       task: 'script_episode_batch',

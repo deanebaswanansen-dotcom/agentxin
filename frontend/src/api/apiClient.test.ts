@@ -409,7 +409,14 @@ describe('apiClient request building', () => {
         apiKey: 'secret',
         modelName: 'deepseek-chat',
       }),
-    ).toMatchObject({ baseUrl: 'https://api.deepseek.com', modelName: 'deepseek-v4-flash' });
+    ).toMatchObject({ baseUrl: 'https://api.deepseek.com', modelName: 'deepseek-v4-flash-vision-exp' });
+    expect(
+      migrateStoredModelConfig({
+        baseUrl: 'https://api.deepseek.com',
+        apiKey: 'secret',
+        modelName: 'deepseek-v4-flash',
+      }),
+    ).toMatchObject({ baseUrl: 'https://api.deepseek.com', modelName: 'deepseek-v4-flash-vision-exp' });
     expect(
       migrateStoredModelConfig({
         baseUrl: 'https://gateway.example.com/v1',

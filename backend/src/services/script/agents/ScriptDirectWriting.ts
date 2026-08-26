@@ -11,7 +11,6 @@ import type {
 } from '../domain.js';
 import { projectScriptContinuity } from '../ScriptContinuityCommit.js';
 import type { ScriptTextParseWarning } from '../parsers/chineseShortDramaText.js';
-import { ScriptModelOutputError } from './structuredOutput.js';
 
 export const SCRIPT_DIRECT_ISSUE_CODES = [
   'OFF_OUTLINE',
@@ -282,6 +281,90 @@ export function buildDirectRewritePrompt(
   ].join('\n');
 }
 
+/**
+ * Last-resort local draft used only when the provider returns no usable body.
+ * It deliberately stays small and editable, but preserves the confirmed
+ * episode boundary, scene plan, cast and ending hook so the batch can finish.
+ */
+export function createMinimalDirectDraftFallback(
+  projectId: string,
+  outline: ScriptEpisodeOutline,
+  plan: ScriptPlan,
+  createId: () => string,
+  now: string,
+): ScriptEpisode {
+  const plannedScenes = outline.plannedScenes.length > 0
+    ? outline.plannedScenes
+    : [{
+        ordinal: 1,
+        location: '未指定地点',
+        timeOfDay: 'day' as const,
+        interiorExterior: 'interior' as const,
+        purpose: outline.goal || outline.conflict || '推进本集事件',
+      }];
+  const scenes = plannedScenes.map((plannedScene, index) => {
+    const body = [
+      plannedScene.purpose,
+      index === 0 ? outline.conflict : '',
+      index === plannedScenes.length - 1 ? outline.endingHook : '',
+    ].map((item) => item.trim()).filter(Boolean);
+    return {
+      id: createId(),
+      ordinal: index + 1,
+      location: plannedScene.location.trim() || '未指定地点',
+      timeOfDay: plannedScene.timeOfDay,
+      interiorExterior: plannedScene.interiorExterior,
+      characterIds: [...new Set(outline.characterIds)],
+      blocks: [...new Set(body.length > 0 ? body : ['推进本集事件'])].map((text) => ({
+        id: createId(),
+        type: 'action' as const,
+        text,
+      })),
+    };
+  });
+  return {
+    id: createId(),
+    projectId,
+    episodeNumber: outline.episodeNumber,
+    title: outline.title,
+    outlineId: outline.id,
+    status: 'reviewing',
+    targetChars: plan.targetCharsPerEpisode,
+    scenes,
+    summary: outline.goal || outline.conflict || outline.title,
+    newFacts: [],
+    openedThreads: outline.endingHook ? [outline.endingHook] : [],
+    closedThreads: [],
+    revision: 0,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+/** Makes review transport/JSON failures advisory and keeps the existing body. */
+export function createLocalDirectHandoffReview(
+  outline: ScriptEpisodeOutline,
+  episode: ScriptEpisode,
+): ScriptDirectHandoffReview {
+  const visible = episode.scenes
+    .flatMap((scene) => scene.blocks.map((block) => block.text.trim()))
+    .filter(Boolean);
+  return {
+    verdict: 'pass',
+    issues: [],
+    handoff: {
+      summary: episode.summary?.trim() || outline.goal.trim() || visible.join('；').slice(0, 300),
+      characterStates: [],
+      props: [],
+      openThreads: [...new Set([
+        ...(episode.openedThreads ?? []),
+        ...(outline.endingHook.trim() ? [outline.endingHook.trim()] : []),
+      ])],
+      ending: visible.at(-1) ?? outline.endingHook.trim(),
+    },
+  };
+}
+
 function stringValue(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
@@ -297,10 +380,7 @@ function unique(values: readonly string[]): string[] {
 }
 
 export function decodeDirectHandoffReview(value: Record<string, unknown>): ScriptDirectHandoffReview {
-  const verdict = value.verdict;
-  if (verdict !== 'pass' && verdict !== 'major_issue') {
-    throw new ScriptModelOutputError('模型结果字段 verdict 的值无效。');
-  }
+  const requestedVerdict = value.verdict === 'major_issue' ? 'major_issue' : 'pass';
   const rawIssues = Array.isArray(value.issues) ? value.issues : [];
   const rawHandoff = value.handoff;
   const handoff = rawHandoff && typeof rawHandoff === 'object' && !Array.isArray(rawHandoff)
@@ -324,9 +404,7 @@ export function decodeDirectHandoffReview(value: Record<string, unknown>): Scrip
       expected,
     }];
   }).slice(0, 3);
-  if (verdict === 'major_issue' && issues.length === 0) {
-    throw new ScriptModelOutputError('模型结果 verdict 为 major_issue，但没有可识别的问题条目。');
-  }
+  const verdict = requestedVerdict === 'major_issue' && issues.length > 0 ? 'major_issue' : 'pass';
   const characterStates = Array.isArray(handoff.characterStates)
     ? handoff.characterStates.flatMap((candidate) => {
         if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return [];

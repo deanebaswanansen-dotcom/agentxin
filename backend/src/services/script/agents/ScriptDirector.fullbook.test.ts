@@ -357,6 +357,27 @@ describe('ScriptDirector offline ten-episode full-book diagnostic', () => {
     expect(rerunFirst.skippedEpisodeNumbers).toEqual([1, 2, 3, 4, 5]);
     expect(rerunSecond.skippedEpisodeNumbers).toEqual([6, 7, 8, 9, 10]);
     expect(model.calls).toHaveLength(callsBeforeRerun);
+
+    const revisionsBeforeRewrite = new Map(
+      state!.episodes.map((episode) => [episode.episodeNumber, episode.revision]),
+    );
+    const rewriteFirst = await director.run({
+      task: 'script_episode_batch',
+      projectId: PROJECT_ID,
+      startEpisode: 1,
+      episodeCount: 5,
+      expectedPlanRevision: latestPlanRevision,
+      regenerate: true,
+    });
+    expect(rewriteFirst.kind).toBe('episode_batch');
+    if (rewriteFirst.kind !== 'episode_batch') throw new Error('预期 episode_batch');
+    expect(rewriteFirst.skippedEpisodeNumbers).toEqual([]);
+    expect(rewriteFirst.episodes.map((episode) => episode.episodeNumber)).toEqual([1, 2, 3, 4, 5]);
+    const rewrittenState = await store.getProjectState(PROJECT_ID);
+    for (const episode of rewrittenState!.episodes.filter((item) => item.episodeNumber <= 5)) {
+      expect(episode.revision).toBe((revisionsBeforeRewrite.get(episode.episodeNumber) ?? 0) + 1);
+    }
+    expect(model.calls.length).toBeGreaterThan(callsBeforeRerun);
   });
 
   it('finishes one hundred episodes in twenty fixed batches and reruns without model calls', async () => {
@@ -498,6 +519,50 @@ describe('ScriptDirector offline ten-episode full-book diagnostic', () => {
     const finalState = await store.getProjectState(PROJECT_ID);
     expect(finalState?.episodes.map((episode) => episode.status)).toEqual(Array(5).fill('completed'));
     expect(currentScriptContinuityCommits(finalState!)).toHaveLength(5);
+  });
+
+  it('does not restart an explicit batch rewrite from episode one after a late retry', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-fullbook-regenerate-resume-'));
+    directories.push(directory);
+    const store = await FileScriptStore.create(join(directory, 'projects'));
+    const checkpoints = await FileScriptCheckpointStore.create(join(directory, 'checkpoints'));
+    const savedPlan = await seedProject(store);
+    const model = new DeterministicFullBookModel(3);
+    let nextId = 0;
+    const director = new ScriptDirector({
+      model,
+      store,
+      checkpoints,
+      now: () => NOW,
+      id: () => `regenerate-resume-id-${++nextId}`,
+    });
+    const request = {
+      task: 'script_episode_batch' as const,
+      projectId: PROJECT_ID,
+      startEpisode: 1,
+      episodeCount: 5,
+      expectedPlanRevision: savedPlan.revision,
+      regenerate: true,
+      regenerationRunId: 'regenerate-resume-run-1',
+    };
+
+    await expect(director.run(request)).rejects.toMatchObject({
+      code: 'SCRIPT_STRUCTURED_NEEDS_REVIEW',
+      recoverable: true,
+    });
+    expect(model.calls.filter((call) => call.node === 'draft' && call.episodeNumber === 1)).toHaveLength(1);
+    expect(model.calls.filter((call) => call.node === 'draft' && call.episodeNumber === 2)).toHaveLength(1);
+    expect(model.calls.filter((call) => call.node === 'draft' && call.episodeNumber === 3)).toHaveLength(1);
+
+    const resumed = await director.run(request);
+    expect(resumed.kind).toBe('episode_batch');
+    if (resumed.kind !== 'episode_batch') throw new Error('预期 episode_batch');
+    expect(resumed.episodes.map((episode) => episode.episodeNumber)).toEqual([1, 2, 3, 4, 5]);
+    expect(resumed.skippedEpisodeNumbers).toEqual([1, 2]);
+    expect(model.calls.filter((call) => call.node === 'draft' && call.episodeNumber === 1)).toHaveLength(1);
+    expect(model.calls.filter((call) => call.node === 'draft' && call.episodeNumber === 2)).toHaveLength(1);
+    expect(model.calls.filter((call) => call.node === 'draft' && call.episodeNumber === 3)).toHaveLength(1);
+    expect(model.calls.filter((call) => call.node === 'episode_outline')).toHaveLength(1);
   });
 
   it('rebuilds a mixed legacy 1-5 batch instead of reusing v1 empty-fingerprint candidates', async () => {

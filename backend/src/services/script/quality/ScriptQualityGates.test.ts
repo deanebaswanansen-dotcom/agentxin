@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 
 import type { ScriptEpisode, ScriptEpisodeOutline, ScriptPlan } from '../domain.js';
 import {
+  collectTemporaryDialogueSpeakers,
   createScriptReviewIssues,
+  isTemporaryDialogueSpeaker,
   validateScriptEpisode,
 } from './ScriptQualityGates.js';
 
@@ -47,6 +49,77 @@ function validScene(ordinal = 1) {
 }
 
 describe('validateScriptEpisode', () => {
+  it('allows disposable role speakers but never treats a real name as temporary', () => {
+    const speakers = [
+      '路人甲', '路人乙', '保安A', '护士二', '主厨', '陌生人',
+      '黑夹克男甲', '周技师', '老周', '金丝眼镜', '刺客甲',
+    ];
+    const candidate = episode({
+      scenes: [{
+        ...validScene(),
+        blocks: [
+          { id: 'action', type: 'action', text: '剧情'.repeat(45) },
+          ...speakers.map((speaker, index) => ({
+            id: `temporary-${index}`,
+            type: 'dialogue' as const,
+            speaker,
+            text: `临时对白${index}`,
+          })),
+          { id: 'named', type: 'dialogue', speaker: '赵铁柱', text: '我会继续出现。' },
+        ],
+      }],
+    });
+    const registeredNames = new Set<string>();
+    const temporarySpeakers = collectTemporaryDialogueSpeakers(candidate, plan, registeredNames);
+    const report = validateScriptEpisode(candidate, plan, {
+      registeredCharacterIds: new Set(),
+      registeredCharacterNames: registeredNames,
+      temporarySpeakers,
+    });
+
+    expect([...temporarySpeakers]).toEqual(speakers);
+    expect(speakers.every((speaker) => isTemporaryDialogueSpeaker(speaker))).toBe(true);
+    expect(isTemporaryDialogueSpeaker('赵铁柱')).toBe(false);
+    expect(report.issues.filter((issue) => issue.code === 'UNKNOWN_SPEAKER')).toEqual([
+      expect.objectContaining({ message: '说话人「赵铁柱」未登记。' }),
+    ]);
+  });
+
+  it('respects an explicit requirement that every dialogue speaker be registered', () => {
+    const strictPlan = {
+      ...plan,
+      coreRequirements: '未登记路人人物不得说话。',
+    } as ScriptPlan;
+    const candidate = episode({
+      scenes: [{
+        ...validScene(),
+        blocks: [
+          { id: 'action', type: 'action', text: '剧情'.repeat(45) },
+          { id: 'temporary', type: 'dialogue', speaker: '路人甲', text: '看那边。' },
+        ],
+      }],
+    });
+    const temporarySpeakers = collectTemporaryDialogueSpeakers(
+      candidate,
+      strictPlan,
+      new Set(),
+    );
+    const report = validateScriptEpisode(candidate, strictPlan, {
+      registeredCharacterNames: new Set(),
+      temporarySpeakers,
+    });
+
+    expect(temporarySpeakers.size).toBe(0);
+    expect(report.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'UNKNOWN_SPEAKER',
+        severity: 'soft',
+        message: '说话人「路人甲」未登记。',
+      }),
+    ]));
+    expect(report.hardFailed).toBe(false);
+  });
+
   it('hard-fails an empty episode instead of allowing it to complete', () => {
     const report = validateScriptEpisode(episode(), plan, { expectedEpisodeNumber: 1 });
 
@@ -89,7 +162,7 @@ describe('validateScriptEpisode', () => {
     ]));
   });
 
-  it('reports all deterministic hard failures with stable issue codes', () => {
+  it('blocks only bottom-line failures and keeps fixable findings advisory', () => {
     const invalidScene = {
       ...validScene(1),
       location: '',
@@ -125,17 +198,19 @@ describe('validateScriptEpisode', () => {
       expect.arrayContaining([
           'EPISODE_NUMBER_MISMATCH',
           'DUPLICATE_EPISODE_NUMBER',
-          'TOO_MANY_SCENES',
-          'DUPLICATE_SCENE_ORDINAL',
-          'MISSING_LOCATION',
-          'MISSING_SPEAKER',
-          'UNKNOWN_CHARACTER_REFERENCE',
           'MODEL_ARTIFACT',
           'FORBIDDEN_ELEMENT',
-          'MISSING_KEY_EVENT',
-          'MISSING_ENDING_HOOK',
         ]),
     );
+    expect(report.advisoryIssues.map((issue) => issue.code)).toEqual(expect.arrayContaining([
+      'TOO_MANY_SCENES',
+      'DUPLICATE_SCENE_ORDINAL',
+      'MISSING_LOCATION',
+      'MISSING_SPEAKER',
+      'UNKNOWN_CHARACTER_REFERENCE',
+      'MISSING_KEY_EVENT',
+      'MISSING_ENDING_HOOK',
+    ]));
   });
 
   it('keeps localized continuity, duplicate-dialogue, and density findings as soft issues', () => {
@@ -307,7 +382,7 @@ describe('validateScriptEpisode', () => {
     '△沈清推门而入。',
     '【字幕：三天后】',
     '沈清（冷静）：证据在这里。',
-  ])('hard-fails caption blocks polluted by action/dialogue structure: %s', (caption) => {
+  ])('keeps caption wrapper pollution advisory: %s', (caption) => {
     const scene = {
       ...validScene(),
       characterIds: ['character-1'],
@@ -320,10 +395,11 @@ describe('validateScriptEpisode', () => {
       registeredCharacterNames: new Set(['沈清']),
     });
 
-    expect(report.hardFailed).toBe(true);
+    expect(report.hardFailed).toBe(false);
     expect(report.issues).toEqual(expect.arrayContaining([
       expect.objectContaining({
         code: 'CAPTION_STRUCTURE_POLLUTION',
+        severity: 'soft',
         sceneId: 'scene-1',
         blockId: 'caption',
       }),
@@ -334,7 +410,7 @@ describe('validateScriptEpisode', () => {
     '△沈清推门而入。',
     '【字幕：三天后】',
     '沈清（冷静）：证据在这里。',
-  ])('hard-fails action blocks polluted by serialized structure: %s', (action) => {
+  ])('keeps action wrapper pollution advisory: %s', (action) => {
     const scene = {
       ...validScene(),
       characterIds: ['character-1'],
@@ -347,11 +423,11 @@ describe('validateScriptEpisode', () => {
       registeredCharacterNames: new Set(['沈清']),
     });
 
-    expect(report.hardFailed).toBe(true);
+    expect(report.hardFailed).toBe(false);
     expect(report.issues).toEqual(expect.arrayContaining([
       expect.objectContaining({
         code: 'ACTION_STRUCTURE_POLLUTION',
-        severity: 'hard',
+        severity: 'soft',
         sceneId: 'scene-1',
         blockId: 'polluted-action',
         path: 'blocks.text',
@@ -364,7 +440,7 @@ describe('validateScriptEpisode', () => {
     '【字幕：三天后】',
     '沈清：证据在这里。',
     '沈清（冷静）：证据在这里。',
-  ])('hard-fails dialogue text polluted by serialized structure: %s', (dialogue) => {
+  ])('keeps dialogue wrapper pollution advisory: %s', (dialogue) => {
     const scene = {
       ...validScene(),
       characterIds: ['character-1'],
@@ -385,11 +461,11 @@ describe('validateScriptEpisode', () => {
       characterNamesById: new Map([['character-1', '沈清']]),
     });
 
-    expect(report.hardFailed).toBe(true);
+    expect(report.hardFailed).toBe(false);
     expect(report.issues).toEqual(expect.arrayContaining([
       expect.objectContaining({
         code: 'DIALOGUE_STRUCTURE_POLLUTION',
-        severity: 'hard',
+        severity: 'soft',
         sceneId: 'scene-1',
         blockId: 'polluted-dialogue',
         path: 'blocks.text',
@@ -416,8 +492,9 @@ describe('validateScriptEpisode', () => {
       { outline },
     );
 
-    expect(report.issues.filter((issue) => issue.code.includes('FORBIDDEN')).map((issue) => issue.code))
-      .toEqual(['FORBIDDEN_FACT']);
+    expect(report.issues.filter((issue) => issue.code.includes('FORBIDDEN')))
+      .toEqual([expect.objectContaining({ code: 'FORBIDDEN_FACT', severity: 'hard' })]);
+    expect(report.hardFailed).toBe(true);
   });
 
   it('reports a localized soft LONG_DIALOGUE finding above 80 visible characters', () => {

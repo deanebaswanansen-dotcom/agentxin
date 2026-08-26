@@ -66,7 +66,7 @@ npm test
 
 1. 在 Netlify 连接本仓库并部署；`netlify.toml` 已包含构建命令和 `VITE_AGENT_BACKGROUND_JOBS=true`。
 2. 普通 API 走同步函数；多步 Agent 任务自动进入后台函数，最长执行 15 分钟，前端每 750 毫秒轮询一次进度。
-3. 打开站点，在设置页选择当前模型并填写自己的 API Key。DeepSeek 官方当前可选 `deepseek-v4-flash` 或 `deepseek-v4-pro`。
+3. 打开站点，在设置页选择当前模型并填写自己的 API Key。DeepSeek 官方当前可选 `deepseek-v4-flash-vision-exp` 或 `deepseek-v4-pro`。
 
 可选常驻后端：仓库根的 [`render.yaml`](render.yaml) 可部署 Render 服务；此模式需把 Netlify 环境变量设为 `VITE_API_BASE_URL=https://<后端域名>/api` 和 `VITE_AGENT_BACKGROUND_JOBS=false`，正式使用时为 `CLIENT_DATA_DIR` 挂载持久磁盘。
 

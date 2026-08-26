@@ -19,7 +19,7 @@ $env:LLM_BASE_URL = "https://api.deepseek.com"
 if (-not $env:LLM_API_KEY) {
   throw "LLM_API_KEY is required in environment."
 }
-if (-not $env:LLM_MODEL) { $env:LLM_MODEL = "deepseek-chat" }
+if (-not $env:LLM_MODEL) { $env:LLM_MODEL = "deepseek-v4-flash-vision-exp" }
 $env:LLM_TEMPERATURE = "0.75"
 
 "[$((Get-Date).ToString('o'))] starting continuity acceptance" | Out-File -FilePath $log -Encoding utf8

@@ -29,7 +29,7 @@ function candidate(index: number) {
 }
 
 describe('ScriptConceptService', () => {
-  it('returns exactly three validated and distinct proposals', async () => {
+  it('returns up to three complete proposals from a complete model response', async () => {
     const complete = vi.fn().mockResolvedValue(JSON.stringify({
       proposals: [candidate(1), candidate(2), candidate(3)],
     }));
@@ -44,27 +44,88 @@ describe('ScriptConceptService', () => {
     }));
   });
 
-  it('rejects duplicate or malformed proposals and non-script projects', async () => {
+  it('salvages one partial proposal and fills missing fields locally', async () => {
     const complete = vi.fn().mockResolvedValue(JSON.stringify({
-      proposals: [candidate(1), candidate(1), candidate(3)],
+      proposals: [{
+        title: '只返回一个也能用',
+        market: '国内',
+        channel: '女频',
+        genres: '都市、悬疑',
+        highlights: '身份反转，绝地翻盘',
+        totalEpisodes: '88集',
+      }],
     }));
     const service = new ScriptConceptService({ complete }, async () => project);
-    await expect(service.generate('project-1')).rejects.toThrow('标题不能重复');
+
+    const result = await service.generate('project-1', '失踪的账本');
+
+    expect(result.proposals).toHaveLength(1);
+    expect(result.proposals[0]).toMatchObject({
+      title: '只返回一个也能用',
+      theme: '失踪的账本',
+      market: 'domestic',
+      channel: 'female',
+      genres: ['都市', '悬疑'],
+      highlights: ['身份反转', '绝地翻盘'],
+      totalEpisodes: 88,
+    });
+    expect(result.proposals[0]?.logline).toBeTruthy();
+    expect(result.proposals[0]?.mainArc).toBeTruthy();
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops duplicate and unusable entries instead of rejecting the usable proposal', async () => {
+    const complete = vi.fn().mockResolvedValue(JSON.stringify({
+      proposals: [candidate(1), {}, { ...candidate(1), title: ' 原创选题1！ ' }, candidate(2)],
+    }));
+    const service = new ScriptConceptService({ complete }, async () => project);
+
+    const result = await service.generate('project-1');
+
+    expect(result.proposals.map((item) => item.title)).toEqual(['原创选题1', '原创选题2']);
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['', '模型暂时没有生成 JSON', '{"proposals":[]}'])('uses deterministic local proposals for empty or unusable output: %j', async (raw) => {
+    const complete = vi.fn().mockResolvedValue(raw);
+    const service = new ScriptConceptService({ complete }, async () => project);
+
+    const result = await service.generate('project-1', '修车佬复出');
+
+    expect(result.proposals).toHaveLength(3);
+    expect(result.proposals[0]).toMatchObject({
+      title: '修车佬复出：绝境反击',
+      theme: '修车佬复出',
+      totalEpisodes: 60,
+    });
+    expect(new Set(result.proposals.map((item) => item.title))).toHaveProperty('size', 3);
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back locally after one failed model call but still honors user cancellation', async () => {
+    const failedComplete = vi.fn().mockRejectedValue(new Error('provider timeout'));
+    const service = new ScriptConceptService({ complete: failedComplete }, async () => project);
+
+    const fallback = await service.generate('project-1', '遗嘱疑云');
+    expect(fallback.proposals).toHaveLength(3);
+    expect(fallback.proposals[0]?.title).toBe('遗嘱疑云：绝境反击');
+    expect(failedComplete).toHaveBeenCalledTimes(1);
+
+    const controller = new AbortController();
+    controller.abort();
+    const abortedComplete = vi.fn().mockRejectedValue(new Error('cancelled'));
+    const abortedService = new ScriptConceptService({ complete: abortedComplete }, async () => project);
+    await expect(abortedService.generate('project-1', '', controller.signal)).rejects.toThrow('cancelled');
+    expect(abortedComplete).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps project and input validation as hard data-integrity floors', async () => {
+    const complete = vi.fn().mockResolvedValue(JSON.stringify({ proposals: [candidate(1)] }));
 
     const novelService = new ScriptConceptService({ complete }, async () => ({ ...project, kind: 'novel' }));
     await expect(novelService.generate('project-1')).rejects.toThrow('只能用于 short_drama');
-  });
-
-  it.each([
-    ['logline', '一句话故事'],
-    ['coreConflict', '核心冲突'],
-    ['mainArc', '主线'],
-  ] as const)('rejects normalized duplicate %s values', async (field, label) => {
-    const proposals = [candidate(1), candidate(2), candidate(3)];
-    proposals[1]![field] = ` ${proposals[0]![field]}！ `;
-    const complete = vi.fn().mockResolvedValue(JSON.stringify({ proposals }));
     const service = new ScriptConceptService({ complete }, async () => project);
-
-    await expect(service.generate('project-1')).rejects.toThrow(label);
+    await expect(service.generate('project-1', 'x'.repeat(20_001))).rejects.toThrow('不能超过 20000');
+    expect(complete).not.toHaveBeenCalled();
   });
 });

@@ -120,11 +120,22 @@ export class AgentService {
         signal,
       });
     } else if (request.task === 'script_series_outline') {
-      result = await this.scriptDirector.run({ task: request.task, projectId, signal });
+      result = await this.scriptDirector.run({
+        task: request.task,
+        projectId,
+        ...(request.regenerate ? { regenerate: true } : {}),
+        ...(request.regenerationRunId ? { regenerationRunId: request.regenerationRunId } : {}),
+        signal,
+        onProgress: (event) => {
+          onProgress?.(event);
+        },
+      });
     } else if (request.task === 'script_bible') {
       result = await this.scriptDirector.run({
         task: request.task,
         projectId,
+        ...(request.regenerate ? { regenerate: true } : {}),
+        ...(request.regenerationRunId ? { regenerationRunId: request.regenerationRunId } : {}),
         signal,
         ...(context?.resumeRejectedCandidates ? { resumeRejectedCandidates: true } : {}),
       });
@@ -138,6 +149,8 @@ export class AgentService {
         projectId,
         ...options,
         draftMode: options.draftMode ?? 'direct_text',
+        ...(request.regenerate ? { regenerate: true } : {}),
+        ...(request.regenerationRunId ? { regenerationRunId: request.regenerationRunId } : {}),
         signal,
         ...(context?.resumeRejectedCandidates ? { resumeRejectedCandidates: true } : {}),
         onProgress: (event) => {

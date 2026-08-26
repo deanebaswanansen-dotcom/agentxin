@@ -35,7 +35,11 @@ import {
   type ScriptStore,
 } from './ScriptStore.js';
 import { currentScriptContinuityCommits } from './ScriptContinuityCommit.js';
-import { isBlockingScriptReviewIssue } from './quality/ScriptQualityGates.js';
+import {
+  allowsTemporaryDialogueSpeakers,
+  isBlockingScriptReviewIssue,
+  isTemporaryDialogueSpeaker,
+} from './quality/ScriptQualityGates.js';
 
 const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const RENAME_DELAYS_MS = [5, 15, 35, 75, 150, 300] as const;
@@ -112,12 +116,28 @@ function legacyStageDirectionFromIssue(issue: ScriptReviewIssue): string | undef
 function normalizeLegacyReviewIssues(
   items: ScriptReviewIssue[],
   projectId: string,
+  plan?: ScriptPlan,
 ): ScriptReviewIssue[] {
-  return items.map((issue) => ({
-    ...issue,
-    projectId,
-    ...(legacyStageDirectionFromIssue(issue) ? { status: 'fixed' as const } : {}),
-  }));
+  return items.map((issue) => {
+    const unknownSpeaker = issue.code === 'UNKNOWN_SPEAKER'
+      ? /^说话人「(.+)」未登记。$/u.exec(issue.message)?.[1]?.trim()
+      : undefined;
+    const obsoleteTemporaryFinding = Boolean(
+      plan &&
+      allowsTemporaryDialogueSpeakers(plan) &&
+      issue.source === 'deterministic' &&
+      issue.status === 'open' &&
+      unknownSpeaker &&
+      isTemporaryDialogueSpeaker(unknownSpeaker),
+    );
+    return {
+      ...issue,
+      projectId,
+      ...(legacyStageDirectionFromIssue(issue) || obsoleteTemporaryFinding
+        ? { status: 'fixed' as const }
+        : {}),
+    };
+  });
 }
 
 function normalizeState(value: unknown, projectId: string): ScriptProjectState {
@@ -132,6 +152,7 @@ function normalizeState(value: unknown, projectId: string): ScriptProjectState {
     throw new StoreError(`短剧项目标识与文件名不一致: ${projectId}`);
   }
   const continuity = input.continuity;
+  const plan = input.plan ? clone(input.plan) : undefined;
   const episodes = Array.isArray(input.episodes)
     ? normalizeLegacyEpisodeBlocks(clone(input.episodes))
     : [];
@@ -143,7 +164,7 @@ function normalizeState(value: unknown, projectId: string): ScriptProjectState {
   return {
     schemaVersion: 1,
     projectId,
-    ...(input.plan ? { plan: clone(input.plan) } : {}),
+    ...(plan ? { plan } : {}),
     characters: Array.isArray(input.characters) ? clone(input.characters) : [],
     ...(input.worldBible ? { worldBible: clone(input.worldBible) } : {}),
     ...(input.seriesOutline ? { seriesOutline: clone(input.seriesOutline) } : {}),
@@ -168,7 +189,7 @@ function normalizeState(value: unknown, projectId: string): ScriptProjectState {
         ? (input.reviewRevision as number)
         : 0,
     reviewIssues: Array.isArray(input.reviewIssues)
-      ? normalizeLegacyReviewIssues(clone(input.reviewIssues), projectId)
+      ? normalizeLegacyReviewIssues(clone(input.reviewIssues), projectId, plan)
       : [],
     updatedAt:
       typeof input.updatedAt === 'string'
@@ -280,6 +301,51 @@ function previousEpisodeContinuityCommit(
     );
   }
   return previous;
+}
+
+function replaceReviewIssuesInState(
+  state: ScriptProjectState,
+  episodeNumber: number,
+  sources: readonly ScriptReviewSource[],
+  items: readonly ScriptReviewIssue[],
+): ScriptReviewIssueCollection {
+  const replacedSources = new Set(sources);
+  const retained = state.reviewIssues.filter(
+    (item) => item.episodeNumber !== episodeNumber || !replacedSources.has(item.source),
+  );
+  const existing = state.reviewIssues.filter(
+    (item) => item.episodeNumber === episodeNumber && replacedSources.has(item.source),
+  );
+  const fingerprint = (item: ScriptReviewIssue): string =>
+    [item.source, item.code, item.sceneId ?? '', item.blockId ?? '', item.path ?? ''].join('\u0000');
+  const existingByFingerprint = new Map<string, ScriptReviewIssue[]>();
+  for (const item of existing) {
+    const key = fingerprint(item);
+    existingByFingerprint.set(key, [...(existingByFingerprint.get(key) ?? []), item]);
+  }
+  const usedIds = new Set(retained.map((item) => item.id));
+  const replacements = clone(items).map((item) => {
+    const previous = existingByFingerprint.get(fingerprint(item))?.shift();
+    let id = previous?.id ?? item.id;
+    if (usedIds.has(id)) id = randomUUID();
+    usedIds.add(id);
+    return {
+      ...item,
+      id,
+      projectId: state.projectId,
+      status: previous?.status === 'ignored' && !isBlockingScriptReviewIssue(item)
+        ? 'ignored' as const
+        : item.status,
+      createdAt: previous?.createdAt ?? item.createdAt,
+    };
+  });
+  const saved = [...retained, ...replacements].sort((left, right) =>
+    left.episodeNumber - right.episodeNumber || left.createdAt.localeCompare(right.createdAt),
+  );
+  const revision = state.reviewRevision + 1;
+  state.reviewRevision = revision;
+  state.reviewIssues = saved;
+  return { revision, items: saved };
 }
 
 function assertUniqueContinuityIds<T>(
@@ -626,13 +692,6 @@ export class FileScriptStore implements ScriptStore {
       const currentEpisodeRevision = currentEpisode?.revision ?? 0;
       assertExpectedRevision(input.expectedEpisodeRevision, currentEpisodeRevision);
       assertExpectedRevision(input.expectedReviewRevision, state.reviewRevision);
-      if (state.reviewIssues.some((issue) =>
-        issue.episodeNumber === input.episode.episodeNumber && isBlockingScriptReviewIssue(issue)
-      )) {
-        throw new ScriptCommitConflictError(
-          `第 ${input.episode.episodeNumber} 集仍有未解决的硬性校稿问题。`,
-        );
-      }
 
       if (input.episode.projectId !== state.projectId) {
         throw new ScriptCommitConflictError('候选正文与短剧项目不一致。');
@@ -659,6 +718,21 @@ export class FileScriptStore implements ScriptStore {
         throw new ScriptCommitConflictError('候选输入指纹不匹配，拒绝提交过期正文。');
       }
       validateContinuityCandidate(state, input.episode, input.continuity);
+      const effectiveReview = input.reviewUpdate
+        ? replaceReviewIssuesInState(
+            state,
+            input.episode.episodeNumber,
+            input.reviewUpdate.sources,
+            input.reviewUpdate.items,
+          ).items
+        : state.reviewIssues;
+      if (effectiveReview.some((issue) =>
+        issue.episodeNumber === input.episode.episodeNumber && isBlockingScriptReviewIssue(issue)
+      )) {
+        throw new ScriptCommitConflictError(
+          `第 ${input.episode.episodeNumber} 集仍有未解决的硬性校稿问题。`,
+        );
+      }
 
       const updatedAt = new Date().toISOString();
       const episode: ScriptEpisode = {
@@ -746,43 +820,7 @@ export class FileScriptStore implements ScriptStore {
   ): Promise<ScriptReviewIssueCollection> {
     return this.mutate(projectId, (state) => {
       assertExpectedRevision(expectedRevision, state.reviewRevision);
-      const replacedSources = new Set(sources);
-      const retained = state.reviewIssues.filter(
-        (item) => item.episodeNumber !== episodeNumber || !replacedSources.has(item.source),
-      );
-      const existing = state.reviewIssues.filter(
-        (item) => item.episodeNumber === episodeNumber && replacedSources.has(item.source),
-      );
-      const fingerprint = (item: ScriptReviewIssue): string =>
-        [item.source, item.code, item.sceneId ?? '', item.blockId ?? '', item.path ?? ''].join('\u0000');
-      const existingByFingerprint = new Map<string, ScriptReviewIssue[]>();
-      for (const item of existing) {
-        const key = fingerprint(item);
-        existingByFingerprint.set(key, [...(existingByFingerprint.get(key) ?? []), item]);
-      }
-      const usedIds = new Set(retained.map((item) => item.id));
-      const replacements = clone(items).map((item) => {
-        const previous = existingByFingerprint.get(fingerprint(item))?.shift();
-        let id = previous?.id ?? item.id;
-        if (usedIds.has(id)) id = randomUUID();
-        usedIds.add(id);
-        return {
-          ...item,
-          id,
-          projectId,
-          status: previous?.status === 'ignored' && !isBlockingScriptReviewIssue(item)
-            ? 'ignored' as const
-            : item.status,
-          createdAt: previous?.createdAt ?? item.createdAt,
-        };
-      });
-      const saved = [...retained, ...replacements].sort((left, right) =>
-        left.episodeNumber - right.episodeNumber || left.createdAt.localeCompare(right.createdAt),
-      );
-      const revision = state.reviewRevision + 1;
-      state.reviewRevision = revision;
-      state.reviewIssues = saved;
-      return { revision, items: saved };
+      return replaceReviewIssuesInState(state, episodeNumber, sources, items);
     });
   }
 

@@ -286,16 +286,15 @@ export function decodeScriptEpisodeOutlineInput(value: unknown): ScriptEpisodeOu
   const scenes = input.plannedScenes.map((rawScene, index) => {
     const scene = record(rawScene, `第${index + 1}个计划场景`);
     return {
-      ordinal: integer(scene.ordinal, '场号', 1, 20),
+      // Model scene numbers are presentation metadata. Preserve the returned
+      // order and normalize locally instead of rejecting duplicate/skipped numbers.
+      ordinal: index + 1,
       location: stringValue(scene.location, '场景地点', 300),
       timeOfDay: enumValue(scene.timeOfDay, '时间', TIMES),
       interiorExterior: enumValue(scene.interiorExterior, '内外景', IN_OUT),
       purpose: stringValue(scene.purpose, '场景目的', 2_000),
     };
   });
-  if (new Set(scenes.map((scene) => scene.ordinal)).size !== scenes.length) {
-    throw ScriptServiceError.validation('场号不能重复');
-  }
   const id = optionalId(input.id);
   const reveal = optionalString(input.reveal, '揭示', 2_000);
   const reversal = optionalString(input.reversal, '反转', 2_000);
@@ -335,9 +334,8 @@ export function validateScriptEpisodeOutlineInput(
   if (options.totalEpisodes !== undefined && outline.episodeNumber > options.totalEpisodes) {
     throw ScriptServiceError.validation('集号超过策划总集数');
   }
-  const maxScenes = options.maxScenesPerEpisode ?? 5;
-  if (outline.plannedScenes.length < 1 || outline.plannedScenes.length > maxScenes) {
-    throw ScriptServiceError.validation(`计划场景数必须为1到${maxScenes}`);
+  if (outline.plannedScenes.length < 1) {
+    throw ScriptServiceError.validation('计划场景至少需要1场');
   }
 }
 
@@ -360,14 +358,14 @@ function decodeScriptBlock(value: unknown, createId: () => string): ScriptBlock 
   };
 }
 
-function decodeScriptScene(value: unknown, createId: () => string): ScriptScene {
+function decodeScriptScene(value: unknown, createId: () => string, ordinal: number): ScriptScene {
   const input = record(value, '剧本场景');
   if (!Array.isArray(input.blocks) || input.blocks.length === 0) {
     throw ScriptServiceError.validation('剧本场景必须包含正文块');
   }
   return {
     id: optionalId(input.id) ?? createId(),
-    ordinal: integer(input.ordinal, '场号', 1, 20),
+    ordinal,
     location: stringValue(input.location, '场景地点', 300),
     timeOfDay: enumValue(input.timeOfDay, '时间', TIMES),
     interiorExterior: enumValue(input.interiorExterior, '内外景', IN_OUT),
@@ -384,10 +382,7 @@ export function decodeScriptEpisodeInput(
   const input = record(value, '剧本正文');
   if (!Array.isArray(input.scenes)) throw ScriptServiceError.validation('剧本场景必须是数组');
   const createId = options.createId ?? randomUUID;
-  const scenes = input.scenes.map((scene) => decodeScriptScene(scene, createId));
-  if (new Set(scenes.map((scene) => scene.ordinal)).size !== scenes.length) {
-    throw ScriptServiceError.validation('场号不能重复');
-  }
+  const scenes = input.scenes.map((scene, index) => decodeScriptScene(scene, createId, index + 1));
   const id = optionalId(input.id);
   return {
     ...(id ? { id } : {}),
@@ -421,8 +416,7 @@ export function validateScriptEpisodeInput(
   if (options.totalEpisodes !== undefined && episode.episodeNumber > options.totalEpisodes) {
     throw ScriptServiceError.validation('集号超过策划总集数');
   }
-  const maxScenes = options.maxScenesPerEpisode ?? 5;
-  if (episode.scenes.length < 1 || episode.scenes.length > maxScenes) {
-    throw ScriptServiceError.validation(`剧本场景数必须为1到${maxScenes}`);
+  if (episode.scenes.length < 1) {
+    throw ScriptServiceError.validation('剧本正文至少需要1场');
   }
 }

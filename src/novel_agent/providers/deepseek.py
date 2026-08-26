@@ -11,7 +11,7 @@ class DeepSeekProvider(OpenAICompatibleProvider):
     def provider_request_extras(self) -> dict[str, Any]:
         model = self.config.model.strip()
         host = self.config.base_url.strip().rstrip("/")
-        if host == "https://api.deepseek.com" and model in {"deepseek-v4-flash", "deepseek-v4-pro"}:
+        if host == "https://api.deepseek.com" and model in {"deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-v4-pro"}:
             return {
                 "thinking": {"type": "enabled"},
                 "reasoning_effort": "high" if model == "deepseek-v4-pro" else "medium",

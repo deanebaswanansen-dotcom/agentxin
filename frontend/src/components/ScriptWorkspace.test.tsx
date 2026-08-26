@@ -335,6 +335,48 @@ describe('ScriptWorkspace', () => {
     expect(screen.getByText('第 1 集校稿完成：未发现阻断完成的硬性问题')).toBeInTheDocument();
   });
 
+  it('proofreads the current batch sequentially with the latest review revision', async () => {
+    const client = createClient();
+    const firstEpisode = buildNumberedEpisode(1, '第一集正文');
+    const secondEpisode = buildNumberedEpisode(2, '第二集正文');
+    Object.assign(client.script, {
+      workspace: {
+        get: vi.fn().mockResolvedValue(buildWorkspaceSnapshot({
+          plan: { ...buildPlan(), status: 'approved' },
+          episodeSummaries: [summarizeEpisode(firstEpisode), summarizeEpisode(secondEpisode)],
+        })),
+      },
+      reviews: { list: vi.fn(), save: vi.fn(), updateStatus: vi.fn() },
+    });
+    Object.assign(client.script.episodes, {
+      get: vi.fn().mockImplementation((_projectId, episodeNumber) => Promise.resolve(
+        episodeNumber === 1 ? firstEpisode : secondEpisode,
+      )),
+      review: vi.fn().mockImplementation((_projectId, _episodeNumber, revision) => Promise.resolve({
+        revision: revision + 1,
+        items: [],
+        report: {
+          hardFailed: false,
+          issues: [],
+          blockingIssues: [],
+          advisoryIssues: [],
+          visibleChars: 5,
+          dialogueDensityPercent: 0,
+        },
+      })),
+    });
+
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+    await screen.findByRole('heading', { level: 3, name: '绝食逼我道歉？我当面吃香喝辣' });
+    fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'AI 校稿当前五集' }));
+
+    await waitFor(() => expect(client.script.episodes.review).toHaveBeenCalledTimes(2));
+    expect(client.script.episodes.review).toHaveBeenNthCalledWith(1, 'project-1', 1, 0);
+    expect(client.script.episodes.review).toHaveBeenNthCalledWith(2, 'project-1', 2, 1);
+    expect(await screen.findByText('当前五集 AI 校稿完成：未发现阻断完成的硬性问题')).toBeInTheDocument();
+  });
+
   it('loads jobs before the aggregate snapshot so a completed job cannot strand stale workspace data', async () => {
     const client = createClient();
     let resolveJobs!: (jobs: Awaited<ReturnType<typeof client.script.jobs.list>>) => void;
@@ -583,6 +625,39 @@ describe('ScriptWorkspace', () => {
     expect(await screen.findByText('策划已确认，可生成大纲、角色与世界设定')).toBeInTheDocument();
   });
 
+  it('can skip manual planning and let AI answer, finish, and approve the plan', async () => {
+    const draft = { ...buildPlan(), status: 'draft' as const };
+    const client = createClient(draft);
+    vi.mocked(client.script.plan.turn)
+      .mockResolvedValueOnce({
+        status: 'asking', session: 'auto-session', round: 1,
+        questions: [{
+          field: 'genres', label: '选择题材', kind: 'multi', required: true,
+          options: [{ label: '都市', value: '都市' }, { label: '家庭', value: '家庭' }],
+        }],
+      })
+      .mockResolvedValueOnce({
+        status: 'ready', session: 'auto-session', round: 2,
+        plan: { ...draft, title: 'AI 自动完成的策划', revision: 4 },
+      });
+    vi.mocked(client.script.plan.approve).mockResolvedValue({
+      ...draft, title: 'AI 自动完成的策划', status: 'approved', revision: 5,
+    });
+
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('button', { name: '跳过手填，AI 自动完成策划' }));
+
+    await waitFor(() => expect(client.script.plan.turn).toHaveBeenCalledTimes(2));
+    expect(client.script.plan.turn).toHaveBeenNthCalledWith(2, {
+      projectId: 'project-1',
+      answers: [{ field: 'genres', delegate: true }],
+    });
+    expect(client.script.plan.approve).toHaveBeenCalledWith('project-1', 4);
+    expect(await screen.findByRole('heading', { name: 'AI 自动完成的策划' })).toBeInTheDocument();
+    expect(screen.getByText(/AI 已自动完成并确认策划/)).toBeInTheDocument();
+  });
+
   it('does not apply a stale Agent plan when the user edits during the request', async () => {
     const client = createClient();
     let resolveTurn!: (result: Awaited<ReturnType<typeof client.script.plan.turn>>) => void;
@@ -630,15 +705,18 @@ describe('ScriptWorkspace', () => {
 
     await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
     fireEvent.click(screen.getByRole('tab', { name: '剧本大纲' }));
+    expect(screen.getByText('跳过手填，AI 自动生成大纲')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Agent 生成大纲' }));
     await waitFor(() => expect(client.script.jobs.create).toHaveBeenCalledWith({
       projectId: 'project-1', task: 'script_series_outline',
     }));
 
     fireEvent.click(screen.getByRole('tab', { name: '角色设定' }));
+    expect(screen.getByText('跳过手填，AI 自动补全人物')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Agent 补全人物与世界' }));
     await waitFor(() => expect(client.script.jobs.create).toHaveBeenCalledTimes(2));
     fireEvent.click(screen.getByRole('tab', { name: '世界设定' }));
+    expect(screen.getByText('跳过手填，AI 自动补全世界')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Agent 补全人物与世界' }));
     await waitFor(() => {
       expect(client.script.jobs.create).toHaveBeenCalledWith({
@@ -647,6 +725,66 @@ describe('ScriptWorkspace', () => {
       expect(client.script.jobs.create).toHaveBeenCalledTimes(2);
     });
     expect(screen.getByText('人物与世界补全任务正在运行，请勿重复提交')).toBeInTheDocument();
+  });
+
+  it('offers explicit AI regeneration for existing outline, bible, and completed episodes', async () => {
+    const client = createClient();
+    const completedEpisodes = Array.from({ length: 5 }, (_, index) => (
+      buildNumberedEpisode(index + 1, `第${index + 1}集旧正文`)
+    ));
+    Object.assign(client.script, {
+      workspace: {
+        get: vi.fn().mockResolvedValue(buildWorkspaceSnapshot({
+          episodeSummaries: completedEpisodes.map(summarizeEpisode),
+          batchSummaries: [{
+            startEpisode: 1,
+            endEpisode: 5,
+            status: 'completed',
+            completedEpisodes: 5,
+            visibleChars: 35,
+            unresolvedHardIssues: 0,
+            unresolvedSoftIssues: 0,
+          }],
+        })),
+      },
+    });
+    vi.mocked(client.script.jobs.create).mockImplementation((request) => Promise.resolve({
+      id: `rewrite-${request.task}`,
+      projectId: request.projectId,
+      task: request.task,
+      status: 'queued',
+      continuable: false,
+      ...(request.scriptBatchOptions ? { scriptBatchOptions: request.scriptBatchOptions } : {}),
+    }));
+
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+
+    fireEvent.click(screen.getByRole('tab', { name: '剧本大纲' }));
+    fireEvent.click(screen.getByRole('button', { name: 'AI 重新生成大纲' }));
+    await waitFor(() => expect(client.script.jobs.create).toHaveBeenLastCalledWith({
+      projectId: 'project-1', task: 'script_series_outline', regenerate: true,
+    }));
+
+    fireEvent.click(screen.getByRole('tab', { name: '角色设定' }));
+    fireEvent.click(screen.getByRole('button', { name: 'AI 重新生成人物与世界' }));
+    await waitFor(() => expect(client.script.jobs.create).toHaveBeenLastCalledWith({
+      projectId: 'project-1', task: 'script_bible', regenerate: true,
+    }));
+
+    fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
+    fireEvent.click(screen.getByRole('button', { name: 'AI 重新写第 1–5 集' }));
+    await waitFor(() => expect(client.script.jobs.create).toHaveBeenLastCalledWith({
+      projectId: 'project-1',
+      task: 'script_episode_batch',
+      regenerate: true,
+      scriptBatchOptions: {
+        startEpisode: 1,
+        episodeCount: 5,
+        expectedPlanRevision: 2,
+        draftMode: 'direct_text',
+      },
+    }));
   });
 
   it('does not start material Agents from unsaved source data', async () => {
@@ -676,6 +814,7 @@ describe('ScriptWorkspace', () => {
 
     fireEvent.change(await screen.findByLabelText('剧本名称'), { target: { value: '未保存策划' } });
     fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
+    expect(screen.getByText('跳过手写，AI 生成第 1–5 集')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '生成第 1–5 集' }));
 
     expect(client.script.jobs.create).not.toHaveBeenCalled();
@@ -721,6 +860,94 @@ describe('ScriptWorkspace', () => {
     expect(client.script.jobs.create).not.toHaveBeenCalled();
   });
 
+  it('shows an outline background task and lets the user cancel it', async () => {
+    const client = createClient();
+    const runningJob: ScriptAgentJobSnapshot = {
+      id: 'job-outline-running', projectId: 'project-1', task: 'script_series_outline',
+      status: 'running', continuable: false,
+      checkpoint: { node: 'series_outline', attempt: 1, artifactRevision: 3 },
+      error: { code: 'PROVIDER_SLOW', message: '模型响应较慢，仍在等待' },
+      updatedAt: '2026-08-26T12:34:00.000Z',
+    };
+    vi.mocked(client.script.jobs.list).mockResolvedValue([runningJob]);
+    vi.mocked(client.script.jobs.cancel).mockResolvedValue({
+      ...runningJob, status: 'cancelled', continuable: true,
+    });
+
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '剧本大纲' }));
+    expect(screen.getByLabelText('大纲任务状态')).toBeInTheDocument();
+    expect(screen.getByText('大纲任务：运行中')).toBeInTheDocument();
+    expect(screen.getByText('全剧大纲')).toBeInTheDocument();
+    expect(screen.getByText('模型响应较慢，仍在等待')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '取消大纲任务' }));
+
+    await waitFor(() => expect(client.script.jobs.cancel).toHaveBeenCalledWith('job-outline-running'));
+    expect(await screen.findByText('任务已取消，可稍后从已保存内容继续')).toBeInTheDocument();
+  });
+
+  it('shows a waiting character/world task and lets the user continue it', async () => {
+    const client = createClient();
+    const waitingJob: ScriptAgentJobSnapshot = {
+      id: 'job-bible-waiting', projectId: 'project-1', task: 'script_bible',
+      status: 'waiting_user', continuable: true,
+      checkpoint: { node: 'world_bible', attempt: 2, artifactRevision: 4 },
+      error: { code: 'RUN_INTERRUPTED', message: '后台服务重启，任务已停在保存点' },
+    };
+    vi.mocked(client.script.jobs.list).mockResolvedValue([waitingJob]);
+    vi.mocked(client.script.jobs.resume).mockResolvedValue(waitingJob);
+
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '角色设定' }));
+    expect(screen.getByText('人物与世界任务：等待确认')).toBeInTheDocument();
+    expect(screen.getByText('世界圣经')).toBeInTheDocument();
+    expect(screen.getByText('后台服务重启，任务已停在保存点')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '取消人物与世界任务' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '从检查点继续人物与世界任务' }));
+
+    await waitFor(() => expect(client.script.jobs.resume).toHaveBeenCalledWith('job-bible-waiting'));
+    expect(await screen.findByText('任务已从检查点继续')).toBeInTheDocument();
+  });
+
+  it('updates ten-episode outline progress when the latest background event changes', async () => {
+    const client = createClient();
+    const snapshot = buildWorkspaceSnapshot();
+    const initialJob: ScriptAgentJobSnapshot = {
+      id: 'job-outline-progress', projectId: 'project-1', task: 'script_series_outline',
+      status: 'running', continuable: false,
+      updatedAt: '2026-08-26T12:00:00.000Z',
+      events: [{ phase: 'setup', message: '正在生成第1—10集', current: 10, total: 60 }],
+    };
+    const progressedJob: ScriptAgentJobSnapshot = {
+      ...initialJob,
+      events: [
+        ...initialJob.events ?? [],
+        { phase: 'setup', message: '正在生成第11—20集', current: 20, total: 60 },
+      ],
+    };
+    const workspaceGet = vi.fn().mockResolvedValue(snapshot);
+    Object.assign(client.script, { workspace: { get: workspaceGet } });
+    vi.mocked(client.script.jobs.list)
+      .mockResolvedValueOnce([initialJob])
+      .mockResolvedValueOnce([progressedJob]);
+    const intervalSpy = vi.spyOn(globalThis, 'setInterval');
+
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '剧本大纲' }));
+    expect(screen.getByText('正在生成第1—10集，10/60')).toBeInTheDocument();
+    const poll = intervalSpy.mock.calls.find((call) => call[1] === 2000)?.[0] as () => Promise<void>;
+    await act(async () => { await poll(); });
+
+    expect(await screen.findByText('正在生成第11—20集，20/60')).toBeInTheDocument();
+    expect(workspaceGet).toHaveBeenCalledTimes(2);
+  });
+
   it('does not poll a waiting-user job and can resume it from its checkpoint', async () => {
     const client = createClient();
     const waitingJob = {
@@ -728,6 +955,7 @@ describe('ScriptWorkspace', () => {
       status: 'waiting_user' as const, continuable: true,
       scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 2 },
       checkpoint: { episodeNumber: 2, node: 'draft' as const, attempt: 1, artifactRevision: 0 },
+      events: [{ phase: 'info' as const, message: '已保存第2集候选', current: 2, total: 5 }],
       error: { code: 'SCRIPT_STRUCTURED_NEEDS_REVIEW', message: '正文结构需要确认' },
     };
     vi.mocked(client.script.jobs.list).mockResolvedValue([waitingJob]);
@@ -743,6 +971,8 @@ describe('ScriptWorkspace', () => {
     expect(intervalSpy.mock.calls.some((call) => call[1] === 2000)).toBe(false);
     fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
     expect(screen.getByText('等待确认')).toBeInTheDocument();
+    expect(screen.getByText('已保存第2集候选，2/5')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '取消任务' })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '继续第 2 集所在的 1–5 集任务' }));
 
     await waitFor(() => expect(client.script.jobs.resume).toHaveBeenCalledWith('job-waiting-review'));

@@ -243,6 +243,8 @@ export interface AgentRunRequest {
   prompt: string;
   projectId?: Id;
   chapterId?: Id;
+  /** Explicit user request to replace an existing script artifact with a fresh AI candidate. */
+  regenerate?: boolean;
   scriptBatchOptions?: ScriptBatchOptions;
   options?: {
     targetWords?: number;
@@ -1511,6 +1513,8 @@ export interface ScriptAgentJobSnapshot {
   projectId: Id;
   task: ScriptAgentTask;
   status: 'queued' | 'running' | 'waiting_user' | 'retrying' | 'completed' | 'failed' | 'cancelled';
+  /** Persisted progress emitted by the background Agent, in chronological order. */
+  events?: AgentProgressEvent[];
   checkpoint?: ScriptAgentJobCheckpoint;
   error?: { code?: string; message: string };
   continuable?: boolean;
@@ -1522,5 +1526,6 @@ export interface ScriptAgentJobRequest {
   projectId: Id;
   task: ScriptAgentTask;
   prompt?: string;
+  regenerate?: boolean;
   scriptBatchOptions?: ScriptBatchOptions;
 }

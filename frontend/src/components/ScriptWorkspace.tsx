@@ -165,6 +165,7 @@ function PlanEditor({
   onAdoptConcept,
   onSave,
   onAgentPlan,
+  onAutoComplete,
   onAnswer,
   onDelegate,
   onSubmitAnswers,
@@ -183,6 +184,7 @@ function PlanEditor({
   onAdoptConcept: (concept: ScriptConceptProposal) => void;
   onSave: () => void;
   onAgentPlan: () => void;
+  onAutoComplete: () => void;
   onAnswer: (field: string, value: NonNullable<ScriptPlanAnswer['value']>) => void;
   onDelegate: (field: string) => void;
   onSubmitAnswers: () => void;
@@ -205,7 +207,7 @@ function PlanEditor({
       </header>
       <section className="script-concept-studio" aria-labelledby="script-concept-heading">
         <div className="script-concept-studio__intro"><span>从一个灵感开始</span><h3 id="script-concept-heading">AI 选题</h3><p>输入题材、冲突或受众，生成 3 个可继续深化的短剧方向。</p></div>
-        <div className="script-concept-input"><input aria-label="选题灵感" value={conceptPrompt} onChange={(event) => onConceptPromptChange(event.target.value)} placeholder="例如：都市女频，儿媳用美食反击情绪勒索" /><button type="button" className="nwa-button" disabled={conceptBusy} onClick={onGenerateConcepts}>{conceptBusy ? '选题生成中…' : '生成 3 个选题'}</button></div>
+        <div className="script-concept-input"><input aria-label="选题灵感" value={conceptPrompt} onChange={(event) => onConceptPromptChange(event.target.value)} placeholder="例如：都市女频，儿媳用美食反击情绪勒索" /><button type="button" className="nwa-button" disabled={conceptBusy} onClick={onGenerateConcepts}>{conceptBusy ? '选题生成中…' : concepts.length > 0 ? 'AI 重新生成选题' : '生成 3 个选题'}</button></div>
         {concepts.length ? <div className="script-concept-cards">{concepts.map((concept, index) => <article key={`${concept.title}-${index}`}><header><span>方向 {index + 1}</span><strong>{concept.title}</strong></header><p>{concept.logline}</p><div className="script-read-tags">{concept.genres.map((genre) => <span key={genre}>{genre}</span>)}</div><dl><div><dt>受众</dt><dd>{concept.audience}</dd></div><div><dt>核心冲突</dt><dd>{concept.coreConflict}</dd></div></dl><button type="button" className="nwa-button nwa-button--ghost" onClick={() => onAdoptConcept(concept)}>采用此方案</button></article>)}</div> : <div className="script-concept-empty">还没有候选方案。AI 只会基于你的灵感生成真实候选，不会用占位内容覆盖现有策划。</div>}
       </section>
       {mode === 'read' ? <ScriptPlanReadView value={value} /> : <>
@@ -275,6 +277,8 @@ function PlanEditor({
       </>}
       <footer className="script-stage-actions">
         <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={onAgentPlan}>Agent 帮我策划</button>
+        <button type="button" className="nwa-button script-ai-skip" disabled={busy} onClick={onAutoComplete}>跳过手填，AI 自动完成策划</button>
+        {value.revision > 0 ? <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={onAutoComplete}>AI 重新生成策划</button> : null}
         <button type="button" className="nwa-button" disabled={busy} onClick={onSave}>{busy ? '保存中…' : '保存策划'}</button>
         {value.status === 'draft' ? <button type="button" className="nwa-button" disabled={busy} onClick={onApprove}>确认策划</button> : null}
       </footer>
@@ -349,13 +353,20 @@ function summarizeEpisode(episode: ScriptEpisode): ScriptEpisodeSummary {
 
 function jobResourceSignature(jobs: ScriptAgentJobSnapshot[]): string {
   return jobs
-    .map((job) => [
-      job.id,
-      job.status,
-      job.checkpoint?.episodeNumber ?? '',
-      job.checkpoint?.node ?? '',
-      job.checkpoint?.artifactRevision ?? '',
-    ].join(':'))
+    .map((job) => {
+      const latestEvent = job.events?.at(-1);
+      return [
+        job.id,
+        job.status,
+        job.updatedAt ?? '',
+        job.checkpoint?.episodeNumber ?? '',
+        job.checkpoint?.node ?? '',
+        job.checkpoint?.artifactRevision ?? '',
+        latestEvent?.message ?? '',
+        latestEvent?.current ?? '',
+        latestEvent?.total ?? '',
+      ].join(':');
+    })
     .sort()
     .join('|');
 }
@@ -371,7 +382,7 @@ function OutlineEditor({
   busy: boolean;
   onChange: (value: ScriptSeriesOutline) => void;
   onSave: () => void;
-  onGenerate: () => void;
+  onGenerate: (regenerate?: boolean) => void;
 }): JSX.Element {
   const [mode, setMode] = useState<'read' | 'edit'>(() => value.revision > 0 ? 'read' : 'edit');
   const patch = <K extends keyof ScriptSeriesOutline>(key: K, next: ScriptSeriesOutline[K]) =>
@@ -403,7 +414,7 @@ function OutlineEditor({
         </article>;
       })}</div> : <p className="script-muted">保存策划后，可让 Agent 生成全剧总纲与连续分集卡。</p>}
       </>}
-      <footer className="script-stage-actions"><button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={onGenerate}>Agent 生成大纲</button><button type="button" className="nwa-button" disabled={busy} onClick={onSave}>{busy ? '保存中…' : '保存大纲'}</button></footer>
+      <footer className="script-stage-actions"><button type="button" aria-label="Agent 生成大纲" className="nwa-button script-ai-skip" disabled={busy} onClick={() => onGenerate(false)}>跳过手填，AI 自动生成大纲</button>{value.revision > 0 || value.episodeCards.length > 0 ? <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => onGenerate(true)}>AI 重新生成大纲</button> : null}<button type="button" className="nwa-button" disabled={busy} onClick={onSave}>{busy ? '保存中…' : '保存大纲'}</button></footer>
     </section>
   );
 }
@@ -588,7 +599,7 @@ function CharacterEditor({
   busy: boolean;
   onChange: (value: ScriptCharacter[]) => void;
   onSave: () => void;
-  onGenerate: () => void;
+  onGenerate: (regenerate?: boolean) => void;
 }): JSX.Element {
   const [mode, setMode] = useState<'read' | 'edit'>(() => value.length > 0 ? 'read' : 'edit');
   const [validationErrors, setValidationErrors] = useState<CharacterValidationError[]>([]);
@@ -606,7 +617,7 @@ function CharacterEditor({
   };
   return (
     <section className="script-stage-panel" aria-labelledby="script-characters-heading">
-      <header className="script-stage-heading"><div><span>第三阶段</span><h2 id="script-characters-heading">角色设定</h2></div><div className="script-stage-heading__actions"><div className="script-view-switch" role="group" aria-label="角色查看模式"><button type="button" aria-pressed={mode === 'read'} onClick={() => setMode('read')}>人物卡</button><button type="button" aria-pressed={mode === 'edit'} onClick={() => setMode('edit')}>编辑模式</button></div><button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={onGenerate}>Agent 补全人物与世界</button><button type="button" className="nwa-button nwa-button--ghost" onClick={() => { setValidationErrors([]); onChange([...value, emptyCharacter(projectId, value)]); }}>添加角色</button></div></header>
+      <header className="script-stage-heading"><div><span>第三阶段</span><h2 id="script-characters-heading">角色设定</h2></div><div className="script-stage-heading__actions"><div className="script-view-switch" role="group" aria-label="角色查看模式"><button type="button" aria-pressed={mode === 'read'} onClick={() => setMode('read')}>人物卡</button><button type="button" aria-pressed={mode === 'edit'} onClick={() => setMode('edit')}>编辑模式</button></div><button type="button" aria-label="Agent 补全人物与世界" className="nwa-button script-ai-skip" disabled={busy} onClick={() => onGenerate(false)}>跳过手填，AI 自动补全人物</button>{value.length > 0 ? <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => onGenerate(true)}>AI 重新生成人物与世界</button> : null}<button type="button" className="nwa-button nwa-button--ghost" onClick={() => { setValidationErrors([]); onChange([...value, emptyCharacter(projectId, value)]); }}>添加角色</button></div></header>
       {mode === 'read' ? <ScriptCharactersReadView value={value} /> : <>
       {validationErrors.length > 0 ? <div className="script-character-errors" role="alert"><strong>请补全人物卡后再保存</strong><ul>{validationErrors.map((error) => <li key={`${error.characterIndex}-${error.field}`}>{error.message}</li>)}</ul></div> : null}
       {value.length === 0 ? <p className="script-muted">尚无角色。可手动添加，或让 Agent 根据策划和总纲补全人物与世界圣经。</p> : <div className="script-character-list">{value.map((character, index) => (
@@ -666,7 +677,7 @@ function WorldEditor({
   busy: boolean;
   onChange: (value: ScriptWorldBible) => void;
   onSave: () => void;
-  onGenerate: () => void;
+  onGenerate: (regenerate?: boolean) => void;
 }): JSX.Element {
   const [mode, setMode] = useState<'read' | 'edit'>(() => value.revision > 0 ? 'read' : 'edit');
   const patch = <K extends keyof ScriptWorldBible>(key: K, next: ScriptWorldBible[K]) =>
@@ -674,7 +685,7 @@ function WorldEditor({
   const lines = (text: string) => text.split('\n').map((item) => item.trim()).filter(Boolean);
   return (
     <section className="script-stage-panel" aria-labelledby="script-world-heading">
-      <header className="script-stage-heading"><div><span>第四阶段</span><h2 id="script-world-heading">世界设定</h2></div><div className="script-stage-heading__actions"><div className="script-view-switch" role="group" aria-label="世界设定查看模式"><button type="button" aria-pressed={mode === 'read'} onClick={() => setMode('read')}>阅读模式</button><button type="button" aria-pressed={mode === 'edit'} onClick={() => setMode('edit')}>编辑模式</button></div><button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={onGenerate}>Agent 补全人物与世界</button><span className="script-status-chip">版本 {value.revision}</span></div></header>
+      <header className="script-stage-heading"><div><span>第四阶段</span><h2 id="script-world-heading">世界设定</h2></div><div className="script-stage-heading__actions"><div className="script-view-switch" role="group" aria-label="世界设定查看模式"><button type="button" aria-pressed={mode === 'read'} onClick={() => setMode('read')}>阅读模式</button><button type="button" aria-pressed={mode === 'edit'} onClick={() => setMode('edit')}>编辑模式</button></div><button type="button" aria-label="Agent 补全人物与世界" className="nwa-button script-ai-skip" disabled={busy} onClick={() => onGenerate(false)}>跳过手填，AI 自动补全世界</button>{value.revision > 0 ? <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => onGenerate(true)}>AI 重新生成人物与世界</button> : null}<span className="script-status-chip">版本 {value.revision}</span></div></header>
       {mode === 'read' ? <ScriptWorldReadView value={value} /> : <>
       <div className="script-form-grid">
         <label className="script-field">时代<input aria-label="时代" value={value.era} onChange={(e) => patch('era', e.target.value)} /></label>
@@ -720,6 +731,50 @@ const CHECKPOINT_LABEL: Record<NonNullable<ScriptAgentJobSnapshot['checkpoint']>
   completed: '本集完成',
   batch_report: '批次报告',
 };
+
+function MaterialJobPanel({
+  job,
+  label,
+  busy,
+  onResume,
+  onCancel,
+}: {
+  job: ScriptAgentJobSnapshot;
+  label: string;
+  busy: boolean;
+  onResume: (jobId: string) => void;
+  onCancel: (jobId: string) => void;
+}): JSX.Element {
+  const canCancel = BLOCKING_JOB_STATUSES.has(job.status);
+  const latestEvent = job.events?.at(-1);
+  const latestProgress = latestEvent?.current !== undefined && latestEvent.total !== undefined
+    ? `，${latestEvent.current}/${latestEvent.total}`
+    : '';
+  const checkpoint = job.checkpoint
+    ? CHECKPOINT_LABEL[job.checkpoint.node]
+    : '等待第一个保存点';
+  const updatedAt = job.updatedAt ? new Date(job.updatedAt) : undefined;
+  const updatedLabel = updatedAt && !Number.isNaN(updatedAt.getTime())
+    ? `最近更新 ${updatedAt.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`
+    : '后台任务状态';
+  return (
+    <section className="script-material-job" aria-label={`${label}任务状态`}>
+      <div className="script-material-job__body">
+        <div className="script-job-card__status">
+          <strong>{label}任务：{JOB_STATUS_LABEL[job.status]}</strong>
+          <span>{updatedLabel}</span>
+        </div>
+        {latestEvent ? <p className="script-material-job__progress">{latestEvent.message}{latestProgress}</p> : null}
+        <p>{checkpoint}</p>
+        {job.error ? <p className="script-job-error">{job.error.message}</p> : null}
+      </div>
+      <div className="script-material-job__actions">
+        {job.continuable ? <button type="button" className="nwa-button nwa-button--sm" disabled={busy} onClick={() => onResume(job.id)}>从检查点继续{label}任务</button> : null}
+        {canCancel ? <button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={busy} onClick={() => onCancel(job.id)}>取消{label}任务</button> : null}
+      </div>
+    </section>
+  );
+}
 
 const REVIEW_SEVERITY_LABEL: Record<ScriptReviewIssue['severity'], string> = {
   hard: '硬性问题',
@@ -768,6 +823,7 @@ function EpisodeBatchPanel({
   onEpisodeChange,
   onSaveEpisode,
   onReviewEpisode,
+  onReviewBatch,
   onReviewStatus,
   onExport,
 }: {
@@ -778,13 +834,14 @@ function EpisodeBatchPanel({
   batchLoading: boolean;
   episode?: ScriptEpisode;
   episodeLoading: boolean;
-  onStart: (startEpisode: number, episodeCount: number) => void;
+  onStart: (startEpisode: number, episodeCount: number, regenerate?: boolean) => void;
   onResume: (jobId: string) => void;
   onCancel: (jobId: string) => void;
   onOpenEpisode: (episodeNumber: number) => void;
   onEpisodeChange: (episode: ScriptEpisode) => void;
   onSaveEpisode: () => void;
   onReviewEpisode: (episodeNumber: number) => void;
+  onReviewBatch: (episodeNumbers: number[]) => void;
   onReviewStatus: (issueId: Id, status: ScriptReviewStatus) => void;
   onExport: (format: 'txt' | 'md' | 'docx' | 'fountain', range?: ScriptExportRange) => void;
 }): JSX.Element {
@@ -847,10 +904,10 @@ function EpisodeBatchPanel({
           <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => onExport('md', exportRange)}>导出 MD</button>
           <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => onExport('docx', exportRange)}>导出 DOCX</button>
           <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => onExport('fountain', exportRange)}>导出 Fountain</button>
-          {continuableBatchJob ? <button type="button" className="nwa-button" disabled={busy} onClick={() => onResume(continuableBatchJob.id)}>继续第 {continuableBatchJob.checkpoint?.episodeNumber ?? fixedBatchStart} 集所在的 {fixedBatchStart}–{batchEnd} 集任务</button>
-            : batchCompleted ? <span className="script-status-chip">本批已完成</span>
+          {continuableBatchJob ? <><button type="button" className="nwa-button" disabled={busy} onClick={() => onResume(continuableBatchJob.id)}>继续第 {continuableBatchJob.checkpoint?.episodeNumber ?? fixedBatchStart} 集所在的 {fixedBatchStart}–{batchEnd} 集任务</button><button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => onStart(fixedBatchStart, batchCount, true)}>放弃错误结果，AI 重新写本批</button></>
+            : batchCompleted ? <><span className="script-status-chip">本批已完成</span><button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => onStart(fixedBatchStart, batchCount, true)}>AI 重新写第 {fixedBatchStart}–{batchEnd} 集</button></>
               : !precedingEpisodesCompleted ? <span className="script-status-chip">请先完成第 1–{fixedBatchStart - 1} 集</span>
-              : batchCount > 0 ? <button type="button" className="nwa-button" disabled={busy} onClick={() => onStart(fixedBatchStart, batchCount)}>生成第 {fixedBatchStart}–{batchEnd} 集</button>
+              : batchCount > 0 ? <button type="button" aria-label={`生成第 ${fixedBatchStart}–${batchEnd} 集`} className="nwa-button script-ai-skip" disabled={busy} onClick={() => onStart(fixedBatchStart, batchCount)}>跳过手写，AI 生成第 {fixedBatchStart}–{batchEnd} 集</button>
                 : <span className="script-status-chip">全剧已完成</span>}
         </div>
       </header>
@@ -868,12 +925,15 @@ function EpisodeBatchPanel({
           {visibleJobs.length === 0 ? <p className="script-muted">当前批次暂无后台任务。</p> : visibleJobs.map((job) => (
             <article className="script-job-card" key={job.id}>
               <div className="script-job-card__status"><strong>{JOB_STATUS_LABEL[job.status]}</strong><span>{job.task === 'script_episode_batch' ? '分批正文' : '资料生成'}</span></div>
+              {job.events?.at(-1) ? <p className="script-material-job__progress">{job.events.at(-1)!.message}{job.events.at(-1)!.current !== undefined && job.events.at(-1)!.total !== undefined
+                ? `，${job.events.at(-1)!.current}/${job.events.at(-1)!.total}`
+                : ''}</p> : null}
               {job.checkpoint ? <p>{job.checkpoint.episodeNumber === undefined
                 ? CHECKPOINT_LABEL[job.checkpoint.node]
                 : `第 ${job.checkpoint.episodeNumber} 集 · ${CHECKPOINT_LABEL[job.checkpoint.node]}`}</p> : <p>等待首个检查点</p>}
               {job.error ? <p className="script-job-error">{job.error.message}</p> : null}
               {job.continuable ? <button type="button" className="nwa-button nwa-button--sm" disabled={busy} onClick={() => onResume(job.id)}>从检查点继续</button> : null}
-              {job.status === 'queued' || job.status === 'running' || job.status === 'retrying' ? <button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={busy} onClick={() => onCancel(job.id)}>取消任务</button> : null}
+              {BLOCKING_JOB_STATUSES.has(job.status) ? <button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={busy} onClick={() => onCancel(job.id)}>取消任务</button> : null}
             </article>
           ))}
         </aside>
@@ -888,10 +948,14 @@ function EpisodeBatchPanel({
           <div className="script-proofread-summary" aria-label="校稿问题统计">
             <span className={unresolvedHardIssues > 0 ? 'is-danger' : ''}>{unresolvedHardIssues} 个硬性</span>
             <span>{unresolvedIssues.length - unresolvedHardIssues} 个待优化</span>
+            {unresolvedIssues.length > 0 ? <button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={busy} onClick={() => onStart(fixedBatchStart, batchCount, true)}>有错误，AI 重新写本批</button> : null}
           </div>
         </header>
         {batchSummaries.length > 0 ? (
           <div className="script-proofread-actions" aria-label="运行单集校稿">
+            <button type="button" className="nwa-button script-ai-skip" disabled={busy} onClick={() => onReviewBatch(batchSummaries.map((item) => item.episodeNumber))}>
+              AI 校稿当前五集
+            </button>
             {batchSummaries.map((item) => (
               <button key={item.episodeNumber} type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={busy} onClick={() => onReviewEpisode(item.episodeNumber)}>
                 校稿第 {item.episodeNumber} 集
@@ -1231,7 +1295,7 @@ export function ScriptWorkspace({
         .map((item) => item.trim()).filter(Boolean).join('\n');
       const result = await client.script.plan.concepts(projectId, conceptPrompt.trim() || fallbackPrompt);
       setConcepts(result.proposals);
-      setNotice('AI 已生成 3 个选题方向，采用前不会覆盖当前策划');
+      setNotice(`AI 已生成 ${result.proposals.length} 个选题方向，采用前不会覆盖当前策划`);
     } catch (error) {
       onError?.(error);
     } finally {
@@ -1292,6 +1356,62 @@ export function ScriptWorkspace({
       setBusy(false);
     }
   }, [applyPlanTurn, client, data, onError, projectId]);
+
+  const autoCompletePlan = useCallback(async () => {
+    if (!data) return;
+    setBusy(true);
+    setNotice('AI 正在自动补全策划，请稍候…');
+    try {
+      const seedPrompt = [
+        conceptPrompt.trim(),
+        `项目名称：${projectNameRef.current ?? ''}`,
+        `当前草稿：${JSON.stringify({
+          title: data.plan.title,
+          theme: data.plan.theme,
+          market: data.plan.market,
+          channel: data.plan.channel,
+          genres: data.plan.genres,
+          audience: data.plan.audience,
+          coreConflict: data.plan.coreConflict,
+          logline: data.plan.logline,
+          totalEpisodes: data.plan.totalEpisodes,
+          targetCharsPerEpisode: data.plan.targetCharsPerEpisode,
+          coreRequirements: data.plan.coreRequirements,
+          endingDirection: data.plan.endingDirection,
+        })}`,
+      ].filter(Boolean).join('\n');
+      let result = await client.script.plan.turn({
+        projectId,
+        seedPrompt,
+        answers: [],
+        reset: true,
+      });
+      for (let round = 0; result.status === 'asking' && round < 16; round += 1) {
+        const questions = result.questions ?? [];
+        if (questions.length === 0) throw new Error('AI 策划没有返回可委托的问题。');
+        result = await client.script.plan.turn({
+          projectId,
+          answers: questions.map((question) => ({ field: question.field, delegate: true })),
+        });
+      }
+      if (result.status !== 'ready' || !result.plan) {
+        throw new Error('AI 策划尚未完成，请重试。');
+      }
+      const approved = result.plan.status === 'draft'
+        ? await client.script.plan.approve(projectId, result.plan.revision)
+        : result.plan;
+      dirtyResources.current.plan = false;
+      setData((current) => current ? { ...current, plan: approved } : current);
+      setPlanQuestions([]);
+      setPlanAnswers({});
+      setNotice('AI 已自动完成并确认策划；你仍可点“编辑模式”修改，修改后记得保存');
+    } catch (error) {
+      setNotice('AI 自动策划未完成，请按错误提示处理后重试');
+      onError?.(error);
+    } finally {
+      setBusy(false);
+    }
+  }, [client, conceptPrompt, data, onError, projectId]);
 
   const submitPlanAnswers = useCallback(async () => {
     const incomplete = planQuestions.some((question) => {
@@ -1450,7 +1570,11 @@ export function ScriptWorkspace({
     }
   }, [client, data, onError, projectId]);
 
-  const startEpisodeBatch = useCallback(async (startEpisode: number, episodeCount: number) => {
+  const startEpisodeBatch = useCallback(async (
+    startEpisode: number,
+    episodeCount: number,
+    regenerate = false,
+  ) => {
     if (!data) return;
     const fixedBatchStart = fixedBatchStartForEpisode(startEpisode);
     const fixedBatchCount = Math.min(5, Math.max(0, data.plan.totalEpisodes - fixedBatchStart + 1));
@@ -1486,6 +1610,7 @@ export function ScriptWorkspace({
       const job = await client.script.jobs.create({
         projectId,
         task: 'script_episode_batch',
+        ...(regenerate ? { regenerate: true } : {}),
         scriptBatchOptions: {
           startEpisode,
           episodeCount,
@@ -1494,7 +1619,7 @@ export function ScriptWorkspace({
         },
       });
       setData((current) => current ? { ...current, jobs: [job, ...current.jobs.filter((item) => item.id !== job.id)] } : current);
-      setNotice(`已提交第 ${startEpisode}–${startEpisode + episodeCount - 1} 集生成任务`);
+      setNotice(`已提交第 ${startEpisode}–${startEpisode + episodeCount - 1} 集${regenerate ? '重新写作' : '生成'}任务`);
     } catch (error) {
       onError?.(error);
     } finally {
@@ -1505,6 +1630,7 @@ export function ScriptWorkspace({
   const startMaterialJob = useCallback(async (
     task: 'script_series_outline' | 'script_bible',
     requiredCleanResources: EditableScriptResource[],
+    regenerate = false,
   ) => {
     const unsavedResources = requiredCleanResources
       .filter((resource) => dirtyResources.current[resource]);
@@ -1524,14 +1650,15 @@ export function ScriptWorkspace({
       const job = await client.script.jobs.create({
         projectId,
         task,
+        ...(regenerate ? { regenerate: true } : {}),
       });
       setData((current) => current ? {
         ...current,
         jobs: [job, ...current.jobs.filter((item) => item.id !== job.id)],
       } : current);
       setNotice(task === 'script_bible'
-        ? '人物与世界补全任务已提交，可切换项目后继续后台运行'
-        : '大纲生成任务已提交，可切换项目后继续后台运行');
+        ? `人物与世界${regenerate ? '重新生成' : '补全'}任务已提交，可切换项目后继续后台运行`
+        : `大纲${regenerate ? '重新生成' : '生成'}任务已提交，可切换项目后继续后台运行`);
     } catch (error) {
       onError?.(error);
     } finally {
@@ -1811,6 +1938,84 @@ export function ScriptWorkspace({
     }
   }, [client, data, onError, projectId]);
 
+  const reviewCurrentBatch = useCallback(async (episodeNumbers: number[]) => {
+    if (!data) return;
+    if (selectedEpisodeDirty.current) {
+      setNotice('请先保存当前集');
+      return;
+    }
+    const numbers = [...new Set(episodeNumbers)].sort((left, right) => left - right);
+    if (numbers.length === 0) {
+      setNotice('当前五集还没有可校稿的正文');
+      return;
+    }
+    setBusy(true);
+    setNotice('AI 正在校稿当前五集，请稍候…');
+    try {
+      let reviewRevision = data.reviewRevision;
+      let reviewIssues = [...data.reviewIssues];
+      let episodeSummaries = [...data.episodes];
+      const reviewedEpisodes: ScriptEpisode[] = [];
+      let hardCount = 0;
+
+      for (const episodeNumber of numbers) {
+        const result = await client.script.episodes.review(projectId, episodeNumber, reviewRevision);
+        reviewRevision = result.revision;
+        reviewIssues = [
+          ...reviewIssues.filter((item) => item.episodeNumber !== episodeNumber),
+          ...result.items,
+        ];
+        hardCount += result.items.filter(isBlockingReviewIssue).length;
+        if (!result.report.hardFailed) {
+          const reviewedEpisode = await client.script.episodes.get(projectId, episodeNumber);
+          const reviewedSummary = summarizeEpisode(reviewedEpisode);
+          reviewedEpisodes.push(reviewedEpisode);
+          episodeSummaries = episodeSummaries.some((item) => item.episodeNumber === episodeNumber)
+            ? episodeSummaries.map((item) => item.episodeNumber === episodeNumber ? reviewedSummary : item)
+            : [...episodeSummaries, reviewedSummary].sort((left, right) => left.episodeNumber - right.episodeNumber);
+        }
+      }
+
+      setData((current) => current ? {
+        ...current,
+        reviewRevision,
+        reviewIssues,
+        episodes: episodeSummaries,
+      } : current);
+      if (reviewedEpisodes.length > 0) {
+        const reviewedByNumber = new Map(reviewedEpisodes.map((episode) => [episode.episodeNumber, episode]));
+        setBatchEpisodes((current) => current.map((episode) => reviewedByNumber.get(episode.episodeNumber) ?? episode));
+        const selectedNumber = selectedEpisodeRef.current?.episodeNumber;
+        const reviewedSelection = selectedNumber === undefined ? undefined : reviewedByNumber.get(selectedNumber);
+        if (reviewedSelection && !selectedEpisodeDirty.current) {
+          selectedEpisodeRef.current = reviewedSelection;
+          selectedEpisodeEditVersion.current = 0;
+          setSelectedEpisode(reviewedSelection);
+        }
+      }
+      setNotice(hardCount > 0
+        ? `当前五集 AI 校稿完成：发现 ${hardCount} 个必须修复的硬性问题`
+        : '当前五集 AI 校稿完成：未发现阻断完成的硬性问题');
+    } catch (error) {
+      if (isApiClientError(error) && error.status === 409) {
+        try {
+          const latest = await client.script.reviews.list(projectId);
+          setData((current) => current ? {
+            ...current,
+            reviewRevision: latest.revision,
+            reviewIssues: latest.items,
+          } : current);
+          setNotice('校稿状态已被其他页面更新，已同步最新结果，请重试。');
+        } catch {
+          // The original conflict is the most useful error for the user.
+        }
+      }
+      onError?.(error);
+    } finally {
+      setBusy(false);
+    }
+  }, [client, data, onError, projectId]);
+
   const updateReviewStatus = useCallback(async (issueId: Id, status: ScriptReviewStatus) => {
     if (!data) return;
     setBusy(true);
@@ -1896,6 +2101,28 @@ export function ScriptWorkspace({
   const prerequisitesReady = Boolean(
     data && data.plan.status !== 'draft' && data.outline && data.characters.length > 0 && data.world,
   );
+  const materialTask = stage === 'outline'
+    ? 'script_series_outline'
+    : stage === 'characters' || stage === 'world'
+      ? 'script_bible'
+      : undefined;
+  const stageMaterialJob = materialTask
+    ? data?.jobs.find((job) => (
+      job.task === materialTask && (BLOCKING_JOB_STATUSES.has(job.status) || job.continuable === true)
+    ))
+    : undefined;
+  const visibleBackgroundJob = stage === 'episodes'
+    ? undefined
+    : stageMaterialJob ?? data?.jobs.find((job) => (
+      BLOCKING_JOB_STATUSES.has(job.status) || job.continuable === true
+    ));
+  const backgroundJobLabel = visibleBackgroundJob?.task === 'script_series_outline'
+    ? '大纲'
+    : visibleBackgroundJob?.task === 'script_bible'
+      ? '人物与世界'
+      : visibleBackgroundJob?.task === 'script_episode_batch'
+        ? '正文'
+        : '策划';
   const batches = data
     ? buildScriptBatchNavigation(data.plan.totalEpisodes, data.episodes, data.jobs, prerequisitesReady).map((batch) => {
         const serverSummary = data.batchSummaries.find((item) => item.startEpisode === batch.startEpisode);
@@ -1943,12 +2170,13 @@ export function ScriptWorkspace({
       <main className="script-workspace-main">
         <header className="script-workspace-header"><div><span className="script-workspace-kicker">短剧生产工作台</span><h1>{workspaceTitle}</h1></div><div className="script-workspace-summary"><span>{totalEpisodes} 集</span><span>{completedEpisodes} 已完成</span><span>{totalVisibleChars.toLocaleString('zh-CN')} 字</span></div></header>
         {notice ? <div className="script-notice" role="status">{notice}</div> : null}
+        {visibleBackgroundJob ? <MaterialJobPanel job={visibleBackgroundJob} label={backgroundJobLabel} busy={busy} onResume={(jobId) => void resumeJob(jobId)} onCancel={(jobId) => void cancelJob(jobId)} /> : null}
         {!data ? <div className="script-loading" role="status">正在加载短剧资料…</div> : null}
-        {data && stage === 'plan' ? <PlanEditor value={data.plan} busy={busy} conceptBusy={conceptBusy} conceptPrompt={conceptPrompt} concepts={concepts} questions={planQuestions} answers={planAnswers} onChange={(plan) => { markResourceDirty('plan'); setData((current) => current ? { ...current, plan } : current); }} onConceptPromptChange={setConceptPrompt} onGenerateConcepts={() => void generateConcepts()} onAdoptConcept={adoptConcept} onSave={() => void savePlan()} onAgentPlan={() => void startPlanInterview()} onAnswer={(field, value) => setPlanAnswers((current) => ({ ...current, [field]: { field, value } }))} onDelegate={(field) => setPlanAnswers((current) => ({ ...current, [field]: { field, delegate: true } }))} onSubmitAnswers={() => void submitPlanAnswers()} onApprove={() => void approvePlan()} /> : null}
-        {data && stage === 'outline' ? <OutlineEditor value={data.outline ?? emptyOutline(projectId)} busy={busy} onChange={(outline) => { markResourceDirty('outline'); setData((current) => current ? { ...current, outline } : current); }} onSave={() => void saveOutline()} onGenerate={() => void startMaterialJob('script_series_outline', ['plan', 'outline'])} /> : null}
-        {data && stage === 'characters' ? <CharacterEditor projectId={projectId} value={data.characters} busy={busy} onChange={(characters) => { markResourceDirty('characters'); setData((current) => current ? { ...current, characters } : current); }} onSave={() => void saveCharacters()} onGenerate={() => void startMaterialJob('script_bible', ['plan', 'outline', 'characters', 'world'])} /> : null}
-        {data && stage === 'episodes' ? <EpisodeBatchPanel data={data} busy={busy} batchStart={selectedBatchStart} batchEpisodes={batchEpisodes} batchLoading={batchLoading} episode={selectedEpisode} episodeLoading={episodeLoading} onStart={(start, count) => void startEpisodeBatch(start, count)} onResume={(jobId) => void resumeJob(jobId)} onCancel={(jobId) => void cancelJob(jobId)} onOpenEpisode={(episodeNumber) => void openEpisode(episodeNumber)} onEpisodeChange={editSelectedEpisode} onSaveEpisode={() => void saveEpisode()} onReviewEpisode={(episodeNumber) => void reviewEpisode(episodeNumber)} onReviewStatus={(issueId, status) => void updateReviewStatus(issueId, status)} onExport={(format, range) => void exportScript(format, range)} /> : null}
-        {data && stage === 'world' ? <WorldEditor value={data.world ?? emptyWorld(projectId)} busy={busy} onChange={(world) => { markResourceDirty('world'); setData((current) => current ? { ...current, world } : current); }} onSave={() => void saveWorld()} onGenerate={() => void startMaterialJob('script_bible', ['plan', 'outline', 'characters', 'world'])} /> : null}
+        {data && stage === 'plan' ? <PlanEditor value={data.plan} busy={busy} conceptBusy={conceptBusy} conceptPrompt={conceptPrompt} concepts={concepts} questions={planQuestions} answers={planAnswers} onChange={(plan) => { markResourceDirty('plan'); setData((current) => current ? { ...current, plan } : current); }} onConceptPromptChange={setConceptPrompt} onGenerateConcepts={() => void generateConcepts()} onAdoptConcept={adoptConcept} onSave={() => void savePlan()} onAgentPlan={() => void startPlanInterview()} onAutoComplete={() => void autoCompletePlan()} onAnswer={(field, value) => setPlanAnswers((current) => ({ ...current, [field]: { field, value } }))} onDelegate={(field) => setPlanAnswers((current) => ({ ...current, [field]: { field, delegate: true } }))} onSubmitAnswers={() => void submitPlanAnswers()} onApprove={() => void approvePlan()} /> : null}
+        {data && stage === 'outline' ? <OutlineEditor value={data.outline ?? emptyOutline(projectId)} busy={busy} onChange={(outline) => { markResourceDirty('outline'); setData((current) => current ? { ...current, outline } : current); }} onSave={() => void saveOutline()} onGenerate={(regenerate) => void startMaterialJob('script_series_outline', ['plan', 'outline'], regenerate)} /> : null}
+        {data && stage === 'characters' ? <CharacterEditor projectId={projectId} value={data.characters} busy={busy} onChange={(characters) => { markResourceDirty('characters'); setData((current) => current ? { ...current, characters } : current); }} onSave={() => void saveCharacters()} onGenerate={(regenerate) => void startMaterialJob('script_bible', ['plan', 'outline', 'characters', 'world'], regenerate)} /> : null}
+        {data && stage === 'episodes' ? <EpisodeBatchPanel data={data} busy={busy} batchStart={selectedBatchStart} batchEpisodes={batchEpisodes} batchLoading={batchLoading} episode={selectedEpisode} episodeLoading={episodeLoading} onStart={(start, count, regenerate) => void startEpisodeBatch(start, count, regenerate)} onResume={(jobId) => void resumeJob(jobId)} onCancel={(jobId) => void cancelJob(jobId)} onOpenEpisode={(episodeNumber) => void openEpisode(episodeNumber)} onEpisodeChange={editSelectedEpisode} onSaveEpisode={() => void saveEpisode()} onReviewEpisode={(episodeNumber) => void reviewEpisode(episodeNumber)} onReviewBatch={(episodeNumbers) => void reviewCurrentBatch(episodeNumbers)} onReviewStatus={(issueId, status) => void updateReviewStatus(issueId, status)} onExport={(format, range) => void exportScript(format, range)} /> : null}
+        {data && stage === 'world' ? <WorldEditor value={data.world ?? emptyWorld(projectId)} busy={busy} onChange={(world) => { markResourceDirty('world'); setData((current) => current ? { ...current, world } : current); }} onSave={() => void saveWorld()} onGenerate={(regenerate) => void startMaterialJob('script_bible', ['plan', 'outline', 'characters', 'world'], regenerate)} /> : null}
       </main>
     </div>
   );

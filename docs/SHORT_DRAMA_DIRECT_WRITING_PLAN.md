@@ -483,7 +483,7 @@ type ScriptDraftMode = 'structured_legacy' | 'direct_text';
 
 ### 13.1 三个实验组
 
-使用完全相同的策划、人物、世界和 5 张分集卡，模型统一为 `deepseek-v4-flash`：
+使用完全相同的策划、人物、世界和 5 张分集卡，模型统一为 `deepseek-v4-flash-vision-exp`：
 
 - A：当前 structured legacy 流水线；
 - B：只用一个直接写作 Prompt，不续写、不检查；

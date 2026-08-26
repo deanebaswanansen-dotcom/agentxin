@@ -225,6 +225,20 @@ describe('normalizeFullNovelOptions', () => {
     expect(nextLongNovelChapterNumber(chapters, flagsOf)).toBe(2);
   });
 
+  it('advances past a completed number when an imported chapter has the same number', () => {
+    const chapters = [
+      { id: 'imported-1', title: '第1章 正文', content: '导入的原文一' },
+      { id: 'imported-2', title: '第2章 起跑', content: '导入的原文二' },
+      { id: 'generated-1', title: '第1章', content: '新生成的第一章' },
+    ];
+    const flagsOf = (chapter: { id: string }) => ({
+      rejected: false,
+      hasSummary: chapter.id === 'generated-1',
+    });
+
+    expect(nextLongNovelChapterNumber(chapters, flagsOf)).toBe(2);
+  });
+
   it('caps every autonomous long-novel batch at five chapters', () => {
     expect(longNovelBatchLimit('assistant')).toBe(1);
     expect(longNovelBatchLimit('semi_auto')).toBe(5);

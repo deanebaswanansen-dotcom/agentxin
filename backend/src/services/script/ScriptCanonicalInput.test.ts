@@ -256,7 +256,7 @@ describe('ScriptCanonicalInput', () => {
     );
     expectValidation(
       () => validateScriptEpisodeOutlineInput({ ...outline, plannedScenes: [] }),
-      '计划场景数必须为1到5',
+      '计划场景至少需要1场',
     );
   });
 
@@ -274,7 +274,7 @@ describe('ScriptCanonicalInput', () => {
     })).not.toThrow();
     expectValidation(
       () => validateScriptEpisodeInput({ ...episode, scenes: [] }),
-      '剧本场景数必须为1到5',
+      '剧本正文至少需要1场',
     );
     expectValidation(
       () => decodeScriptEpisodeInput({

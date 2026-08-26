@@ -83,7 +83,7 @@ describe('parseChineseShortDramaText', () => {
     expect(JSON.stringify(result.episode)).not.toContain('model-id');
   });
 
-  it('retains unknown lines and reports speaker and scene-membership problems', () => {
+  it('preserves headingless and unknown lines as editable action text', () => {
     const result = parseChineseShortDramaText([
       '解释：下面是我为你写的剧本',
       '3-1 修车厂 日/内',
@@ -94,19 +94,21 @@ describe('parseChineseShortDramaText', () => {
     ].join('\n'), options());
 
     expect(result.warnings.map((item) => item.code)).toEqual([
-      'TEXT_BEFORE_FIRST_SCENE',
+      'SCENE_HEADING_INFERRED',
+      'UNKNOWN_DIALOGUE_CHARACTER',
+      'SCENE_ORDINAL_REPAIRED',
       'UNKNOWN_SCENE_CHARACTER',
       'DIALOGUE_CHARACTER_NOT_IN_SCENE',
       'UNKNOWN_DIALOGUE_CHARACTER',
-      'UNPARSED_LINE',
+      'UNPARSED_LINE_PRESERVED',
     ]);
-    expect(result.unparsedLines).toEqual([
-      { line: 1, text: '解释：下面是我为你写的剧本' },
-      { line: 6, text: '这一行没有剧本前缀' },
-    ]);
+    expect(result.unparsedLines).toEqual([]);
+    expect(result.episode?.scenes.flatMap((scene) => scene.blocks).map((block) => block.text)).toContain(
+      '这一行没有剧本前缀',
+    );
   });
 
-  it('rejects copied scene episode prefixes instead of silently keeping them in the current episode', () => {
+  it('normalizes copied scene episode prefixes to the requested episode', () => {
     const result = parseChineseShortDramaText([
       '第3集 公开挑战',
       '1-1 修车厂 日/内',
@@ -118,28 +120,16 @@ describe('parseChineseShortDramaText', () => {
       '周野：十年前的记录，今天必须重见天日。',
     ].join('\n'), options());
 
-    expect(result.episode).toBeUndefined();
-    expect(result.unparsedLines.map((item) => item.text)).toEqual([
-      '1-1 修车厂 日/内',
-      '人物：周野 林秋',
-      '△周野把旧赛车服铺在工作台上。',
-      '林秋：记者已经到了，我们现在就公开证据。',
-      '1-2 赛车场媒体中心 日/内',
-      '人物：周野',
-      '周野：十年前的记录，今天必须重见天日。',
-    ]);
+    expect(result.episode?.episodeNumber).toBe(3);
+    expect(result.episode?.scenes).toHaveLength(2);
+    expect(result.unparsedLines).toEqual([]);
     expect(result.warnings.map((item) => item.code)).toEqual([
       'SCENE_EPISODE_NUMBER_REPAIRED',
-      'UNPARSED_LINE',
-      'UNPARSED_LINE',
-      'UNPARSED_LINE',
       'SCENE_EPISODE_NUMBER_REPAIRED',
-      'UNPARSED_LINE',
-      'UNPARSED_LINE',
     ]);
   });
 
-  it('does not keep 2-1 or 3-1 scenes inside episode 1', () => {
+  it('keeps useful scenes while repairing mixed episode prefixes to the requested episode', () => {
     const result = parseChineseShortDramaText([
       '第1集',
       '1-1 修车厂 日/内',
@@ -154,26 +144,37 @@ describe('parseChineseShortDramaText', () => {
     ].join('\n'), { ...options(), episodeNumber: 1, title: '第一集', outlineId: 'outline-1' });
 
     expect(result.episode?.episodeNumber).toBe(1);
-    expect(result.episode?.scenes).toHaveLength(1);
+    expect(result.episode?.scenes).toHaveLength(3);
     expect(result.episode?.scenes[0]).toMatchObject({
       ordinal: 1,
       location: '修车厂',
     });
-    expect(result.unparsedLines.map((item) => item.text)).toEqual([
-      '2-1 篮球场 日/外',
-      '人物：周野',
-      '△周野投进压哨三分。',
-      '3-1 颁奖台 夜/外',
-      '人物：周野',
-      '周野：冠军是我的。',
-    ]);
+    expect(result.unparsedLines).toEqual([]);
     expect(result.warnings.map((item) => item.code)).toEqual([
       'SCENE_EPISODE_NUMBER_REPAIRED',
-      'UNPARSED_LINE',
-      'UNPARSED_LINE',
+      'SCENE_ORDINAL_REPAIRED',
       'SCENE_EPISODE_NUMBER_REPAIRED',
-      'UNPARSED_LINE',
-      'UNPARSED_LINE',
+      'SCENE_ORDINAL_REPAIRED',
+    ]);
+  });
+
+  it('turns plain headingless prose into one editable scene without a repair call', () => {
+    const result = parseChineseShortDramaText([
+      '周野推开卷帘门，寒风裹着雪灌进修车铺。',
+      '林秋：仓库只剩最后一箱电池。',
+      '两人对视一眼，立刻开始装车。',
+    ].join('\n'), options());
+
+    expect(result.unparsedLines).toEqual([]);
+    expect(result.episode?.scenes).toHaveLength(1);
+    expect(result.episode?.scenes[0]).toMatchObject({
+      ordinal: 1,
+      location: '未指定地点',
+    });
+    expect(result.episode?.scenes[0]?.blocks.map((block) => block.text)).toEqual([
+      '周野推开卷帘门，寒风裹着雪灌进修车铺。',
+      '仓库只剩最后一箱电池。',
+      '两人对视一眼，立刻开始装车。',
     ]);
   });
 
@@ -225,7 +226,7 @@ describe('parseChineseShortDramaText', () => {
     ]);
   });
 
-  it('preserves legal non-consecutive scene ordinals', () => {
+  it('normalizes non-consecutive scene ordinals without losing content', () => {
     const result = parseChineseShortDramaText([
       '第3集',
       '3-3 赛道入口 日/外',
@@ -236,9 +237,12 @@ describe('parseChineseShortDramaText', () => {
       '林秋：原始记录还在。',
     ].join('\n'), options());
 
-    expect(result.episode?.scenes.map((scene) => scene.ordinal)).toEqual([3, 4]);
+    expect(result.episode?.scenes.map((scene) => scene.ordinal)).toEqual([1, 2]);
     expect(result.unparsedLines).toEqual([]);
-    expect(result.warnings).toEqual([]);
+    expect(result.warnings.map((warning) => warning.code)).toEqual([
+      'SCENE_ORDINAL_REPAIRED',
+      'SCENE_ORDINAL_REPAIRED',
+    ]);
   });
 
   it('accepts numbered scene headings without an episode prefix', () => {

@@ -10,10 +10,10 @@ import {
   buildDirectRewritePrompt,
   buildDirectReviewPrompt,
   decodeDirectHandoffReview,
+  createLocalDirectHandoffReview,
   mergeDirectHandoffContinuity,
   reconcileDirectReviewBoundary,
 } from './ScriptDirectWriting.js';
-import { ScriptModelOutputError } from './structuredOutput.js';
 
 const character = {
   id: 'character-zhou',
@@ -193,14 +193,25 @@ describe('ScriptDirectWriting', () => {
     });
   });
 
-  it('does not coerce major_issue into pass after dropping unrecognised issues', () => {
-    expect(() => decodeDirectHandoffReview({
+  it('downgrades an unusable major_issue payload to an advisory pass', () => {
+    expect(decodeDirectHandoffReview({
       verdict: 'major_issue',
       issues: [
         { code: 'LITERARY_STYLE', evidence: '不够优美', expected: '加修辞' },
         { code: 'UNKNOWN_STYLE', evidence: '太口语', expected: '更文学' },
       ],
       handoff: { summary: '本集完成复出准备', openThreads: ['谁篡改了数据'] },
-    })).toThrow(ScriptModelOutputError);
+    })).toMatchObject({ verdict: 'pass', issues: [] });
+  });
+
+  it('synthesizes a local handoff when the review provider is unavailable', () => {
+    const review = createLocalDirectHandoffReview({
+      goal: '周野决定复出',
+      endingHook: '门外传来引擎声',
+    } as unknown as Parameters<typeof createLocalDirectHandoffReview>[0], episode);
+
+    expect(review.verdict).toBe('pass');
+    expect(review.handoff.summary).toBe('周野决定复出');
+    expect(review.handoff.ending).toBe('周野把原始数据卡锁进工具柜。');
   });
 });

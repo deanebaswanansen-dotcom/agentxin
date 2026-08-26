@@ -19,6 +19,7 @@ interface RunAgentBody {
   chapterId?: unknown;
   options?: unknown;
   scriptBatchOptions?: unknown;
+  regenerate?: unknown;
 }
 
 const NOT_FOUND = { error: { code: 'NOT_FOUND', message: '后台任务不存在。' } };

@@ -372,7 +372,7 @@ describe('scriptRoutes', () => {
     }
   });
 
-  it('rejects marking an episode completed when it fails the hard quality gate', async () => {
+  it('allows a short but non-empty episode to complete with a soft quality warning', async () => {
     await app.inject({
       method: 'PUT',
       url: `/api/projects/${projectId}/script-plan`,
@@ -395,12 +395,10 @@ describe('scriptRoutes', () => {
       payload: { expectedRevision: 0, value: episodeInput(1) },
     });
 
-    expect(response.statusCode).toBe(400);
+    expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({
-      error: {
-        code: 'VALIDATION_ERROR',
-        details: { issues: expect.arrayContaining([expect.objectContaining({ code: 'TOO_SHORT' })]) },
-      },
+      episodeNumber: 1,
+      status: 'completed',
     });
   });
 
@@ -585,6 +583,53 @@ describe('scriptRoutes', () => {
       expect.objectContaining({ status: 'stale', episodeRevision: 1 }),
       expect.objectContaining({ status: 'current', episodeRevision: 3 }),
     ]);
+  });
+
+  it('does not block proofreading on disposable speakers without character cards', async () => {
+    await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-plan`,
+      payload: { expectedRevision: 0, value: planInput() },
+    });
+    await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-characters`,
+      payload: { expectedRevision: 0, items: charactersInput() },
+    });
+    const value = episodeInput(1);
+    const saved = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-episodes/1`,
+      payload: {
+        expectedRevision: 0,
+        value: {
+          ...value,
+          status: 'reviewing',
+          scenes: [{
+            ...value.scenes[0],
+            blocks: [
+              ...value.scenes[0].blocks,
+              { id: 'passerby-a', type: 'dialogue', speaker: '路人甲', text: '快看那边。' },
+              { id: 'guard-b', type: 'dialogue', speaker: '保安乙', text: '请退到警戒线外。' },
+              { id: 'chef', type: 'dialogue', speaker: '主厨', text: '马上出餐。' },
+            ],
+          }],
+        },
+      },
+    });
+    expect(saved.statusCode).toBe(200);
+
+    const reviewed = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${projectId}/script-episodes/1/review`,
+      payload: { expectedRevision: 0 },
+    });
+
+    expect(reviewed.statusCode).toBe(200);
+    expect(reviewed.json()).toMatchObject({ report: { hardFailed: false } });
+    expect(reviewed.json().items).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'UNKNOWN_SPEAKER' }),
+    ]));
   });
 
   it('returns a compact five-episode workspace and persists proofreading issue status', async () => {

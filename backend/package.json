@@ -13,6 +13,7 @@
     "test": "vitest run --pool=threads --maxWorkers=1 --minWorkers=1 --fileParallelism=false",
     "acceptance:long-novel": "tsx scripts/run-long-novel-acceptance.ts",
     "acceptance:continuity": "tsx scripts/run-continuity-acceptance.ts",
+    "acceptance:deepseek-flash": "tsx scripts/run-deepseek-flash-cases.ts",
     "acceptance:short-drama": "tsx scripts/run-short-drama-acceptance.ts",
     "test:watch": "vitest"
   },

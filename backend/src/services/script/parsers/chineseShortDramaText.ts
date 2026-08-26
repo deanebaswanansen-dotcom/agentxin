@@ -9,8 +9,10 @@ import type {
 
 export type ScriptTextParseWarningCode =
   | 'TEXT_BEFORE_FIRST_SCENE'
+  | 'SCENE_HEADING_INFERRED'
   | 'SCENE_EPISODE_NUMBER_REPAIRED'
   | 'SCENE_ORDINAL_REPAIRED'
+  | 'UNPARSED_LINE_PRESERVED'
   | 'UNPARSED_LINE'
   | 'UNKNOWN_SCENE_CHARACTER'
   | 'UNKNOWN_DIALOGUE_CHARACTER'
@@ -54,6 +56,7 @@ const QUOTED_SCREEN_TEXT_LINE = /^(?:[“"])(.+?)(?:[”"])$/u;
 const SHOT_ACTION_LINE = /^((?:【\s*(?:特写|近景|中景|远景|全景|空镜|俯拍|仰拍|航拍|跟拍|推镜|拉镜|摇镜|慢镜头|定格|蒙太奇|画面|镜头)\s*】.*|(?:特写|近景|中景|远景|全景|空镜|俯拍|仰拍|航拍|跟拍|推镜|拉镜|摇镜|慢镜头|定格|蒙太奇|画面|镜头)\s*[：:].+))$/u;
 const ACTION_LINE = /^[△▲]\s*(.*)$/u;
 const DIALOGUE_LINE = /^([^：:（）()]+?)(?:[（(]([^）)]*)[）)])?\s*[：:]\s*(.+)$/u;
+const DEFAULT_SCENE_LOCATION = '未指定地点';
 
 function dialogueSpeaker(value: string): { name: string; suffixMode?: 'OS' | 'VO' } {
   const match = /^(.*?)(OS|VO)$/iu.exec(value.trim());
@@ -209,7 +212,6 @@ export function parseChineseShortDramaText(
   const scenes: ScriptScene[] = [];
   const usedSceneOrdinals = new Set<number>();
   let currentScene: ScriptScene | undefined;
-  let skippingForeignScene = false;
   const lines = rawText.replace(/^\uFEFF/u, '').replace(/\r\n?/gu, '\n').split('\n');
 
   const warn = (
@@ -223,12 +225,35 @@ export function parseChineseShortDramaText(
     if (unparsed) unparsedLines.push({ line, text });
   };
 
+  const createInferredScene = (lineNumber: number, source: string): ScriptScene => {
+    let ordinal = scenes.length + 1;
+    while (usedSceneOrdinals.has(ordinal)) ordinal += 1;
+    usedSceneOrdinals.add(ordinal);
+    const scene: ScriptScene = {
+      id: options.createId(),
+      ordinal,
+      location: DEFAULT_SCENE_LOCATION,
+      timeOfDay: 'day',
+      interiorExterior: 'interior',
+      characterIds: [],
+      blocks: [],
+    };
+    scenes.push(scene);
+    warn(
+      lineNumber,
+      'SCENE_HEADING_INFERRED',
+      `未找到可用场景头，已自动归入第 ${ordinal} 场。`,
+      source,
+    );
+    return scene;
+  };
+
   for (let index = 0; index < lines.length; index += 1) {
     const lineNumber = index + 1;
     const line = lines[index]!.trim();
     if (!line || EPISODE_HEADING.test(line)) continue;
     if (/^```/u.test(line)) {
-      warn(lineNumber, 'UNPARSED_LINE', '正文包含 Markdown 围栏。', line, true);
+      warn(lineNumber, 'UNPARSED_LINE', '已忽略正文中的 Markdown 围栏。', line);
       continue;
     }
 
@@ -238,15 +263,10 @@ export function parseChineseShortDramaText(
         warn(
           lineNumber,
           'SCENE_EPISODE_NUMBER_REPAIRED',
-          `场景头集号 ${heading.episodeNumber} 不属于当前第 ${options.episodeNumber} 集，已拒绝纳入。`,
+          `场景头集号 ${heading.episodeNumber} 不属于当前第 ${options.episodeNumber} 集，已按当前集号继续解析。`,
           line,
-          true,
         );
-        currentScene = undefined;
-        skippingForeignScene = true;
-        continue;
       }
-      skippingForeignScene = false;
       let ordinal = heading.originalOrdinal;
       while (usedSceneOrdinals.has(ordinal)) ordinal += 1;
       if (ordinal !== heading.originalOrdinal) {
@@ -271,14 +291,8 @@ export function parseChineseShortDramaText(
       continue;
     }
 
-    if (skippingForeignScene) {
-      warn(lineNumber, 'UNPARSED_LINE', '无法识别该剧本行。', line, true);
-      continue;
-    }
-
     if (!currentScene) {
-      warn(lineNumber, 'TEXT_BEFORE_FIRST_SCENE', '首个场景头之前存在无法归属的正文。', line, true);
-      continue;
+      currentScene = createInferredScene(lineNumber, line);
     }
 
     const characterLine = CHARACTER_LINE.exec(line);
@@ -407,16 +421,39 @@ export function parseChineseShortDramaText(
       continue;
     }
 
-    warn(lineNumber, 'UNPARSED_LINE', '无法识别该剧本行。', line, true);
+    currentScene.blocks.push({
+      id: options.createId(),
+      type: 'action',
+      text: line,
+    });
+    warn(
+      lineNumber,
+      'UNPARSED_LINE_PRESERVED',
+      '未识别为标准格式，已按动作正文保留。',
+      line,
+    );
   }
 
-  for (const scene of scenes) {
+  const nonEmptyScenes = scenes.filter((scene) => {
     if (scene.blocks.length === 0) {
       warn(0, 'EMPTY_SCENE', `第 ${scene.ordinal} 场没有正文。`, `${options.episodeNumber}-${scene.ordinal}`);
+      return false;
     }
-  }
+    return true;
+  });
+  nonEmptyScenes.forEach((scene, index) => {
+    if (scene.ordinal !== index + 1) {
+      warn(
+        0,
+        'SCENE_ORDINAL_REPAIRED',
+        `移除空场后，场号 ${scene.ordinal} 已顺延为 ${index + 1}。`,
+        `${options.episodeNumber}-${scene.ordinal}`,
+      );
+      scene.ordinal = index + 1;
+    }
+  });
 
-  if (scenes.length === 0) return { warnings, unparsedLines };
+  if (nonEmptyScenes.length === 0) return { warnings, unparsedLines };
   return {
     episode: {
       episodeNumber: options.episodeNumber,
@@ -424,7 +461,7 @@ export function parseChineseShortDramaText(
       outlineId: options.outlineId,
       status: 'reviewing',
       targetChars: options.targetChars,
-      scenes,
+      scenes: nonEmptyScenes,
       summary: '',
       newFacts: [],
       openedThreads: [],

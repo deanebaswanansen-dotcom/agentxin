@@ -174,15 +174,20 @@ export function nextLongNovelChapterNumber(
   flagsOf: (chapter: { id: string }) => { rejected: boolean; hasSummary: boolean },
 ): number {
   let maxParsed = 0;
-  let retryAt: number | undefined;
+  const completedNumbers = new Set<number>();
+  const retryNumbers = new Set<number>();
   for (const chapter of chapters) {
     const num = parseLongNovelChapterNumber(chapter.title);
     if (num === undefined) continue;
     if (num > maxParsed) maxParsed = num;
     const flags = flagsOf(chapter);
     const completed = chapter.content.trim().length > 0 && flags.hasSummary && !flags.rejected;
-    if (!completed && (retryAt === undefined || num < retryAt)) retryAt = num;
+    if (completed) completedNumbers.add(num);
+    else retryNumbers.add(num);
   }
+  const retryAt = [...retryNumbers]
+    .filter((num) => !completedNumbers.has(num))
+    .sort((a, b) => a - b)[0];
   return retryAt ?? maxParsed + 1;
 }
 

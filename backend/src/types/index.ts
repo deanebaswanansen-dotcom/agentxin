@@ -243,6 +243,10 @@ export interface AgentRunRequest {
   prompt: string;
   projectId?: Id;
   chapterId?: Id;
+  /** Explicit user request to replace an existing script artifact with a fresh AI candidate. */
+  regenerate?: boolean;
+  /** Internal id shared by retries/resume of one explicit regeneration job. */
+  regenerationRunId?: string;
   scriptBatchOptions?: {
     startEpisode: number;
     episodeCount: number;

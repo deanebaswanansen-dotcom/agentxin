@@ -6,7 +6,7 @@
  * Optional:
  *   TEST_BASE_URL  Public frontend (default: http://101.133.150.84)
  *   TEST_API_BASE_URL  API root when frontend/backend use different local ports
- *   TEST_MODEL     Provider model (default: deepseek-v4-flash)
+ *   TEST_MODEL     Provider model (default: deepseek-v4-flash-vision-exp)
  *   TEST_SCENARIO  campus | western (default: campus)
  *   TEST_TOTAL_CHAPTERS  Planned novel size (default: 3); one run must still cap at 5.
  */
@@ -18,7 +18,7 @@ const { chromium } = require('playwright');
 const SITE = (process.env.TEST_BASE_URL ?? 'http://101.133.150.84').replace(/\/$/, '');
 const API = (process.env.TEST_API_BASE_URL ?? `${SITE}/api`).replace(/\/$/, '');
 const API_KEY = process.env.TEST_API_KEY?.trim();
-const MODEL = process.env.TEST_MODEL?.trim() || 'deepseek-v4-flash';
+const MODEL = process.env.TEST_MODEL?.trim() || 'deepseek-v4-flash-vision-exp';
 const SCENARIO = process.env.TEST_SCENARIO === 'western' ? 'western' : 'campus';
 const TOTAL_CHAPTERS = Math.min(500, Math.max(1, Number.parseInt(process.env.TEST_TOTAL_CHAPTERS ?? '3', 10) || 3));
 const EXPECTED_BATCH = Math.min(5, TOTAL_CHAPTERS);

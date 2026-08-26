@@ -51,6 +51,53 @@ export interface ScriptGateReport {
   dialogueDensityPercent: number;
 }
 
+const TEMPORARY_DIALOGUE_ROLE = /^(?:(?:前台|保安|报名员|检录员|车检员|赛会官员|快递员|外卖员|服务员|店员|司机|护士|医生|警察|记者|主持人|裁判|裁判员|解说员|工作人员|维修工|技师|工程师|检测员|鉴定员|邻居|同事|客户|顾客|观众|学员|乘客|门卫|秘书|助理|老板|经理|教练|队员|播音员|法医|消防员|调度员|接线员|售票员|乘务员|清洁工|物业|房东|摊主|商贩|学生|老师|证人|患者|家属|主厨|厨师|路人|群众|人群|众人|围观者|陌生人|男子|男人|女人|女子|青年|壮汉|老人|大妈|大叔|少年|少女|黑衣人|打手|手下|刺客|侍卫|侍女|宫女|太监|士兵|官兵|弟子|随从|车手|男|女)(?:[甲乙丙丁戊己庚辛A-HＡ-Ｈ\d一二三四五六七八九]{0,2})?|(?:电话|对讲机|广播|扬声器|门外|场外)(?:里|里的)?(?:声音|男声|女声)|(?:广播|系统)(?:音|声音))$/u;
+const TEMPORARY_DESCRIPTIVE_DIALOGUE_ROLE = /^(?:[\p{Script=Han}]{1,6}(?:眼镜|西装|夹克|背心|衬衫|帽子)(?:男|女|男人|女人)?[甲乙丙丁戊己A-HＡ-Ｈ\d一二三四五六七八九]{0,2}|[\p{Script=Han}]{1,2}(?:技师|师傅|医生|护士|老师|警察|保安|经理|老板|教练|记者|司机|裁判|主厨|厨师)|(?:老|小)[\p{Script=Han}]{1,2})$/u;
+
+/** Whether the user explicitly requires every dialogue speaker to be registered. */
+export function allowsTemporaryDialogueSpeakers(plan: ScriptPlan): boolean {
+  const requirements = `${plan.coreRequirements ?? ''}\n${(plan.forbiddenElements ?? []).join('\n')}`;
+  return !(
+    /(?:只能|仅允许|只允许)[^。；\n]{0,24}(?:已登记|登记)[^。；\n]{0,16}(?:人物)?[^。；\n]{0,12}(?:对白|说话)/u.test(requirements) ||
+    /(?:未登记|临时|路人)[^。；\n]{0,16}(?:人物)?[^。；\n]{0,12}(?:禁止|不能|不得)[^。；\n]{0,12}(?:对白|说话)/u.test(requirements)
+  );
+}
+
+/**
+ * Recognizes disposable role labels, not named characters. Keep this list
+ * explicit so a real two-to-four-character Chinese name never bypasses the
+ * character registry merely because it is short.
+ */
+export function isTemporaryDialogueSpeaker(value: string): boolean {
+  const role = value.trim().replace(/^[【[]\s*|\s*[】\]]$/gu, '');
+  return Boolean(role) && role.length <= 12 && (
+    TEMPORARY_DIALOGUE_ROLE.test(role) ||
+    TEMPORARY_DESCRIPTIVE_DIALOGUE_ROLE.test(role)
+  );
+}
+
+/** Builds the same temporary-speaker allowance for generation and manual review. */
+export function collectTemporaryDialogueSpeakers(
+  episode: ScriptEpisode,
+  plan: ScriptPlan,
+  registeredCharacterNames: ReadonlySet<string>,
+): Set<string> {
+  const result = new Set<string>();
+  if (!allowsTemporaryDialogueSpeakers(plan)) return result;
+  for (const scene of episode.scenes) {
+    for (const block of scene.blocks) {
+      if (block.type !== 'dialogue' || block.characterId) continue;
+      const speaker = block.speaker.trim();
+      if (
+        speaker &&
+        !registeredCharacterNames.has(speaker) &&
+        isTemporaryDialogueSpeaker(speaker)
+      ) result.add(speaker);
+    }
+  }
+  return result;
+}
+
 export function isBlockingScriptReviewIssue(
   issue: Pick<ScriptReviewIssue, 'severity' | 'source' | 'status'>,
 ): boolean {
@@ -99,8 +146,23 @@ export function validateScriptEpisode(
     0,
   );
   const dialogueDensityPercent = visibleChars === 0 ? 0 : Math.round((dialogueChars / visibleChars) * 100);
+  const blockingCodes = new Set([
+    'EPISODE_NUMBER_MISMATCH',
+    'DUPLICATE_EPISODE_NUMBER',
+    'NO_SCENES',
+    'EMPTY_BODY',
+    'MODEL_ARTIFACT',
+    'FORBIDDEN_ELEMENT',
+    'FORBIDDEN_FACT',
+  ]);
   const addHard = (code: string, message: string, path?: string, sceneId?: string): void => {
-    issues.push({ code, severity: 'hard', message, path, sceneId });
+    issues.push({
+      code,
+      severity: blockingCodes.has(code) ? 'hard' : 'soft',
+      message,
+      path,
+      sceneId,
+    });
   };
   if (
     _options.expectedEpisodeNumber !== undefined &&
@@ -117,6 +179,9 @@ export function validateScriptEpisode(
   }
   if (episode.scenes.length === 0) {
     addHard('NO_SCENES', '正文没有场景。', 'scenes');
+  }
+  if (visibleChars === 0) {
+    addHard('EMPTY_BODY', '正文没有可见内容。', 'scenes');
   }
   if (episode.scenes.length > plan.maxScenesPerEpisode) {
     addHard(
@@ -177,7 +242,7 @@ export function validateScriptEpisode(
       if (blockIds.has(block.id)) {
         issues.push({
           code: 'DUPLICATE_BLOCK_ID',
-          severity: 'hard',
+          severity: 'soft',
           message: `正文块 ID「${block.id}」重复。`,
           sceneId: scene.id,
           blockId: block.id,
@@ -188,7 +253,7 @@ export function validateScriptEpisode(
       if (!block.text.trim()) {
         issues.push({
           code: 'EMPTY_BLOCK_TEXT',
-          severity: 'hard',
+          severity: 'soft',
           message: '正文块内容为空。',
           sceneId: scene.id,
           blockId: block.id,
@@ -222,7 +287,7 @@ export function validateScriptEpisode(
         ) {
           issues.push({
             code: 'CAPTION_STRUCTURE_POLLUTION',
-            severity: 'hard',
+            severity: 'soft',
             message: '字幕块混入了字幕包装、动作标记或对白前缀。',
             sceneId: scene.id,
             blockId: block.id,
@@ -241,7 +306,7 @@ export function validateScriptEpisode(
       ) {
         issues.push({
           code: 'ACTION_STRUCTURE_POLLUTION',
-          severity: 'hard',
+          severity: 'soft',
           message: '动作块混入了动作标记、字幕包装或对白前缀。',
           sceneId: scene.id,
           blockId: block.id,
@@ -265,7 +330,7 @@ export function validateScriptEpisode(
       ) {
         issues.push({
           code: 'DIALOGUE_STRUCTURE_POLLUTION',
-          severity: 'hard',
+          severity: 'soft',
           message: '对白文本混入了动作标记、字幕包装或重复的说话人前缀。',
           sceneId: scene.id,
           blockId: block.id,
@@ -283,7 +348,13 @@ export function validateScriptEpisode(
         _options.registeredCharacterIds || _options.registeredCharacterNames || _options.temporarySpeakers,
       );
       if (registryProvided && !knownById && !knownByName && !temporary) {
-        addHard('UNKNOWN_SPEAKER', `说话人「${speaker}」未登记。`, 'speaker', scene.id);
+        issues.push({
+          code: 'UNKNOWN_SPEAKER',
+          severity: 'soft',
+          message: `说话人「${speaker}」未登记。`,
+          path: 'speaker',
+          sceneId: scene.id,
+        });
       }
       if (
         block.characterId &&
@@ -292,7 +363,7 @@ export function validateScriptEpisode(
       ) {
         issues.push({
           code: 'UNKNOWN_DIALOGUE_CHARACTER_REFERENCE',
-          severity: 'hard',
+          severity: 'soft',
           message: `对白引用了未登记人物 ID「${block.characterId}」。`,
           sceneId: scene.id,
           blockId: block.id,
@@ -304,7 +375,7 @@ export function validateScriptEpisode(
       if (speakerCharacterId && !scene.characterIds.includes(speakerCharacterId)) {
         issues.push({
           code: 'SPEAKER_NOT_IN_SCENE',
-          severity: 'hard',
+          severity: 'soft',
           message: `说话人「${speaker}」未列入本场人物。`,
           sceneId: scene.id,
           blockId: block.id,
@@ -317,7 +388,7 @@ export function validateScriptEpisode(
       if (registeredName && registeredName !== speaker) {
         issues.push({
           code: 'SPEAKER_CHARACTER_MISMATCH',
-          severity: 'hard',
+          severity: 'soft',
           message: `对白人物 ID 对应「${registeredName}」，但署名为「${speaker}」。`,
           sceneId: scene.id,
           blockId: block.id,
