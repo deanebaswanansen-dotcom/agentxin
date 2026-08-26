@@ -11,6 +11,7 @@ import type {
 } from '../domain.js';
 import { projectScriptContinuity } from '../ScriptContinuityCommit.js';
 import type { ScriptTextParseWarning } from '../parsers/chineseShortDramaText.js';
+import { scriptEpisodeLengthRange } from './ScriptEpisodeLength.js';
 
 export const SCRIPT_DIRECT_ISSUE_CODES = [
   'OFF_OUTLINE',
@@ -75,6 +76,23 @@ function hasNextEpisodeDirection(context: Record<string, unknown>): boolean {
     typeof context.nextEpisodeDirection === 'object' &&
     !Array.isArray(context.nextEpisodeDirection)
   );
+}
+
+function targetCharsFromContext(context: Record<string, unknown>): number | undefined {
+  if (!context.episode || typeof context.episode !== 'object' || Array.isArray(context.episode)) {
+    return undefined;
+  }
+  const target = (context.episode as Record<string, unknown>).targetChars;
+  return typeof target === 'number' && Number.isFinite(target) && target > 0
+    ? Math.floor(target)
+    : undefined;
+}
+
+function directLengthInstruction(context: Record<string, unknown>): string {
+  const targetChars = targetCharsFromContext(context);
+  if (!targetChars) return '正文保持紧凑完整，不要靠重复台词凑字。';
+  const { minimum, maximum } = scriptEpisodeLengthRange(targetChars);
+  return `正文以 ${targetChars} 个可见字符为目标，允许约 ${minimum}—${maximum} 字；${maximum} 是浮动后的上限，绝不能超过。不要靠重复台词凑字。`;
 }
 
 export function reconcileDirectReviewBoundary(
@@ -193,7 +211,8 @@ export function buildDirectDraftPrompt(context: Record<string, unknown>): string
     '必须保持项目题材、人物身份、职业、关系和证物状态一致，不能把项目换成另一种题材。',
     '必须落实本集 goal、conflict、beats 与 endingHook；forbiddenFacts 和 forbiddenElements 不得出现。',
     boundaryInstruction,
-    '篇幅和对白比例是建议，不要为了精确数字机械重复：尽量接近 targetChars，对白用冲突推进。',
+    directLengthInstruction(context),
+    '对白比例允许按剧情自然波动，对白要用冲突推进。',
     '若创作要求禁止临时角色对白，就让路人用动作表达；否则前台、保安、快递员等临时角色必须用自己的称谓署名，绝不能把他们的台词挂到主角或其他登记人物名下。',
     '通常控制在 maxScenes 场；如完整讲清本集确有需要，最多可以写5场，不要因场数限制截断主要事件。',
     '只使用以下格式：',
@@ -220,7 +239,7 @@ export function buildDirectContinuationPrompt(
     '下面是一集已经写完但明显偏短的中文短剧。请从现有结尾自然继续，补充冲突、行动与对白。',
     '不要重写已有内容，不要复述已经发生的事件，不要再次制造“首次发现”同一证物。',
     '可以继续最后一场或增加下一场；只输出新增的标准剧本文本，不要输出解释、JSON或Markdown围栏。',
-    `当前约 ${currentChars} 字，建议新增约 ${suggestedAddition} 字；这是建议，不需要精确凑字。`,
+    `当前约 ${currentChars} 字，最多新增约 ${suggestedAddition} 字；续写后整集不得超过 ${scriptEpisodeLengthRange(targetChars).maximum} 个可见字符。`,
     `创作资料：${JSON.stringify(context)}`,
     `已有完整正文：\n${rawText}`,
   ].join('\n');
@@ -264,6 +283,7 @@ export function buildDirectRewritePrompt(
       '不要参考、延续或改写上一版正文，只使用创作资料和下面列出的问题边界。',
       boundaryInstruction,
       offOutlineInstruction,
+      directLengthInstruction(context),
       '输出完整标准剧本文本，不要解释，不要JSON，不要Markdown围栏。',
       `禁止边界：${JSON.stringify(issues.slice(0, 3))}`,
       `创作资料：${JSON.stringify(context)}`,
@@ -274,6 +294,7 @@ export function buildDirectRewritePrompt(
     '只修列出的大问题，保留原稿中没有问题的事件、人物关系和可用对白。',
     boundaryInstruction,
     offOutlineInstruction,
+    directLengthInstruction(context),
     '输出完整标准剧本文本，不要解释，不要JSON，不要Markdown围栏。',
     `问题：${JSON.stringify(issues.slice(0, 3))}`,
     `创作资料：${JSON.stringify(context)}`,

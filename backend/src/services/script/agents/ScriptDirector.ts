@@ -124,6 +124,10 @@ import {
   type ScriptDirectReviewArtifact,
   type ScriptDirectReviewIssue,
 } from './ScriptDirectWriting.js';
+import {
+  capGeneratedEpisodeLength,
+  scriptEpisodeLengthRange,
+} from './ScriptEpisodeLength.js';
 import { parseStructuredModelOutput, ScriptModelOutputError } from './structuredOutput.js';
 
 export { InMemoryScriptCheckpointStore } from './ScriptCheckpoint.js';
@@ -402,13 +406,13 @@ function scriptLengthInstruction(
 ): string {
   const safeSceneCount = Math.max(1, sceneCount);
   const charsPerScene = Math.round(targetChars / safeSceneCount);
-  const preferredMinimum = Math.ceil(targetChars * 0.75);
+  const { minimum, maximum } = scriptEpisodeLengthRange(targetChars);
   const current = currentChars === undefined
     ? ''
     : `当前正文已有 ${currentChars} 个可见字符，只需从现有结尾自然续写，不得复述或重写。`;
   return [
     current,
-    `整集以约 ${targetChars} 个可见字符为创作目标，达到约 ${preferredMinimum} 字即可进入审查，不要求精确凑数；`,
+    `整集正文写在 ${minimum}—${maximum} 个可见字符之间；${targetChars} 是目标值，${maximum} 是允许浮动后的上限，不得超出，也不要机械凑数；`,
     `当前 ${safeSceneCount} 场可按戏剧任务自然分配，平均约 ${charsPerScene} 字，重要冲突场可以更长；`,
     `对白目标约 ${dialogueDensityPercent}%，允许按剧情自然波动，不得为了比例重复台词或灌水；`,
     '每个 blocks.text 写完整、可拍摄的动作或有信息量的对白，不要用四五字短句机械凑块数；',
@@ -421,8 +425,7 @@ function scriptRevisionLengthInstruction(
   currentChars: number,
   reduceOnly: boolean,
 ): string {
-  const minimum = Math.ceil(targetChars * 0.75);
-  const maximum = Math.floor(targetChars * 1.25);
+  const { minimum, maximum } = scriptEpisodeLengthRange(targetChars);
   const operationConstraint = reduceOnly
     ? `本轮只能使用 replaceBlockText 精简现有正文块，至少净减少 ${Math.max(1, currentChars - maximum)} 个可见字符；不得插入、追加、改人物或改结构。`
     : '只执行当前阻断项授权的 Patch 操作，不要为了初稿块数建议而重构未授权内容。';
@@ -847,7 +850,7 @@ function revisionPolicyPromptContext(
       current: currentChars,
       target: targetChars,
       minimum: Math.ceil(targetChars * 0.75),
-      maximum: Math.floor(targetChars * 1.25),
+      maximum: scriptEpisodeLengthRange(targetChars).maximum,
       idealNetChange: targetChars - currentChars,
     })}`,
   ];
@@ -2655,7 +2658,7 @@ export class ScriptDirector {
       );
       episodeUpstreamRefs.push(scenePlanRef);
       const draftInputRevisionRefs = buildScriptInputRevisionRefs(state, episodeNumber);
-      const draftPromptVersion = 'episode-draft-v6';
+      const draftPromptVersion = 'episode-draft-v7';
       const currentEpisodeRevision = state.episodes.find(
         (episode) => episode.episodeNumber === episodeNumber,
       )?.revision ?? 0;
@@ -2733,7 +2736,7 @@ export class ScriptDirector {
             outline.plannedScenes.length,
             plan.dialogueDensityPercent,
           ),
-          `所有 blocks.text 去除空白后的总字符数以约 ${plan.targetCharsPerEpisode} 为目标；优先把本集剧情完整写出来，不要为了精确凑字重复台词或省略关键过程。`,
+          `所有 blocks.text 去除空白后的总字符数以 ${plan.targetCharsPerEpisode} 为目标，允许上下浮动约 400 字，但不得超过 ${scriptEpisodeLengthRange(plan.targetCharsPerEpisode).maximum}；优先保留关键冲突、行动过程与结尾卡点。`,
           `对白只能使用这些已登记人物：${JSON.stringify(state.characters.map((character) => ({ id: character.id, name: character.name })))}`,
           this.assembleEpisodeContext(state, plan, outline, episodeNumber),
         ].join('\n');
@@ -2859,7 +2862,7 @@ export class ScriptDirector {
             '严格顶层模板：{"blocks":[...]}。每项只允许 action 或 dialogue，并必须包含 sceneOrdinal、type、text；dialogue 还必须包含本场人物的 characterId、speaker，可选 delivery、mode(normal|os|vo)。',
             'action.text 不带“△”；dialogue.text 不重复说话人或冒号。每条写成完整、可拍摄的动作或推动冲突的对白。',
             `当前已有 ${continuationRequest.current.visibleChars} 字，本轮最多自然续写约 ${continuationRequest.requestedVisibleChars} 字；续写后至少达到 ${continuationRequest.minimumVisibleChars} 字（目标的 75%）。这是唯一一次续写，请把尚未完成的冲突、行动过程和结尾卡点写完整，但不要为了凑数重复内容。`,
-            `整集目标约 ${plan.targetCharsPerEpisode} 字，对白倾向约 ${plan.dialogueDensityPercent}%，二者都允许按剧情自然波动。`,
+            `续写后整集不得超过 ${scriptEpisodeLengthRange(plan.targetCharsPerEpisode).maximum} 个可见字符；对白倾向约 ${plan.dialogueDensityPercent}%，允许按剧情自然波动。`,
             `对白人物白名单：${JSON.stringify(knownCharacters)}`,
             rejectedDraftFeedback.length > 0
               ? `上一轮续写反馈：${JSON.stringify(rejectedDraftFeedback)}`
@@ -3063,7 +3066,10 @@ export class ScriptDirector {
             }));
             break;
           }
-          draft = assessed.candidate;
+          draft = capGeneratedEpisodeLength(
+            assessed.candidate,
+            plan.targetCharsPerEpisode,
+          ).episode;
           const continuedArtifact = buildScriptEpisodeCandidateArtifact({
             projectId: request.projectId,
             episodeNumber,
@@ -3287,7 +3293,7 @@ export class ScriptDirector {
         const hasTooLongIssue = report.blockingIssues.some((issue) => issue.code === 'TOO_LONG');
         const revisionInputRevisionRefs = buildScriptInputRevisionRefs(reviewState, episodeNumber);
         const revisionUpstreamArtifactRefs = [currentCandidateRef, currentReviewRef];
-        const revisionPromptVersion = 'script-revision-patch-v4';
+      const revisionPromptVersion = 'script-revision-patch-v5';
         const revisionInputFingerprint = computeScriptCheckpointInputFingerprint({
           node: 'revision',
           inputRevisionRefs: revisionInputRevisionRefs,
@@ -3406,8 +3412,8 @@ export class ScriptDirector {
           }
           const exactRevisionPolicy = revisionPolicy as ScriptRevisionPatchPolicy;
           const revisionBase = draft;
-          const minimumVisibleChars = Math.ceil(plan.targetCharsPerEpisode * 0.75);
-          const maximumVisibleChars = Math.floor(plan.targetCharsPerEpisode * 1.25);
+          const { minimum: minimumVisibleChars, maximum: maximumVisibleChars } =
+            scriptEpisodeLengthRange(plan.targetCharsPerEpisode);
           const validateAndApplyRevisionPatch = (
             patch: ScriptRevisionPatch,
             createId: () => string,
@@ -3899,7 +3905,7 @@ export class ScriptDirector {
       );
     const canonicalDirectCandidate = (value: ScriptEpisode): ScriptEpisode =>
       reconcileDirectSceneCast(canonicalStoredDirectCandidate(value));
-    const promptVersion = 'direct-draft-v2';
+    const promptVersion = 'direct-draft-v3';
     const draftFingerprint = computeScriptCheckpointInputFingerprint({
       node: 'direct_draft',
       inputRevisionRefs,
@@ -3927,14 +3933,14 @@ export class ScriptDirector {
       }
       const now = this.now();
       try {
-        const episode = canonicalDirectCandidate({
+        const episode = capGeneratedEpisodeLength(canonicalDirectCandidate({
           ...parsed.episode,
           id: currentEpisode?.id ?? this.createId(),
           projectId: request.projectId,
           revision: baseEpisodeRevision,
           createdAt: currentEpisode?.createdAt ?? now,
           updatedAt: now,
-        });
+        }), plan.targetCharsPerEpisode).episode;
         return { ...parsed, episode };
       } catch (error) {
         const message = error instanceof Error ? error.message : '剧本结构无法规范化。';
@@ -4130,6 +4136,7 @@ export class ScriptDirector {
       const parsedDraft = parsed.episode;
       if (!parsedDraft) throw new ScriptModelOutputError(`第 ${episodeNumber} 集本地正文兜底失败。`);
       draft = parsedDraft;
+      rawText = directEpisodeText(draft, state.characters);
       draftWarnings = parsed.warnings;
       directDraftRevision = await this.nextCheckpointArtifactRevision(
         request.projectId,
@@ -4179,7 +4186,7 @@ export class ScriptDirector {
     const episodeUpstreamRefs: ScriptUpstreamArtifactRef[] = [outlineRef, directDraftRef];
     const continuationThreshold = Math.max(150, Math.round(plan.targetCharsPerEpisode * 0.58));
     if (writerCallsUsed <= 1 && scriptVisibleChars(draft) < continuationThreshold) {
-      const continuationPromptVersion = 'direct-continuation-v1';
+      const continuationPromptVersion = 'direct-continuation-v2';
       const continuationFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'continuation',
         inputRevisionRefs,
@@ -4233,7 +4240,10 @@ export class ScriptDirector {
         recordCall('draft', 'ChineseShortDramaContinuation@v1', 1);
         const addition = parseCandidate(additionText);
         if (addition.episode) {
-          draft = canonicalDirectCandidate(mergeDirectContinuation(draft, addition.episode));
+          draft = capGeneratedEpisodeLength(
+            canonicalDirectCandidate(mergeDirectContinuation(draft, addition.episode)),
+            plan.targetCharsPerEpisode,
+          ).episode;
           rawText = directEpisodeText(draft, state.characters);
           draftWarnings = [...draftWarnings, ...addition.warnings];
         }
@@ -4436,8 +4446,8 @@ export class ScriptDirector {
       );
       const rewriteFromOutline = storedRewrite?.status === 'stale';
       const rewritePromptVersion = rewriteFromOutline
-        ? 'direct-rewrite-from-outline-v1'
-        : 'direct-rewrite-v4';
+        ? 'direct-rewrite-from-outline-v2'
+        : 'direct-rewrite-v5';
       const rewriteFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'direct_rewrite',
         inputRevisionRefs,
@@ -4487,7 +4497,7 @@ export class ScriptDirector {
         } else {
           recordCall('revision', 'ChineseShortDramaDirectRewrite@v1', 1);
           draft = rewritten.episode;
-          rawText = rewrittenText;
+          rawText = directEpisodeText(draft, state.characters);
           draftWarnings = rewritten.warnings;
           rewriteRevision = await this.nextCheckpointArtifactRevision(
             request.projectId,
@@ -4786,7 +4796,10 @@ export class ScriptDirector {
       createId: () => this.createId(),
       now: this.now(),
     });
-    return this.canonicalEpisodeCandidate(candidate, plan, outline.episodeNumber);
+    return capGeneratedEpisodeLength(
+      this.canonicalEpisodeCandidate(candidate, plan, outline.episodeNumber),
+      plan.targetCharsPerEpisode,
+    ).episode;
   }
 
   private canonicalEpisodeCandidate(

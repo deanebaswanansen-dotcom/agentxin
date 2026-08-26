@@ -45,13 +45,15 @@ const emptyContinuity: ScriptEpisodeContinuityCommitInput = {
 };
 
 describe('ScriptDirectWriting', () => {
-  it('keeps the direct-writing prompt focused on outline fidelity instead of exact quotas', () => {
+  it('treats targetChars as a hard ceiling without asking the model to pad the draft', () => {
     const prompt = buildDirectDraftPrompt({
       episode: { targetChars: 1_200, dialogueDensityPercent: 60 },
       nextEpisodeDirection: { mainEvent: '公开挑战' },
     });
     expect(prompt).toContain('直接写出本集完整中文短剧正文');
-    expect(prompt).toContain('篇幅和对白比例是建议');
+    expect(prompt).toContain('1200 个可见字符为目标');
+    expect(prompt).toContain('800—1600 字');
+    expect(prompt).toContain('1600 是浮动后的上限，绝不能超过');
     expect(prompt).not.toContain('恰好');
     expect(prompt).toContain('不要输出 JSON');
     expect(prompt).toContain('必须在 endingHook 处停住');
