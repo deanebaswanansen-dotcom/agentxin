@@ -626,7 +626,7 @@ describe('ScriptWorkspace', () => {
     fireEvent.click(screen.getByRole('button', { name: '保存策划' }));
     await screen.findByText('策划已保存');
     fireEvent.click(screen.getByRole('tab', { name: '剧本大纲' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Agent 生成大纲' }));
+    fireEvent.click(screen.getByRole('button', { name: 'AI 自动补全大纲' }));
     await waitFor(() => expect(client.script.jobs.create).toHaveBeenCalledWith({
       projectId: 'project-1', task: 'script_series_outline',
     }));
@@ -747,8 +747,8 @@ describe('ScriptWorkspace', () => {
 
     await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
     fireEvent.click(screen.getByRole('tab', { name: '剧本大纲' }));
-    expect(screen.getByText('跳过手填，AI 自动生成大纲')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Agent 生成大纲' }));
+    expect(screen.getByText('AI 自动补全大纲')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'AI 自动补全大纲' }));
     await waitFor(() => expect(client.script.jobs.create).toHaveBeenCalledWith({
       projectId: 'project-1', task: 'script_series_outline',
     }));
@@ -767,6 +767,58 @@ describe('ScriptWorkspace', () => {
       expect(client.script.jobs.create).toHaveBeenCalledTimes(2);
     });
     expect(screen.getByText('人物与世界补全任务正在运行，请勿重复提交')).toBeInTheDocument();
+  });
+
+  it('sends a pasted outline directly to AI completion without requiring a partial save', async () => {
+    const client = createClient();
+    vi.mocked(client.script.jobs.create).mockResolvedValue({
+      id: 'outline-completion', projectId: 'project-1', task: 'script_series_outline',
+      status: 'queued', continuable: false,
+    });
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '剧本大纲' }));
+    fireEvent.change(screen.getByLabelText('全剧梗概'), {
+      target: { value: '这是我自己写好的大纲，请识别后补全其他状态。' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'AI 自动补全大纲' }));
+
+    await waitFor(() => expect(client.script.jobs.create).toHaveBeenCalledTimes(1));
+    const request = vi.mocked(client.script.jobs.create).mock.calls[0]?.[0];
+    expect(request).toMatchObject({ projectId: 'project-1', task: 'script_series_outline' });
+    expect(JSON.parse(request?.prompt ?? '{}')).toMatchObject({
+      synopsis: '这是我自己写好的大纲，请识别后补全其他状态。',
+    });
+    expect(client.script.outline.save).not.toHaveBeenCalled();
+    expect(screen.getByText(/粘贴的原文会保留/)).toBeInTheDocument();
+  });
+
+  it('saves optional custom creative rules without turning them into blockers', async () => {
+    const client = createClient();
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByText('创作规则（可选）'));
+    fireEvent.change(screen.getByLabelText('创作模板'), { target: { value: 'hongguo' } });
+    fireEvent.change(screen.getByLabelText('质检方式'), { target: { value: 'custom' } });
+    fireEvent.change(screen.getByLabelText('自定义质检标准'), {
+      target: { value: '重点检查人物动机，不符合时只提示。' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '保存策划' }));
+
+    await waitFor(() => expect(client.script.plan.save).toHaveBeenCalledWith(
+      'project-1',
+      expect.objectContaining({
+        creativeRules: expect.objectContaining({
+          preset: 'hongguo',
+          qualityMode: 'custom',
+          qualityInstructions: '重点检查人物动机，不符合时只提示。',
+        }),
+      }),
+      2,
+    ));
+    expect(screen.getByText(/这些规则全部是软约束/)).toBeInTheDocument();
   });
 
   it('offers explicit AI regeneration for existing outline, bible, and completed episodes', async () => {
@@ -803,7 +855,7 @@ describe('ScriptWorkspace', () => {
     await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
 
     fireEvent.click(screen.getByRole('tab', { name: '剧本大纲' }));
-    fireEvent.click(screen.getByRole('button', { name: 'AI 重新生成大纲' }));
+    fireEvent.click(screen.getByRole('button', { name: 'AI 重新生成全部大纲' }));
     await waitFor(() => expect(client.script.jobs.create).toHaveBeenLastCalledWith({
       projectId: 'project-1', task: 'script_series_outline', regenerate: true,
     }));
@@ -836,7 +888,7 @@ describe('ScriptWorkspace', () => {
     const title = await screen.findByLabelText('剧本名称');
     fireEvent.change(title, { target: { value: '尚未保存的策划' } });
     fireEvent.click(screen.getByRole('tab', { name: '剧本大纲' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Agent 生成大纲' }));
+    fireEvent.click(screen.getByRole('button', { name: 'AI 自动补全大纲' }));
     expect(client.script.jobs.create).not.toHaveBeenCalled();
     expect(screen.getByText('请先保存策划，再启动 Agent')).toBeInTheDocument();
 

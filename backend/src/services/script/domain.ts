@@ -12,6 +12,27 @@ export type ScriptEpisodeStatus =
 export type ScriptTimeOfDay = 'day' | 'night' | 'dawn' | 'dusk';
 export type ScriptInteriorExterior = 'interior' | 'exterior';
 
+export type ScriptCreativeRulePreset = 'light' | 'hongguo' | 'custom' | 'agent';
+export type ScriptQualityRuleMode = 'light' | 'hongguo' | 'custom';
+
+/**
+ * Optional project-level writing preferences. They guide existing generation
+ * and review calls, but never become a deterministic blocking gate.
+ */
+export interface ScriptCreativeRules {
+  preset: ScriptCreativeRulePreset;
+  fiveEpisodeArc: boolean;
+  openingHook: boolean;
+  endingHook: boolean;
+  goldenLine: boolean;
+  firstAppearanceDetails: boolean;
+  productionLabels: boolean;
+  writingInstructions: string;
+  formatInstructions: string;
+  qualityMode: ScriptQualityRuleMode;
+  qualityInstructions: string;
+}
+
 export interface ScriptPlan {
   id: ScriptId;
   projectId: ScriptId;
@@ -37,6 +58,7 @@ export interface ScriptPlan {
   coreRequirements: string;
   forbiddenElements: string[];
   endingDirection: string;
+  creativeRules?: ScriptCreativeRules;
   coverPrompt?: string;
   createdAt: string;
   updatedAt: string;

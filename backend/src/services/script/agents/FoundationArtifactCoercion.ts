@@ -200,6 +200,9 @@ export function coerceScriptPlanCandidate(
     coreRequirements: text(firstValue(source, ['coreRequirements', 'requirements', '核心要求']), seed, 4_000),
     forbiddenElements: textArray(firstValue(source, ['forbiddenElements', 'forbidden', '禁止元素']), [], 30),
     endingDirection,
+    ...(options.current?.creativeRules
+      ? { creativeRules: structuredClone(options.current.creativeRules) }
+      : {}),
     ...(optionalText(firstValue(source, ['coverPrompt', 'cover_prompt', '封面提示词']), 4_000)
       ? { coverPrompt: optionalText(firstValue(source, ['coverPrompt', 'cover_prompt', '封面提示词']), 4_000) }
       : {}),

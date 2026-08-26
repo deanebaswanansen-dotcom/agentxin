@@ -8,6 +8,7 @@ import type {
   ScriptSeriesOutline,
   ScriptWorldBible,
 } from '../../types/index.js';
+import { scriptCreativeRuleSummary } from '../../lib/scriptCreativeRules.js';
 
 export type ScriptPrimaryStage = 'plan' | 'outline' | 'characters' | 'world' | 'episodes';
 
@@ -201,6 +202,7 @@ export function ScriptPlanReadView({ value }: { value: ScriptPlan }): JSX.Elemen
           <article><span>市场 / 频道</span><p>{market} · {channel}</p></article>
           <article><span>规模</span><p>{value.totalEpisodes} 集 · {value.episodeDurationSeconds.min}–{value.episodeDurationSeconds.max} 秒/集</p></article>
           <article><span>创作规格</span><p>{value.targetCharsPerEpisode} 字/集 · 最多 {value.maxScenesPerEpisode} 场 · 对白 {value.dialogueDensityPercent}%</p></article>
+          <article><span>创作规则</span><p>{scriptCreativeRuleSummary(value.creativeRules)}</p></article>
           <article className="is-wide"><span>核心要求</span><p><TextValue value={value.coreRequirements} /></p></article>
           <article className="is-wide"><span>结局方向</span><p><TextValue value={value.endingDirection} /></p></article>
         </div>

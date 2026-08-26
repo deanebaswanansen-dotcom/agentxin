@@ -138,6 +138,31 @@ describe('ScriptCanonicalInput', () => {
     );
   });
 
+  it('accepts bounded optional creative rules while keeping old plans compatible', () => {
+    expect(decodeScriptPlanInput(planInput()).creativeRules).toBeUndefined();
+    const decoded = decodeScriptPlanInput({
+      ...planInput(),
+      creativeRules: {
+        preset: 'custom',
+        fiveEpisodeArc: true,
+        openingHook: true,
+        endingHook: true,
+        goldenLine: false,
+        firstAppearanceDetails: true,
+        productionLabels: false,
+        writingInstructions: '优先保持人物动机清楚',
+        formatInstructions: '',
+        qualityMode: 'custom',
+        qualityInstructions: '只提示明显的情绪断层',
+      },
+    });
+    expect(decoded.creativeRules).toMatchObject({
+      preset: 'custom',
+      qualityMode: 'custom',
+      qualityInstructions: '只提示明显的情绪断层',
+    });
+  });
+
   it('decodes every required character field and rejects duplicate supplied identity', () => {
     expect(decodeScriptCharacterInputs([character('character-1', '沈清')]))
       .toMatchObject([{ id: 'character-1', name: '沈清', hairstyle: '黑色长发' }]);

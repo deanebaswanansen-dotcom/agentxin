@@ -11,6 +11,10 @@ import type {
 } from '../domain.js';
 import { projectScriptContinuity } from '../ScriptContinuityCommit.js';
 import type { ScriptTextParseWarning } from '../parsers/chineseShortDramaText.js';
+import {
+  scriptCreativeWritingInstruction,
+  scriptQualityReviewInstruction,
+} from './ScriptCreativeRules.js';
 import { scriptEpisodeLengthRange } from './ScriptEpisodeLength.js';
 
 export const SCRIPT_DIRECT_ISSUE_CODES = [
@@ -34,6 +38,7 @@ export interface ScriptDirectReviewIssue {
 export interface ScriptDirectHandoffReview {
   verdict: 'pass' | 'major_issue';
   issues: ScriptDirectReviewIssue[];
+  qualityNotes?: string[];
   handoff: {
     summary: string;
     characterStates: Array<{
@@ -86,6 +91,13 @@ function targetCharsFromContext(context: Record<string, unknown>): number | unde
   return typeof target === 'number' && Number.isFinite(target) && target > 0
     ? Math.floor(target)
     : undefined;
+}
+
+function creativeRulesFromContext(context: Record<string, unknown>): ScriptPlan['creativeRules'] {
+  if (!context.project || typeof context.project !== 'object' || Array.isArray(context.project)) {
+    return undefined;
+  }
+  return (context.project as { creativeRules?: ScriptPlan['creativeRules'] }).creativeRules;
 }
 
 function directLengthInstruction(context: Record<string, unknown>): string {
@@ -175,6 +187,7 @@ export function directWritingContext(
       coreConflict: plan.coreConflict,
       coreRequirements: plan.coreRequirements,
       forbiddenElements: plan.forbiddenElements,
+      creativeRules: plan.creativeRules,
     },
     episode: {
       episodeNumber: outline.episodeNumber,
@@ -213,6 +226,7 @@ export function buildDirectDraftPrompt(context: Record<string, unknown>): string
     boundaryInstruction,
     directLengthInstruction(context),
     '对白比例允许按剧情自然波动，对白要用冲突推进。',
+    scriptCreativeWritingInstruction({ creativeRules: creativeRulesFromContext(context) }),
     '若创作要求禁止临时角色对白，就让路人用动作表达；否则前台、保安、快递员等临时角色必须用自己的称谓署名，绝不能把他们的台词挂到主角或其他登记人物名下。',
     '通常控制在 maxScenes 场；如完整讲清本集确有需要，最多可以写5场，不要因场数限制截断主要事件。',
     '只使用以下格式：',
@@ -258,8 +272,9 @@ export function buildDirectReviewPrompt(
     boundaryInstruction,
     '不要评论服装丰富度、文学性、节奏、镜头、表演和普通台词润色。没有明显错误必须 verdict=pass、issues=[]。',
     '只返回 JSON：',
-    '{"verdict":"pass|major_issue","issues":[{"code":"OFF_OUTLINE|WRONG_GENRE_OR_SETTING|CHARACTER_IDENTITY_CONFLICT|DUPLICATE_MAJOR_EVENT|CAUSAL_CONTRADICTION|PROP_STATE_CONTRADICTION","sceneNumber":1,"evidence":"正文证据","expected":"大纲或连续性要求"}],"handoff":{"summary":"本集摘要","characterStates":[{"characterId":"登记ID","location":"最后地点","state":"当前状态","knows":["已知信息"]}],"props":[{"name":"道具","holder":"人物ID","location":"地点","state":"状态"}],"openThreads":["未解决悬念"],"ending":"本集最后状态"}}',
+    '{"verdict":"pass|major_issue","issues":[{"code":"OFF_OUTLINE|WRONG_GENRE_OR_SETTING|CHARACTER_IDENTITY_CONFLICT|DUPLICATE_MAJOR_EVENT|CAUSAL_CONTRADICTION|PROP_STATE_CONTRADICTION","sceneNumber":1,"evidence":"正文证据","expected":"大纲或连续性要求"}],"qualityNotes":["可选优化建议"],"handoff":{"summary":"本集摘要","characterStates":[{"characterId":"登记ID","location":"最后地点","state":"当前状态","knows":["已知信息"]}],"props":[{"name":"道具","holder":"人物ID","location":"地点","state":"状态"}],"openThreads":["未解决悬念"],"ending":"本集最后状态"}}',
     'issues 最多3条；不得虚构未在资料或正文中出现的信息。',
+    scriptQualityReviewInstruction({ creativeRules: creativeRulesFromContext(context) }),
     `创作资料：${JSON.stringify(context)}`,
     `本集正文：\n${rawText}`,
   ].join('\n');
@@ -373,6 +388,7 @@ export function createLocalDirectHandoffReview(
   return {
     verdict: 'pass',
     issues: [],
+    qualityNotes: [],
     handoff: {
       summary: episode.summary?.trim() || outline.goal.trim() || visible.join('；').slice(0, 300),
       characterStates: [],
@@ -426,6 +442,7 @@ export function decodeDirectHandoffReview(value: Record<string, unknown>): Scrip
     }];
   }).slice(0, 3);
   const verdict = requestedVerdict === 'major_issue' && issues.length > 0 ? 'major_issue' : 'pass';
+  const qualityNotes = strings(value.qualityNotes).slice(0, 2);
   const characterStates = Array.isArray(handoff.characterStates)
     ? handoff.characterStates.flatMap((candidate) => {
         if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return [];
@@ -454,6 +471,7 @@ export function decodeDirectHandoffReview(value: Record<string, unknown>): Scrip
   return {
     verdict,
     issues,
+    qualityNotes,
     handoff: {
       summary,
       characterStates,

@@ -125,6 +125,7 @@ export class AgentService {
         projectId,
         ...(request.regenerate ? { regenerate: true } : {}),
         ...(request.regenerationRunId ? { regenerationRunId: request.regenerationRunId } : {}),
+        ...(request.prompt.trim() ? { sourceOutline: request.prompt } : {}),
         signal,
         onProgress: (event) => {
           onProgress?.(event);

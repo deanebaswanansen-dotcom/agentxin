@@ -19,6 +19,13 @@ import type {
 } from '../types/index.js';
 import { buildProjectDocxBlob, downloadBlobFile, sanitizeDownloadName } from '../lib/projectExport.js';
 import {
+  DEFAULT_SCRIPT_CREATIVE_RULES,
+  normalizeScriptCreativeRules,
+  SCRIPT_CREATIVE_RULE_PRESET_LABELS,
+  SCRIPT_QUALITY_RULE_MODE_LABELS,
+  scriptCreativeRulePreset,
+} from '../lib/scriptCreativeRules.js';
+import {
   buildScriptBatchNavigation,
   ScriptCharactersReadView,
   ScriptEpisodeReader,
@@ -100,6 +107,7 @@ function emptyPlan(projectId: Id, projectName?: string): ScriptPlan {
     coreRequirements: '',
     forbiddenElements: [],
     endingDirection: '',
+    creativeRules: { ...DEFAULT_SCRIPT_CREATIVE_RULES },
     createdAt: now,
     updatedAt: now,
   };
@@ -193,6 +201,9 @@ function PlanEditor({
   const [mode, setMode] = useState<'read' | 'edit'>(() => value.status === 'draft' ? 'edit' : 'read');
   const patch = <K extends keyof ScriptPlan>(key: K, next: ScriptPlan[K]) =>
     onChange({ ...value, [key]: next });
+  const creativeRules = normalizeScriptCreativeRules(value.creativeRules);
+  const patchCreativeRules = (next: Partial<typeof creativeRules>) =>
+    patch('creativeRules', { ...creativeRules, ...next });
   return (
     <section className="script-stage-panel" aria-labelledby="script-plan-heading">
       <header className="script-stage-heading">
@@ -228,6 +239,35 @@ function PlanEditor({
         <label className="script-field">主要角色上限<input type="number" min={1} max={20} value={value.maxPrimaryCharacters} onChange={(e) => patch('maxPrimaryCharacters', Number(e.target.value))} /></label>
         <label className="script-field">每集场景上限<input type="number" min={1} max={5} value={value.maxScenesPerEpisode} onChange={(e) => patch('maxScenesPerEpisode', Number(e.target.value))} /></label>
         <label className="script-field script-field--wide">目标受众<input value={value.audience} onChange={(e) => patch('audience', e.target.value)} /></label>
+        <details className="script-creative-rules script-field--wide">
+          <summary>
+            <span><strong>创作规则（可选）</strong><small>默认轻量；只作为 AI 创作和质检参考，永远不会卡住生成</small></span>
+            <span className="script-creative-rules__status">{SCRIPT_CREATIVE_RULE_PRESET_LABELS[creativeRules.preset]}</span>
+          </summary>
+          <div className="script-creative-rules__body">
+            <div className="script-creative-rules__intro">
+              <p>字数、对白比例和场景数仍以前面的数值为准。这里不用整份粘贴提示词，选模板后只改你真正关心的部分。</p>
+              <button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" onClick={() => patch('creativeRules', scriptCreativeRulePreset('agent', creativeRules))}>交给 AI 决定</button>
+            </div>
+            <div className="script-creative-rules__grid">
+              <label className="script-field">创作模板<select aria-label="创作模板" value={creativeRules.preset} onChange={(event) => patch('creativeRules', scriptCreativeRulePreset(event.target.value as keyof typeof SCRIPT_CREATIVE_RULE_PRESET_LABELS, creativeRules))}>{Object.entries(SCRIPT_CREATIVE_RULE_PRESET_LABELS).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></label>
+              <label className="script-field">质检方式<select aria-label="质检方式" value={creativeRules.qualityMode} onChange={(event) => patchCreativeRules({ qualityMode: event.target.value as keyof typeof SCRIPT_QUALITY_RULE_MODE_LABELS })}>{Object.entries(SCRIPT_QUALITY_RULE_MODE_LABELS).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></label>
+            </div>
+            <fieldset className="script-creative-rules__checks">
+              <legend>需要 AI 尽量做到</legend>
+              <label><input type="checkbox" checked={creativeRules.fiveEpisodeArc} onChange={(event) => patchCreativeRules({ fiveEpisodeArc: event.target.checked, preset: 'custom' })} />五集一个推进单元</label>
+              <label><input type="checkbox" checked={creativeRules.openingHook} onChange={(event) => patchCreativeRules({ openingHook: event.target.checked, preset: 'custom' })} />开场尽快进入冲突</label>
+              <label><input type="checkbox" checked={creativeRules.endingHook} onChange={(event) => patchCreativeRules({ endingHook: event.target.checked, preset: 'custom' })} />非终局集保留卡点</label>
+              <label><input type="checkbox" checked={creativeRules.goldenLine} onChange={(event) => patchCreativeRules({ goldenLine: event.target.checked, preset: 'custom' })} />合适时安排传播台词</label>
+              <label><input type="checkbox" checked={creativeRules.firstAppearanceDetails} onChange={(event) => patchCreativeRules({ firstAppearanceDetails: event.target.checked, preset: 'custom' })} />重要人物首次出场说明</label>
+              <label><input type="checkbox" checked={creativeRules.productionLabels} onChange={(event) => patchCreativeRules({ productionLabels: event.target.checked, preset: 'custom' })} />需要镜头或场景时长标注</label>
+            </fieldset>
+            <label className="script-field script-field--wide">补充创作要求<textarea rows={4} maxLength={4000} value={creativeRules.writingInstructions} onChange={(event) => patchCreativeRules({ writingInstructions: event.target.value, preset: 'custom' })} placeholder="例如：女主不靠偶然获胜，反派行为要有利益动机。留空也能正常生成。" /></label>
+            <label className="script-field script-field--wide">补充输出格式<textarea rows={3} maxLength={4000} value={creativeRules.formatInstructions} onChange={(event) => patchCreativeRules({ formatInstructions: event.target.value, preset: 'custom' })} placeholder="例如：不要写复杂运镜；每场保留人物行。留空使用系统标准格式。" /></label>
+            {creativeRules.qualityMode === 'custom' ? <label className="script-field script-field--wide">自定义质检标准<textarea rows={4} maxLength={4000} value={creativeRules.qualityInstructions} onChange={(event) => patchCreativeRules({ qualityInstructions: event.target.value })} placeholder="例如：重点检查人物动机和前后因果。检查结果只提示，不会阻断或自动判失败。" /></label> : null}
+            <p className="script-creative-rules__safety"><strong>P0：</strong>这些规则全部是软约束。AI 没完全做到时保存正文并给出建议，你可以点重新写；系统不会因此暂停整批任务。</p>
+          </div>
+        </details>
         <label className="script-field script-field--wide">核心要求<textarea rows={5} value={value.coreRequirements} onChange={(e) => patch('coreRequirements', e.target.value)} /></label>
         <label className="script-field script-field--wide">禁用元素（每行一项）<textarea value={value.forbiddenElements.join('\n')} onChange={(e) => patch('forbiddenElements', e.target.value.split('\n').map((item) => item.trim()).filter(Boolean))} /></label>
         <label className="script-field script-field--wide">结局方向<textarea value={value.endingDirection} onChange={(e) => patch('endingDirection', e.target.value)} /></label>
@@ -394,10 +434,10 @@ function OutlineEditor({
       <div className="script-form-grid">
         <label className="script-field script-field--wide">
           <span className="script-field-heading">
-            <span>全剧梗概</span>
+            <span>全剧梗概（可直接粘贴你已有的大纲）</span>
             <small className={value.synopsis.trim().length < 350 ? 'is-warning' : ''}>建议约 500 字 · 当前 {value.synopsis.trim().length} 字</small>
           </span>
-          <textarea aria-label="全剧梗概" rows={12} value={value.synopsis} onChange={(e) => patch('synopsis', e.target.value)} />
+          <textarea aria-label="全剧梗概" rows={12} value={value.synopsis} onChange={(e) => patch('synopsis', e.target.value)} placeholder="把已有的大纲直接粘贴到这里；只写几句话也可以。点击“AI 自动补全大纲”后，AI 会识别内容并补齐下面的状态、主支线和分集卡。" />
         </label>
         <label className="script-field">开局状态<textarea value={value.openingState} onChange={(e) => patch('openingState', e.target.value)} /></label>
         <label className="script-field">中点转折<textarea value={value.midpointTurn} onChange={(e) => patch('midpointTurn', e.target.value)} /></label>
@@ -406,6 +446,7 @@ function OutlineEditor({
         <label className="script-field script-field--wide">主线节拍（每行一条）<textarea rows={5} value={value.mainArc.join('\n')} onChange={(e) => patch('mainArc', e.target.value.split('\n').map((item) => item.trim()).filter(Boolean))} /></label>
         <label className="script-field script-field--wide">支线（每行一条）<textarea rows={4} value={value.subplotArcs.join('\n')} onChange={(e) => patch('subplotArcs', e.target.value.split('\n').map((item) => item.trim()).filter(Boolean))} /></label>
       </div>
+      <p className="script-outline-completion-help">已有内容优先保留，空缺交给 AI 补齐；补全后所有字段都可以继续手改。识别不完整也不会卡住流程。</p>
       {value.episodeCards.length > 0 ? <div className="script-outline-cards"><h3>分集卡</h3>{value.episodeCards.map((card, index) => {
         const updateCard = (changes: Partial<typeof card>) => patch(
           'episodeCards',
@@ -437,7 +478,7 @@ function OutlineEditor({
         </article>;
       })}</div> : <p className="script-muted">保存策划后，可让 Agent 生成全剧总纲与连续分集卡。</p>}
       </>}
-      <footer className="script-stage-actions"><button type="button" aria-label="Agent 生成大纲" className="nwa-button script-ai-skip" disabled={busy} onClick={() => onGenerate(false)}>跳过手填，AI 自动生成大纲</button>{value.revision > 0 || value.episodeCards.length > 0 ? <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => onGenerate(true)}>AI 重新生成大纲</button> : null}<button type="button" className="nwa-button" disabled={busy} onClick={onSave}>{busy ? '保存中…' : '保存大纲'}</button></footer>
+      <footer className="script-stage-actions"><button type="button" aria-label="AI 自动补全大纲" className="nwa-button script-ai-skip" disabled={busy} onClick={() => onGenerate(false)}>AI 自动补全大纲</button>{value.revision > 0 || value.episodeCards.length > 0 ? <button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => onGenerate(true)}>AI 重新生成全部大纲</button> : null}<button type="button" className="nwa-button" disabled={busy} onClick={onSave}>{busy ? '保存中…' : '保存大纲'}</button></footer>
     </section>
   );
 }
@@ -1168,6 +1209,7 @@ export function ScriptWorkspace({
   const selectedEpisodeRef = useRef<ScriptEpisode>();
   const selectedEpisodeDirty = useRef(false);
   const selectedEpisodeEditVersion = useRef(0);
+  const outlineCompletionJob = useRef<{ id: string; editVersion: number }>();
 
   // A rename only changes the project's display metadata. Keep the newest
   // value available to async loads without treating it as a workspace switch,
@@ -1208,6 +1250,7 @@ export function ScriptWorkspace({
     selectedEpisodeRef.current = undefined;
     selectedEpisodeDirty.current = false;
     selectedEpisodeEditVersion.current = 0;
+    outlineCompletionJob.current = undefined;
     void (async () => {
       try {
         const jobs = await client.script.jobs.list(projectId, controller.signal);
@@ -1299,6 +1342,20 @@ export function ScriptWorkspace({
 
           jobSignature.current = nextSignature;
           const incoming = fromWorkspaceSnapshot(snapshot, jobs, projectId, projectNameRef.current);
+          const pendingOutline = outlineCompletionJob.current;
+          const outlineJob = pendingOutline ? jobs.find((job) => job.id === pendingOutline.id) : undefined;
+          if (outlineJob?.status === 'completed') {
+            outlineCompletionJob.current = undefined;
+            if (resourceEditVersions.current.outline === pendingOutline!.editVersion) {
+              dirtyResources.current.outline = false;
+              setNotice('AI 已根据你提供的大纲补全结构和分集卡；原有内容已保留，仍可继续修改');
+            } else {
+              setNotice('AI 大纲补全已完成；检测到你又修改了页面，已优先保留当前编辑内容');
+            }
+          } else if (outlineJob && ['failed', 'cancelled', 'waiting_user'].includes(outlineJob.status)) {
+            outlineCompletionJob.current = undefined;
+            setNotice('AI 大纲补全没有完成，页面里粘贴的原文已完整保留，可以再次点击补全');
+          }
           setData((current) => current
             ? mergeWorkspaceSnapshot(current, incoming, dirtyResources.current)
             : incoming);
@@ -1388,7 +1445,13 @@ export function ScriptWorkspace({
     }
     if (result.plan) {
       dirtyResources.current.plan = false;
-      setData((current) => current ? { ...current, plan: result.plan! } : current);
+      setData((current) => current ? {
+        ...current,
+        plan: {
+          ...result.plan!,
+          creativeRules: current.plan.creativeRules ?? result.plan!.creativeRules,
+        },
+      } : current);
       setPlanQuestions([]);
       setPlanAnswers({});
       setNotice('Agent 已生成策划草稿，请检查后确认');
@@ -1451,7 +1514,12 @@ export function ScriptWorkspace({
     setBusy(true);
     setNotice('');
     try {
-      const seedPrompt = [data.plan.title, data.plan.logline, data.plan.coreRequirements]
+      const seedPrompt = [
+        data.plan.title,
+        data.plan.logline,
+        data.plan.coreRequirements,
+        data.plan.creativeRules ? `创作规则：${JSON.stringify(data.plan.creativeRules)}` : '',
+      ]
         .map((item) => item.trim()).filter(Boolean).join('\n');
       applyPlanTurn(await client.script.plan.turn({
         projectId,
@@ -1484,9 +1552,10 @@ export function ScriptWorkspace({
           coreConflict: data.plan.coreConflict,
           logline: data.plan.logline,
           totalEpisodes: data.plan.totalEpisodes,
-          targetCharsPerEpisode: data.plan.targetCharsPerEpisode,
-          coreRequirements: data.plan.coreRequirements,
-          endingDirection: data.plan.endingDirection,
+           targetCharsPerEpisode: data.plan.targetCharsPerEpisode,
+           coreRequirements: data.plan.coreRequirements,
+           creativeRules: data.plan.creativeRules,
+           endingDirection: data.plan.endingDirection,
         })}`,
       ].filter(Boolean).join('\n');
       let result = await client.script.plan.turn({
@@ -1510,7 +1579,13 @@ export function ScriptWorkspace({
         ? await client.script.plan.approve(projectId, result.plan.revision)
         : result.plan;
       dirtyResources.current.plan = false;
-      setData((current) => current ? { ...current, plan: approved } : current);
+      setData((current) => current ? {
+        ...current,
+        plan: {
+          ...approved,
+          creativeRules: current.plan.creativeRules ?? approved.creativeRules,
+        },
+      } : current);
       setPlanQuestions([]);
       setPlanAnswers({});
       setNotice('AI 已自动完成并确认策划；你仍可点“编辑模式”修改，修改后记得保存');
@@ -1731,6 +1806,63 @@ export function ScriptWorkspace({
       setNotice(`已提交第 ${startEpisode}–${startEpisode + episodeCount - 1} 集${regenerate ? '重新写作' : '生成'}任务`);
     } catch (error) {
       onError?.(error);
+    } finally {
+      setBusy(false);
+    }
+  }, [client, data, onError, projectId]);
+
+  const startOutlineCompletion = useCallback(async () => {
+    if (!data) return;
+    if (dirtyResources.current.plan) {
+      setNotice('请先保存策划，再启动 Agent');
+      return;
+    }
+    if (data.jobs.some((job) => job.task === 'script_series_outline' && BLOCKING_JOB_STATUSES.has(job.status))) {
+      setNotice('大纲补全任务正在运行，请勿重复提交');
+      return;
+    }
+    const outline = data.outline ?? emptyOutline(projectId);
+    const source = {
+      synopsis: outline.synopsis,
+      openingState: outline.openingState,
+      midpointTurn: outline.midpointTurn,
+      climax: outline.climax,
+      endingState: outline.endingState,
+      mainArc: outline.mainArc,
+      subplotArcs: outline.subplotArcs,
+      episodeCards: outline.episodeCards,
+    };
+    const hasUserOutline = [
+      source.synopsis,
+      source.openingState,
+      source.midpointTurn,
+      source.climax,
+      source.endingState,
+      ...source.mainArc,
+      ...source.subplotArcs,
+    ].some((item) => item.trim().length > 0) || source.episodeCards.length > 0;
+    const editVersion = resourceEditVersions.current.outline;
+    setBusy(true);
+    setNotice(hasUserOutline
+      ? 'AI 正在识别你提供的大纲，并补全空缺状态与分集卡…'
+      : 'AI 正在根据策划自动补全大纲…');
+    try {
+      const job = await client.script.jobs.create({
+        projectId,
+        task: 'script_series_outline',
+        ...(hasUserOutline ? { prompt: JSON.stringify(source) } : {}),
+      });
+      outlineCompletionJob.current = { id: job.id, editVersion };
+      setData((current) => current ? {
+        ...current,
+        jobs: [job, ...current.jobs.filter((item) => item.id !== job.id)],
+      } : current);
+      setNotice(hasUserOutline
+        ? '大纲识别与补全任务已提交，粘贴的原文会保留；任务在后台运行'
+        : '大纲自动补全任务已提交，可切换页面继续使用');
+    } catch (error) {
+      onError?.(error);
+      setNotice('大纲补全任务没有启动，当前填写内容已保留');
     } finally {
       setBusy(false);
     }
@@ -2358,7 +2490,7 @@ export function ScriptWorkspace({
         {visibleBackgroundJob ? <MaterialJobPanel job={visibleBackgroundJob} label={backgroundJobLabel} busy={busy} onResume={(jobId) => void resumeJob(jobId)} onCancel={(jobId) => void cancelJob(jobId)} /> : null}
         {!data ? <div className="script-loading" role="status">正在加载短剧资料…</div> : null}
         {data && stage === 'plan' ? <PlanEditor value={data.plan} busy={busy} conceptBusy={conceptBusy} conceptPrompt={conceptPrompt} concepts={concepts} questions={planQuestions} answers={planAnswers} onChange={(plan) => { markResourceDirty('plan'); setData((current) => current ? { ...current, plan } : current); }} onConceptPromptChange={setConceptPrompt} onGenerateConcepts={() => void generateConcepts()} onAdoptConcept={adoptConcept} onSave={() => void savePlan()} onAgentPlan={() => void startPlanInterview()} onAutoComplete={() => void autoCompletePlan()} onAnswer={(field, value) => setPlanAnswers((current) => ({ ...current, [field]: { field, value } }))} onDelegate={(field) => setPlanAnswers((current) => ({ ...current, [field]: { field, delegate: true } }))} onSubmitAnswers={() => void submitPlanAnswers()} onApprove={() => void approvePlan()} /> : null}
-        {data && stage === 'outline' ? <OutlineEditor value={data.outline ?? emptyOutline(projectId)} busy={busy} onChange={(outline) => { markResourceDirty('outline'); setData((current) => current ? { ...current, outline } : current); }} onSave={() => void saveOutline()} onGenerate={(regenerate) => void startMaterialJob('script_series_outline', ['plan', 'outline'], regenerate)} /> : null}
+        {data && stage === 'outline' ? <OutlineEditor value={data.outline ?? emptyOutline(projectId)} busy={busy} onChange={(outline) => { markResourceDirty('outline'); setData((current) => current ? { ...current, outline } : current); }} onSave={() => void saveOutline()} onGenerate={(regenerate) => void (regenerate ? startMaterialJob('script_series_outline', ['plan', 'outline'], true) : startOutlineCompletion())} /> : null}
         {data && stage === 'characters' ? <CharacterEditor projectId={projectId} value={data.characters} busy={busy} onChange={(characters) => { markResourceDirty('characters'); setData((current) => current ? { ...current, characters } : current); }} onSave={() => void saveCharacters()} onGenerate={(regenerate) => void startMaterialJob('script_bible', ['plan', 'outline', 'characters', 'world'], regenerate)} /> : null}
         {data && stage === 'episodes' ? <EpisodeBatchPanel data={data} busy={busy} batchStart={selectedBatchStart} batchEpisodes={batchEpisodes} batchLoading={batchLoading} episode={selectedEpisode} episodeLoading={episodeLoading} onStart={(start, count, regenerate) => void startEpisodeBatch(start, count, regenerate)} onResume={(jobId) => void resumeJob(jobId)} onCancel={(jobId) => void cancelJob(jobId)} onTrash={(jobId) => void trashJob(jobId)} onOpenEpisode={(episodeNumber) => void openEpisode(episodeNumber)} onEpisodeChange={editSelectedEpisode} onSaveEpisode={() => void saveEpisode()} onReviewEpisode={(episodeNumber) => void reviewEpisode(episodeNumber)} onReviewBatch={(episodeNumbers) => void reviewCurrentBatch(episodeNumbers)} onReviewStatus={(issueId, status) => void updateReviewStatus(issueId, status)} onExport={(format, range) => void exportScript(format, range)} /> : null}
         {data && stage === 'world' ? <WorldEditor value={data.world ?? emptyWorld(projectId)} busy={busy} onChange={(world) => { markResourceDirty('world'); setData((current) => current ? { ...current, world } : current); }} onSave={() => void saveWorld()} onGenerate={(regenerate) => void startMaterialJob('script_bible', ['plan', 'outline', 'characters', 'world'], regenerate)} /> : null}
