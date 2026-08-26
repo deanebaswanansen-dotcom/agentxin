@@ -248,6 +248,7 @@ export function ChatWorkspace({
   const [planEndingDirection, setPlanEndingDirection] = useState('');
   const [planWritingRequirements, setPlanWritingRequirements] = useState('');
   const planAbortRef = useRef<AbortController | null>(null);
+  const referenceAbortRef = useRef<AbortController | null>(null);
   const planRestoreAbortRef = useRef<AbortController | null>(null);
   const chatMessagesRef = useRef(chat.messages);
 
@@ -262,6 +263,7 @@ export function ChatWorkspace({
   useEffect(() => {
     return () => {
       planAbortRef.current?.abort();
+      referenceAbortRef.current?.abort();
       planRestoreAbortRef.current?.abort();
     };
   }, []);
@@ -272,6 +274,7 @@ export function ChatWorkspace({
 
   useEffect(() => {
     planAbortRef.current?.abort();
+    referenceAbortRef.current?.abort();
     planRestoreAbortRef.current?.abort();
     setPlanSeed('');
     setPlanHistory([]);
@@ -614,13 +617,17 @@ export function ChatWorkspace({
         kind: 'text',
         content: '正在导入整本并识别章节（支持几十～上百章）…',
       });
+      const controller = new AbortController();
+      referenceAbortRef.current?.abort();
+      referenceAbortRef.current = controller;
       try {
         const imported = await apiClient.references.import({
           title: title ?? sourceLabel,
           text,
           depth,
           isCompleteWork: true,
-        });
+        }, controller.signal);
+        controller.signal.throwIfAborted();
         chat.removeMessage(progressId);
         chat.appendMessage({
           id: makeId(),
@@ -638,7 +645,10 @@ export function ChatWorkspace({
           onError?.(error);
         }
       } finally {
-        setPlanBusy(false);
+        if (referenceAbortRef.current === controller) {
+          referenceAbortRef.current = null;
+          setPlanBusy(false);
+        }
       }
     },
     [chat, onError, parseReferenceInput],
@@ -667,11 +677,15 @@ export function ChatWorkspace({
         kind: 'text',
         content: `正在分析已选 ${chapterIds.length} 章（深度 ${depth}）…`,
       });
+      const controller = new AbortController();
+      referenceAbortRef.current?.abort();
+      referenceAbortRef.current = controller;
       try {
         const analyzed = await apiClient.references.analyze(referenceId, {
           chapterIds,
           depth,
-        });
+        }, controller.signal);
+        controller.signal.throwIfAborted();
         chat.removeMessage(progressId);
         chat.appendMessage({
           id: makeId(),
@@ -703,9 +717,14 @@ export function ChatWorkspace({
           prev.kind === 'reference-import' ? { ...prev, resolved: false } : prev,
         );
         chat.removeMessage(progressId);
-        onError?.(error);
+        if (!(error instanceof DOMException && error.name === 'AbortError')) {
+          onError?.(error);
+        }
       } finally {
-        setPlanBusy(false);
+        if (referenceAbortRef.current === controller) {
+          referenceAbortRef.current = null;
+          setPlanBusy(false);
+        }
       }
     },
     [agent.running, chat, onAgentCompleted, onError, planBusy],
@@ -768,11 +787,15 @@ export function ChatWorkspace({
       }
       if (planBusy || agent.running) return;
       setPlanBusy(true);
+      const controller = new AbortController();
+      referenceAbortRef.current?.abort();
+      referenceAbortRef.current = controller;
       try {
         const result = await apiClient.references.transfer(projectId, {
           referenceId,
           dimensions,
-        });
+        }, controller.signal);
+        controller.signal.throwIfAborted();
         chat.updateMessage(messageId, (prev) =>
           prev.kind === 'reference-result' ? { ...prev, transferred: true } : prev,
         );
@@ -791,9 +814,14 @@ export function ChatWorkspace({
           artifacts: result.artifacts,
         }, projectId);
       } catch (error) {
-        onError?.(error);
+        if (!(error instanceof DOMException && error.name === 'AbortError')) {
+          onError?.(error);
+        }
       } finally {
-        setPlanBusy(false);
+        if (referenceAbortRef.current === controller) {
+          referenceAbortRef.current = null;
+          setPlanBusy(false);
+        }
       }
     },
     [agent.running, chat, onAgentCompleted, onError, planBusy, projectId],
@@ -956,6 +984,8 @@ export function ChatWorkspace({
     chat.stop();
     agent.stop();
     planAbortRef.current?.abort();
+    referenceAbortRef.current?.abort();
+    setPlanBusy(false);
   }, [chat, agent]);
 
   const handleClear = useCallback(() => {

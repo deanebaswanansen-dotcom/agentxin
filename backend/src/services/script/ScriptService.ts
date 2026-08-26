@@ -46,6 +46,7 @@ import { serializeFountain } from './serializers/fountain.js';
 import { ScriptConflictError, type ScriptStore } from './ScriptStore.js';
 import { ScriptServiceError } from './ScriptServiceError.js';
 import {
+  collectTemporaryDialogueSpeakers,
   createScriptReviewIssues,
   isBlockingScriptReviewIssue,
   type ScriptGateReport,
@@ -521,10 +522,16 @@ export class ScriptService {
     if (!episode) throw ScriptServiceError.notFound(`第${episodeNumber}集正文尚未创建`);
     const outline = state.episodeOutlines.find((item) => item.episodeNumber === episodeNumber);
     const charactersById = new Map(state.characters.map((item) => [item.id, item.name]));
+    const registeredCharacterNames = new Set(charactersById.values());
     const report = validateScriptEpisode(episode, plan, {
       expectedEpisodeNumber: episodeNumber,
       registeredCharacterIds: new Set(charactersById.keys()),
-      registeredCharacterNames: new Set(charactersById.values()),
+      registeredCharacterNames,
+      temporarySpeakers: collectTemporaryDialogueSpeakers(
+        episode,
+        plan,
+        registeredCharacterNames,
+      ),
       characterNamesById: charactersById,
       ...(outline ? { outline } : {}),
       previousEpisode: state.episodes

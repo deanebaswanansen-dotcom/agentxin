@@ -45,11 +45,11 @@ const SHOW_MOCK_CONTROLS = SETTINGS_ENV?.DEV === true;
 
 const PROVIDER_PRESETS: ProviderPreset[] = [
   {
-    id: 'deepseek-v4-flash',
-    label: 'DeepSeek V4 Flash',
-    description: '默认推荐。响应快、首字延迟低，适合日常写作与一键整本生成。',
+    id: 'deepseek-v4-flash-vision-exp',
+    label: 'DeepSeek V4 Flash Vision Exp',
+    description: '默认推荐。同价位下能力更强，适合日常写作与一键整本生成。',
     baseUrl: 'https://api.deepseek.com',
-    modelName: 'deepseek-v4-flash',
+    modelName: 'deepseek-v4-flash-vision-exp',
   },
   {
     id: 'deepseek-v4-pro',
@@ -389,7 +389,7 @@ export function SettingsPanel({
             <p className="nwa-muted">
               当前使用 DeepSeek 官方 OpenAI 兼容接口。<code>deepseek-chat</code> 和{' '}
               <code>deepseek-reasoner</code> 将于 2026-07-24 15:59 UTC 废弃，本产品默认使用
-              V4 Pro。
+              V4 Flash Vision Exp。
             </p>
           ) : null}
 
@@ -429,7 +429,7 @@ export function SettingsPanel({
               }}
             />
             <span className="nwa-field__hint nwa-muted">
-              可选官方模型：deepseek-v4-pro、deepseek-v4-flash；旧 deepseek-chat / reasoner 会自动迁移。
+              可选官方模型：deepseek-v4-pro、deepseek-v4-flash-vision-exp；旧 Flash / chat / reasoner 会自动迁移。
             </span>
           </label>
 

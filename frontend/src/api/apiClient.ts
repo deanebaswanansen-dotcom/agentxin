@@ -152,8 +152,8 @@ export function migrateStoredModelConfig(config: ModelConfig): ModelConfig {
     // Custom and local OpenAI-compatible endpoints remain untouched.
   }
   if (!isOfficialDeepSeek) return config;
-  if (config.modelName === 'deepseek-chat') {
-    return { ...config, baseUrl: 'https://api.deepseek.com', modelName: 'deepseek-v4-flash' };
+  if (config.modelName === 'deepseek-chat' || config.modelName === 'deepseek-v4-flash') {
+    return { ...config, baseUrl: 'https://api.deepseek.com', modelName: 'deepseek-v4-flash-vision-exp' };
   }
   if (config.modelName === 'deepseek-reasoner') {
     return { ...config, baseUrl: 'https://api.deepseek.com', modelName: 'deepseek-v4-pro' };

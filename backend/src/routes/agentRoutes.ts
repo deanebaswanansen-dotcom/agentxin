@@ -47,6 +47,7 @@ interface RunAgentBody {
   chapterId?: unknown;
   options?: unknown;
   scriptBatchOptions?: unknown;
+  regenerate?: unknown;
 }
 
 function isAgentTask(value: unknown): value is AgentTask {
@@ -219,6 +220,7 @@ export function parseAgentBody(raw: RunAgentBody): AgentRunRequest {
     prompt: typeof raw.prompt === 'string' ? raw.prompt : '',
     projectId: raw.projectId,
     chapterId: raw.chapterId,
+    ...(scriptTask && raw.regenerate === true ? { regenerate: true } : {}),
     options: parseAgentOptions(raw.options),
     scriptBatchOptions,
   };

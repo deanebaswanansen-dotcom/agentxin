@@ -136,6 +136,127 @@ function isAbortError(error: unknown): boolean {
 
 const FETCH_MAX_ATTEMPTS = 4;
 const FETCH_RETRY_BASE_MS = 2000;
+const DEFAULT_MODEL_REQUEST_TIMEOUT_MS = 180_000;
+const DEFAULT_MODEL_REQUEST_MAX_DURATION_MS = 600_000;
+
+function modelRequestTimeoutMs(): number {
+  const configured = Number(process.env.MODEL_REQUEST_TIMEOUT_MS);
+  if (!Number.isFinite(configured) || configured <= 0) {
+    return DEFAULT_MODEL_REQUEST_TIMEOUT_MS;
+  }
+  return Math.min(60 * 60 * 1000, Math.max(1, Math.round(configured)));
+}
+
+function modelRequestMaxDurationMs(): number {
+  const configured = Number(process.env.MODEL_REQUEST_MAX_DURATION_MS);
+  if (!Number.isFinite(configured) || configured <= 0) {
+    return DEFAULT_MODEL_REQUEST_MAX_DURATION_MS;
+  }
+  return Math.min(2 * 60 * 60 * 1000, Math.max(1, Math.round(configured)));
+}
+
+function formatTimeout(timeoutMs: number): string {
+  if (timeoutMs >= 60_000 && timeoutMs % 60_000 === 0) {
+    return `${timeoutMs / 60_000} 分钟`;
+  }
+  if (timeoutMs >= 1000 && timeoutMs % 1000 === 0) {
+    return `${timeoutMs / 1000} 秒`;
+  }
+  return `${timeoutMs} 毫秒`;
+}
+
+function createRequestDeadline(callerSignal: AbortSignal): {
+  signal: AbortSignal;
+  timeoutMs: number;
+  maxDurationMs: number;
+  timedOut: () => boolean;
+  timeoutKind: () => 'idle' | 'total' | undefined;
+  touch: () => void;
+  dispose: () => void;
+} {
+  const timeoutMs = modelRequestTimeoutMs();
+  const maxDurationMs = modelRequestMaxDurationMs();
+  const controller = new AbortController();
+  let didTimeOut: 'idle' | 'total' | undefined;
+  const onCallerAbort = (): void => controller.abort(callerSignal.reason);
+  if (callerSignal.aborted) {
+    onCallerAbort();
+  } else {
+    callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+  }
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  const armTimer = (): void => {
+    if (controller.signal.aborted) return;
+    if (idleTimer !== undefined) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      didTimeOut = 'idle';
+      const error = new Error('Model provider request timed out');
+      error.name = 'TimeoutError';
+      controller.abort(error);
+    }, timeoutMs);
+    idleTimer.unref?.();
+  };
+  const totalTimer = setTimeout(() => {
+    didTimeOut = 'total';
+    const error = new Error('Model provider request exceeded maximum duration');
+    error.name = 'TimeoutError';
+    controller.abort(error);
+  }, maxDurationMs);
+  totalTimer.unref?.();
+  armTimer();
+  return {
+    signal: controller.signal,
+    timeoutMs,
+    maxDurationMs,
+    timedOut: () => didTimeOut !== undefined,
+    timeoutKind: () => didTimeOut,
+    touch: armTimer,
+    dispose: () => {
+      if (idleTimer !== undefined) clearTimeout(idleTimer);
+      clearTimeout(totalTimer);
+      callerSignal.removeEventListener('abort', onCallerAbort);
+    },
+  };
+}
+
+function timeoutProxyError(
+  deadline: { timeoutMs: number; maxDurationMs: number; timeoutKind: () => 'idle' | 'total' | undefined },
+  cause: unknown,
+): ProxyError {
+  const message = deadline.timeoutKind() === 'total'
+    ? `单次模型请求已达到最长${formatTimeout(deadline.maxDurationMs)}，任务已停止，可重试。`
+    : `模型提供商超过${formatTimeout(deadline.timeoutMs)}未响应，任务已停止，可重试。`;
+  return new ProxyError(
+    message,
+    { cause, status: 504 },
+  );
+}
+
+async function readStreamChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal: AbortSignal,
+): Promise<{ done: boolean; value?: Uint8Array }> {
+  if (signal.aborted) {
+    throw signal.reason ?? new Error('The operation was aborted');
+  }
+  return new Promise<{ done: boolean; value?: Uint8Array }>((resolve, reject) => {
+    const onAbort = (): void => {
+      signal.removeEventListener('abort', onAbort);
+      reject(signal.reason ?? new Error('The operation was aborted'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    reader.read().then(
+      (result) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(result);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+}
 
 function isRetryableStatus(status: number): boolean {
   return status === 429 || status === 502 || status === 503 || status === 504;
@@ -190,7 +311,10 @@ async function sleepMs(ms: number, signal: AbortSignal): Promise<void> {
     throw new ProxyError('请求模型提供商超时或已被取消');
   }
   await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
     const onAbort = (): void => {
       clearTimeout(timer);
       signal.removeEventListener('abort', onAbort);
@@ -266,10 +390,13 @@ export class OpenAiCompatibleModelProxy implements ModelProxy {
     }
     applyProviderRequestOptions(requestBody, config, options);
 
-    let response: Response | undefined;
-    for (let attempt = 0; attempt < FETCH_MAX_ATTEMPTS; attempt += 1) {
-      try {
-        response = await fetch(url, {
+    const deadline = createRequestDeadline(signal);
+    const requestSignal = deadline.signal;
+    try {
+      let response: Response | undefined;
+      for (let attempt = 0; attempt < FETCH_MAX_ATTEMPTS; attempt += 1) {
+        try {
+          response = await fetch(url, {
           method: 'POST',
           headers: {
             Authorization: `Bearer ${config.apiKey}`,
@@ -277,91 +404,105 @@ export class OpenAiCompatibleModelProxy implements ModelProxy {
             Accept: 'text/event-stream',
           },
           body: JSON.stringify(requestBody),
-          signal,
+          signal: requestSignal,
           redirect: 'error',
         });
-      } catch (error: unknown) {
-        if (isAbortError(error) || signal.aborted) {
-          throw new ProxyError('请求模型提供商超时或已被取消', {
-            cause: error,
-          });
-        }
-        if (attempt < FETCH_MAX_ATTEMPTS - 1) {
-          const delay = retryDelayMs(attempt);
-          console.warn(`[ModelProxy] Connection failed (attempt ${attempt + 1}/${FETCH_MAX_ATTEMPTS}), retrying in ${delay}ms`);
-          await sleepMs(delay, signal);
-          continue;
-        }
-        throw new ProxyError('无法连接到模型提供商', { cause: error });
-      }
-
-      if (response.ok) {
-        break;
-      }
-
-      if (isRetryableStatus(response.status) && attempt < FETCH_MAX_ATTEMPTS - 1) {
-        const delay = retryDelayMs(attempt);
-        console.warn(
-          `[ModelProxy] Provider status ${response.status} (attempt ${attempt + 1}/${FETCH_MAX_ATTEMPTS}), retrying in ${delay}ms`,
-        );
-        await sleepMs(delay, signal);
-        continue;
-      }
-
-      throw new ProxyError(await providerFailureMessage(response), { status: response.status });
-    }
-
-    if (response === undefined) {
-      throw new ProxyError('无法连接到模型提供商');
-    }
-
-    if (response.body === null) {
-      throw new ProxyError('模型提供商未返回响应内容');
-    }
-
-    const decoder = new TextDecoder('utf-8');
-    const parser = new SseDeltaParser(config.modelName);
-    const reader = response.body.getReader();
-
-    try {
-      for (;;) {
-        let done: boolean;
-        let value: Uint8Array | undefined;
-        try {
-          ({ done, value } = await reader.read());
         } catch (error: unknown) {
-          if (isAbortError(error) || signal.aborted) {
-            throw new ProxyError('接收模型响应时超时或已被取消', {
-              cause: error,
-            });
+          if (isAbortError(error) || requestSignal.aborted) {
+            if (deadline.timedOut()) throw timeoutProxyError(deadline, error);
+            throw new ProxyError('请求模型提供商已被取消', { cause: error });
           }
-          throw new ProxyError('读取模型响应流失败', { cause: error });
+          if (attempt < FETCH_MAX_ATTEMPTS - 1) {
+            const delay = retryDelayMs(attempt);
+            console.warn(`[ModelProxy] Connection failed (attempt ${attempt + 1}/${FETCH_MAX_ATTEMPTS}), retrying in ${delay}ms`);
+            await sleepMs(delay, requestSignal);
+            continue;
+          }
+          throw new ProxyError('无法连接到模型提供商', { cause: error });
         }
 
-        if (done) {
+        if (response.ok) {
+          deadline.touch();
           break;
         }
-        if (value === undefined) {
+
+        if (isRetryableStatus(response.status) && attempt < FETCH_MAX_ATTEMPTS - 1) {
+          const delay = retryDelayMs(attempt);
+          console.warn(
+            `[ModelProxy] Provider status ${response.status} (attempt ${attempt + 1}/${FETCH_MAX_ATTEMPTS}), retrying in ${delay}ms`,
+          );
+          await sleepMs(delay, requestSignal);
           continue;
         }
 
-        const text = decoder.decode(value, { stream: true });
-        for (const delta of parser.push(text)) {
-          yield delta;
-        }
+        throw new ProxyError(await providerFailureMessage(response), { status: response.status });
       }
 
-      const tail = decoder.decode();
-      if (tail.length > 0) {
-        for (const delta of parser.push(tail)) {
+      if (response === undefined) {
+        throw new ProxyError('无法连接到模型提供商');
+      }
+
+      if (response.body === null) {
+        throw new ProxyError('模型提供商未返回响应内容');
+      }
+
+      const decoder = new TextDecoder('utf-8');
+      const parser = new SseDeltaParser(config.modelName);
+      const reader = response.body.getReader();
+
+      try {
+        for (;;) {
+          let done: boolean;
+          let value: Uint8Array | undefined;
+          try {
+            ({ done, value } = await readStreamChunk(reader, requestSignal));
+          } catch (error: unknown) {
+            if (isAbortError(error) || requestSignal.aborted) {
+              if (deadline.timedOut()) throw timeoutProxyError(deadline, error);
+              throw new ProxyError('接收模型响应时已被取消', { cause: error });
+            }
+            throw new ProxyError('读取模型响应流失败', { cause: error });
+          }
+
+          if (done) {
+            break;
+          }
+          if (value === undefined) {
+            continue;
+          }
+          deadline.touch();
+
+          const text = decoder.decode(value, { stream: true });
+          for (const delta of parser.push(text)) {
+            yield delta;
+          }
+        }
+
+        const tail = decoder.decode();
+        if (tail.length > 0) {
+          for (const delta of parser.push(tail)) {
+            yield delta;
+          }
+        }
+        for (const delta of parser.flush()) {
           yield delta;
         }
+      } finally {
+        if (requestSignal.aborted) {
+          // Some broken provider streams never settle `cancel()`. The request
+          // has already reached a terminal timeout/cancel state, so cleanup
+          // must not be allowed to keep the job in `running` forever.
+          void reader.cancel().catch(() => undefined);
+        }
+        reader.releaseLock();
       }
-      for (const delta of parser.flush()) {
-        yield delta;
+    } catch (error: unknown) {
+      if (deadline.timedOut() && !(error instanceof ProxyError && error.status === 504)) {
+        throw timeoutProxyError(deadline, error);
       }
+      throw error;
     } finally {
-      reader.releaseLock();
+      deadline.dispose();
     }
   }
 }

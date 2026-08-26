@@ -45,7 +45,7 @@ async function run(): Promise<void> {
   const modelConfig = encodeURIComponent(JSON.stringify({
     baseUrl: process.env.SHORT_DRAMA_E2E_BASE_URL?.trim() || 'https://api.deepseek.com',
     apiKey,
-    modelName: process.env.SHORT_DRAMA_E2E_MODEL?.trim() || 'deepseek-chat',
+    modelName: process.env.SHORT_DRAMA_E2E_MODEL?.trim() || 'deepseek-v4-flash-vision-exp',
     temperature: 0.6,
     maxTokens: 16_000,
   }));
@@ -193,7 +193,7 @@ async function run(): Promise<void> {
       .reduce((total, job) => total + (job.events?.length ?? 0), 0);
     process.stdout.write(`${JSON.stringify({
       ok: true,
-      model: process.env.SHORT_DRAMA_E2E_MODEL?.trim() || 'deepseek-chat',
+      model: process.env.SHORT_DRAMA_E2E_MODEL?.trim() || 'deepseek-v4-flash-vision-exp',
       totalMilliseconds: Date.now() - startedAt,
       timings,
       checkpointEvents,

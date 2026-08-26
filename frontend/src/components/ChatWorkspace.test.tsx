@@ -18,6 +18,11 @@ vi.mock('../api/apiClient.js', () => ({
       cancelJob: vi.fn(),
     },
     chapters: { list: vi.fn() },
+    references: {
+      import: vi.fn(),
+      analyze: vi.fn(),
+      transfer: vi.fn(),
+    },
   },
 }));
 
@@ -132,6 +137,67 @@ describe('ChatWorkspace', () => {
     const input = screen.getByLabelText('对话输入');
     fireEvent.change(input, { target: { value: '/计' } });
     expect(await screen.findByText(/Agent 先理解目标与硬约束/)).toBeInTheDocument();
+  });
+
+  it('stops reference analysis without leaving the workspace disabled', async () => {
+    const onError = vi.fn();
+    let analyzeSignal: AbortSignal | undefined;
+    vi.mocked(apiClient.references.import).mockResolvedValue({
+      reference: {
+        id: 'ref-1',
+        title: '测试参考书',
+        depth: 'standard',
+        status: 'imported',
+        chapterCount: 1,
+        wordCount: 120,
+        createdAt: '2026-08-26T00:00:00.000Z',
+        updatedAt: '2026-08-26T00:00:00.000Z',
+      },
+      chaptersDetected: 1,
+      wordCount: 120,
+      message: '已识别 1 章',
+      chapters: [{
+        id: 'ref-ch-1',
+        number: 1,
+        title: '第一章',
+        wordCount: 120,
+        contentPreview: '正文预览',
+      }],
+    });
+    vi.mocked(apiClient.references.analyze).mockImplementation((_id, _body, signal) => {
+      analyzeSignal = signal;
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener('abort', () => {
+          reject(signal.reason ?? new DOMException('Aborted', 'AbortError'));
+        }, { once: true });
+      });
+    });
+
+    render(<ChatWorkspace projectId="p-1" projectName="测试项目" onError={onError} />);
+
+    const input = screen.getByRole('textbox', { name: '对话输入' });
+    fireEvent.change(input, { target: { value: '/参' } });
+    fireEvent.click(await screen.findByRole('option', { name: /\/参考 · 小说内容拆解/ }));
+    fireEvent.change(input, {
+      target: { value: `名称：测试参考书\n\n第一章\n${'这是用于参考分析取消测试的正文。'.repeat(8)}` },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '执行' }));
+
+    const analyzeButton = await screen.findByRole('button', { name: '分析选中的 1 章' });
+    fireEvent.click(analyzeButton);
+    await waitFor(() => expect(apiClient.references.analyze).toHaveBeenCalledWith(
+      'ref-1',
+      { chapterIds: ['ref-ch-1'], depth: 'standard' },
+      expect.any(AbortSignal),
+    ));
+    expect(input).toBeDisabled();
+
+    fireEvent.click(screen.getByRole('button', { name: '停止' }));
+
+    await waitFor(() => expect(analyzeSignal?.aborted).toBe(true));
+    expect(input).toBeEnabled();
+    expect(await screen.findByRole('button', { name: '分析选中的 1 章' })).toBeEnabled();
+    expect(onError).not.toHaveBeenCalled();
   });
 
   it('opens plan configuration before sending a direct /计划 command', async () => {

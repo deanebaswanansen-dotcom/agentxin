@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { getCurrentClientId } from '../../client/clientScope.js';
 import { getRequestModelConfig } from '../../modelConfig/requestModelConfig.js';
 import { AgentJobRunner } from './AgentJobRunner.js';
-import { AgentRunConflictError, AgentRunStore } from './AgentRunStore.js';
+import { AgentRunStore } from './AgentRunStore.js';
 
 const CLIENT_ID = 'a'.repeat(64);
 
@@ -411,6 +411,7 @@ describe('AgentJobRunner', () => {
       undefined,
     );
     await vi.waitFor(() => expect(store.get(created.id)?.status).toBe('running'));
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'));
     await runner.cancel(CLIENT_ID, created.id);
     finish();
     await runner.waitUntilIdle(created.id);
@@ -435,6 +436,7 @@ describe('AgentJobRunner', () => {
       undefined,
     );
     await vi.waitFor(() => expect(store.get(created.id)?.status).toBe('running'));
+    await vi.waitFor(() => expect(rejectRun).toBeTypeOf('function'));
     await runner.cancel(CLIENT_ID, created.id);
     rejectRun(Object.assign(new Error('候选等待人工检查'), {
       code: 'SCRIPT_STRUCTURED_NEEDS_REVIEW',
@@ -445,17 +447,73 @@ describe('AgentJobRunner', () => {
     expect(store.get(created.id)?.status).toBe('cancelled');
   });
 
-  it('rejects an overlapping long-form start while a cancelled job is still settling', async () => {
+  it('fails instead of staying running when an executor never settles', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-watchdog-'));
+    const store = await AgentRunStore.create(join(directory, 'runs.json'));
+    let executorSignal: AbortSignal | undefined;
+    const runner = new AgentJobRunner(store, {
+      run: (_request, signal) => {
+        executorSignal = signal;
+        return new Promise(() => undefined);
+      },
+    }, { idleTimeoutMs: 20, maxAttemptDurationMs: 100, maxAttempts: 1 });
+
+    const created = await runner.start(
+      CLIENT_ID,
+      { task: 'script_series_outline', mode: 'draft', prompt: '', projectId: 'p1' },
+      undefined,
+    );
+    await runner.waitUntilIdle(created.id);
+
+    expect(executorSignal?.aborted).toBe(true);
+    expect(store.get(created.id)).toMatchObject({
+      status: 'failed',
+      error: { code: 'RUN_TIMEOUT' },
+    });
+  });
+
+  it('uses an absolute limit even while progress keeps resetting the idle watchdog', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-absolute-watchdog-'));
+    const store = await AgentRunStore.create(join(directory, 'runs.json'));
+    const runner = new AgentJobRunner(store, {
+      run: (_request, _signal, onProgress) => new Promise(() => {
+        const timer = setInterval(() => onProgress?.({ phase: 'info', message: '仍在处理' }), 10);
+        timer.unref?.();
+      }),
+    }, { idleTimeoutMs: 100, maxAttemptDurationMs: 45, maxAttempts: 1 });
+
+    const created = await runner.start(
+      CLIENT_ID,
+      { task: 'script_series_outline', mode: 'draft', prompt: '', projectId: 'p1' },
+      undefined,
+    );
+    await runner.waitUntilIdle(created.id);
+
+    expect(store.get(created.id)).toMatchObject({
+      status: 'failed',
+      error: { code: 'RUN_TIMEOUT' },
+    });
+  });
+
+  it('releases a cancelled active slot even when the old executor ignores abort', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-cancel-overlap-'));
     const store = await AgentRunStore.create(join(directory, 'runs.json'));
-    let finish!: () => void;
+    let finishFirst!: () => void;
+    let calls = 0;
     const runner = new AgentJobRunner(store, {
-      run: (request) => new Promise((resolve) => {
-        finish = () => resolve({
+      run: (request) => {
+        calls += 1;
+        if (calls > 1) return Promise.resolve({
           task: request.task, mode: request.mode, projectId: request.projectId ?? 'project-a',
-          summary: '迟到的完成结果', steps: [], artifacts: [],
+          summary: '替代任务完成', steps: [], artifacts: [],
         });
-      }),
+        return new Promise((resolve) => {
+          finishFirst = () => resolve({
+            task: request.task, mode: request.mode, projectId: request.projectId ?? 'project-a',
+            summary: '迟到的完成结果', steps: [], artifacts: [],
+          });
+        });
+      },
     });
 
     const created = await runner.start(
@@ -464,26 +522,83 @@ describe('AgentJobRunner', () => {
       undefined,
     );
     await vi.waitFor(() => expect(store.get(created.id)?.status).toBe('running'));
+    await vi.waitFor(() => expect(finishFirst).toBeTypeOf('function'));
     await runner.cancel(CLIENT_ID, created.id);
-    expect(store.get(created.id)?.status).toBe('cancelled');
-
-    await expect(runner.start(
-      CLIENT_ID,
-      { task: 'full_novel', mode: 'draft', prompt: '再写十章', projectId: 'project-a' },
-      undefined,
-    )).rejects.toBeInstanceOf(AgentRunConflictError);
-    await expect(runner.start(
-      CLIENT_ID,
-      { task: 'full_novel', mode: 'draft', prompt: '再写十章', projectId: 'project-a' },
-      undefined,
-    )).rejects.toMatchObject({
-      code: 'CONFLICT',
-      existingJobId: created.id,
-    });
-    expect(store.get(created.id)?.status).toBe('cancelled');
-
-    finish();
     await runner.waitUntilIdle(created.id);
     expect(store.get(created.id)?.status).toBe('cancelled');
+
+    const replacement = await runner.start(
+      CLIENT_ID,
+      { task: 'full_novel', mode: 'draft', prompt: '再写十章', projectId: 'project-a' },
+      undefined,
+    );
+    await runner.waitUntilIdle(replacement.id);
+    expect(store.get(replacement.id)?.status).toBe('completed');
+
+    finishFirst();
+    await Promise.resolve();
+    expect(store.get(created.id)?.status).toBe('cancelled');
+  });
+
+  it('fails a newly reserved job instead of leaving it queued when its first persistence write stalls', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-create-write-timeout-'));
+    const store = await AgentRunStore.create(join(directory, 'runs.json'));
+    const persist = vi.spyOn(
+      store as unknown as { persist: () => Promise<void> },
+      'persist',
+    ).mockImplementation(() => new Promise(() => undefined));
+    const execute = vi.fn();
+    const runner = new AgentJobRunner(store, { run: execute }, {
+      storageWriteTimeoutMs: 20,
+    });
+
+    await expect(runner.start(
+      CLIENT_ID,
+      { task: 'script_series_outline', mode: 'draft', prompt: '', projectId: 'p1' },
+      undefined,
+    )).rejects.toMatchObject({ code: 'RUN_STORAGE_TIMEOUT' });
+
+    expect(persist).toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    expect(store.listForClient(CLIENT_ID, 'p1')).toEqual([
+      expect.objectContaining({
+        status: 'failed',
+        error: expect.objectContaining({ code: 'RUN_STORAGE_TIMEOUT' }),
+      }),
+    ]);
+  });
+
+  it('restores waiting_user instead of leaving a runner-less queued job when resume persistence stalls', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-resume-write-timeout-'));
+    const store = await AgentRunStore.create(join(directory, 'runs.json'));
+    const request = {
+      task: 'script_episode_batch' as const,
+      mode: 'draft' as const,
+      prompt: '',
+      projectId: 'p1',
+      scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 1 },
+    };
+    const stored = await store.create(CLIENT_ID, request);
+    await store.markWaiting(stored.id, {
+      code: 'RUN_INTERRUPTED',
+      message: '后台进程重启，等待继续。',
+    });
+    vi.spyOn(
+      store as unknown as { persist: () => Promise<void> },
+      'persist',
+    ).mockImplementation(() => new Promise(() => undefined));
+    const execute = vi.fn();
+    const runner = new AgentJobRunner(store, { run: execute }, {
+      storageWriteTimeoutMs: 20,
+    });
+
+    await expect(runner.resume(CLIENT_ID, stored.id, undefined))
+      .rejects.toMatchObject({ code: 'RUN_STORAGE_TIMEOUT' });
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(store.get(stored.id)).toMatchObject({
+      status: 'waiting_user',
+      error: { code: 'RUN_STORAGE_TIMEOUT' },
+    });
   });
 });

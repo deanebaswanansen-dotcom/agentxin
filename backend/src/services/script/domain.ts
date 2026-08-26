@@ -315,8 +315,13 @@ export interface ScriptEpisodeContinuityCommit
 export interface ScriptCommitEpisodeWithContinuityInput {
   episode: ScriptEpisode;
   expectedEpisodeRevision: number;
-  /** Review ledger revision observed after the last quality-gate write. */
+  /** Review ledger revision observed before this atomic Episode commit. */
   expectedReviewRevision: number;
+  /** Candidate review findings replaced in the same store mutation as the Episode. */
+  reviewUpdate?: {
+    sources: ScriptReviewSource[];
+    items: ScriptReviewIssue[];
+  };
   continuity: ScriptEpisodeContinuityCommitInput;
   inputRevisionRefs: ScriptInputRevisionRef[];
   upstreamArtifactRefs: ScriptUpstreamArtifactRef[];

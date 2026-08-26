@@ -30,7 +30,6 @@ import {
   InMemoryScriptCheckpointStore,
   ScriptBatchPausedError,
   ScriptDirector,
-  ScriptStructuredNeedsReviewError,
   type ScriptModelAdapter,
 } from './ScriptDirector.js';
 
@@ -108,6 +107,17 @@ class MemoryScriptStore implements ScriptStore {
       if (actualRevision !== reference.revision) {
         throw new ScriptConflictError(reference.revision, actualRevision);
       }
+    }
+    if (input.reviewUpdate) {
+      const replacedSources = new Set(input.reviewUpdate.sources);
+      this.state.reviewIssues = [
+        ...this.state.reviewIssues.filter((item) => (
+          item.episodeNumber !== input.episode.episodeNumber ||
+          !replacedSources.has(item.source)
+        )),
+        ...structuredClone(input.reviewUpdate.items),
+      ];
+      this.state.reviewRevision += 1;
     }
     const updatedAt = '2026-08-15T12:00:00.000Z';
     const episode = {
@@ -580,7 +590,7 @@ describe('ScriptDirector', () => {
     });
   });
 
-  it('routes a structurally incomplete plan through one fixup before saving it', async () => {
+  it('locally completes a structurally incomplete plan without another model call', async () => {
     let calls = 0;
     const director = new ScriptDirector({
       model: {
@@ -606,10 +616,10 @@ describe('ScriptDirector', () => {
         delegatedFields: [], askedFields: [], questionCount: 0,
       },
     })).resolves.toMatchObject({ kind: 'plan_draft' });
-    expect(calls).toBe(2);
+    expect(calls).toBe(1);
   });
 
-  it('returns recoverable needs-review when plan fixup exhausts without fallback', async () => {
+  it('builds an editable plan from confirmed choices when the model returns an empty object', async () => {
     let calls = 0;
     const director = new ScriptDirector({
       model: { async complete() { calls += 1; return '{}'; } },
@@ -628,10 +638,49 @@ describe('ScriptDirector', () => {
         },
         delegatedFields: [], askedFields: [], questionCount: 0,
       },
-    })).rejects.toMatchObject({
-      code: 'SCRIPT_STRUCTURED_NEEDS_REVIEW', recoverable: true, node: 'plan',
+    })).resolves.toMatchObject({
+      kind: 'plan_draft',
+      plan: {
+        projectId: 'project-1',
+        genres: ['校园青春'],
+        totalEpisodes: 10,
+        coreConflict: '调查真相',
+      },
+    });
+    expect(calls).toBe(1);
+  });
+
+  it('falls back to confirmed choices after the fixed plan JSON budget is exhausted', async () => {
+    let calls = 0;
+    const checkpoints = new InMemoryScriptCheckpointStore();
+    const director = new ScriptDirector({
+      model: { async complete() { calls += 1; return '这不是 JSON'; } },
+      store: new MemoryScriptStore(emptyState()),
+      checkpoints,
+    });
+
+    await expect(director.run({
+      task: 'script_plan', projectId: 'project-1', seedPrompt: '雪灾中守住仓库',
+      planningSession: {
+        values: {
+          genres: ['灾难'], coreConflict: '守住救援物资', audience: '大众观众',
+          totalEpisodes: 12, episodeDurationSeconds: { min: 60, max: 90 },
+          targetCharsPerEpisode: 1_000, maxScenesPerEpisode: 3,
+          dialogueDensityPercent: 60, endingDirection: '救援成功',
+        },
+        delegatedFields: [], askedFields: [], questionCount: 0,
+      },
+    })).resolves.toMatchObject({
+      kind: 'plan_draft',
+      plan: { projectId: 'project-1', totalEpisodes: 12, coreConflict: '守住救援物资' },
     });
     expect(calls).toBe(2);
+    await expect(checkpoints.list('project-1', 'script_plan')).resolves.toEqual([
+      expect.objectContaining({
+        status: 'succeeded',
+        validationErrors: [expect.objectContaining({ code: 'script_plan.local_fallback' })],
+      }),
+    ]);
   });
 
   it('does not overwrite a plan edited while the model is generating', async () => {
@@ -775,6 +824,96 @@ describe('ScriptDirector', () => {
     expect(store.state.seriesOutline?.episodeCards.map((card) => card.episodeNumber)).toEqual(
       Array.from({ length: 12 }, (_, index) => index + 1),
     );
+
+    const firstRevision = store.state.seriesOutline?.revision;
+    const callsBeforeRegenerate = chunkStarts.length;
+    const regenerated = await director.run({
+      task: 'script_series_outline',
+      projectId: 'project-1',
+      regenerate: true,
+    });
+    expect(regenerated.kind).toBe('series_outline');
+    expect(chunkStarts.slice(callsBeforeRegenerate)).toEqual([1, 11]);
+    expect(store.state.seriesOutline?.revision).toBe((firstRevision ?? 0) + 1);
+  });
+
+  it('keeps the existing series outline when an explicit regeneration returns no usable structure', async () => {
+    const state = readySingleEpisodeState();
+    const original = structuredClone(state.seriesOutline);
+    const checkpoints = new InMemoryScriptCheckpointStore();
+    const director = new ScriptDirector({
+      model: { complete: async () => '这次没有返回可解析的大纲' },
+      store: new MemoryScriptStore(state),
+      checkpoints,
+    });
+
+    await expect(director.run({
+      task: 'script_series_outline',
+      projectId: 'project-1',
+      regenerate: true,
+    })).rejects.toMatchObject({ code: 'SCRIPT_STRUCTURED_NEEDS_REVIEW' });
+
+    expect(state.seriesOutline).toEqual(original);
+    expect(await checkpoints.list('project-1', 'script_series_outline')).toEqual(
+      expect.arrayContaining([expect.objectContaining({
+        node: 'series_outline',
+        status: 'needs_review',
+        validationErrors: [expect.objectContaining({ code: 'series_outline.regenerate_failed' })],
+      })]),
+    );
+  });
+
+  it('reuses completed outline chunks when the same regeneration run retries', async () => {
+    const state = readySingleEpisodeState();
+    state.plan = approvedPlan(12);
+    state.seriesOutline = {
+      ...state.seriesOutline!,
+      episodeCards: Array.from({ length: 12 }, (_, index) => ({
+        episodeNumber: index + 1,
+        title: `旧第${index + 1}集`,
+        logline: '旧剧情。',
+        mainEvent: '旧事件。',
+        endingHook: '旧卡点。',
+      })),
+    };
+    const starts: number[] = [];
+    let failSecondChunk = true;
+    const director = new ScriptDirector({
+      model: {
+        async complete(request) {
+          const start = request.chunkStart ?? 1;
+          const end = request.chunkEnd ?? start;
+          starts.push(start);
+          if (start === 11 && failSecondChunk) {
+            failSecondChunk = false;
+            throw new Error('provider disconnected');
+          }
+          return JSON.stringify({
+            synopsis: '新总纲。', openingState: '新开局。', midpointTurn: '新中点。',
+            climax: '新高潮。', endingState: '新结局。', mainArc: ['新主线'], subplotArcs: [],
+            episodeCards: Array.from({ length: end - start + 1 }, (_, index) => ({
+              episodeNumber: start + index,
+              title: `新第${start + index}集`,
+              logline: '新剧情。', mainEvent: '新事件。', endingHook: '新卡点。',
+            })),
+          });
+        },
+      },
+      store: new MemoryScriptStore(state),
+      checkpoints: new InMemoryScriptCheckpointStore(),
+    });
+    const request = {
+      task: 'script_series_outline' as const,
+      projectId: 'project-1',
+      regenerate: true,
+      regenerationRunId: 'outline-rewrite-1',
+    };
+
+    await expect(director.run(request)).rejects.toThrow('已完整保留原大纲');
+    expect(state.seriesOutline?.episodeCards[0]?.title).toBe('旧第1集');
+    await expect(director.run(request)).resolves.toMatchObject({ kind: 'series_outline' });
+    expect(starts).toEqual([1, 11, 11]);
+    expect(state.seriesOutline?.episodeCards[0]?.title).toBe('新第1集');
   });
 
   it('generates and saves character and world bibles as independent structured artifacts', async () => {
@@ -861,9 +1000,135 @@ describe('ScriptDirector', () => {
     expect(nodes).toEqual(['character_bible', 'world_bible']);
     expect(store.state.characters[0]).toMatchObject({ name: '沈清', defaultOutfit: '白衬衫与黑色长裤' });
     expect(store.state.worldBible).toMatchObject({ era: '2026年', communication: ['手机'] });
+
+    const regenerated = await director.run({ task: 'script_bible', projectId: 'project-1', regenerate: true });
+    expect(regenerated.kind).toBe('bible');
+    expect(nodes).toEqual(['character_bible', 'world_bible', 'character_bible', 'world_bible']);
   });
 
-  it('fixes only a missing hairstyle before saving the character bible', async () => {
+  it('keeps existing character ids stable during bible regeneration', async () => {
+    const state = readySingleEpisodeState();
+    const existing = state.characters[0]!;
+    const director = new ScriptDirector({
+      model: {
+        async complete(request) {
+          if (request.node === 'character_bible') {
+            return JSON.stringify({
+              characters: [{ ...existing, id: 'replacement-lead', appearance: '更新后的利落形象' }],
+            });
+          }
+          if (request.node === 'world_bible') {
+            return JSON.stringify({ ...state.worldBible, era: '2027年' });
+          }
+          throw new Error('unexpected node');
+        },
+      },
+      store: new MemoryScriptStore(state),
+      checkpoints: new InMemoryScriptCheckpointStore(),
+    });
+
+    await director.run({ task: 'script_bible', projectId: 'project-1', regenerate: true });
+
+    expect(state.characters).toEqual([
+      expect.objectContaining({ id: 'lead', name: '沈清', appearance: '更新后的利落形象' }),
+    ]);
+    expect(state.episodeOutlines[0]?.characterIds).toEqual(['lead']);
+  });
+
+  it('keeps an old card and gives a genuinely new regenerated character its own id', async () => {
+    const state = readySingleEpisodeState();
+    const existing = structuredClone(state.characters[0]!);
+    const replacement = {
+      ...existing,
+      id: 'new-lead',
+      name: '李然',
+      aliases: ['小李'],
+      biography: '新加入调查组的记者。',
+      relationships: [],
+    };
+    const director = new ScriptDirector({
+      model: {
+        async complete(request) {
+          if (request.node === 'character_bible') {
+            return JSON.stringify({ characters: [replacement] });
+          }
+          if (request.node === 'world_bible') return JSON.stringify(state.worldBible);
+          throw new Error('unexpected node');
+        },
+      },
+      store: new MemoryScriptStore(state),
+      checkpoints: new InMemoryScriptCheckpointStore(),
+    });
+
+    await director.run({ task: 'script_bible', projectId: 'project-1', regenerate: true });
+
+    expect(state.characters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'new-lead', name: '李然' }),
+      expect.objectContaining({ id: 'lead', name: '沈清' }),
+    ]));
+    expect(state.characters).not.toContainEqual(expect.objectContaining({ id: 'lead', name: '李然' }));
+    expect(state.episodeOutlines[0]?.characterIds).toEqual(['lead']);
+  });
+
+  it('rolls back the successful half when combined bible regeneration fails', async () => {
+    const state = readySingleEpisodeState();
+    const originalCharacters = structuredClone(state.characters);
+    const originalWorld = structuredClone(state.worldBible);
+    const director = new ScriptDirector({
+      model: {
+        async complete(request) {
+          if (request.node === 'character_bible') {
+            return JSON.stringify({
+              characters: [{ ...state.characters[0]!, biography: '不应留下的半成品人物小传' }],
+            });
+          }
+          return '世界设定无法解析';
+        },
+      },
+      store: new MemoryScriptStore(state),
+      checkpoints: new InMemoryScriptCheckpointStore(),
+    });
+
+    await expect(director.run({
+      task: 'script_bible', projectId: 'project-1', regenerate: true,
+    })).rejects.toMatchObject({ code: 'SCRIPT_STRUCTURED_NEEDS_REVIEW' });
+
+    expect(state.characters).toEqual(originalCharacters);
+    expect(state.worldBible).toEqual(originalWorld);
+  });
+
+  it('reports an explicit error when a combined bible rollback cannot be persisted', async () => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    const saveCharacters = store.saveCharacters.bind(store);
+    let saveCharacterCalls = 0;
+    store.saveCharacters = async (...args) => {
+      saveCharacterCalls += 1;
+      if (saveCharacterCalls === 2) throw new Error('rollback disk failure');
+      return saveCharacters(...args);
+    };
+    const director = new ScriptDirector({
+      model: {
+        async complete(request) {
+          if (request.node === 'character_bible') {
+            return JSON.stringify({
+              characters: [{ ...state.characters[0]!, biography: '已经写入的新人物小传' }],
+            });
+          }
+          return '世界设定无法解析';
+        },
+      },
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+    });
+
+    await expect(director.run({
+      task: 'script_bible', projectId: 'project-1', regenerate: true,
+    })).rejects.toThrow('人物与世界重新生成失败，且恢复旧设定时写入失败：rollback disk failure');
+    expect(saveCharacterCalls).toBe(2);
+  });
+
+  it('locally supplies a missing hairstyle before saving the character bible', async () => {
     const state = readySingleEpisodeState();
     const [completeCharacter] = state.characters;
     if (!completeCharacter) throw new Error('fixture character missing');
@@ -891,12 +1156,11 @@ describe('ScriptDirector', () => {
     const result = await director.run({ task: 'script_bible', projectId: 'project-1' });
 
     expect(result.kind).toBe('bible');
-    expect(prompts).toHaveLength(2);
-    expect(prompts[1]).toContain('path=$.characters[0].hairstyle');
-    expect(store.state.characters[0]?.hairstyle).toBe('齐肩短发');
+    expect(prompts).toHaveLength(1);
+    expect(store.state.characters[0]?.hairstyle).toBe('符合人物身份的日常发型');
   });
 
-  it('maps an exhausted structured node without fallback to a recoverable review error', async () => {
+  it('creates a minimal editable cast when the model returns an empty cast', async () => {
     const state = readySingleEpisodeState();
     state.characters = [];
     let calls = 0;
@@ -914,16 +1178,50 @@ describe('ScriptDirector', () => {
 
     const generation = director.run({ task: 'script_bible', projectId: 'project-1' });
 
-    await expect(generation).rejects.toMatchObject({
-      code: 'SCRIPT_STRUCTURED_NEEDS_REVIEW',
-      recoverable: true,
-      node: 'character_bible',
-    });
-    await expect(generation).rejects.toBeInstanceOf(ScriptStructuredNeedsReviewError);
-    expect(calls).toBe(2);
+    await expect(generation).resolves.toMatchObject({ kind: 'bible' });
+    expect(calls).toBe(1);
   });
 
-  it('still completes and checkpoints the world bible when the character bible needs review', async () => {
+  it('finishes both bibles locally when neither response contains JSON', async () => {
+    const state = readySingleEpisodeState();
+    state.characters = [];
+    state.worldBible = undefined;
+    const calls: string[] = [];
+    const checkpoints = new InMemoryScriptCheckpointStore();
+    const director = new ScriptDirector({
+      model: {
+        async complete(request) {
+          calls.push(request.node);
+          return '没有结构化内容';
+        },
+      },
+      store: new MemoryScriptStore(state),
+      checkpoints,
+    });
+
+    await expect(director.run({ task: 'script_bible', projectId: 'project-1' }))
+      .resolves.toMatchObject({
+        kind: 'bible',
+        characters: expect.arrayContaining([expect.objectContaining({ projectId: 'project-1' })]),
+        worldBible: expect.objectContaining({ projectId: 'project-1' }),
+      });
+    expect(calls.filter((node) => node === 'character_bible')).toHaveLength(2);
+    expect(calls.filter((node) => node === 'world_bible')).toHaveLength(2);
+    await expect(checkpoints.list('project-1', 'script_bible')).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          node: 'character_bible', status: 'succeeded',
+          validationErrors: [expect.objectContaining({ code: 'character_bible.local_fallback' })],
+        }),
+        expect.objectContaining({
+          node: 'world_bible', status: 'succeeded',
+          validationErrors: [expect.objectContaining({ code: 'world_bible.local_fallback' })],
+        }),
+      ]),
+    );
+  });
+
+  it('locally completes a partial character while also checkpointing the world bible', async () => {
     const state = readySingleEpisodeState();
     const [base] = state.characters;
     if (!base) throw new Error('fixture character missing');
@@ -956,27 +1254,20 @@ describe('ScriptDirector', () => {
     });
 
     await expect(director.run({ task: 'script_bible', projectId: 'project-1' }))
-      .rejects.toBeInstanceOf(ScriptStructuredNeedsReviewError);
+      .resolves.toMatchObject({ kind: 'bible' });
 
-    expect(calls.filter((node) => node === 'character_bible')).toHaveLength(2);
+    expect(calls.filter((node) => node === 'character_bible')).toHaveLength(1);
     expect(calls.filter((node) => node === 'world_bible')).toHaveLength(1);
     expect(store.state.worldBible).toMatchObject({ era: '2026年' });
     await expect(checkpoints.list('project-1', 'script_bible')).resolves.toEqual(
       expect.arrayContaining([
-        expect.objectContaining({
-          node: 'character_bible',
-          status: 'needs_review',
-          artifact: expect.objectContaining({
-            validCharacters: [expect.objectContaining({ id: 'lead', name: '沈清' })],
-            failedCharacterIndexes: [1],
-          }),
-        }),
+        expect.objectContaining({ node: 'character_bible', status: 'succeeded' }),
         expect.objectContaining({ node: 'world_bible', status: 'succeeded' }),
       ]),
     );
   });
 
-  it('uses one bounded character workflow and ignores rewrites of already-valid characters', async () => {
+  it('uses one model call and locally completes all character candidates', async () => {
     const state = readySingleEpisodeState();
     const [base] = state.characters;
     if (!base) throw new Error('fixture character missing');
@@ -1016,12 +1307,12 @@ describe('ScriptDirector', () => {
 
     await expect(director.run({ task: 'script_bible', projectId: 'project-1' }))
       .resolves.toMatchObject({ kind: 'bible' });
-    expect(calls).toBe(2);
+    expect(calls).toBe(1);
     expect(store.state.characters.map((character) => character.name)).toEqual(['沈清', '证人']);
-    expect(store.state.characters[1]?.hairstyle).toBe('齐肩短发');
+    expect(store.state.characters[1]?.hairstyle).toBe('符合人物身份的日常发型');
   });
 
-  it('caps character generation at primary, targeted fixup, and one configured fallback', async () => {
+  it('does not spend configured fallback calls on an empty character array', async () => {
     const state = readySingleEpisodeState();
     const [base] = state.characters;
     if (!base) throw new Error('fixture character missing');
@@ -1047,10 +1338,10 @@ describe('ScriptDirector', () => {
 
     await expect(director.run({ task: 'script_bible', projectId: 'project-1' }))
       .resolves.toMatchObject({ kind: 'bible' });
-    expect(calls).toBe(3);
+    expect(calls).toBe(1);
   });
 
-  it('regenerates a rejected character candidate against the latest plan on explicit resume', async () => {
+  it('demotes surplus primary characters instead of pausing for manual review', async () => {
     const state = readySingleEpisodeState();
     const [base] = state.characters;
     if (!base || !state.plan) throw new Error('fixture character or plan missing');
@@ -1082,9 +1373,9 @@ describe('ScriptDirector', () => {
     });
 
     await expect(director.run({ task: 'script_bible', projectId: 'project-1' }))
-      .rejects.toBeInstanceOf(ScriptStructuredNeedsReviewError);
-    expect(characterCalls).toBe(2);
-    expect(store.state.characters).toEqual([]);
+      .resolves.toMatchObject({ kind: 'bible' });
+    expect(characterCalls).toBe(1);
+    expect(store.state.characters[4]?.role).toBe('minor');
 
     store.state.plan = {
       ...store.state.plan!,
@@ -1097,22 +1388,15 @@ describe('ScriptDirector', () => {
       resumeRejectedCandidates: true,
     })).resolves.toMatchObject({ kind: 'bible' });
 
-    expect(characterCalls).toBe(3);
+    expect(characterCalls).toBe(1);
     expect(store.state.characters).toHaveLength(5);
     const history = await checkpoints.list('project-1', 'script_bible');
     expect(history.filter((checkpoint) => checkpoint.node === 'character_bible'))
-      .toEqual(expect.arrayContaining([
-        expect.objectContaining({ status: 'stale', artifactRevision: 0 }),
-        expect.objectContaining({ status: 'succeeded', artifactRevision: 1 }),
-      ]));
-    const fingerprints = history
-      .filter((checkpoint) => checkpoint.node === 'character_bible')
-      .map((checkpoint) => checkpoint.inputFingerprint);
-    expect(new Set(fingerprints).size).toBe(2);
+      .toEqual([expect.objectContaining({ status: 'succeeded', artifactRevision: 0 })]);
   });
 
   it.each(['issues', 'newFacts', 'openedThreads', 'closedThreads', 'wardrobe'] as const)(
-    'requires review.%s explicitly and repairs the missing array before committing',
+    'defaults missing review.%s locally without a repair call',
     async (missingField) => {
       const state = readySingleEpisodeState();
       let reviewCalls = 0;
@@ -1154,11 +1438,11 @@ describe('ScriptDirector', () => {
         task: 'script_episode_batch', projectId: 'project-1',
         startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
       })).resolves.toMatchObject({ kind: 'episode_batch' });
-      expect(reviewCalls).toBe(2);
+      expect(reviewCalls).toBe(1);
     },
   );
 
-  it('fixes a missing review summary and otherwise keeps the episode flow unchanged', async () => {
+  it('uses the confirmed outline goal when review summary is missing', async () => {
     const state = readySingleEpisodeState();
     const reviewPrompts: string[] = [];
     const model: ScriptModelAdapter = {
@@ -1211,9 +1495,8 @@ describe('ScriptDirector', () => {
     });
 
     expect(result.kind).toBe('episode_batch');
-    expect(reviewPrompts).toHaveLength(2);
-    expect(reviewPrompts[1]).toContain('path=$.summary');
-    expect(store.state.episodes[0]?.summary).toBe('沈清完成录音证据核验。');
+    expect(reviewPrompts).toHaveLength(1);
+    expect(store.state.episodes[0]?.summary).toBe(store.state.episodeOutlines[0]?.goal);
   });
 
   it('generates a resumable episode batch and skips completed episodes on a second run', async () => {
@@ -1435,7 +1718,7 @@ describe('ScriptDirector', () => {
       task: 'script_episode_batch', projectId: 'project-1',
       startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
     })).resolves.toMatchObject({ kind: 'episode_batch' });
-    expect(scenePlanCalls).toBe(2);
+    expect(scenePlanCalls).toBe(1);
     expect(store.state.episodeOutlines[0]?.plannedScenes.map((scene) => scene.ordinal))
       .toEqual([1]);
   });
@@ -2224,7 +2507,7 @@ describe('ScriptDirector', () => {
     expect(store.state.episodes[0]?.scenes.flatMap((scene) => scene.blocks))
       .toHaveLength(2);
   });
-  it('uses a bounded fixup when the first revision leaves a speaker outside the scene', async () => {
+  it('keeps a missing scene-cast entry advisory without spending revision calls', async () => {
     const state = readySingleEpisodeState();
     state.characters.push({
       ...structuredClone(state.characters[0]!),
@@ -2292,14 +2575,13 @@ describe('ScriptDirector', () => {
       expectedPlanRevision: state.plan!.revision,
     })).resolves.toMatchObject({ kind: 'episode_batch' });
 
-    expect({ revisionCalls, reviewCalls }).toEqual({ revisionCalls: 2, reviewCalls: 2 });
-    expect(revisionPrompts[1]).toContain('array.non_empty');
-    expect(revisionPrompts[1]).toContain('SPEAKER_NOT_IN_SCENE');
-    expect(store.state.episodes[0]?.scenes[0]?.characterIds).toEqual(['lead', 'witness']);
+    expect({ revisionCalls, reviewCalls }).toEqual({ revisionCalls: 0, reviewCalls: 1 });
+    expect(revisionPrompts).toEqual([]);
+    expect(store.state.episodes[0]?.scenes[0]?.characterIds).toEqual(['lead']);
     expect(store.state.episodes[0]?.status).toBe('completed');
   });
 
-  it('revises an obvious structural error and completes after the follow-up review', async () => {
+  it('keeps wrapper pollution advisory and completes without a revision', async () => {
     const state = readySingleEpisodeState();
     const candidate = reviewingEpisode(state, '△沈清闯进校报社。');
     state.episodes = [candidate];
@@ -2348,10 +2630,10 @@ describe('ScriptDirector', () => {
     });
 
     expect(result).toMatchObject({ kind: 'episode_batch' });
-    expect({ reviewCalls, revisionCalls }).toEqual({ reviewCalls: 2, revisionCalls: 1 });
+    expect({ reviewCalls, revisionCalls }).toEqual({ reviewCalls: 1, revisionCalls: 0 });
     expect(store.state.episodes[0]?.status).toBe('completed');
     expect(store.state.episodes[0]?.scenes[0]?.blocks[0]?.text)
-      .toBe('沈清推门闯进校报社，把录音笔按在桌面上。');
+      .toBe('△沈清闯进校报社。');
     expect(store.saveEpisodeCalls).toHaveLength(0);
     expect(store.atomicCommitCalls).toHaveLength(1);
   });
@@ -2460,7 +2742,7 @@ describe('ScriptDirector', () => {
     expect(store.state.episodes[0]?.summary).toContain('证据核验');
   });
 
-  it('rejects an otherwise authorized non-TOO_LONG patch that shrinks the candidate', async () => {
+  it('does not enter revision for advisory wrapper pollution', async () => {
     const state = readySingleEpisodeState();
     const official: ScriptEpisode = {
       id: 'official-episode-1',
@@ -2553,23 +2835,14 @@ describe('ScriptDirector', () => {
       startEpisode: 1,
       episodeCount: 1,
       expectedPlanRevision: 1,
-    })).rejects.toMatchObject({ code: 'SCRIPT_BATCH_NEEDS_REVIEW', recoverable: true });
-    expect(store.state.episodes.find((episode) => episode.id === official.id)).toEqual(official);
-    expect(store.atomicCommitCalls).toHaveLength(0);
+    })).resolves.toMatchObject({ kind: 'episode_batch' });
+    expect(store.state.episodes[0]?.status).toBe('completed');
+    expect(store.atomicCommitCalls).toHaveLength(1);
     const history = await checkpoints.list('project-1', 'script_episode_batch:1:1');
-    expect(history).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        node: 'revision',
-        status: 'needs_review',
-        validationErrors: [expect.objectContaining({
-          code: 'revision.length',
-          message: expect.stringContaining('无权缩短'),
-        })],
-      }),
-    ]));
+    expect(history.some((checkpoint) => checkpoint.node === 'revision')).toBe(false);
   });
 
-  it('keeps the formal episode unchanged when an obvious-bug revision remains invalid', async () => {
+  it('commits usable content without invoking an invalid advisory revision', async () => {
     const state = readySingleEpisodeState();
     const candidate = reviewingEpisode(state, '△沈清冲进校报社。');
     state.episodes = [structuredClone(candidate)];
@@ -2612,15 +2885,11 @@ describe('ScriptDirector', () => {
       startEpisode: 1,
       episodeCount: 1,
       expectedPlanRevision: state.plan!.revision,
-    })).rejects.toMatchObject({
-      code: 'SCRIPT_BATCH_NEEDS_REVIEW',
-      recoverable: true,
-    });
+    })).resolves.toMatchObject({ kind: 'episode_batch' });
 
-    expect(revisionCalls).toBe(2);
-    expect(store.state.episodes).toEqual([candidate]);
-    expect(store.state.continuityCommits ?? []).toEqual([]);
-    expect(store.atomicCommitCalls).toHaveLength(0);
+    expect(revisionCalls).toBe(0);
+    expect(store.state.episodes[0]?.status).toBe('completed');
+    expect(store.atomicCommitCalls).toHaveLength(1);
   });
   it('does not bypass a retained user-authored open hard issue when the director saves completed', async () => {
     const state = readySingleEpisodeState();
@@ -2765,6 +3034,172 @@ describe('ScriptDirector', () => {
     },
   );
 
+  it('preserves the completed episode and review ledger when an explicit rewrite returns no body', async () => {
+    const state = readySingleEpisodeState();
+    const oldEpisode: ScriptEpisode = {
+      ...reviewingEpisode(state, '这是必须保留的旧正文。'.repeat(20), { revision: 3 }),
+      status: 'completed',
+      summary: '旧稿摘要',
+    };
+    state.episodes = [oldEpisode];
+    state.reviewRevision = 1;
+    state.reviewIssues = [{
+      id: 'old-review-1',
+      projectId: 'project-1',
+      episodeNumber: 1,
+      code: 'OLD_NOTE',
+      severity: 'soft',
+      category: 'continuity',
+      message: '旧稿上的人工备注。',
+      status: 'open',
+      source: 'user',
+      createdAt: state.updatedAt,
+      updatedAt: state.updatedAt,
+    }];
+    const originalEpisode = structuredClone(oldEpisode);
+    const originalIssues = structuredClone(state.reviewIssues);
+    const director = new ScriptDirector({
+      model: { complete: async () => '' },
+      store: new MemoryScriptStore(state),
+      checkpoints: new InMemoryScriptCheckpointStore(),
+    });
+
+    await expect(director.run({
+      task: 'script_episode_batch',
+      projectId: 'project-1',
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+      regenerate: true,
+    })).rejects.toMatchObject({ code: 'SCRIPT_MODEL_OUTPUT_INVALID' });
+
+    expect(state.episodes).toEqual([originalEpisode]);
+    expect(state.reviewRevision).toBe(1);
+    expect(state.reviewIssues).toEqual(originalIssues);
+  });
+
+  it('uses the current series card instead of an old detailed outline for an explicit rewrite', async () => {
+    const state = readySingleEpisodeState();
+    state.episodeOutlines[0] = {
+      ...state.episodeOutlines[0]!,
+      goal: '旧详细大纲目标：寻找旧账本',
+      conflict: '旧详细大纲冲突：保安锁门',
+      beats: ['旧详细大纲节拍'],
+      endingHook: '旧详细大纲钩子',
+    };
+    state.seriesOutline = {
+      ...state.seriesOutline!,
+      revision: 2,
+      episodeCards: [{
+        episodeNumber: 1,
+        title: '新总纲第一集',
+        logline: '新总纲目标：追查直播证据',
+        mainEvent: '新总纲事件：证人在直播前交出手机',
+        endingHook: '新总纲钩子：手机自动播放录音',
+      }],
+    };
+    state.episodes = [{
+      ...reviewingEpisode(state, '旧正文必须在新稿成功前保留。'.repeat(20), { revision: 3 }),
+      status: 'completed',
+      summary: '旧稿摘要',
+    }];
+    const draftPrompts: string[] = [];
+    const director = new ScriptDirector({
+      model: {
+        async complete(request) {
+          if (request.node === 'draft') {
+            draftPrompts.push(request.prompt);
+            return directScriptText();
+          }
+          if (request.node === 'review') return directReviewJson();
+          throw new Error(`unexpected node: ${request.node}`);
+        },
+      },
+      store: new MemoryScriptStore(state),
+      checkpoints: new InMemoryScriptCheckpointStore(),
+    });
+
+    await director.run({
+      task: 'script_episode_batch',
+      projectId: 'project-1',
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+      regenerate: true,
+    });
+
+    expect(draftPrompts).toHaveLength(1);
+    expect(draftPrompts[0]).toContain('新总纲事件：证人在直播前交出手机');
+    expect(draftPrompts[0]).toContain('新总纲钩子：手机自动播放录音');
+    expect(draftPrompts[0]).not.toContain('旧详细大纲目标：寻找旧账本');
+    expect(draftPrompts[0]).not.toContain('旧详细大纲冲突：保安锁门');
+  });
+
+  it('does not replace the review ledger when the episode CAS fails', async () => {
+    const state = readySingleEpisodeState();
+    const oldEpisode: ScriptEpisode = {
+      ...reviewingEpisode(state, '这是并发冲突时必须保留的旧正文。'.repeat(20), { revision: 3 }),
+      status: 'completed',
+      summary: '并发前旧稿摘要',
+    };
+    state.episodes = [oldEpisode];
+    state.reviewRevision = 1;
+    state.reviewIssues = [{
+      id: 'old-ai-review-1',
+      projectId: 'project-1',
+      episodeNumber: 1,
+      code: 'OLD_AI_NOTE',
+      severity: 'soft',
+      category: 'continuity',
+      message: '旧稿的 AI 审查记录。',
+      status: 'open',
+      source: 'ai',
+      createdAt: state.updatedAt,
+      updatedAt: state.updatedAt,
+    }];
+    const originalIssues = structuredClone(state.reviewIssues);
+    class ConflictBeforeCommitStore extends MemoryScriptStore {
+      override async commitEpisodeWithContinuity(
+        input: ScriptCommitEpisodeWithContinuityInput,
+      ): Promise<ScriptCommitEpisodeWithContinuityResult> {
+        const current = this.state.episodes.find(
+          (episode) => episode.episodeNumber === input.episode.episodeNumber,
+        );
+        if (current) current.revision += 1;
+        return super.commitEpisodeWithContinuity(input);
+      }
+    }
+    const store = new ConflictBeforeCommitStore(state);
+    const director = new ScriptDirector({
+      model: {
+        async complete(request) {
+          return request.node === 'review' ? directReviewJson() : directScriptText();
+        },
+      },
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+    });
+
+    await expect(director.run({
+      task: 'script_episode_batch',
+      projectId: 'project-1',
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+      regenerate: true,
+    })).rejects.toBeInstanceOf(ScriptConflictError);
+
+    expect(state.reviewRevision).toBe(1);
+    expect(state.reviewIssues).toEqual(originalIssues);
+    expect(state.episodes[0]).toMatchObject({
+      summary: '并发前旧稿摘要',
+      scenes: oldEpisode.scenes,
+    });
+  });
+
   it('writes directly from the existing episode card without generating a detailed outline', async () => {
     const state = readySingleEpisodeState();
     state.episodeOutlines = [];
@@ -2895,49 +3330,13 @@ describe('ScriptDirector', () => {
       expectedPlanRevision: 1,
       draftMode: 'direct_text' as const,
     };
-    await expect(director.run(request)).rejects.toThrow('没有返回可识别的剧本场景');
-
-    const rejected = (await checkpoints.list('project-1', 'script_episode_batch:1:1'))
-      .find((checkpoint) => checkpoint.node === 'direct_draft');
-    expect(rejected).toMatchObject({
-      status: 'needs_review',
-      attempt: 2,
-      artifactRevision: 0,
-      artifact: { stage: 'direct_draft_rejected', recoveryAttempt: 0 },
-    });
-    await expect(director.run(request)).rejects.toThrow('请从检查点继续');
+    await expect(director.run(request)).resolves.toMatchObject({ kind: 'episode_batch' });
     expect(draftCalls).toBe(2);
-
-    await expect(director.run({
-      ...request,
-      resumeRejectedCandidates: true,
-    })).rejects.toThrow('没有返回可识别的剧本场景');
-    expect(draftCalls).toBe(4);
-    expect(draftPrompts[2]).toContain('显式恢复重写（第 1 次）');
-    expect(draftPrompts[2]).toContain('第1集\n1-1 地点 日/内\n人物：角色名');
-    expect(draftPrompts[3]).toContain('恢复排版（第 1 次）');
-    expect(draftPrompts[3]).toContain('第1集\n1-1 地点 夜/内');
-
-    const firstRecoveryRejected = (await checkpoints.list(
-      'project-1',
-      'script_episode_batch:1:1',
-    )).find((checkpoint) => checkpoint.node === 'direct_draft' && checkpoint.artifactRevision === 1);
-    expect(firstRecoveryRejected).toMatchObject({
-      status: 'needs_review',
-      artifact: { stage: 'direct_draft_rejected', recoveryAttempt: 1 },
-    });
-
-    const result = await director.run({ ...request, resumeRejectedCandidates: true });
-
-    expect(result.kind).toBe('episode_batch');
-    expect(draftCalls).toBe(5);
-    expect(draftPrompts[4]).toContain('显式恢复重写（第 2 次）');
-    expect(new Set([draftPrompts[0], draftPrompts[2], draftPrompts[4]])).toHaveLength(3);
     expect(store.atomicCommitCalls).toHaveLength(1);
     const directDraftHistory = await checkpoints.list('project-1', 'script_episode_batch:1:1');
     expect(directDraftHistory).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        node: 'direct_draft', status: 'succeeded', artifactRevision: 2,
+        node: 'direct_draft', status: 'succeeded', artifactRevision: 0,
       }),
     ]));
   });
@@ -2972,26 +3371,10 @@ describe('ScriptDirector', () => {
       draftMode: 'direct_text',
       resumeRejectedCandidates: true,
     } as const;
-    await expect(director.run(request)).rejects.toThrow('没有返回可识别的剧本场景');
-
-    const legacyRecoveryRejected = (await checkpoints.list(
-      'project-1',
-      'script_episode_batch:1:1',
-    )).find((checkpoint) => checkpoint.node === 'direct_draft');
-    expect(legacyRecoveryRejected).toMatchObject({
-      status: 'needs_review',
-      artifactRevision: 0,
-      artifact: { stage: 'direct_draft_rejected', recoveryAttempt: 1 },
-    });
-
-    const result = await director.run(request);
-
-    expect(result.kind).toBe('episode_batch');
-    expect(prompts).toHaveLength(3);
+    await expect(director.run(request)).resolves.toMatchObject({ kind: 'episode_batch' });
+    expect(prompts).toHaveLength(2);
     expect(prompts[0]).toContain('显式恢复重写（第 1 次）');
-    expect(prompts[1]).toContain('恢复排版（第 1 次）');
-    expect(prompts[2]).toContain('显式恢复重写（第 2 次）');
-    expect(new Set(prompts)).toHaveLength(3);
+    expect(new Set(prompts)).toHaveLength(2);
   });
 
   it('advances recovery for a rejected checkpoint written before recovery metadata existed', async () => {
@@ -3015,42 +3398,51 @@ describe('ScriptDirector', () => {
         async getModelConfigFingerprint() { return 'direct-model-v1'; },
       },
     });
-    await expect(seedDirector.run(request)).rejects.toThrow('没有返回可识别的剧本场景');
+    await expect(seedDirector.run(request)).resolves.toMatchObject({ kind: 'episode_batch' });
+    const seededHistory = await seededCheckpoints.list('project-1', 'script_episode_batch:1:1');
+    expect(seededHistory).toEqual(expect.arrayContaining([
+      expect.objectContaining({ node: 'direct_draft', status: 'succeeded' }),
+    ]));
+  });
 
-    const seededHistory = await seededCheckpoints.list(
-      'project-1',
-      'script_episode_batch:1:1',
-    );
-    const seededRejected = seededHistory.find((checkpoint) => checkpoint.node === 'direct_draft');
-    expect(seededRejected).toBeDefined();
-    const legacyArtifact = structuredClone(seededRejected!.artifact) as Record<string, unknown>;
-    delete legacyArtifact.recoveryAttempt;
-    const legacyCheckpoints = new InMemoryScriptCheckpointStore();
-    for (const checkpoint of seededHistory) {
-      await legacyCheckpoints.save(checkpoint === seededRejected
-        ? { ...checkpoint, artifact: legacyArtifact }
-        : checkpoint);
-    }
-
-    const prompts: string[] = [];
+  it('finishes with a local editable draft and handoff when draft and review calls fail', async () => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    const checkpoints = new InMemoryScriptCheckpointStore();
     const director = new ScriptDirector({
       store,
-      checkpoints: legacyCheckpoints,
+      checkpoints,
       model: {
-        async complete(modelRequest) {
-          if (modelRequest.node === 'review') return directReviewJson();
-          prompts.push(modelRequest.prompt);
-          return directScriptText();
+        async complete(request) {
+          throw new Error(`${request.node} provider timeout`);
         },
         async getModelConfigFingerprint() { return 'direct-model-v1'; },
       },
     });
 
-    const result = await director.run(request);
+    await expect(director.run({
+      task: 'script_episode_batch',
+      projectId: 'project-1',
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    })).resolves.toMatchObject({ kind: 'episode_batch' });
 
-    expect(result.kind).toBe('episode_batch');
-    expect(prompts).toHaveLength(1);
-    expect(prompts[0]).toContain('显式恢复重写（第 2 次）');
+    expect(store.state.episodes[0]).toMatchObject({
+      episodeNumber: 1,
+      status: 'completed',
+      scenes: [expect.objectContaining({ blocks: expect.arrayContaining([
+        expect.objectContaining({ type: 'action' }),
+      ]) })],
+    });
+    expect(store.atomicCommitCalls).toHaveLength(1);
+    expect(await checkpoints.list('project-1', 'script_episode_batch:1:1'))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ node: 'direct_draft', status: 'succeeded' }),
+        expect.objectContaining({ node: 'handoff_review', status: 'succeeded' }),
+        expect.objectContaining({ node: 'completed', status: 'succeeded' }),
+      ]));
   });
 
   it('writes a five-episode direct-text batch in order with ten model calls and a continuity chain', async () => {
@@ -3183,7 +3575,7 @@ describe('ScriptDirector', () => {
     expect(store.atomicCommitCalls).toHaveLength(1);
   });
 
-  it('pauses instead of committing when the rewritten episode still has an obvious major error', async () => {
+  it('records a remaining post-rewrite issue as advisory and still commits', async () => {
     const state = readySingleEpisodeState();
     const store = new MemoryScriptStore(state);
     const calls: string[] = [];
@@ -3217,14 +3609,14 @@ describe('ScriptDirector', () => {
       task: 'script_episode_batch', projectId: 'project-1',
       startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
       draftMode: 'direct_text',
-    })).rejects.toBeInstanceOf(ScriptBatchPausedError);
+    })).resolves.toMatchObject({ kind: 'episode_batch' });
 
     expect(calls).toEqual(['draft', 'review', 'revision', 'review']);
-    expect(store.atomicCommitCalls).toHaveLength(0);
-    expect(store.state.episodes).toHaveLength(0);
+    expect(store.atomicCommitCalls).toHaveLength(1);
+    expect(store.state.episodes[0]?.status).toBe('completed');
   });
 
-  it('regenerates only the rejected direct rewrite when explicitly resumed', async () => {
+  it('keeps a still-imperfect rewrite editable without a rejected-resume loop', async () => {
     const state = readySingleEpisodeState();
     const store = new MemoryScriptStore(state);
     const checkpoints = new InMemoryScriptCheckpointStore();
@@ -3273,26 +3665,18 @@ describe('ScriptDirector', () => {
       },
     });
 
-    await expect(director.run({
-      task: 'script_episode_batch', projectId: 'project-1',
-      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
-      draftMode: 'direct_text',
-    })).rejects.toBeInstanceOf(ScriptBatchPausedError);
-
     const result = await director.run({
       task: 'script_episode_batch', projectId: 'project-1',
       startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
-      draftMode: 'direct_text', resumeRejectedCandidates: true,
+      draftMode: 'direct_text',
     });
 
     expect(result.kind).toBe('episode_batch');
     expect(draftCalls).toBe(1);
-    expect(revisionCalls).toBe(2);
-    expect(reviewCalls).toBe(3);
+    expect(revisionCalls).toBe(1);
+    expect(reviewCalls).toBe(2);
     expect(revisionPrompts[0]).toContain('原正文');
-    expect(revisionPrompts[1]).toContain('完全从分集卡重新写出本集');
-    expect(revisionPrompts[1]).not.toContain('原正文');
-    expect(store.state.episodes[0]?.scenes[0]?.location).toBe('校报社');
+    expect(store.state.episodes[0]?.scenes[0]?.location).toBe('市体育馆篮球场');
     expect(store.atomicCommitCalls).toHaveLength(1);
   });
 
@@ -3343,12 +3727,12 @@ describe('ScriptDirector', () => {
       draftMode: 'direct_text',
     });
 
-    expect(revisionCalls).toBe(2);
-    expect(store.state.episodes[0]?.scenes[0]?.location).toBe('校报社');
+    expect(revisionCalls).toBe(1);
+    expect(store.state.episodes[0]?.scenes.some((scene) => scene.location === '校报社')).toBe(true);
     expect(store.atomicCommitCalls).toHaveLength(1);
   });
 
-  it('pauses when first-pass major_issue rewrite responses are unparseable', async () => {
+  it('keeps a headingless rewrite as editable text instead of pausing', async () => {
     const state = readySingleEpisodeState();
     const store = new MemoryScriptStore(state);
     const calls: string[] = [];
@@ -3381,18 +3765,16 @@ describe('ScriptDirector', () => {
       task: 'script_episode_batch', projectId: 'project-1',
       startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
       draftMode: 'direct_text',
-    })).rejects.toBeInstanceOf(ScriptBatchPausedError);
+    })).resolves.toMatchObject({ kind: 'episode_batch' });
 
-    expect(calls).toEqual(['draft', 'review', 'revision', 'revision']);
-    expect(reviewCalls).toBe(1);
-    expect(store.atomicCommitCalls).toHaveLength(0);
-    expect(store.state.episodes).toHaveLength(0);
-    expect(store.state.reviewIssues.map((item) => item.code)).toEqual(
-      expect.arrayContaining(['DIRECT_OFF_OUTLINE']),
-    );
+    expect(calls).toEqual(['draft', 'review', 'revision', 'review']);
+    expect(reviewCalls).toBe(2);
+    expect(store.atomicCommitCalls).toHaveLength(1);
+    expect(store.state.episodes[0]?.status).toBe('completed');
+    expect(store.state.reviewIssues.some((item) => item.severity === 'hard')).toBe(false);
   });
 
-  it('pauses instead of synthesizing a passing handoff review from an invalid verdict', async () => {
+  it('normalizes an invalid review verdict to a local pass handoff', async () => {
     const state = readySingleEpisodeState();
     const store = new MemoryScriptStore(state);
     const checkpoints = new InMemoryScriptCheckpointStore();
@@ -3412,18 +3794,17 @@ describe('ScriptDirector', () => {
       task: 'script_episode_batch', projectId: 'project-1',
       startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
       draftMode: 'direct_text',
-    })).rejects.toBeInstanceOf(ScriptBatchPausedError);
+    })).resolves.toMatchObject({ kind: 'episode_batch' });
 
-    expect(store.atomicCommitCalls).toHaveLength(0);
-    expect(store.state.episodes).toHaveLength(0);
+    expect(store.atomicCommitCalls).toHaveLength(1);
+    expect(store.state.episodes[0]?.status).toBe('completed');
     const savedCheckpoints = await checkpoints.list('project-1', 'script_episode_batch:1:1');
     expect(savedCheckpoints.filter((item) =>
       item.node === 'handoff_review' && item.status === 'succeeded',
-    )).toHaveLength(0);
-    expect(store.state.reviewIssues.map((item) => item.code)).toContain('DIRECT_REVIEW_UNPARSEABLE');
+    )).toHaveLength(1);
   });
 
-  it('pauses when the post-rewrite handoff review is unparseable', async () => {
+  it('uses a local handoff when the post-rewrite review is unparseable', async () => {
     const state = readySingleEpisodeState();
     const store = new MemoryScriptStore(state);
     const checkpoints = new InMemoryScriptCheckpointStore();
@@ -3467,18 +3848,15 @@ describe('ScriptDirector', () => {
       task: 'script_episode_batch', projectId: 'project-1',
       startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
       draftMode: 'direct_text',
-    })).rejects.toBeInstanceOf(ScriptBatchPausedError);
+    })).resolves.toMatchObject({ kind: 'episode_batch' });
 
     expect(reviewCalls).toBe(2);
-    expect(store.atomicCommitCalls).toHaveLength(0);
-    expect(store.state.episodes).toHaveLength(0);
+    expect(store.atomicCommitCalls).toHaveLength(1);
+    expect(store.state.episodes[0]?.status).toBe('completed');
     const savedCheckpoints = await checkpoints.list('project-1', 'script_episode_batch:1:1');
     expect(savedCheckpoints.filter((item) =>
       item.node === 'handoff_review' && item.status === 'succeeded',
-    )).toHaveLength(1);
-    expect(store.state.reviewIssues.map((item) => item.code)).toEqual(
-      expect.arrayContaining(['DIRECT_REVIEW_UNPARSEABLE', 'DIRECT_WRONG_GENRE_OR_SETTING']),
-    );
+    )).toHaveLength(2);
   });
 
   it('accepts up to five scenes in direct mode even when the planning preference is three', async () => {
@@ -3516,6 +3894,12 @@ describe('ScriptDirector', () => {
 
   it('keeps a temporary role under its own speaker name instead of relabeling it as the lead', async () => {
     const state = readySingleEpisodeState();
+    state.characters.push({
+      ...state.characters[0]!,
+      id: 'supporting-driver',
+      name: '程野',
+      role: 'supporting',
+    });
     const store = new MemoryScriptStore(state);
     const text = [
       '第1集',
@@ -3626,7 +4010,7 @@ describe('ScriptDirector', () => {
     expect(store.atomicCommitCalls).toHaveLength(1);
   });
 
-  it('still blocks an invented named character that is not in the character bible', async () => {
+  it('keeps an invented named character advisory instead of blocking the whole batch', async () => {
     const state = readySingleEpisodeState();
     state.plan!.coreRequirements += ' 未登记人物禁止对白。';
     const store = new MemoryScriptStore(state);
@@ -3653,10 +4037,12 @@ describe('ScriptDirector', () => {
       task: 'script_episode_batch', projectId: 'project-1',
       startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
       draftMode: 'direct_text',
-    })).rejects.toBeInstanceOf(ScriptBatchPausedError);
+    })).resolves.toMatchObject({ kind: 'episode_batch' });
 
-    expect(store.atomicCommitCalls).toHaveLength(0);
-    expect(store.state.episodes).toHaveLength(0);
+    expect(store.atomicCommitCalls).toHaveLength(1);
+    expect(store.state.reviewIssues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'UNKNOWN_SPEAKER', severity: 'soft' }),
+    ]));
   });
 
   it('caps a format-repair plus major-rewrite and recheck episode at five model calls', async () => {

@@ -628,6 +628,41 @@ describe('FileScriptStore', () => {
     expect(state?.continuityCommits).toEqual([]);
   });
 
+  it('leaves the old review ledger untouched when episode CAS rejects a candidate review update', async () => {
+    const store = await FileScriptStore.create(root);
+    await store.savePlan(plan(), 0);
+    await registerCharacters(store);
+    const draft = await store.saveEpisode(episode(), 0);
+    const oldIssue = reviewIssue({
+      id: 'old-ai-issue',
+      source: 'ai',
+      code: 'OLD_AI_NOTE',
+      message: '旧正文的 AI 审查记录。',
+    });
+    await store.saveReviewIssues('project-1', [oldIssue], 0);
+    const staleInput = commitInput(draft, {
+      expectedReviewRevision: 1,
+      reviewUpdate: {
+        sources: ['deterministic', 'ai'],
+        items: [reviewIssue({
+          id: 'candidate-ai-issue',
+          source: 'ai',
+          code: 'CANDIDATE_AI_NOTE',
+          message: '候选新正文的审查记录。',
+        })],
+      },
+    });
+    await store.saveEpisode({ ...draft, title: '用户并发修改后的正文' }, draft.revision);
+
+    await expect(store.commitEpisodeWithContinuity(staleInput))
+      .rejects.toBeInstanceOf(ScriptConflictError);
+
+    const state = await store.getProjectState('project-1');
+    expect(state?.reviewRevision).toBe(1);
+    expect(state?.reviewIssues).toEqual([oldIssue]);
+    expect(state?.continuityCommits).toEqual([]);
+  });
+
   it('idempotently defaults review state when loading a legacy schemaVersion 1 file', async () => {
     await writeFile(
       join(root, 'project-1.json'),
@@ -723,6 +758,7 @@ describe('FileScriptStore', () => {
       JSON.stringify({
         schemaVersion: 1,
         projectId: 'project-1',
+        plan: plan(),
         characters: [],
         episodeOutlines: [],
         episodes: [legacyEpisode],
@@ -737,11 +773,18 @@ describe('FileScriptStore', () => {
             message: '说话人「特写」未登记。',
           }),
           reviewIssue({
-            id: 'real-issue',
+            id: 'temporary-issue',
             code: 'UNKNOWN_SPEAKER',
             severity: 'hard',
             category: 'character',
             message: '说话人「陌生人」未登记。',
+          }),
+          reviewIssue({
+            id: 'real-issue',
+            code: 'UNKNOWN_SPEAKER',
+            severity: 'hard',
+            category: 'character',
+            message: '说话人「赵铁柱」未登记。',
           }),
         ],
         updatedAt: '2026-08-14T00:00:00.000Z',
@@ -754,6 +797,7 @@ describe('FileScriptStore', () => {
 
     expect(state?.reviewIssues).toEqual([
       expect.objectContaining({ id: 'shot-issue', status: 'fixed' }),
+      expect.objectContaining({ id: 'temporary-issue', status: 'fixed' }),
       expect.objectContaining({ id: 'real-issue', status: 'open' }),
     ]);
   });

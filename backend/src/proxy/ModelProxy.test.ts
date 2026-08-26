@@ -25,6 +25,8 @@ import type { StreamDelta } from './sseParser.js';
 import type { ChatMessage, ModelConfig } from '../types/index.js';
 
 const API_KEY = 'sk-secret-LEAK-CANARY';
+const ORIGINAL_MODEL_REQUEST_TIMEOUT_MS = process.env.MODEL_REQUEST_TIMEOUT_MS;
+const ORIGINAL_MODEL_REQUEST_MAX_DURATION_MS = process.env.MODEL_REQUEST_MAX_DURATION_MS;
 
 const CONFIG: ModelConfig = {
   baseUrl: 'https://provider.example.com/v1',
@@ -74,6 +76,16 @@ async function collect(iterable: AsyncIterable<StreamDelta>): Promise<string[]> 
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  if (ORIGINAL_MODEL_REQUEST_TIMEOUT_MS === undefined) {
+    delete process.env.MODEL_REQUEST_TIMEOUT_MS;
+  } else {
+    process.env.MODEL_REQUEST_TIMEOUT_MS = ORIGINAL_MODEL_REQUEST_TIMEOUT_MS;
+  }
+  if (ORIGINAL_MODEL_REQUEST_MAX_DURATION_MS === undefined) {
+    delete process.env.MODEL_REQUEST_MAX_DURATION_MS;
+  } else {
+    process.env.MODEL_REQUEST_MAX_DURATION_MS = ORIGINAL_MODEL_REQUEST_MAX_DURATION_MS;
+  }
 });
 
 describe('assertPublicModelBaseUrl', () => {
@@ -269,7 +281,7 @@ describe('OpenAiCompatibleModelProxy request shape', () => {
         {
           ...CONFIG,
           baseUrl: 'https://api.deepseek.com',
-          modelName: 'deepseek-v4-flash',
+          modelName: 'deepseek-v4-flash-vision-exp',
         },
         MESSAGES,
         new AbortController().signal,
@@ -370,6 +382,101 @@ describe('OpenAiCompatibleModelProxy error handling', () => {
 
     expect(isProxyError(thrown)).toBe(true);
     expect((thrown as ProxyError).code).toBe('PROVIDER_ERROR');
+  });
+
+  it('stops a provider stream that never produces data at the configured idle timeout', async () => {
+    process.env.MODEL_REQUEST_TIMEOUT_MS = '20';
+    const stalledStream = new ReadableStream<Uint8Array>({
+      cancel: vi.fn(),
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      body: stalledStream,
+    }) as unknown as Response));
+
+    const proxy = new OpenAiCompatibleModelProxy();
+    let thrown: unknown;
+    try {
+      await collect(proxy.streamCompletion(CONFIG, MESSAGES, new AbortController().signal));
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(isProxyError(thrown)).toBe(true);
+    expect(thrown).toMatchObject({
+      code: 'PROVIDER_ERROR',
+      status: 504,
+    });
+    expect((thrown as ProxyError).message).toContain('20 毫秒未响应');
+    expect((thrown as ProxyError).message).toContain('任务已停止');
+  });
+
+  it('resets the idle timeout while a long provider stream keeps producing data', async () => {
+    process.env.MODEL_REQUEST_TIMEOUT_MS = '60';
+    const encoder = new TextEncoder();
+    const activeStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const wire = (text: string) => `data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`;
+        setTimeout(() => controller.enqueue(encoder.encode(wire('第一段'))), 35);
+        setTimeout(() => controller.enqueue(encoder.encode(wire('第二段'))), 70);
+        setTimeout(() => {
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+        }, 105);
+      },
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      body: activeStream,
+    }) as unknown as Response));
+
+    const proxy = new OpenAiCompatibleModelProxy();
+    const collected = await collect(
+      proxy.streamCompletion(CONFIG, MESSAGES, new AbortController().signal),
+    );
+
+    expect(collected).toEqual(['第一段', '第二段']);
+  });
+
+  it('stops a provider that keeps dripping bytes past the absolute request limit', async () => {
+    process.env.MODEL_REQUEST_TIMEOUT_MS = '100';
+    process.env.MODEL_REQUEST_MAX_DURATION_MS = '45';
+    const encoder = new TextEncoder();
+    const activeForever = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let delayMs = 10; delayMs <= 200; delayMs += 10) {
+          setTimeout(() => {
+            try {
+              controller.enqueue(encoder.encode(': keepalive\n\n'));
+            } catch {
+              // The absolute deadline may already have closed the stream.
+            }
+          }, delayMs);
+        }
+      },
+      // Deliberately never settles: timeout cleanup itself must not block.
+      cancel: () => new Promise<void>(() => undefined),
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      body: activeForever,
+    }) as unknown as Response));
+
+    const proxy = new OpenAiCompatibleModelProxy();
+    let thrown: unknown;
+    try {
+      await collect(proxy.streamCompletion(CONFIG, MESSAGES, new AbortController().signal));
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(isProxyError(thrown)).toBe(true);
+    expect(thrown).toMatchObject({ status: 504 });
+    expect((thrown as ProxyError).message).toContain('最长45 毫秒');
+    expect((thrown as ProxyError).message).toContain('任务已停止');
   });
 });
 

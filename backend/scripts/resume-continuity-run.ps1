@@ -3,7 +3,7 @@ if (-not $env:LLM_API_KEY) {
   throw "LLM_API_KEY is required in environment."
 }
 $env:LLM_BASE_URL = "https://api.deepseek.com"
-$env:LLM_MODEL = "deepseek-chat"
+$env:LLM_MODEL = "deepseek-v4-flash-vision-exp"
 $env:LLM_TEMPERATURE = "0.75"
 
 $backend = Split-Path -Parent $PSScriptRoot

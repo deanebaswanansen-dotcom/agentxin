@@ -140,7 +140,11 @@ export class AgentRunStore {
     return store;
   }
 
-  async create(clientId: string, request: AgentRunRequest): Promise<StoredAgentRun> {
+  async create(
+    clientId: string,
+    request: AgentRunRequest,
+    requestedId = randomUUID(),
+  ): Promise<StoredAgentRun> {
     const conflict = Object.values(this.data.runs).find((run) =>
       run.clientId === clientId &&
       ACTIVE_STATUSES.has(run.status) &&
@@ -151,8 +155,11 @@ export class AgentRunStore {
     }
 
     const now = new Date().toISOString();
+    if (this.data.runs[requestedId]) {
+      throw new Error(`Agent run already exists: ${requestedId}`);
+    }
     const run: StoredAgentRun = {
-      id: randomUUID(),
+      id: requestedId,
       clientId,
       request: clone(request),
       status: 'queued',

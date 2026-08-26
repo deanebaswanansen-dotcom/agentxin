@@ -9,8 +9,9 @@ import type {
   ScriptPlannedScene,
   ScriptPlan,
   ScriptProjectState,
+  ScriptReviewIssue,
   ScriptReviewIssueCollection,
-  ScriptScene,
+  ScriptReviewSource,
   ScriptSeriesOutline,
   ScriptWorldBible,
   ScriptUpstreamArtifactRef,
@@ -42,6 +43,7 @@ import {
 } from '../ScriptStore.js';
 import { parseChineseShortDramaText } from '../parsers/chineseShortDramaText.js';
 import {
+  collectTemporaryDialogueSpeakers,
   createScriptReviewIssues,
   isBlockingScriptReviewIssue,
   validateScriptEpisode,
@@ -53,6 +55,11 @@ import {
   assessScriptPlanning,
   type ScriptPlanningSession,
 } from './ScriptPlanningAgent.js';
+import {
+  coerceEpisodeDraftCandidate,
+  coerceEpisodeOutlineCandidate,
+  coercePlannedScenes,
+} from './EpisodeArtifactCoercion.js';
 import {
   buildScriptEpisodeCandidateArtifact,
   buildScriptScenePlanArtifact,
@@ -79,6 +86,12 @@ import {
   type StructuredDecodeIssue,
 } from './StructuredContract.js';
 import {
+  coerceCharacterBibleCandidate,
+  coerceScriptPlanCandidate,
+  coerceSeriesOutlineChunk,
+  coerceWorldBibleCandidate,
+} from './FoundationArtifactCoercion.js';
+import {
   generateStructured,
   type StructuredGenerationError,
   type StructuredGenerationResult,
@@ -98,6 +111,8 @@ import {
   buildDirectDraftPrompt,
   buildDirectReviewPrompt,
   buildDirectRewritePrompt,
+  createLocalDirectHandoffReview,
+  createMinimalDirectDraftFallback,
   decodeDirectHandoffReview,
   directEpisodeText,
   directWritingContext,
@@ -206,11 +221,18 @@ export type ScriptDirectorRequest =
   | {
       task: 'script_series_outline';
       projectId: string;
+      /** User explicitly requested a fresh candidate instead of checkpoint reuse. */
+      regenerate?: boolean;
+      regenerationRunId?: string;
       signal?: AbortSignal;
+      onProgress?: (event: ScriptProgressEvent) => void | Promise<void>;
     }
   | {
       task: 'script_bible';
       projectId: string;
+      /** User explicitly requested fresh character and world candidates. */
+      regenerate?: boolean;
+      regenerationRunId?: string;
       signal?: AbortSignal;
       /** Regenerate the candidate that caused a durable needs-review pause. */
       resumeRejectedCandidates?: boolean;
@@ -222,6 +244,9 @@ export type ScriptDirectorRequest =
       episodeCount: number;
       expectedPlanRevision: number;
       draftMode?: 'structured_legacy' | 'direct_text';
+      /** User explicitly requested fresh episode bodies for this batch. */
+      regenerate?: boolean;
+      regenerationRunId?: string;
       signal?: AbortSignal;
       /** Regenerate the candidate that caused a durable needs-review pause. */
       resumeRejectedCandidates?: boolean;
@@ -449,18 +474,67 @@ function planForDirectDraftValidation(plan: ScriptPlan): ScriptPlan {
   return { ...plan, maxScenesPerEpisode: 5 };
 }
 
-function allowsTemporaryDialogueSpeakers(plan: ScriptPlan): boolean {
-  const requirements = `${plan.coreRequirements}\n${plan.forbiddenElements.join('\n')}`;
-  return !(
-    /(?:只能|仅允许|只允许)[^。；\n]{0,24}(?:已登记|登记)[^。；\n]{0,16}(?:人物)?[^。；\n]{0,12}(?:对白|说话)/u.test(requirements) ||
-    /(?:未登记|临时|路人)[^。；\n]{0,16}(?:人物)?[^。；\n]{0,12}(?:禁止|不能|不得)[^。；\n]{0,12}(?:对白|说话)/u.test(requirements)
-  );
+function stableCharacterName(value: string): string {
+  return value.normalize('NFKC').trim().toLocaleLowerCase('zh-CN');
 }
 
-function isTemporaryDialogueRole(value: string): boolean {
-  const role = value.trim();
-  if (!role || role.length > 12) return false;
-  return /(?:(?:前台|保安|报名员|检录员|车检员|赛会官员|快递员|外卖员|服务员|店员|司机|护士|医生|警察|记者|主持人|裁判|裁判员|解说员|工作人员|维修工|技师|工程师|检测员|鉴定员|邻居|同事|客户|观众|学员|乘客|门卫|秘书|助理|老板|经理|教练|队员|播音员|广播|系统音|法医|消防员|调度员|接线员|售票员|乘务员|清洁工|物业|房东|摊主|商贩|学生|老师|证人|患者|家属|路人|群众|男子|男人|女人|女子|青年|壮汉|老人|大妈|大叔|少年|少女|黑衣人|打手|手下|男|女)(?:[甲乙丙丁A-D\d]{0,2})?|(?:电话|对讲机|广播|扬声器|门外|场外)(?:里的)?(?:声音|男声|女声)|[\p{Script=Han}]{1,6}(?:眼镜|西装|夹克|背心|衬衫|帽子)(?:男|女|男人|女人)?[甲乙丙丁]?|(?:老|小)[\p{Script=Han}]{1,2}|[\p{Script=Han}]{2,4})$/u.test(role);
+/** Keep IDs already referenced by outlines, scripts and continuity records. */
+function stabilizeRegeneratedCharacters(
+  generated: readonly ScriptCharacter[],
+  existing: readonly ScriptCharacter[],
+  maxPrimaryCharacters: number,
+): ScriptCharacter[] {
+  if (existing.length === 0) return [...generated];
+  const existingById = new Map(existing.map((character) => [character.id, character]));
+  const existingByIdentity = new Map<string, ScriptCharacter>();
+  for (const character of existing) {
+    for (const identity of [character.name, ...character.aliases]) {
+      const key = stableCharacterName(identity);
+      if (key && !existingByIdentity.has(key)) existingByIdentity.set(key, character);
+    }
+  }
+  const matchedByIndex = new Map<number, ScriptCharacter>();
+  const usedExistingIds = new Set<string>();
+
+  generated.forEach((character, index) => {
+    const exact = existingById.get(character.id) ?? [character.name, ...character.aliases]
+      .map((identity) => existingByIdentity.get(stableCharacterName(identity)))
+      .find((candidate): candidate is ScriptCharacter => candidate !== undefined);
+    if (exact && !usedExistingIds.has(exact.id)) {
+      matchedByIndex.set(index, exact);
+      usedExistingIds.add(exact.id);
+    }
+  });
+
+  const generatedIdMap = new Map<string, string>();
+  const stabilized = generated.map((character, index) => {
+    const matched = matchedByIndex.get(index);
+    const id = matched?.id ?? character.id;
+    generatedIdMap.set(character.id, id);
+    return { ...character, id, revision: matched?.revision ?? character.revision };
+  });
+  stabilized.push(...existing.filter((character) => !usedExistingIds.has(character.id)));
+
+  const validIds = new Set(stabilized.map((character) => character.id));
+  const existingIds = new Set(existing.map((character) => character.id));
+  let primaryCount = stabilized.filter((character) => (
+    existingIds.has(character.id) && character.role !== 'minor'
+  )).length;
+  return stabilized.map((character) => {
+    let role = character.role;
+    if (!existingIds.has(character.id) && role !== 'minor') {
+      primaryCount += 1;
+      if (primaryCount > maxPrimaryCharacters) role = 'minor';
+    }
+    const relationships = character.relationships
+      .map((relationship) => ({
+        ...relationship,
+        characterId: generatedIdMap.get(relationship.characterId) ?? relationship.characterId,
+      }))
+      .filter((relationship) =>
+        relationship.characterId !== character.id && validIds.has(relationship.characterId));
+    return { ...character, role, relationships };
+  });
 }
 
 function isDirectStageDirectionSpeaker(value: string): boolean {
@@ -858,18 +932,75 @@ const PLAN_LOCK_CONFIG_REVISION = createHash('sha256')
   .update('agentxin:script-plan-lock:v1', 'utf8')
   .digest('hex');
 
+/**
+ * Produces a complete, editable outline chunk from the already approved plan.
+ * This is deliberately local: if the provider cannot return even the first
+ * chunk, the job must still finish instead of leaving an empty outline behind.
+ */
+function directSeriesOutlineChunk(
+  plan: ScriptPlan,
+  start: number,
+  end: number,
+  previousBoundary: readonly Record<string, unknown>[],
+): Record<string, unknown> {
+  const phaseFor = (episodeNumber: number): string => {
+    const progress = episodeNumber / plan.totalEpisodes;
+    if (progress <= 0.2) return '危机显现';
+    if (progress <= 0.45) return '主动破局';
+    if (progress <= 0.7) return '局势逆转';
+    if (progress <= 0.9) return '终局逼近';
+    return '结局兑现';
+  };
+  const previousHook = previousBoundary.at(-1)?.endingHook;
+  const episodeCards = Array.from({ length: end - start + 1 }, (_, offset) => {
+    const episodeNumber = start + offset;
+    const phase = phaseFor(episodeNumber);
+    const isLastEpisode = episodeNumber === plan.totalEpisodes;
+    const nextPhase = phaseFor(Math.min(plan.totalEpisodes, episodeNumber + 1));
+    const bridge = offset === 0 && typeof previousHook === 'string' && previousHook.trim()
+      ? `承接上一集“${previousHook.trim()}”，`
+      : '';
+    return {
+      episodeNumber,
+      title: `第${episodeNumber}集 ${phase}`,
+      logline: `${bridge}主角围绕“${plan.coreConflict}”推进到${phase}阶段。`,
+      mainEvent: `在${plan.theme}主题下，主线完成第${episodeNumber}步推进，并形成一次可见的行动结果。`,
+      endingHook: isLastEpisode
+        ? plan.endingDirection
+        : `新的证据或阻力出现，把剧情推向下一阶段“${nextPhase}”。`,
+    };
+  });
+  return {
+    synopsis: plan.logline,
+    openingState: `故事从“${plan.coreConflict}”全面显现开始。`,
+    midpointTurn: `主角取得关键证据或盟友，围绕“${plan.coreConflict}”转守为攻。`,
+    climax: `核心冲突在终局正面爆发，${plan.highlights.at(-1) ?? plan.theme}成为胜负关键。`,
+    endingState: plan.endingDirection,
+    mainArc: [plan.coreConflict, plan.endingDirection],
+    subplotArcs: plan.highlights.length > 0 ? [...plan.highlights] : [...plan.genres],
+    episodeCards,
+  };
+}
+
 export class ScriptDirector {
   constructor(private readonly dependencies: ScriptDirectorDependencies) {}
 
   async run(request: ScriptDirectorRequest): Promise<ScriptDirectorResult> {
     if (request.task === 'script_series_outline') {
-      return this.generateSeriesOutline(request.projectId, request.signal);
+      return this.generateSeriesOutline(
+        request.projectId,
+        request.signal,
+        request.onProgress,
+        request.regenerate === true,
+        request.regenerationRunId,
+      );
     }
     if (request.task === 'script_bible') {
       return this.generateBible(
         request.projectId,
         request.signal,
         request.resumeRejectedCandidates === true,
+        request.regenerate === true,
       );
     }
     if (request.task === 'script_episode_batch') {
@@ -892,14 +1023,14 @@ export class ScriptDirector {
         '你是短剧策划 Agent。根据已确认选项补全专业策划。',
         '只返回与 ScriptPlan 对应的 JSON，不输出思考过程或 Markdown 围栏。',
         [
-          '必须返回以下全部字段：',
+          '优先返回以下字段；不确定的辅助字段可以省略，系统会本地补齐：',
           'title, theme, market, channel, genres, audience, coreConflict, logline, highlights,',
           'totalEpisodes, episodeDurationSeconds, targetCharsPerEpisode, maxPrimaryCharacters,',
           'maxScenesPerEpisode, dialogueDensityPercent, language, format, coreRequirements,',
           'forbiddenElements, endingDirection；coverPrompt 可选。',
         ].join(' '),
-        'episodeDurationSeconds 必须是 {"min":数字,"max":数字}；genres、highlights、forbiddenElements 必须是字符串数组。',
-        'market 只能是 domestic/overseas，channel 只能是 female/male/general，language 必须是 zh-CN，format 必须是 cn_short_drama。',
+        'episodeDurationSeconds 建议使用 {"min":数字,"max":数字}；genres、highlights、forbiddenElements 建议使用字符串数组。',
+        'market 优先使用 domestic/overseas，channel 优先使用 female/male/general；中文值和少量格式偏差也可由系统转换。',
         '范围：总集数1—200，时长30—180秒，单集300—3000字，主要角色1—20，场景1—5，对话密度20—90。',
         `用户故事想法：${request.seedPrompt?.trim() || '未提供，由 Agent 原创'}`,
         `已确认：${JSON.stringify(assessment.values)}`,
@@ -920,63 +1051,42 @@ export class ScriptDirector {
     const inputFingerprint = computeScriptCheckpointInputFingerprint({
       node: 'plan', inputRevisionRefs, upstreamArtifactRefs, promptVersion, configRevision,
     });
-    const plan = await this.generateNodeStructured({
-      node: 'plan', projectId: request.projectId, prompt, signal: request.signal,
-    }, parserContract(
-      'script_plan',
-      '必须返回全部 ScriptPlan 字段；缺失字段必须修复后才可保存。',
-      (parsed): ScriptPlan => {
-        const duration = recordField(parsed.episodeDurationSeconds, 'episodeDurationSeconds');
-        const candidate: ScriptPlan = {
-          id: current?.id ?? this.dependencies.id?.() ?? randomUUID(),
-          projectId: request.projectId,
-          status: 'draft',
-          revision: current?.revision ?? 0,
-          title: stringField(parsed.title, 'title'),
-          theme: stringField(parsed.theme, 'theme'),
-          market: enumField(parsed.market, 'market', ['domestic', 'overseas']),
-          channel: enumField(parsed.channel, 'channel', ['female', 'male', 'general']),
-          genres: explicit.genres ?? stringsField(parsed.genres, 'genres'),
-          audience: explicit.audience ?? stringField(parsed.audience, 'audience'),
-          coreConflict: explicit.coreConflict ?? stringField(parsed.coreConflict, 'coreConflict'),
-          logline: stringField(parsed.logline, 'logline'),
-          highlights: stringsField(parsed.highlights, 'highlights'),
-          totalEpisodes: explicit.totalEpisodes ?? numberField(parsed.totalEpisodes, 'totalEpisodes'),
-          episodeDurationSeconds: explicit.episodeDurationSeconds ?? {
-            min: numberField(duration.min, 'episodeDurationSeconds.min'),
-            max: numberField(duration.max, 'episodeDurationSeconds.max'),
-          },
-          targetCharsPerEpisode: explicit.targetCharsPerEpisode
-            ?? numberField(parsed.targetCharsPerEpisode, 'targetCharsPerEpisode'),
-          maxPrimaryCharacters: numberField(parsed.maxPrimaryCharacters, 'maxPrimaryCharacters'),
-          maxScenesPerEpisode: explicit.maxScenesPerEpisode
-            ?? numberField(parsed.maxScenesPerEpisode, 'maxScenesPerEpisode'),
-          dialogueDensityPercent: explicit.dialogueDensityPercent
-            ?? numberField(parsed.dialogueDensityPercent, 'dialogueDensityPercent'),
-          language: enumField(parsed.language, 'language', ['zh-CN']),
-          format: enumField(parsed.format, 'format', ['cn_short_drama']),
-          coreRequirements: stringField(parsed.coreRequirements, 'coreRequirements'),
-          forbiddenElements: stringsField(parsed.forbiddenElements, 'forbiddenElements'),
-          endingDirection: explicit.endingDirection
-            ?? stringField(parsed.endingDirection, 'endingDirection'),
-          ...(typeof parsed.coverPrompt === 'string' && parsed.coverPrompt.trim()
-            ? { coverPrompt: parsed.coverPrompt.trim() }
-            : {}),
-          createdAt: current?.createdAt ?? now,
-          updatedAt: now,
-        };
-        const canonical = canonicalModelCandidate(() => decodeScriptPlanInput(candidate));
-        return {
-          ...canonical,
-          id: candidate.id,
-          projectId: candidate.projectId,
-          status: candidate.status,
-          revision: candidate.revision,
-          createdAt: candidate.createdAt,
-          updatedAt: candidate.updatedAt,
-        };
-      },
-    ));
+    const planId = current?.id ?? this.dependencies.id?.() ?? randomUUID();
+    const completePlan = (parsed: Record<string, unknown>): ScriptPlan => {
+      const candidate = coerceScriptPlanCandidate(parsed, {
+        projectId: request.projectId,
+        now,
+        id: planId,
+        ...(current ? { current } : {}),
+        explicit,
+        seedPrompt: request.seedPrompt,
+      });
+      const canonical = canonicalModelCandidate(() => decodeScriptPlanInput(candidate));
+      return {
+        ...canonical,
+        id: candidate.id,
+        projectId: candidate.projectId,
+        status: candidate.status,
+        revision: candidate.revision,
+        createdAt: candidate.createdAt,
+        updatedAt: candidate.updatedAt,
+      };
+    };
+    let plan: ScriptPlan;
+    let planFallbackReason: string | undefined;
+    try {
+      plan = await this.generateNodeStructured({
+        node: 'plan', projectId: request.projectId, prompt, signal: request.signal,
+      }, parserContract(
+        'script_plan',
+        '返回可用的短剧策划即可；系统会从用户已确认选项和安全默认值补齐非关键缺项。',
+        completePlan,
+      ));
+    } catch (error) {
+      if (!(error instanceof ScriptStructuredNeedsReviewError)) throw error;
+      planFallbackReason = '模型未返回可解析策划，已根据用户确认项生成可编辑策划。';
+      plan = completePlan({});
+    }
     request.signal?.throwIfAborted();
     const saved = await this.dependencies.store.savePlan(plan, current?.revision ?? 0);
     const planCheckpointRevision = await this.nextCheckpointArtifactRevision(
@@ -997,7 +1107,9 @@ export class ScriptDirector {
       promptVersion,
       configRevision,
       inputFingerprint,
-      validationErrors: [],
+      validationErrors: planFallbackReason
+        ? [{ code: 'script_plan.local_fallback', message: planFallbackReason }]
+        : [],
       updatedAt: now,
     });
     return { kind: 'plan_draft', plan: saved };
@@ -1006,21 +1118,65 @@ export class ScriptDirector {
   private async generateSeriesOutline(
     projectId: string,
     signal?: AbortSignal,
+    onProgress?: (event: ScriptProgressEvent) => void | Promise<void>,
+    regenerate = false,
+    regenerationRunId?: string,
   ): Promise<ScriptDirectorResult> {
     const state = await this.dependencies.store.getProjectState(projectId);
     const plan = state?.plan;
     if (!plan || (plan.status !== 'approved' && plan.status !== 'locked')) {
       throw new ScriptModelOutputError('生成全剧大纲前必须先确认策划。');
     }
-    if (state?.seriesOutline?.episodeCards.length === plan.totalEpisodes) {
+    if (!regenerate && state?.seriesOutline?.episodeCards.length === plan.totalEpisodes) {
       return { kind: 'series_outline', outline: state.seriesOutline };
     }
 
     const runKey = 'script_series_outline';
     const checkpoints = await this.dependencies.checkpoints.list(projectId, runKey);
     const configRevision = await this.modelConfigFingerprint();
+    const regenerationMarkerChunk = plan.totalEpisodes + 1;
+    const regenerationInitialized = Boolean(
+      regenerate &&
+      regenerationRunId &&
+      checkpoints.some((checkpoint) => {
+        if (checkpoint.node !== 'series_outline' || checkpoint.chunkStart !== regenerationMarkerChunk) return false;
+        const artifact = checkpoint.artifact;
+        return Boolean(
+          artifact &&
+          typeof artifact === 'object' &&
+          !Array.isArray(artifact) &&
+          (artifact as Record<string, unknown>).stage === 'regeneration_started' &&
+          (artifact as Record<string, unknown>).regenerationRunId === regenerationRunId,
+        );
+      })
+    );
+    if (regenerate && !regenerationInitialized && regenerationRunId) {
+      for (const checkpoint of checkpoints) {
+        if (checkpoint.node === 'series_outline' && checkpoint.chunkStart !== regenerationMarkerChunk && checkpoint.status !== 'stale') {
+          await this.markCheckpointStale(checkpoint);
+        }
+      }
+      const markerRevision = await this.nextCheckpointArtifactRevision(
+        projectId,
+        runKey,
+        { node: 'series_outline', chunkStart: regenerationMarkerChunk },
+      );
+      await this.dependencies.checkpoints.save({
+        projectId,
+        runKey,
+        node: 'series_outline',
+        status: 'running',
+        attempt: 1,
+        artifactRevision: markerRevision,
+        chunkStart: regenerationMarkerChunk,
+        artifact: { schemaVersion: 1, stage: 'regeneration_started', regenerationRunId },
+        validationErrors: [],
+        updatedAt: this.dependencies.now?.() ?? new Date().toISOString(),
+      });
+    }
     const inputRevisionRefs = [{ resource: 'plan' as const, id: plan.id, revision: plan.revision }];
     const chunks: Record<string, unknown>[] = [];
+    let directFallbackReason: string | undefined;
     for (let start = 1; start <= plan.totalEpisodes; start += 10) {
       const end = Math.min(plan.totalEpisodes, start + 9);
       const previousChunkCards = chunks.at(-1)?.episodeCards;
@@ -1054,99 +1210,160 @@ export class ScriptDirector {
         promptVersion,
         configRevision,
       });
+      const completeOutlineChunk = (value: Record<string, unknown>): Record<string, unknown> => {
+        const completed = coerceSeriesOutlineChunk(value, {
+          plan,
+          start,
+          end,
+          previousBoundary,
+        });
+        const canonical = canonicalModelCandidate(() => decodeScriptSeriesOutlineInput({
+          ...completed,
+          episodeCards: (completed.episodeCards as unknown[]).map((card, index) => ({
+            ...recordField(card, `episodeCards.${index}`),
+            episodeNumber: index + 1,
+          })),
+        }));
+        return {
+          ...canonical,
+          episodeCards: canonical.episodeCards.map((card, index) => ({
+            ...card,
+            episodeNumber: start + index,
+          })),
+        };
+      };
       const restored = latestScriptCheckpoint(checkpoints, {
         node: 'series_outline',
         chunkStart: start,
       });
       if (restored) {
+        if (regenerate && !regenerationInitialized && !regenerationRunId && restored.status !== 'stale') {
+          await this.markCheckpointStale(restored);
+        }
         const decision = decideScriptCheckpointResume(restored, inputFingerprint);
-        if (decision.disposition === 'reuse' && restored.artifact !== undefined) {
-          chunks.push(recordField(restored.artifact, 'seriesOutlineChunk'));
+        if ((!regenerate || regenerationInitialized) && decision.disposition === 'reuse' && restored.artifact !== undefined) {
+          // Older checkpoints may predate the lenient contract. Normalize them
+          // on reuse so a sparse/duplicated old chunk cannot break the final
+          // 1..N merge or leave a resumed outline stuck.
+          chunks.push(completeOutlineChunk(recordField(restored.artifact, 'seriesOutlineChunk')));
           continue;
         }
         if (decision.disposition === 'stale') await this.markCheckpointStale(restored);
       }
       const prompt = [
         '你是 SeriesOutlineAgent，生成全剧总纲和指定范围的轻量分集卡。',
-        `本段只返回第 ${start}—${end} 集，集号必须连续。`,
+        `本段只返回第 ${start}—${end} 集；请尽量给全，缺集、重号和乱序会由系统补齐。`,
         '只返回 JSON，字段：synopsis, openingState, midpointTurn, climax, endingState, mainArc, subplotArcs, episodeCards。',
-        '严格模板：{"synopsis":"字符串","openingState":"字符串","midpointTurn":"字符串","climax":"字符串","endingState":"字符串","mainArc":["字符串"],"subplotArcs":["字符串"],"episodeCards":[{"episodeNumber":1,"title":"字符串","logline":"字符串","mainEvent":"字符串","endingHook":"字符串"}]}。不得翻译、缩写或改名任何键。',
+        '建议模板：{"synopsis":"字符串","openingState":"字符串","midpointTurn":"字符串","climax":"字符串","endingState":"字符串","mainArc":["字符串"],"subplotArcs":["字符串"],"episodeCards":[{"episodeNumber":1,"title":"字符串","logline":"字符串","mainEvent":"字符串","endingHook":"字符串"}]}。优先使用这些键，辅助缺项可省略。',
         previousBoundary.length > 0
           ? `上一段最后两集：${JSON.stringify(previousBoundary)}。本段第 ${start} 集必须直接承接上一集 endingHook；已经发生、取得或发现的关键事件不得重新当作首次发生。`
           : '',
         `已锁定策划：${JSON.stringify(plan)}`,
       ].filter(Boolean).join('\n');
-      const parsed = await this.generateNodeStructured({
-        node: 'series_outline',
-        projectId,
-        chunkStart: start,
-        chunkEnd: end,
-        prompt,
-        signal,
-      }, parserContract(
-        'series_outline_chunk',
-        `必须包含全部总纲字段以及第 ${start}—${end} 集连续、唯一的 episodeCards。`,
-        (value) => {
-          stringField(value.synopsis, 'synopsis');
-          stringField(value.openingState, 'openingState');
-          stringField(value.midpointTurn, 'midpointTurn');
-          stringField(value.climax, 'climax');
-          stringField(value.endingState, 'endingState');
-          stringsField(value.mainArc, 'mainArc');
-          stringsField(value.subplotArcs, 'subplotArcs');
-          if (!Array.isArray(value.episodeCards)) {
-            throw new ScriptModelOutputError('分集卡字段 episodeCards 必须是数组。');
-          }
-          const episodeNumbers = value.episodeCards.map((candidate) => {
-            const card = recordField(candidate, 'episodeCard');
-            const episodeNumber = numberField(card.episodeNumber, 'episodeCard.episodeNumber');
-            stringField(card.title, 'episodeCard.title');
-            stringField(card.logline, 'episodeCard.logline');
-            stringField(card.mainEvent, 'episodeCard.mainEvent');
-            stringField(card.endingHook, 'episodeCard.endingHook');
-            return episodeNumber;
-          });
-          if (episodeNumbers.length !== end - start + 1 || episodeNumbers.some((item, index) => item !== start + index)) {
-            throw new ScriptModelOutputError(`分集卡字段 episodeCards 必须连续覆盖 ${start}—${end} 集。`);
-          }
-          const canonical = canonicalModelCandidate(() => decodeScriptSeriesOutlineInput({
-            ...value,
-            episodeCards: (value.episodeCards as unknown[]).map((card, index) => ({
-              ...recordField(card, `episodeCards.${index}`),
-              episodeNumber: index + 1,
-            })),
-          }));
-          return {
-            ...canonical,
-            episodeCards: canonical.episodeCards.map((card, index) => ({
-              ...card,
-              episodeNumber: start + index,
-            })),
-          };
-        },
-      ));
-      chunks.push(parsed);
       const artifactRevision = await this.nextCheckpointArtifactRevision(
         projectId,
         runKey,
         { node: 'series_outline', chunkStart: start },
       );
-      await this.dependencies.checkpoints.save({
+      const checkpointBase = {
         projectId,
         runKey,
-        node: 'series_outline',
-        status: 'succeeded',
+        node: 'series_outline' as const,
         attempt: 1,
         artifactRevision,
         chunkStart: start,
-        artifact: parsed,
         inputRevisionRefs,
         upstreamArtifactRefs,
         promptVersion,
         configRevision,
         inputFingerprint,
+      };
+      await this.dependencies.checkpoints.save({
+        ...checkpointBase,
+        status: 'running',
         validationErrors: [],
         updatedAt: this.dependencies.now?.() ?? new Date().toISOString(),
+      });
+      await onProgress?.({
+        phase: 'info',
+        message: directFallbackReason
+          ? `正在用保底方案生成第 ${start}—${end} 集分集卡…`
+          : `正在生成第 ${start}—${end} 集分集卡…`,
+        current: start,
+        total: plan.totalEpisodes,
+        scriptCheckpoint: {
+          node: 'series_outline',
+          attempt: 1,
+          artifactRevision,
+        },
+      });
+      const contract = parserContract(
+        'series_outline_chunk',
+        `返回第 ${start}—${end} 集的主要剧情即可；系统会补齐次要总纲字段并强制集号连续唯一。`,
+        completeOutlineChunk,
+      );
+      let parsed: Record<string, unknown>;
+      if (directFallbackReason) {
+        parsed = directSeriesOutlineChunk(plan, start, end, previousBoundary);
+      } else {
+        try {
+          parsed = await this.generateNodeStructured({
+            node: 'series_outline',
+            projectId,
+            chunkStart: start,
+            chunkEnd: end,
+            prompt,
+            signal,
+          }, contract);
+        } catch (error) {
+          if (!(error instanceof ScriptStructuredNeedsReviewError)) throw error;
+          if (regenerate && state.seriesOutline) {
+            error.message = '全剧大纲重新生成失败，已完整保留原大纲；可再次点击重新生成。';
+            await this.dependencies.checkpoints.save({
+              ...checkpointBase,
+              status: 'needs_review',
+              validationErrors: [{
+                code: 'series_outline.regenerate_failed',
+                message: error.message,
+              }],
+              updatedAt: this.dependencies.now?.() ?? new Date().toISOString(),
+            });
+            throw error;
+          }
+          directFallbackReason = '模型未在固定结构预算内返回有效分集卡，已自动补全剩余大纲。';
+          parsed = directSeriesOutlineChunk(plan, start, end, previousBoundary);
+        }
+      }
+      // Apply the same canonical decoder to local fallback output. The fallback
+      // may be simpler than the model result, but it is never allowed to bypass
+      // the saved outline contract.
+      const decoded = contract.decode(parsed);
+      if (!decoded.success) {
+        throw new ScriptModelOutputError('保底分集卡未通过全剧大纲结构校验。');
+      }
+      parsed = decoded.value as unknown as Record<string, unknown>;
+      chunks.push(parsed);
+      await this.dependencies.checkpoints.save({
+        ...checkpointBase,
+        status: 'succeeded',
+        artifact: parsed,
+        validationErrors: directFallbackReason
+          ? [{ code: 'series_outline.local_fallback', message: directFallbackReason }]
+          : [],
+        updatedAt: this.dependencies.now?.() ?? new Date().toISOString(),
+      });
+      await onProgress?.({
+        phase: 'info',
+        message: directFallbackReason
+          ? `第 ${start}—${end} 集分集卡已由保底方案生成并保存。`
+          : `第 ${start}—${end} 集分集卡已生成并保存。`,
+        current: end,
+        total: plan.totalEpisodes,
+        scriptCheckpoint: {
+          node: 'series_outline',
+          attempt: 1,
+          artifactRevision,
+        },
       });
     }
     const first = chunks[0];
@@ -1209,6 +1426,7 @@ export class ScriptDirector {
     projectId: string,
     signal?: AbortSignal,
     resumeRejectedCandidates = false,
+    regenerate = false,
   ): Promise<ScriptDirectorResult> {
     const state = await this.dependencies.store.getProjectState(projectId);
     if (!state?.plan || !state.seriesOutline) {
@@ -1242,7 +1460,7 @@ export class ScriptDirector {
       await this.markCheckpointStale(rejectedCharacters);
     }
     const generateCharacters = async (): Promise<ScriptCharacter[]> => {
-      if (state.characters.length > 0) return state.characters;
+      if (!regenerate && state.characters.length > 0) return state.characters;
       let preservedCharacters: Array<{ index: number; character: ScriptCharacter }> = [];
       let failedIndexes: number[] = [];
       let characterCount: number | undefined;
@@ -1250,9 +1468,12 @@ export class ScriptDirector {
         const prompt = [
           '你是 CharacterDesignAgent。根据策划和大纲生成结构化人物圣经。',
           '只返回 JSON 对象 {"characters": [...]} ，不输出思考过程。',
-          '每个人物严格包含：id, name, aliases, role, age(可选), occupation(可选), identity, biography, motivation, goal, weakness, arc, appearance, hairstyle, physique, defaultOutfit, personality, skills, speechStyle, catchphrases, relationships。',
-          'role 只能是 lead/supporting/antagonist/minor；aliases/personality/skills/catchphrases/relationships 必须是数组；relationship 使用 {"characterId":"已存在人物id","label":"关系","notes":"可选说明"}。不得改名任何键。',
+          '每个人物优先包含 name、role、身份、动机和人物弧光；其余外貌、服装、语言风格等字段尽量提供，缺项由系统本地补齐。',
+          'role 优先使用 lead/supporting/antagonist/minor；数组和 relationship 格式有轻微偏差也可由系统转换。',
           `当前策划允许最多 ${plan.maxPrimaryCharacters} 个非 minor 主要人物；请以当前数字为准，不沿用旧候选约束。`,
+          regenerate && state.characters.length > 0
+            ? `这是重新生成人物。相同人物必须沿用以下已有 id；可以改善内容，但不要给同一人物换 id：${JSON.stringify(state.characters.map((character) => ({ id: character.id, name: character.name, aliases: character.aliases, role: character.role })))}。`
+            : '',
           resumeRejectedCandidates
             ? '这是用户显式恢复后的新候选生成；必须重新依据下方最新策划与大纲作答。'
             : '',
@@ -1261,13 +1482,20 @@ export class ScriptDirector {
         ].filter(Boolean).join('\n');
         const characterContract = defineStructuredContract<ScriptCharacter[]>({
           name: 'character_bible',
-          version: 2,
+          version: 3,
           instructions: [
-            '首次必须返回 {"characters":[完整人物...]}。',
+            '返回 {"characters":[人物...]} 即可；系统会本地补齐人物的非关键缺项。',
             '若校验错误只指向部分 characters[i]，修复时只改这些索引；可返回完整 characters 数组，或 {"repairs":[{"index":i,"character":{...}}]}。',
             '未报错人物会由系统保留，模型对它们的改写不会生效。',
           ].join(''),
           decode: (raw) => {
+            // Missing descriptive fields, invalid optional relationships and an
+            // empty cast are all recoverable locally. This happens before the
+            // existing canonical/uniqueness boundary, so it consumes no extra
+            // model call and cannot alter project or revision ownership.
+            raw = {
+              characters: coerceCharacterBibleCandidate(raw, { projectId, now, plan }),
+            };
             let value: Record<string, unknown>;
             try {
               value = recordField(raw, 'character_bible');
@@ -1407,11 +1635,29 @@ export class ScriptDirector {
             }
           },
         });
-        const generated = await this.generateNodeStructured({
-          node: 'character_bible', projectId, prompt, signal,
-        }, characterContract);
+        let generated: ScriptCharacter[];
+        let characterFallbackReason: string | undefined;
+        try {
+          generated = await this.generateNodeStructured({
+            node: 'character_bible', projectId, prompt, signal,
+          }, characterContract);
+        } catch (error) {
+          if (!(error instanceof ScriptStructuredNeedsReviewError)) throw error;
+          if (regenerate && state.characters.length > 0) {
+            error.message = '人物重新生成失败，已完整保留原人物卡；可再次点击重新生成。';
+            throw error;
+          }
+          const completed = characterContract.decode({});
+          if (!completed.success) throw error;
+          generated = completed.value;
+          characterFallbackReason = '模型未返回可解析人物资料，已生成最小可编辑人物卡。';
+        }
         signal?.throwIfAborted();
-        const saved = await this.dependencies.store.saveCharacters(projectId, generated, 0);
+        const stableGenerated = regenerate
+          ? stabilizeRegeneratedCharacters(generated, state.characters, plan.maxPrimaryCharacters)
+          : generated;
+        const expectedRevision = Math.max(0, ...state.characters.map((character) => character.revision));
+        const saved = await this.dependencies.store.saveCharacters(projectId, stableGenerated, expectedRevision);
         const artifactRevision = await this.nextCheckpointArtifactRevision(
           projectId,
           'script_bible',
@@ -1427,7 +1673,9 @@ export class ScriptDirector {
           promptVersion: characterPromptVersion,
           configRevision: characterConfigRevision,
           inputFingerprint: characterInputFingerprint,
-          validationErrors: [],
+          validationErrors: characterFallbackReason
+            ? [{ code: 'character_bible.local_fallback', message: characterFallbackReason }]
+            : [],
           updatedAt: now,
         });
         return saved;
@@ -1458,24 +1706,46 @@ export class ScriptDirector {
     };
 
     const generateWorld = async (): Promise<ScriptWorldBible> => {
-      if (state.worldBible) return state.worldBible;
+      if (!regenerate && state.worldBible) return state.worldBible;
       try {
         const prompt = [
           '你是 WorldDesignAgent。根据策划和大纲生成结构化世界圣经。',
           '只返回 JSON，不输出思考过程。',
-          '严格模板：{"era":"字符串","primaryLocations":["字符串"],"worldState":"字符串","rules":["字符串"],"transport":["字符串"],"communication":["字符串"],"organizations":["字符串"],"recurringProps":["字符串"],"forbiddenAnachronisms":["字符串"]}。不得翻译、缩写或改名任何键。',
+          '建议模板：{"era":"字符串","primaryLocations":["字符串"],"worldState":"字符串","rules":["字符串"],"transport":["字符串"],"communication":["字符串"],"organizations":["字符串"],"recurringProps":["字符串"],"forbiddenAnachronisms":["字符串"]}。时代、主要地点、世界状态最重要，辅助数组可以省略。',
           `策划：${JSON.stringify(plan)}`,
           `大纲：${JSON.stringify(outline)}`,
         ].join('\n');
-        const generated = await this.generateNodeStructured({
-          node: 'world_bible', projectId, prompt, signal,
-        }, parserContract(
+        const worldContract = parserContract(
           'world_bible',
-          '必须返回完整世界圣经对象，era、primaryLocations、worldState 及所有数组字段不可省略。',
-          (value) => this.parseWorld(value, projectId, now),
-        ));
+          '返回主要时代、地点和世界状态即可；系统会把省略的辅助数组补为空数组。',
+          (value) => {
+            const completed = coerceWorldBibleCandidate(value, { projectId, now, plan });
+            const canonical = canonicalModelCandidate(() => decodeScriptWorldBibleInput(completed));
+            return { ...canonical, projectId, revision: 0, updatedAt: now };
+          },
+        );
+        let generated: ScriptWorldBible;
+        let worldFallbackReason: string | undefined;
+        try {
+          generated = await this.generateNodeStructured({
+            node: 'world_bible', projectId, prompt, signal,
+          }, worldContract);
+        } catch (error) {
+          if (!(error instanceof ScriptStructuredNeedsReviewError)) throw error;
+          if (regenerate && state.worldBible) {
+            error.message = '世界设定重新生成失败，已完整保留原世界设定；可再次点击重新生成。';
+            throw error;
+          }
+          const completed = worldContract.decode({});
+          if (!completed.success) throw error;
+          generated = completed.value;
+          worldFallbackReason = '模型未返回可解析世界观，已生成最小可编辑世界设定。';
+        }
         signal?.throwIfAborted();
-        const saved = await this.dependencies.store.saveWorldBible(generated, 0);
+        const saved = await this.dependencies.store.saveWorldBible(
+          generated,
+          state.worldBible?.revision ?? 0,
+        );
         const artifactRevision = await this.nextCheckpointArtifactRevision(
           projectId,
           'script_bible',
@@ -1483,7 +1753,11 @@ export class ScriptDirector {
         );
         await this.dependencies.checkpoints.save({
           projectId, runKey: 'script_bible', node: 'world_bible', status: 'succeeded',
-          attempt: 1, artifactRevision, artifact: saved, updatedAt: now,
+          attempt: 1, artifactRevision, artifact: saved,
+          validationErrors: worldFallbackReason
+            ? [{ code: 'world_bible.local_fallback', message: worldFallbackReason }]
+            : [],
+          updatedAt: now,
         });
         return saved;
       } catch (error) {
@@ -1507,8 +1781,47 @@ export class ScriptDirector {
       generateCharacters(),
       generateWorld(),
     ]);
-    if (charactersResult.status === 'rejected') throw charactersResult.reason;
-    if (worldResult.status === 'rejected') throw worldResult.reason;
+    if (charactersResult.status === 'rejected' || worldResult.status === 'rejected') {
+      // The UI presents this as one “人物与世界” rewrite. If either half
+      // fails, restore the other half's old content so a partial success never
+      // leaves the project in a mixed old/new bible state. Store revisions may
+      // advance, but the user-visible canon and every referenced character ID
+      // remain unchanged.
+      if (regenerate) {
+        const rollbacks: Promise<unknown>[] = [];
+        if (charactersResult.status === 'fulfilled' && state.characters.length > 0) {
+          const writtenRevision = Math.max(
+            0,
+            ...charactersResult.value.map((character) => character.revision),
+          );
+          rollbacks.push(this.dependencies.store.saveCharacters(
+            projectId,
+            state.characters,
+            writtenRevision,
+          ));
+        }
+        if (worldResult.status === 'fulfilled' && state.worldBible) {
+          rollbacks.push(this.dependencies.store.saveWorldBible(
+            state.worldBible,
+            worldResult.value.revision,
+          ));
+        }
+        const rollbackResults = await Promise.allSettled(rollbacks);
+        const rollbackFailure = rollbackResults.find(
+          (result): result is PromiseRejectedResult => result.status === 'rejected',
+        );
+        if (rollbackFailure) {
+          const message = rollbackFailure.reason instanceof Error
+            ? rollbackFailure.reason.message
+            : String(rollbackFailure.reason);
+          throw new ScriptModelOutputError(
+            `人物与世界重新生成失败，且恢复旧设定时写入失败：${message}`,
+          );
+        }
+      }
+      if (charactersResult.status === 'rejected') throw charactersResult.reason;
+      throw (worldResult as PromiseRejectedResult).reason;
+    }
     return { kind: 'bible', characters: charactersResult.value, worldBible: worldResult.value };
   }
 
@@ -1570,38 +1883,6 @@ export class ScriptDirector {
         revision: 0,
         updatedAt: now,
       };
-  }
-
-  private parseWorld(
-    value: Record<string, unknown>,
-    projectId: string,
-    now: string,
-  ): ScriptWorldBible {
-    const primaryLocations = stringsField(value.primaryLocations, 'primaryLocations');
-    if (primaryLocations.length === 0) {
-      throw new ScriptModelOutputError('模型结果字段 primaryLocations 必须至少包含一项。');
-    }
-    const candidate: ScriptWorldBible = {
-      projectId,
-      era: stringField(value.era, 'era'),
-      primaryLocations,
-      worldState: stringField(value.worldState, 'worldState'),
-      rules: stringsField(value.rules, 'rules'),
-      transport: stringsField(value.transport, 'transport'),
-      communication: stringsField(value.communication, 'communication'),
-      organizations: stringsField(value.organizations, 'organizations'),
-      recurringProps: stringsField(value.recurringProps, 'recurringProps'),
-      forbiddenAnachronisms: stringsField(value.forbiddenAnachronisms, 'forbiddenAnachronisms'),
-      revision: 0,
-      updatedAt: now,
-    };
-    const canonical = canonicalModelCandidate(() => decodeScriptWorldBibleInput(candidate));
-    return {
-      ...canonical,
-      projectId,
-      revision: candidate.revision,
-      updatedAt: candidate.updatedAt,
-    };
   }
 
   private async generateEpisodeBatch(
@@ -1671,7 +1952,7 @@ export class ScriptDirector {
         episode.status === 'completed' &&
         hasCanonicalContinuity(state, episode),
     );
-    if (completed.length === range.length) {
+    if (!request.regenerate && completed.length === range.length) {
       return {
         kind: 'episode_batch',
         episodes: completed.sort((left, right) => left.episodeNumber - right.episodeNumber),
@@ -1684,6 +1965,62 @@ export class ScriptDirector {
     const runKey = `script_episode_batch:${request.startEpisode}:${request.episodeCount}`;
     const existingCheckpoints = await this.dependencies.checkpoints.list(request.projectId, runKey);
     const configRevision = await this.modelConfigFingerprint();
+    const regenerationInitialized = Boolean(
+      request.regenerate &&
+      request.regenerationRunId &&
+      existingCheckpoints.some((checkpoint) => {
+        if (checkpoint.node !== 'batch_report' || checkpoint.chunkStart !== request.startEpisode) {
+          return false;
+        }
+        const artifact = checkpoint.artifact;
+        return Boolean(
+          artifact &&
+          typeof artifact === 'object' &&
+          !Array.isArray(artifact) &&
+          (artifact as Record<string, unknown>).stage === 'regeneration_started' &&
+          (artifact as Record<string, unknown>).regenerationRunId === request.regenerationRunId,
+        );
+      })
+    );
+    if (request.regenerate && !regenerationInitialized) {
+      // A deliberate rewrite keeps the stored episodes visible until each new
+      // candidate commits, but it must not silently reuse old AI artifacts.
+      // Plan-lock provenance remains reusable; every generation/review node in
+      // this range is marked stale before fresh work begins.
+      for (const checkpoint of existingCheckpoints) {
+        if (
+          checkpoint.status !== 'stale' &&
+          checkpoint.node !== 'plan' &&
+          checkpoint.node !== 'batch_report' &&
+          (checkpoint.episodeNumber === undefined || range.includes(checkpoint.episodeNumber))
+        ) {
+          await this.markCheckpointStale(checkpoint);
+        }
+      }
+      if (request.regenerationRunId) {
+        const markerRevision = await this.nextCheckpointArtifactRevision(
+          request.projectId,
+          runKey,
+          { node: 'batch_report', chunkStart: request.startEpisode },
+        );
+        await this.saveCheckpoint(request, {
+          projectId: request.projectId,
+          runKey,
+          node: 'batch_report',
+          status: 'running',
+          attempt: 1,
+          artifactRevision: markerRevision,
+          chunkStart: request.startEpisode,
+          artifact: {
+            schemaVersion: 1,
+            stage: 'regeneration_started',
+            regenerationRunId: request.regenerationRunId,
+          },
+          validationErrors: [],
+          updatedAt: this.now(),
+        }, `第 ${request.startEpisode}—${endEpisode} 集重新写作已初始化。`);
+      }
+    }
     await this.invalidateRejectedEpisodeCandidates(existingCheckpoints, range);
     let plan: ScriptPlan = state.plan ?? validatedPlan;
     if (plan.status === 'approved') {
@@ -1765,7 +2102,11 @@ export class ScriptDirector {
     if (!seriesOutline) {
       throw new ScriptModelOutputError('生成正文前必须先生成全剧大纲。');
     }
-    let outlines = state.episodeOutlines.filter((outline) => range.includes(outline.episodeNumber));
+    // A deliberate rewrite must follow the latest series cards rather than a
+    // detailed outline saved under an older series-outline revision.
+    let outlines = request.regenerate
+      ? []
+      : state.episodeOutlines.filter((outline) => range.includes(outline.episodeNumber));
     const missingOutlineNumbers = range.filter(
       (episodeNumber) => !outlines.some((outline) => outline.episodeNumber === episodeNumber),
     );
@@ -1847,32 +2188,40 @@ export class ScriptDirector {
         'episode_outlines',
         '根对象必须包含 outlines 数组；每个所需集号恰好出现一次且各字段完整。',
         (value) => {
-          if (!Array.isArray(value.outlines)) {
-            throw new ScriptModelOutputError('详细分集大纲字段 outlines 必须是数组。');
-          }
-          const parsed = value.outlines.map((candidate) => {
-            const parsedCandidate = this.parseEpisodeOutline(
-              recordField(candidate, 'episodeOutline'),
-              request.projectId,
-              registeredCharacterIds,
+          const rawOutlines = Array.isArray(value.outlines) ? value.outlines : [];
+          const byEpisode = new Map<number, unknown>();
+          rawOutlines.forEach((candidate) => {
+            const raw = candidate && typeof candidate === 'object' && !Array.isArray(candidate)
+              ? candidate as Record<string, unknown>
+              : {};
+            const number = typeof raw.episodeNumber === 'number'
+              ? raw.episodeNumber
+              : typeof raw.episodeNumber === 'string'
+                ? Number(raw.episodeNumber)
+                : Number.NaN;
+            if (Number.isInteger(number) && range.includes(number) && !byEpisode.has(number)) {
+              byEpisode.set(number, candidate);
+            }
+          });
+          const unused = rawOutlines.filter((candidate) => ![...byEpisode.values()].includes(candidate));
+          const parsed = range.map((episodeNumber, index) => {
+            const card = batchCards.find((candidate) => candidate.episodeNumber === episodeNumber)!;
+            const parsedCandidate = coerceEpisodeOutlineCandidate(
+              byEpisode.get(episodeNumber) ?? unused[index] ?? {},
+              {
+                projectId: request.projectId,
+                episodeNumber,
+                card,
+                registeredCharacterIds,
+                createId: () => this.createId(),
+              },
             );
             return this.canonicalEpisodeOutlineCandidate(
               parsedCandidate,
               plan,
-              parsedCandidate.episodeNumber,
+              episodeNumber,
             );
           });
-          parsed.sort((left, right) => left.episodeNumber - right.episodeNumber);
-          if (
-            parsed.length !== range.length ||
-            parsed.some((item, index) => item.episodeNumber !== range[index])
-          ) {
-            const actualEpisodeNumbers = parsed.map((item) => item.episodeNumber);
-            throw new ScriptModelOutputError(
-              `详细分集大纲需要且只能覆盖集号 ${range.join('、')}；` +
-              `实际集号为 ${actualEpisodeNumbers.length > 0 ? actualEpisodeNumbers.join('、') : '空'}。`,
-            );
-          }
           return parsed;
         },
       );
@@ -1883,6 +2232,7 @@ export class ScriptDirector {
       );
       let generated: ScriptEpisodeOutline[] | undefined;
       let artifactRevision: number | undefined;
+      let reusedEpisodeOutlineCheckpoint = false;
       if (storedEpisodeOutlines) {
         const decision = decideScriptCheckpointResume(
           storedEpisodeOutlines,
@@ -1895,6 +2245,7 @@ export class ScriptDirector {
           if (decoded.success) {
             generated = decoded.value;
             artifactRevision = storedEpisodeOutlines.artifactRevision;
+            reusedEpisodeOutlineCheckpoint = true;
           } else {
             await this.markCheckpointStale(storedEpisodeOutlines);
           }
@@ -1916,28 +2267,35 @@ export class ScriptDirector {
         // rejects an empty scene plan, so no formal store write is allowed yet.
         outlines.push(outline);
       }
-      artifactRevision ??= await this.nextCheckpointArtifactRevision(
-          request.projectId,
+      // A restored artifact may be normalized in memory by a newer decoder
+      // (for example, deterministic IDs can change). Never overwrite the
+      // immutable checkpoint with the old artifact revision during resume.
+      // The existing checkpoint is already durable; only newly generated
+      // output needs a new checkpoint write.
+      if (!reusedEpisodeOutlineCheckpoint) {
+        artifactRevision ??= await this.nextCheckpointArtifactRevision(
+            request.projectId,
+            runKey,
+            { node: 'episode_outline', episodeNumber: request.startEpisode },
+          );
+        await this.saveCheckpoint(request, {
+          projectId: request.projectId,
           runKey,
-          { node: 'episode_outline', episodeNumber: request.startEpisode },
-        );
-      await this.saveCheckpoint(request, {
-        projectId: request.projectId,
-        runKey,
-        node: 'episode_outline',
-        status: 'completed',
-        attempt: 1,
-        artifactRevision,
-        episodeNumber: request.startEpisode,
-        artifact: generated,
-        inputRevisionRefs: episodeOutlineInputRevisionRefs,
-        upstreamArtifactRefs: episodeOutlineUpstreamArtifactRefs,
-        promptVersion: episodeOutlinePromptVersion,
-        configRevision,
-        inputFingerprint: episodeOutlineInputFingerprint,
-        validationErrors: [],
-        updatedAt: this.now(),
-      }, `已保存第 ${request.startEpisode}—${endEpisode} 集详细大纲。`);
+          node: 'episode_outline',
+          status: 'completed',
+          attempt: 1,
+          artifactRevision,
+          episodeNumber: request.startEpisode,
+          artifact: generated,
+          inputRevisionRefs: episodeOutlineInputRevisionRefs,
+          upstreamArtifactRefs: episodeOutlineUpstreamArtifactRefs,
+          promptVersion: episodeOutlinePromptVersion,
+          configRevision,
+          inputFingerprint: episodeOutlineInputFingerprint,
+          validationErrors: [],
+          updatedAt: this.now(),
+        }, `已保存第 ${request.startEpisode}—${endEpisode} 集详细大纲。`);
+      }
     }
 
     const reports: Array<{ episodeNumber: number; report: ScriptGateReport }> = [];
@@ -1952,13 +2310,39 @@ export class ScriptDirector {
           episode.status === 'completed' &&
           hasCanonicalContinuity(state, episode),
       );
-      if (alreadyCompleted) {
+      const completedInCurrentRegeneration = Boolean(
+        request.regenerate &&
+        regenerationInitialized &&
+        existingCheckpoints.some((checkpoint) =>
+          checkpoint.node === 'completed' &&
+          checkpoint.episodeNumber === episodeNumber &&
+          checkpoint.status === 'succeeded')
+      );
+      if (alreadyCompleted && (!request.regenerate || completedInCurrentRegeneration)) {
         episodes.push(alreadyCompleted);
         skippedEpisodeNumbers.push(episodeNumber);
         continue;
       }
-      let outline = state.episodeOutlines.find((item) => item.episodeNumber === episodeNumber)
-        ?? outlines.find((item) => item.episodeNumber === episodeNumber);
+      const storedOutline = state.episodeOutlines.find(
+        (item) => item.episodeNumber === episodeNumber,
+      );
+      const regeneratedOutline = outlines.find((item) => item.episodeNumber === episodeNumber);
+      const reachedInCurrentRegeneration = Boolean(
+        request.regenerate &&
+        regenerationInitialized &&
+        existingCheckpoints.some((checkpoint) =>
+          checkpoint.episodeNumber === episodeNumber &&
+          checkpoint.status !== 'stale' &&
+          ['scene_plan', 'draft', 'review', 'revision', 'completed'].includes(checkpoint.node)),
+      );
+      let outline = reachedInCurrentRegeneration && storedOutline
+        ? storedOutline
+        : request.regenerate && regeneratedOutline
+        ? {
+            ...regeneratedOutline,
+            ...(storedOutline ? { id: storedOutline.id, revision: storedOutline.revision } : {}),
+          }
+        : storedOutline ?? regeneratedOutline;
       if (!outline) throw new ScriptModelOutputError(`第 ${episodeNumber} 集详细大纲不存在。`);
       if (request.draftMode === 'direct_text') {
         const direct = await this.generateDirectTextEpisode({
@@ -2785,7 +3169,7 @@ export class ScriptDirector {
       episodeUpstreamRefs.push(reviewed.artifactRef);
       draft = {
         ...draft,
-        summary: review.summary,
+        summary: review.summary || outline.goal,
         newFacts: review.newFacts,
         openedThreads: review.openedThreads,
         closedThreads: review.closedThreads,
@@ -3010,7 +3394,7 @@ export class ScriptDirector {
             }
             const candidate = {
               ...applied.episode,
-              summary: review.summary,
+              summary: review.summary || outline.goal,
               newFacts: review.newFacts,
               openedThreads: review.openedThreads,
               closedThreads: review.closedThreads,
@@ -3187,7 +3571,7 @@ export class ScriptDirector {
         episodeUpstreamRefs.push(currentReviewRef);
         draft = {
           ...draft,
-          summary: review.summary,
+          summary: review.summary || outline.goal,
           newFacts: review.newFacts,
           openedThreads: review.openedThreads,
           closedThreads: review.closedThreads,
@@ -3245,15 +3629,18 @@ export class ScriptDirector {
       }
 
       request.signal?.throwIfAborted();
-      const persistedReview = await this.persistReviewIssues(
+      const reviewUpdate = this.createReviewIssueUpdate(
         request.projectId,
         episodeNumber,
         deterministicReport.issues,
         review.issues,
       );
-      const retainedOpenHard = persistedReview.items.filter(
+      const replacedReviewSources = new Set(reviewUpdate.sources);
+      const retainedOpenHard = reviewState.reviewIssues.filter(
         (item) =>
-          item.episodeNumber === episodeNumber && isBlockingScriptReviewIssue(item),
+          item.episodeNumber === episodeNumber &&
+          !replacedReviewSources.has(item.source) &&
+          isBlockingScriptReviewIssue(item),
       );
       if (retainedOpenHard.length > 0) {
         const known = new Set(report.issues.map((issue) =>
@@ -3343,16 +3730,14 @@ export class ScriptDirector {
       // these stable refs atomically against current canon and rejects any
       // plan/outline/character/episode drift that landed while the model ran.
       const continuity = buildScriptContinuityCandidate(reviewState, draft, review.wardrobe);
-      const commitInput = buildScriptAtomicCommitInput({
-        ...reviewState,
-        reviewRevision: persistedReview.revision,
-      }, draft, continuity, {
+      const commitInput = buildScriptAtomicCommitInput(reviewState, draft, continuity, {
         upstreamArtifactRefs: episodeUpstreamRefs,
         promptVersion: 'short-drama-director-v2',
         modelConfigFingerprint: configRevision,
       });
+      commitInput.reviewUpdate = reviewUpdate;
       commitInput.inputRevisionRefs = structuredClone(currentCandidateInputRevisionRefs);
-      commitInput.expectedReviewRevision = persistedReview.revision;
+      commitInput.expectedReviewRevision = reviewState.reviewRevision;
       commitInput.inputFingerprint = computeScriptInputFingerprint(commitInput);
       const commitEpisodeWithContinuity = this.dependencies.store.commitEpisodeWithContinuity;
       if (!commitEpisodeWithContinuity) {
@@ -3603,101 +3988,62 @@ export class ScriptDirector {
             buildDirectDraftPrompt(context),
           ].join('\n')
         : buildDirectDraftPrompt(context);
-      rawText = await this.dependencies.model.complete({
-        node: 'draft',
-        projectId: request.projectId,
-        episodeNumber,
-        prompt: directDraftPrompt,
-        responseFormat: 'text',
-        signal: request.signal,
-      });
-      const originalRawText = rawText;
-      let parsed = parseCandidate(rawText);
-      const firstParsed = parsed;
-      let callsUsed = 1;
-      if (!parsed.episode || parsed.unparsedLines.length > 0) {
-        const formatPrompt = [
-          ...(recoveryAttempt > 0
-            ? [`恢复排版（第 ${recoveryAttempt} 次）：不得复用此前的排版结果。`]
-            : []),
-          '只修正下面剧本的排版，不改变事件、人物、对白含义和篇幅。',
-          `删除解释文字与Markdown围栏，严格整理为：第${episodeNumber}集、${episodeNumber}-M 地点 日或夜/内或外、人物、字幕、△动作、人物对白。`,
-          '格式示例：',
-          `第${episodeNumber}集`,
-          `${episodeNumber}-1 地点 夜/内`,
-          '人物：角色名',
-          '△动作',
-          '角色名：对白',
-          '只输出整理后的完整剧本文本。',
-          rawText,
-        ].join('\n');
-        const repairedText = await this.dependencies.model.complete({
+      let providerFailureMessage = '';
+      try {
+        rawText = await this.dependencies.model.complete({
           node: 'draft',
           projectId: request.projectId,
           episodeNumber,
-          prompt: formatPrompt,
+          prompt: directDraftPrompt,
           responseFormat: 'text',
           signal: request.signal,
         });
-        callsUsed += 1;
-        const repaired = parseCandidate(repairedText);
-        if (repaired.episode) {
-          rawText = repairedText;
-          parsed = repaired;
-        } else if (firstParsed.episode) {
-          rawText = originalRawText;
-          parsed = firstParsed;
-        } else {
-          rawText = originalRawText;
-          parsed = repaired.unparsedLines.length > 0 ? repaired : firstParsed;
-        }
+      } catch (error) {
+        if (request.signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw error;
+        providerFailureMessage = error instanceof Error ? error.message : String(error);
+        rawText = '';
       }
+      let parsed = parseCandidate(rawText);
+      const callsUsed = 1;
       if (!parsed.episode) {
-        recordCall('draft', 'ChineseShortDramaText@v1', callsUsed, 'needs_review');
-        const rejectedRevision = await this.nextCheckpointArtifactRevision(
+        if (request.regenerate && currentEpisode) {
+          throw new ScriptModelOutputError(
+            `第 ${episodeNumber} 集重新写作没有返回可识别正文，已完整保留旧稿；可再次点击重新写。`,
+          );
+        }
+        const localDraft = createMinimalDirectDraftFallback(
           request.projectId,
-          runKey,
-          { node: 'direct_draft', episodeNumber },
+          outline,
+          plan,
+          () => this.createId(),
+          this.now(),
         );
-        await this.saveCheckpoint(request, {
-          projectId: request.projectId,
-          runKey,
-          node: 'direct_draft',
-          status: 'needs_review',
-          attempt: (rejectedDirectDraft?.attempt ?? 0) + callsUsed,
-          artifactRevision: rejectedRevision,
-          episodeNumber,
-          artifact: {
-            schemaVersion: 1,
-            stage: 'direct_draft_rejected',
-            recoveryAttempt,
-            rawText,
-            createdAt: this.now(),
-          },
-          inputRevisionRefs,
-          upstreamArtifactRefs: [outlineRef],
-          promptVersion,
-          configRevision,
-          inputFingerprint: draftFingerprint,
-          validationErrors: [
-            ...parsed.warnings.map((warning) => ({
-              path: `line:${warning.line}`,
-              code: warning.code,
-              message: warning.message,
-            })),
-            ...parsed.unparsedLines.map((line) => ({
-              path: `line:${line.line}`,
-              code: 'UNPARSED_LINE',
-              message: '无法识别该剧本行。',
-            })),
-          ],
-          updatedAt: this.now(),
-        }, `第 ${episodeNumber} 集排版仍无法识别，可从检查点恢复重写。`);
-        throw new ScriptModelOutputError(`第 ${episodeNumber} 集没有返回可识别的剧本场景。`);
+        const fallback = canonicalDirectCandidate({
+          ...localDraft,
+          id: currentEpisode?.id ?? localDraft.id,
+          revision: baseEpisodeRevision,
+          createdAt: currentEpisode?.createdAt ?? localDraft.createdAt,
+        });
+        const fallbackMessage = providerFailureMessage
+          ? `正文模型调用失败，已保存本地可编辑分场稿：${providerFailureMessage}`
+          : '正文模型未返回可见正文，已保存本地可编辑分场稿。';
+        rawText = directEpisodeText(fallback, state.characters);
+        parsed = {
+          episode: fallback,
+          warnings: [{
+            line: 0,
+            code: 'UNPARSED_LINE',
+            message: fallbackMessage,
+            text: '',
+          }],
+          unparsedLines: [],
+        };
       }
       recordCall('draft', 'ChineseShortDramaText@v1', callsUsed);
       writerCallsUsed = callsUsed;
-      draft = parsed.episode;
+      const parsedDraft = parsed.episode;
+      if (!parsedDraft) throw new ScriptModelOutputError(`第 ${episodeNumber} 集本地正文兜底失败。`);
+      draft = parsedDraft;
       draftWarnings = parsed.warnings;
       directDraftRevision = await this.nextCheckpointArtifactRevision(
         request.projectId,
@@ -3708,8 +4054,8 @@ export class ScriptDirector {
         schemaVersion: 1,
         stage: 'direct_draft',
         rawText,
-        episode: draft,
-        candidateHash: computeScriptEpisodeCandidateHash(draft),
+        episode: parsedDraft,
+        candidateHash: computeScriptEpisodeCandidateHash(parsedDraft),
         parseWarnings: draftWarnings,
         createdAt: this.now(),
       };
@@ -3735,6 +4081,8 @@ export class ScriptDirector {
         updatedAt: this.now(),
       }, `第 ${episodeNumber} 集首稿已保存。`);
     }
+
+    if (!draft) throw new ScriptModelOutputError(`第 ${episodeNumber} 集直接写作候选丢失。`);
 
     const directDraftRef = buildScriptUpstreamArtifactRef(
       'direct_draft',
@@ -3772,19 +4120,30 @@ export class ScriptDirector {
       }
       if (!continued) {
         request.signal?.throwIfAborted();
-        const additionText = await this.dependencies.model.complete({
-          node: 'draft',
-          projectId: request.projectId,
-          episodeNumber,
-          prompt: buildDirectContinuationPrompt(
-            context,
-            rawText,
-            scriptVisibleChars(draft),
-            plan.targetCharsPerEpisode,
-          ),
-          responseFormat: 'text',
-          signal: request.signal,
-        });
+        let additionText = '';
+        try {
+          additionText = await this.dependencies.model.complete({
+            node: 'draft',
+            projectId: request.projectId,
+            episodeNumber,
+            prompt: buildDirectContinuationPrompt(
+              context,
+              rawText,
+              scriptVisibleChars(draft),
+              plan.targetCharsPerEpisode,
+            ),
+            responseFormat: 'text',
+            signal: request.signal,
+          });
+        } catch (error) {
+          if (request.signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw error;
+          draftWarnings.push({
+            line: 0,
+            code: 'UNPARSED_LINE',
+            message: `续写失败，已保留现有正文：${error instanceof Error ? error.message : String(error)}`,
+            text: '',
+          });
+        }
         recordCall('draft', 'ChineseShortDramaContinuation@v1', 1);
         const addition = parseCandidate(additionText);
         if (addition.episode) {
@@ -3836,35 +4195,6 @@ export class ScriptDirector {
       episodeUpstreamRefs.push(currentCandidateRef);
     }
 
-    const pauseUnparseableReview = async (
-      error: ScriptModelOutputError,
-      contractName: string,
-      extraAiIssues: readonly ScriptGateIssue[] = [],
-    ): Promise<never> => {
-      recordCall('review', contractName, 1, 'needs_review');
-      const reviewFailure: ScriptEvaluatedGateIssue = {
-        code: 'DIRECT_REVIEW_UNPARSEABLE',
-        severity: 'hard',
-        source: 'deterministic',
-        blocking: true,
-        message: error.message,
-        path: 'review',
-      };
-      await this.persistReviewIssues(
-        request.projectId,
-        episodeNumber,
-        [reviewFailure],
-        extraAiIssues,
-      );
-      throw new ScriptBatchPausedError(episodeNumber, {
-        hardFailed: true,
-        issues: [reviewFailure],
-        blockingIssues: [reviewFailure],
-        advisoryIssues: [],
-        visibleChars: draft ? scriptVisibleChars(draft) : 0,
-        dialogueDensityPercent: 0,
-      });
-    };
     const reviewPromptVersion = 'direct-handoff-review-v3';
     const reviewFingerprint = computeScriptCheckpointInputFingerprint({
       node: 'handoff_review',
@@ -3913,8 +4243,9 @@ export class ScriptDirector {
         );
         recordCall('review', 'ScriptDirectHandoffReview@v1', 1);
       } catch (error) {
-        if (!(error instanceof ScriptModelOutputError)) throw error;
-        await pauseUnparseableReview(error, 'ScriptDirectHandoffReview@v1');
+        if (request.signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw error;
+        review = createLocalDirectHandoffReview(outline, draft);
+        recordCall('review', 'ScriptDirectHandoffReview@v1', 1, 'needs_review');
       }
       if (!review) {
         throw new ScriptModelOutputError(`第 ${episodeNumber} 集审校结果无效。`);
@@ -3970,19 +4301,11 @@ export class ScriptDirector {
 
     const registeredCharacterNames = new Set(state.characters.map((character) => character.name));
     const validateDraft = (candidate: ScriptEpisode, reviewIssues: readonly ScriptGateIssue[] = []): ScriptGateReport => {
-      const temporarySpeakers = new Set<string>();
-      if (allowsTemporaryDialogueSpeakers(plan)) {
-        for (const scene of candidate.scenes) {
-          for (const block of scene.blocks) {
-            if (
-              block.type === 'dialogue' &&
-              !block.characterId &&
-              !registeredCharacterNames.has(block.speaker.trim()) &&
-              isTemporaryDialogueRole(block.speaker)
-            ) temporarySpeakers.add(block.speaker.trim());
-          }
-        }
-      }
+      const temporarySpeakers = collectTemporaryDialogueSpeakers(
+        candidate,
+        plan,
+        registeredCharacterNames,
+      );
       return validateScriptEpisode(candidate, directValidationPlan, {
         expectedEpisodeNumber: episodeNumber,
         registeredCharacterIds: new Set(state.characters.map((character) => character.id)),
@@ -4050,39 +4373,33 @@ export class ScriptDirector {
       }
       if (!rewriteArtifact) {
         request.signal?.throwIfAborted();
-        let rewrittenText = await this.dependencies.model.complete({
-          node: 'revision',
-          projectId: request.projectId,
-          episodeNumber,
-          prompt: buildDirectRewritePrompt(context, rawText, rewriteIssues, {
-            rewriteFromOutline,
-          }),
-          responseFormat: 'text',
-          signal: request.signal,
-        });
-        let rewritten = parseCandidate(rewrittenText);
-        let rewriteCallsUsed = 1;
-        if (!rewritten.episode || rewritten.unparsedLines.length > 0) {
+        let rewrittenText = '';
+        try {
           rewrittenText = await this.dependencies.model.complete({
             node: 'revision',
             projectId: request.projectId,
             episodeNumber,
-            prompt: [
-              '只修正下面剧本的排版，不改变事件、人物、对白含义和篇幅。',
-              '删除解释文字与Markdown围栏，严格整理为：第N集、N-M 地点 日或夜/内或外、人物、字幕、△动作、人物对白。',
-              '只输出整理后的完整剧本文本。',
-              rewrittenText,
-            ].join('\n'),
+            prompt: buildDirectRewritePrompt(context, rawText, rewriteIssues, {
+              rewriteFromOutline,
+            }),
             responseFormat: 'text',
             signal: request.signal,
           });
-          rewriteCallsUsed += 1;
-          rewritten = parseCandidate(rewrittenText);
+        } catch (error) {
+          if (request.signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw error;
+          draftWarnings.push({
+            line: 0,
+            code: 'UNPARSED_LINE',
+            message: `自动重写失败，已保留原正文：${error instanceof Error ? error.message : String(error)}`,
+            text: '',
+          });
         }
-        if (!rewritten.episode || rewritten.unparsedLines.length > 0) {
-          recordCall('revision', 'ChineseShortDramaDirectRewrite@v1', rewriteCallsUsed, 'needs_review');
+        const rewritten = parseCandidate(rewrittenText);
+        const rewriteCallsUsed = 1;
+        if (!rewritten.episode) {
+          recordCall('revision', 'ChineseShortDramaDirectRewrite@v1', 1, 'needs_review');
         } else {
-          recordCall('revision', 'ChineseShortDramaDirectRewrite@v1', rewriteCallsUsed);
+          recordCall('revision', 'ChineseShortDramaDirectRewrite@v1', 1);
           draft = rewritten.episode;
           rawText = rewrittenText;
           draftWarnings = rewritten.warnings;
@@ -4181,12 +4498,9 @@ export class ScriptDirector {
           );
           recordCall('review', 'ScriptDirectHandoffReviewAfterRewrite@v1', 1);
         } catch (error) {
-          if (!(error instanceof ScriptModelOutputError)) throw error;
-          await pauseUnparseableReview(
-            error,
-            'ScriptDirectHandoffReviewAfterRewrite@v1',
-            aiIssues,
-          );
+          if (request.signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw error;
+          postRewriteReview = createLocalDirectHandoffReview(outline, draft);
+          recordCall('review', 'ScriptDirectHandoffReviewAfterRewrite@v1', 1, 'needs_review');
         }
         if (!postRewriteReview) {
           throw new ScriptModelOutputError(`第 ${episodeNumber} 集重写后审校结果无效。`);
@@ -4245,8 +4559,8 @@ export class ScriptDirector {
       draft = postRewriteDraft;
       const postRewriteBlockingIssues: ScriptGateIssue[] = review.issues.map((issue) => ({
         code: `DIRECT_RECHECK_${issue.code}`,
-        severity: 'hard',
-        source: 'deterministic',
+        severity: 'soft',
+        source: 'ai',
         message: `${issue.evidence}；应为：${issue.expected}`,
         ...(issue.sceneNumber
           ? { sceneId: postRewriteDraft.scenes.find((scene) => scene.ordinal === issue.sceneNumber)?.id }
@@ -4258,22 +4572,19 @@ export class ScriptDirector {
       }
     }
 
-    if (rewriteIssues.length > 0 && !rewriteApplied) {
-      deterministicReport = validateDraft(draft, aiIssues.map((issue) => ({
-        ...issue,
-        severity: 'hard',
-        source: 'deterministic',
-      })));
-      report = deterministicReport;
-    }
-
-    const persistedReview = await this.persistReviewIssues(
+    const reviewUpdate = this.createReviewIssueUpdate(
       request.projectId,
       episodeNumber,
       deterministicReport.issues,
       rewriteApplied && review.verdict === 'pass' ? [] : aiIssues,
     );
     if (report.hardFailed) {
+      await this.dependencies.store.replaceEpisodeReviewIssues(
+        request.projectId,
+        episodeNumber,
+        reviewUpdate.sources,
+        reviewUpdate.items,
+      );
       const completedCheckpointRevision = await this.nextCheckpointArtifactRevision(
         request.projectId,
         runKey,
@@ -4336,16 +4647,14 @@ export class ScriptDirector {
       draft,
       state.characters,
     );
-    const commitInput = buildScriptAtomicCommitInput({
-      ...reviewState,
-      reviewRevision: persistedReview.revision,
-    }, draft, continuity, {
+    const commitInput = buildScriptAtomicCommitInput(reviewState, draft, continuity, {
       upstreamArtifactRefs: [...episodeUpstreamRefs, finalCandidateRef],
       promptVersion: 'short-drama-direct-writing-v1',
       modelConfigFingerprint: configRevision,
     });
+    commitInput.reviewUpdate = reviewUpdate;
     commitInput.inputRevisionRefs = structuredClone(inputRevisionRefs);
-    commitInput.expectedReviewRevision = persistedReview.revision;
+    commitInput.expectedReviewRevision = reviewState.reviewRevision;
     commitInput.candidateHash = computeScriptEpisodeCandidateHash(draft);
     commitInput.inputFingerprint = computeScriptInputFingerprint(commitInput);
     const commitEpisodeWithContinuity = this.dependencies.store.commitEpisodeWithContinuity;
@@ -4372,66 +4681,8 @@ export class ScriptDirector {
     return { episode: saved, report };
   }
 
-  private parseEpisodeOutline(
-    value: Record<string, unknown>,
-    projectId: string,
-    registeredCharacterIds?: ReadonlySet<string>,
-  ): ScriptEpisodeOutline {
-    if (!Array.isArray(value.plannedScenes)) {
-      throw new ScriptModelOutputError('模型结果缺少数组字段 plannedScenes。');
-    }
-    const plannedScenes = value.plannedScenes.length > 0
-      ? this.parsePlannedScenes(value.plannedScenes, 5)
-      : [];
-    const characterIds = stringsField(value.characterIds, 'characterIds');
-    const unknownCharacterId = characterIds.find(
-      (characterId) => registeredCharacterIds && !registeredCharacterIds.has(characterId),
-    );
-    if (unknownCharacterId) {
-      throw new ScriptModelOutputError(`详细大纲引用了未登记人物 ID：${unknownCharacterId}。`);
-    }
-    return {
-      id: optionalStringField(value.id) ?? this.createId(),
-      projectId,
-      episodeNumber: numberField(value.episodeNumber, 'episodeNumber'),
-      title: stringField(value.title, 'title'),
-      goal: stringField(value.goal, 'goal'),
-      conflict: stringField(value.conflict, 'conflict'),
-      beats: stringsField(value.beats, 'beats'),
-      characterIds,
-      plannedScenes,
-      ...(optionalStringField(value.reveal) ? { reveal: optionalStringField(value.reveal) } : {}),
-      ...(optionalStringField(value.reversal) ? { reversal: optionalStringField(value.reversal) } : {}),
-      endingHook: stringField(value.endingHook, 'endingHook'),
-      requiredFacts: stringsField(value.requiredFacts, 'requiredFacts'),
-      forbiddenFacts: stringsField(value.forbiddenFacts, 'forbiddenFacts'),
-      status: 'expanded',
-      revision: 0,
-    };
-  }
-
   private parsePlannedScenes(value: unknown, maxScenes: number): ScriptPlannedScene[] {
-    if (!Array.isArray(value) || value.length < 1 || value.length > maxScenes) {
-      throw new ScriptModelOutputError(`plannedScenes 数量必须为 1—${maxScenes}。`);
-    }
-    const ordinals = new Set<number>();
-    const plannedScenes = value.map((candidate) => {
-      const scene = recordField(candidate, 'plannedScene');
-      const ordinal = numberField(scene.ordinal, 'ordinal');
-      if (ordinals.has(ordinal)) throw new ScriptModelOutputError(`场号 ${ordinal} 重复。`);
-      ordinals.add(ordinal);
-      return {
-        ordinal,
-        location: stringField(scene.location, 'location'),
-        timeOfDay: enumField(scene.timeOfDay, 'timeOfDay', ['day', 'night', 'dawn', 'dusk']),
-        interiorExterior: enumField(scene.interiorExterior, 'interiorExterior', ['interior', 'exterior']),
-        purpose: stringField(scene.purpose, 'purpose'),
-      };
-    });
-    if (plannedScenes.some((scene, index) => scene.ordinal !== index + 1)) {
-      throw new ScriptModelOutputError('plannedScenes 场号必须从 1 开始连续递增。');
-    }
-    return plannedScenes;
+    return coercePlannedScenes(value, { max: Math.max(1, maxScenes) });
   }
 
   private parseEpisode(
@@ -4441,58 +4692,14 @@ export class ScriptDirector {
     plan: ScriptPlan,
     current?: ScriptEpisode,
   ): ScriptEpisode {
-    if (!Array.isArray(value.scenes)) throw new ScriptModelOutputError('scenes 必须是数组。');
-    const scenes: ScriptScene[] = value.scenes.map((candidate) => {
-      const scene = recordField(candidate, 'scene');
-      if (!Array.isArray(scene.blocks)) throw new ScriptModelOutputError('blocks 必须是数组。');
-      return {
-        id: optionalStringField(scene.id) ?? this.createId(),
-        ordinal: numberField(scene.ordinal, 'ordinal'),
-        location: stringField(scene.location, 'location'),
-        timeOfDay: enumField(scene.timeOfDay, 'timeOfDay', ['day', 'night', 'dawn', 'dusk']),
-        interiorExterior: enumField(scene.interiorExterior, 'interiorExterior', ['interior', 'exterior']),
-        characterIds: stringsField(scene.characterIds, 'characterIds'),
-        blocks: scene.blocks.map((candidateBlock) => {
-          const block = recordField(candidateBlock, 'block');
-          const type = enumField(block.type, 'type', ['caption', 'action', 'dialogue']);
-          const id = optionalStringField(block.id) ?? this.createId();
-          const text = stringField(block.text, 'text');
-          if (type === 'caption' || type === 'action') return { id, type, text };
-          return {
-            id,
-            type: 'dialogue' as const,
-            ...(optionalStringField(block.characterId) ? { characterId: optionalStringField(block.characterId) } : {}),
-            speaker: stringField(block.speaker, 'speaker'),
-            ...(optionalStringField(block.delivery) ? { delivery: optionalStringField(block.delivery) } : {}),
-            ...(block.mode !== undefined
-              ? { mode: enumField(block.mode, 'mode', ['normal', 'os', 'vo']) }
-              : {}),
-            text,
-          };
-        }),
-      };
-    });
-    const now = this.now();
-    if (typeof value.summary !== 'string') {
-      throw new ScriptModelOutputError('模型结果缺少字符串字段 summary。');
-    }
-    const candidate: ScriptEpisode = {
-      id: current?.id ?? optionalStringField(value.id) ?? this.createId(),
+    const candidate = coerceEpisodeDraftCandidate(value, {
       projectId,
-      episodeNumber: numberField(value.episodeNumber, 'episodeNumber'),
-      title: stringField(value.title, 'title'),
-      outlineId: outline.id,
-      status: 'reviewing',
-      targetChars: plan.targetCharsPerEpisode,
-      scenes,
-      summary: value.summary.trim(),
-      newFacts: stringsField(value.newFacts, 'newFacts'),
-      openedThreads: stringsField(value.openedThreads, 'openedThreads'),
-      closedThreads: stringsField(value.closedThreads, 'closedThreads'),
-      revision: current?.revision ?? 0,
-      createdAt: current?.createdAt ?? now,
-      updatedAt: now,
-    };
+      outline,
+      plan,
+      ...(current ? { current } : {}),
+      createId: () => this.createId(),
+      now: this.now(),
+    });
     return this.canonicalEpisodeCandidate(candidate, plan, outline.episodeNumber);
   }
 
@@ -4558,20 +4765,21 @@ export class ScriptDirector {
     closedThreads: string[];
     wardrobe: Array<{ characterId: string; outfit: string }>;
   } {
-    if (!Array.isArray(value.issues)) {
-      throw new ScriptModelOutputError('模型结果缺少数组字段 issues。');
-    }
-    const rawIssues = value.issues;
-    const parsedIssues = rawIssues.map((candidate) => {
-      const issue = recordField(candidate, 'issue');
-      return {
-        code: stringField(issue.code, 'issue.code'),
-        severity: enumField(issue.severity, 'issue.severity', ['hard', 'soft']),
-        message: stringField(issue.message, 'issue.message'),
+    const rawIssues = Array.isArray(value.issues) ? value.issues : [];
+    const parsedIssues = rawIssues.flatMap((candidate): ScriptGateIssue[] => {
+      if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return [];
+      const issue = candidate as Record<string, unknown>;
+      const code = optionalStringField(issue.code);
+      const message = optionalStringField(issue.message);
+      if (!code || !message) return [];
+      return [{
+        code,
+        severity: issue.severity === 'hard' ? 'hard' : 'soft',
+        message,
         ...(optionalStringField(issue.sceneId) ? { sceneId: optionalStringField(issue.sceneId) } : {}),
         ...(optionalStringField(issue.blockId) ? { blockId: optionalStringField(issue.blockId) } : {}),
         ...(optionalStringField(issue.path) ? { path: optionalStringField(issue.path) } : {}),
-      };
+      }];
     });
     const seenIssues = new Set<string>();
     const issues = parsedIssues
@@ -4589,22 +4797,23 @@ export class ScriptDirector {
         return true;
       })
       .slice(0, SCRIPT_SANITY_REVIEW_MAX_ISSUES);
-    if (!Array.isArray(value.wardrobe)) {
-      throw new ScriptModelOutputError('模型结果缺少数组字段 wardrobe。');
-    }
-    const wardrobe = value.wardrobe.map((candidate) => {
-          const item = recordField(candidate, 'wardrobe');
-          return {
-            characterId: stringField(item.characterId, 'wardrobe.characterId'),
-            outfit: stringField(item.outfit, 'wardrobe.outfit'),
-          };
-        });
+    const wardrobe = (Array.isArray(value.wardrobe) ? value.wardrobe : []).flatMap((candidate) => {
+      if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return [];
+      const item = candidate as Record<string, unknown>;
+      const characterId = optionalStringField(item.characterId);
+      const outfit = optionalStringField(item.outfit);
+      return characterId && outfit ? [{ characterId, outfit }] : [];
+    });
+    const looseStrings = (candidate: unknown): string[] => Array.isArray(candidate)
+      ? [...new Set(candidate.filter((item): item is string => typeof item === 'string')
+        .map((item) => item.trim()).filter(Boolean))]
+      : [];
     return {
       issues,
-      summary: stringField(value.summary, 'summary'),
-      newFacts: stringsField(value.newFacts, 'newFacts'),
-      openedThreads: stringsField(value.openedThreads, 'openedThreads'),
-      closedThreads: stringsField(value.closedThreads, 'closedThreads'),
+      summary: optionalStringField(value.summary) ?? '',
+      newFacts: looseStrings(value.newFacts),
+      openedThreads: looseStrings(value.openedThreads),
+      closedThreads: looseStrings(value.closedThreads),
       wardrobe,
     };
   }
@@ -4615,12 +4824,30 @@ export class ScriptDirector {
     deterministicIssues: readonly ScriptGateIssue[],
     aiIssues: readonly ScriptGateIssue[],
   ): Promise<ScriptReviewIssueCollection> {
-    const now = this.now();
+    const update = this.createReviewIssueUpdate(
+      projectId,
+      episodeNumber,
+      deterministicIssues,
+      aiIssues,
+    );
     return this.dependencies.store.replaceEpisodeReviewIssues(
       projectId,
       episodeNumber,
-      ['deterministic', 'ai'],
-      [
+      update.sources,
+      update.items,
+    );
+  }
+
+  private createReviewIssueUpdate(
+    projectId: string,
+    episodeNumber: number,
+    deterministicIssues: readonly ScriptGateIssue[],
+    aiIssues: readonly ScriptGateIssue[],
+  ): { sources: ScriptReviewSource[]; items: ScriptReviewIssue[] } {
+    const now = this.now();
+    return {
+      sources: ['deterministic', 'ai'],
+      items: [
         ...createScriptReviewIssues(
           projectId,
           episodeNumber,
@@ -4630,7 +4857,7 @@ export class ScriptDirector {
         ),
         ...createScriptReviewIssues(projectId, episodeNumber, 'ai', aiIssues, now),
       ],
-    );
+    };
   }
 
   private assembleEpisodeContext(
