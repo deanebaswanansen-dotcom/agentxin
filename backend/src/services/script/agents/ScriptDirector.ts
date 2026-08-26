@@ -932,6 +932,75 @@ const PLAN_LOCK_CONFIG_REVISION = createHash('sha256')
   .update('agentxin:script-plan-lock:v1', 'utf8')
   .digest('hex');
 
+const SERIES_SYNOPSIS_MIN_CHARS = 450;
+
+function synopsisFragment(value: string): string {
+  const normalized = value.replace(/\s+/gu, ' ').trim();
+  if (!normalized) return '';
+  return /[。！？]$/u.test(normalized) ? normalized : `${normalized}。`;
+}
+
+/**
+ * Keeps a useful model-written synopsis intact, but expands a one-line result
+ * locally from the approved plan and generated cards. This does not make an
+ * extra model call and therefore cannot turn a short synopsis into a stuck job.
+ */
+function completeSeriesSynopsis(
+  original: string,
+  plan: ScriptPlan,
+  cards: readonly ScriptEpisodeCard[],
+  milestones: {
+    openingState: string;
+    midpointTurn: string;
+    climax: string;
+    endingState: string;
+    mainArc: readonly string[];
+    subplotArcs: readonly string[];
+  },
+): string {
+  const normalizedOriginal = original.replace(/\s+/gu, ' ').trim();
+  if (normalizedOriginal.length >= SERIES_SYNOPSIS_MIN_CHARS) return normalizedOriginal;
+
+  const paragraphs: string[] = [];
+  const seen = new Set<string>();
+  const add = (value: string): void => {
+    const fragment = synopsisFragment(value);
+    if (!fragment || seen.has(fragment)) return;
+    seen.add(fragment);
+    paragraphs.push(fragment);
+  };
+  add(normalizedOriginal);
+  add(`《${plan.title}》面向${plan.audience}，以“${plan.theme}”为主题，围绕“${plan.coreConflict}”展开。${plan.logline}`);
+  add(`开篇阶段，${milestones.openingState} 主角由此被卷入核心矛盾，必须在连续升级的阻力中作出选择并推动局面变化`);
+
+  const addCard = (card: ScriptEpisodeCard): void => add(
+    `推进到第${card.episodeNumber}集《${card.title}》时，${card.logline} 主要事件是：${card.mainEvent} 本集以“${card.endingHook}”形成下一阶段的推动力`,
+  );
+  add(`全剧主线依次推进${milestones.mainArc.join('、') || plan.coreConflict}；支线围绕${milestones.subplotArcs.join('、') || plan.highlights.join('、') || plan.theme}展开，并持续影响主角的判断与关系`);
+  add(`中段发生关键转折：${milestones.midpointTurn} 此后人物从被动应对转为主动破局，前段埋下的线索、关系和利益冲突开始汇合`);
+  add(`高潮阶段，${milestones.climax} 冲突在公开行动或不可回避的正面对抗中兑现，主角必须为此前的选择承担代价`);
+  add(`最终，${milestones.endingState || plan.endingDirection} 结局回应开篇提出的核心矛盾，并完成主要人物的阶段性成长与主题落点`);
+
+  // Add representative concrete events only while the structural paragraphs
+  // are still short, so the local completion stays around 500–700 Chinese
+  // characters instead of dumping dozens of cards into the synopsis.
+  const milestoneIndexes = new Set<number>();
+  if (cards.length > 0) {
+    for (const ratio of [0, 0.25, 0.5, 0.75, 1]) {
+      milestoneIndexes.add(Math.min(cards.length - 1, Math.round((cards.length - 1) * ratio)));
+    }
+  }
+  for (const index of [...milestoneIndexes].sort((left, right) => left - right)) {
+    if (paragraphs.join('\n\n').length >= 540) break;
+    const card = cards[index];
+    if (card) addCard(card);
+  }
+  if (paragraphs.join('\n\n').length < SERIES_SYNOPSIS_MIN_CHARS) {
+    add(`创作执行中保持“${plan.coreRequirements}”，突出${plan.highlights.join('、') || plan.genres.join('、')}，并避免${plan.forbiddenElements.join('、') || '无因果的突变'}，使每一阶段都能自然承接下一阶段`);
+  }
+  return paragraphs.join('\n\n');
+}
+
 /**
  * Produces a complete, editable outline chunk from the already approved plan.
  * This is deliberately local: if the provider cannot return even the first
@@ -1202,7 +1271,7 @@ export class ScriptDirector {
             previousBoundary,
           )]
         : [])];
-      const promptVersion = 'series-outline-chunk-v3';
+      const promptVersion = 'series-outline-chunk-v4';
       const inputFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'series_outline',
         inputRevisionRefs,
@@ -1253,6 +1322,10 @@ export class ScriptDirector {
       const prompt = [
         '你是 SeriesOutlineAgent，生成全剧总纲和指定范围的轻量分集卡。',
         `本段只返回第 ${start}—${end} 集；请尽量给全，缺集、重号和乱序会由系统补齐。`,
+        start === 1
+          ? 'synopsis 必须写成 450—650 个汉字的全剧大纲，不是一句话简介。要完整交代故事起因、矛盾升级、关键反转、人物选择、高潮对决和最终结局，并能直接指导后续各集写作。'
+          : '本段重点写分集卡；synopsis 可简写或沿用全剧大纲，最终以第一段的完整 synopsis 为准。',
+        '每张分集卡要具体：title 约 4—12 字；logline 约 40—80 字；mainEvent 约 40—100 字；endingHook 约 20—50 字。不要只写“调查真相”“冲突升级”这类空话。',
         '只返回 JSON，字段：synopsis, openingState, midpointTurn, climax, endingState, mainArc, subplotArcs, episodeCards。',
         '建议模板：{"synopsis":"字符串","openingState":"字符串","midpointTurn":"字符串","climax":"字符串","endingState":"字符串","mainArc":["字符串"],"subplotArcs":["字符串"],"episodeCards":[{"episodeNumber":1,"title":"字符串","logline":"字符串","mainEvent":"字符串","endingHook":"字符串"}]}。优先使用这些键，辅助缺项可省略。',
         previousBoundary.length > 0
@@ -1299,7 +1372,7 @@ export class ScriptDirector {
       });
       const contract = parserContract(
         'series_outline_chunk',
-        `返回第 ${start}—${end} 集的主要剧情即可；系统会补齐次要总纲字段并强制集号连续唯一。`,
+        `返回第 ${start}—${end} 集可直接指导正文的剧情；系统会补齐缺项并强制集号连续唯一，不因篇幅不足卡死。`,
         completeOutlineChunk,
       );
       let parsed: Record<string, unknown>;
@@ -1392,15 +1465,28 @@ export class ScriptDirector {
         `分集卡必须完整覆盖 1—${plan.totalEpisodes} 集且集号唯一连续。`,
       );
     }
+    const openingState = stringField(first.openingState, 'openingState');
+    const midpointTurn = stringField(first.midpointTurn, 'midpointTurn');
+    const climax = stringField(first.climax, 'climax');
+    const endingState = stringField(first.endingState, 'endingState');
+    const mainArc = stringsField(first.mainArc, 'mainArc');
+    const subplotArcs = stringsField(first.subplotArcs, 'subplotArcs');
     const candidateOutline: ScriptSeriesOutline = {
       projectId,
-      synopsis: stringField(first.synopsis, 'synopsis'),
-      openingState: stringField(first.openingState, 'openingState'),
-      midpointTurn: stringField(first.midpointTurn, 'midpointTurn'),
-      climax: stringField(first.climax, 'climax'),
-      endingState: stringField(first.endingState, 'endingState'),
-      mainArc: stringsField(first.mainArc, 'mainArc'),
-      subplotArcs: stringsField(first.subplotArcs, 'subplotArcs'),
+      synopsis: completeSeriesSynopsis(stringField(first.synopsis, 'synopsis'), plan, cards, {
+        openingState,
+        midpointTurn,
+        climax,
+        endingState,
+        mainArc,
+        subplotArcs,
+      }),
+      openingState,
+      midpointTurn,
+      climax,
+      endingState,
+      mainArc,
+      subplotArcs,
       episodeCards: cards,
       revision: state?.seriesOutline?.revision ?? 0,
     };
