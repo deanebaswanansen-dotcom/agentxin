@@ -84,14 +84,39 @@ export function registerAgentJobRoutes(
     return reply.code(200).send(toClientRun(run));
   });
 
-  app.get<{ Params: { projectId: string } }>(
+  app.get<{ Params: { projectId: string }; Querystring: { trashed?: string } }>(
     '/api/projects/:projectId/agent-jobs',
     async (request, reply) => {
       const clientId = getCurrentClientId();
-      const runs = store.listForClient(clientId, request.params.projectId);
+      const runs = store.listForClient(clientId, request.params.projectId, {
+        trashed: request.query.trashed === 'true',
+      });
       return reply.code(200).send(runs.map(toClientRun));
     },
   );
+
+  app.delete<{ Params: { id: string } }>('/api/agent/jobs/:id', async (request, reply) => {
+    try {
+      const run = await store.moveToTrash(getCurrentClientId(), request.params.id);
+      return run ? reply.code(200).send(toClientRun(run)) : reply.code(404).send(NOT_FOUND);
+    } catch (error) {
+      if (error instanceof AgentRunConflictError) {
+        return reply.code(409).send({ error: { code: 'CONFLICT', message: error.message } });
+      }
+      const { status, body } = toErrorResponse(error);
+      return reply.code(status).send(body);
+    }
+  });
+
+  app.post<{ Params: { id: string } }>('/api/agent/jobs/:id/restore', async (request, reply) => {
+    const run = await store.restoreFromTrash(getCurrentClientId(), request.params.id);
+    return run ? reply.code(200).send(toClientRun(run)) : reply.code(404).send(NOT_FOUND);
+  });
+
+  app.delete<{ Params: { id: string } }>('/api/agent/jobs/:id/permanent', async (request, reply) => {
+    const deleted = await store.deletePermanently(getCurrentClientId(), request.params.id);
+    return deleted ? reply.code(204).send() : reply.code(404).send(NOT_FOUND);
+  });
 
   app.post<{ Params: { id: string } }>('/api/agent/jobs/:id/resume', async (request, reply) => {
     const run = await runner.resume(

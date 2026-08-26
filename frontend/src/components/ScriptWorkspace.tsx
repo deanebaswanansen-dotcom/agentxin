@@ -714,6 +714,83 @@ const JOB_STATUS_LABEL: Record<ScriptAgentJobSnapshot['status'], string> = {
   cancelled: '已取消',
 };
 
+const JOB_TASK_LABEL: Record<ScriptAgentJobSnapshot['task'], string> = {
+  script_plan: '剧本策划',
+  script_series_outline: '剧本大纲',
+  script_bible: '人物与世界',
+  script_episode_batch: '分批正文',
+};
+
+function jobDisplayLabel(job: ScriptAgentJobSnapshot): string {
+  if (job.task !== 'script_episode_batch' || !job.scriptBatchOptions) return JOB_TASK_LABEL[job.task];
+  const start = job.scriptBatchOptions.startEpisode;
+  const end = start + job.scriptBatchOptions.episodeCount - 1;
+  return `第 ${start}–${end} 集正文`;
+}
+
+function TaskRecordPanel({
+  mode,
+  jobs,
+  busy,
+  loading,
+  onClose,
+  onTrash,
+  onRestore,
+  onDeletePermanently,
+}: {
+  mode: 'history' | 'trash';
+  jobs: ScriptAgentJobSnapshot[];
+  busy: boolean;
+  loading: boolean;
+  onClose: () => void;
+  onTrash: (jobId: string) => void;
+  onRestore: (jobId: string) => void;
+  onDeletePermanently: (jobId: string) => void;
+}): JSX.Element {
+  const isTrash = mode === 'trash';
+  return (
+    <section className="script-task-records" aria-label={isTrash ? '任务回收站' : '任务记录'}>
+      <header>
+        <div>
+          <span>{isTrash ? '删除保护' : '后台任务'}</span>
+          <h2>{isTrash ? '任务回收站' : '任务记录'}</h2>
+          <p>{isTrash ? '恢复不会重新调用 AI；永久删除只删除任务记录，不删除已经生成的剧本。' : '已完成、失败或已取消的任务可以删除到回收站。正在运行的任务请先取消。'}</p>
+        </div>
+        <button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" onClick={onClose}>关闭</button>
+      </header>
+      {loading ? <p className="script-muted">正在读取回收站…</p> : jobs.length === 0 ? (
+        <p className="script-task-records__empty">{isTrash ? '回收站是空的。' : '当前项目还没有任务记录。'}</p>
+      ) : (
+        <div className="script-task-records__list">
+          {jobs.map((job) => {
+            const terminal = !BLOCKING_JOB_STATUSES.has(job.status);
+            const updatedAt = job.updatedAt ? new Date(job.updatedAt) : undefined;
+            const updatedLabel = updatedAt && !Number.isNaN(updatedAt.getTime())
+              ? updatedAt.toLocaleString('zh-CN', { hour12: false })
+              : '时间未知';
+            return (
+              <article key={job.id} className="script-task-record">
+                <div>
+                  <strong>{jobDisplayLabel(job)}</strong>
+                  <span>{JOB_STATUS_LABEL[job.status]} · {isTrash ? '删除于' : '更新于'} {updatedLabel}</span>
+                </div>
+                <div className="script-task-record__actions">
+                  {isTrash ? <>
+                    <button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={busy} onClick={() => onRestore(job.id)}>恢复</button>
+                    <button type="button" className="nwa-button nwa-button--danger nwa-button--sm" disabled={busy} onClick={() => onDeletePermanently(job.id)}>永久删除</button>
+                  </> : terminal ? (
+                    <button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={busy} onClick={() => onTrash(job.id)}>删除</button>
+                  ) : <span>运行中不可删除</span>}
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
 const CHECKPOINT_LABEL: Record<NonNullable<ScriptAgentJobSnapshot['checkpoint']>['node'], string> = {
   plan: '策划锁定',
   series_outline: '全剧大纲',
@@ -819,6 +896,7 @@ function EpisodeBatchPanel({
   onStart,
   onResume,
   onCancel,
+  onTrash,
   onOpenEpisode,
   onEpisodeChange,
   onSaveEpisode,
@@ -837,6 +915,7 @@ function EpisodeBatchPanel({
   onStart: (startEpisode: number, episodeCount: number, regenerate?: boolean) => void;
   onResume: (jobId: string) => void;
   onCancel: (jobId: string) => void;
+  onTrash: (jobId: string) => void;
   onOpenEpisode: (episodeNumber: number) => void;
   onEpisodeChange: (episode: ScriptEpisode) => void;
   onSaveEpisode: () => void;
@@ -934,6 +1013,7 @@ function EpisodeBatchPanel({
               {job.error ? <p className="script-job-error">{job.error.message}</p> : null}
               {job.continuable ? <button type="button" className="nwa-button nwa-button--sm" disabled={busy} onClick={() => onResume(job.id)}>从检查点继续</button> : null}
               {BLOCKING_JOB_STATUSES.has(job.status) ? <button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={busy} onClick={() => onCancel(job.id)}>取消任务</button> : null}
+              {!BLOCKING_JOB_STATUSES.has(job.status) ? <button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={busy} onClick={() => onTrash(job.id)}>删除</button> : null}
             </article>
           ))}
         </aside>
@@ -1049,6 +1129,9 @@ export function ScriptWorkspace({
   const [conceptBusy, setConceptBusy] = useState(false);
   const [planQuestions, setPlanQuestions] = useState<ScriptPlanQuestion[]>([]);
   const [planAnswers, setPlanAnswers] = useState<Record<string, ScriptPlanAnswer>>({});
+  const [taskRecordMode, setTaskRecordMode] = useState<'history' | 'trash'>();
+  const [trashJobs, setTrashJobs] = useState<ScriptAgentJobSnapshot[]>([]);
+  const [trashLoading, setTrashLoading] = useState(false);
   const episodeRequest = useRef<AbortController>();
   const batchRequest = useRef<AbortController>();
   const jobSignature = useRef('');
@@ -1087,6 +1170,9 @@ export function ScriptWorkspace({
     setConceptBusy(false);
     setPlanQuestions([]);
     setPlanAnswers({});
+    setTaskRecordMode(undefined);
+    setTrashJobs([]);
+    setTrashLoading(false);
     episodeRequest.current?.abort();
     batchRequest.current?.abort();
     jobSignature.current = '';
@@ -2094,6 +2180,81 @@ export function ScriptWorkspace({
     }
   }, [client, data?.plan.title, onError, projectId, projectName]);
 
+  const openTaskRecords = useCallback(async (mode: 'history' | 'trash') => {
+    setTaskRecordMode(mode);
+    if (mode !== 'trash') return;
+    if (!client.script.jobs.listTrash) {
+      setNotice('回收站接口尚未部署，请先部署新版后端。');
+      return;
+    }
+    setTrashLoading(true);
+    try {
+      setTrashJobs(await client.script.jobs.listTrash(projectId));
+    } catch (error) {
+      onError?.(error);
+    } finally {
+      setTrashLoading(false);
+    }
+  }, [client, onError, projectId]);
+
+  const trashJob = useCallback(async (jobId: string) => {
+    if (!client.script.jobs.trash) {
+      setNotice('删除任务接口尚未部署，请先部署新版后端。');
+      return;
+    }
+    setBusy(true);
+    setNotice('');
+    try {
+      const trashed = await client.script.jobs.trash(jobId);
+      setData((current) => current ? {
+        ...current,
+        jobs: current.jobs.filter((job) => job.id !== jobId),
+      } : current);
+      setTrashJobs((current) => [trashed, ...current.filter((job) => job.id !== jobId)]);
+      setNotice('任务已移入回收站，已生成的剧本没有删除。');
+    } catch (error) {
+      onError?.(error);
+    } finally {
+      setBusy(false);
+    }
+  }, [client, onError]);
+
+  const restoreJob = useCallback(async (jobId: string) => {
+    if (!client.script.jobs.restore) return;
+    setBusy(true);
+    setNotice('');
+    try {
+      const restored = await client.script.jobs.restore(jobId);
+      setTrashJobs((current) => current.filter((job) => job.id !== jobId));
+      setData((current) => current ? {
+        ...current,
+        jobs: [restored, ...current.jobs.filter((job) => job.id !== jobId)],
+      } : current);
+      setNotice('任务记录已恢复。');
+    } catch (error) {
+      onError?.(error);
+    } finally {
+      setBusy(false);
+    }
+  }, [client, onError]);
+
+  const deleteJobPermanently = useCallback(async (jobId: string) => {
+    if (!client.script.jobs.removePermanently) return;
+    const confirmed = window.confirm('永久删除后无法恢复。只会删除任务记录，不会删除已经生成的剧本。确定永久删除吗？');
+    if (!confirmed) return;
+    setBusy(true);
+    setNotice('');
+    try {
+      await client.script.jobs.removePermanently(jobId);
+      setTrashJobs((current) => current.filter((job) => job.id !== jobId));
+      setNotice('任务记录已永久删除，剧本内容仍然保留。');
+    } catch (error) {
+      onError?.(error);
+    } finally {
+      setBusy(false);
+    }
+  }, [client, onError]);
+
   const workspaceTitle = data?.plan.title || projectName || '未命名短剧';
   const totalEpisodes = data?.plan.totalEpisodes ?? 0;
   const completedEpisodes = data?.episodes.filter((item) => item.status === 'completed').length ?? 0;
@@ -2168,14 +2329,15 @@ export function ScriptWorkspace({
         onBatchChange={(startEpisode) => void openBatch(startEpisode)}
       />
       <main className="script-workspace-main">
-        <header className="script-workspace-header"><div><span className="script-workspace-kicker">短剧生产工作台</span><h1>{workspaceTitle}</h1></div><div className="script-workspace-summary"><span>{totalEpisodes} 集</span><span>{completedEpisodes} 已完成</span><span>{totalVisibleChars.toLocaleString('zh-CN')} 字</span></div></header>
+        <header className="script-workspace-header"><div><span className="script-workspace-kicker">短剧生产工作台</span><h1>{workspaceTitle}</h1></div><div className="script-workspace-summary"><span>{totalEpisodes} 集</span><span>{completedEpisodes} 已完成</span><span>{totalVisibleChars.toLocaleString('zh-CN')} 字</span><button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" aria-expanded={taskRecordMode === 'history'} onClick={() => void openTaskRecords('history')}>任务记录{data ? ` ${data.jobs.length}` : ''}</button><button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" aria-expanded={taskRecordMode === 'trash'} onClick={() => void openTaskRecords('trash')}>回收站{trashJobs.length > 0 ? ` ${trashJobs.length}` : ''}</button></div></header>
         {notice ? <div className="script-notice" role="status">{notice}</div> : null}
+        {taskRecordMode ? <TaskRecordPanel mode={taskRecordMode} jobs={taskRecordMode === 'trash' ? trashJobs : data?.jobs ?? []} busy={busy} loading={taskRecordMode === 'trash' && trashLoading} onClose={() => setTaskRecordMode(undefined)} onTrash={(jobId) => void trashJob(jobId)} onRestore={(jobId) => void restoreJob(jobId)} onDeletePermanently={(jobId) => void deleteJobPermanently(jobId)} /> : null}
         {visibleBackgroundJob ? <MaterialJobPanel job={visibleBackgroundJob} label={backgroundJobLabel} busy={busy} onResume={(jobId) => void resumeJob(jobId)} onCancel={(jobId) => void cancelJob(jobId)} /> : null}
         {!data ? <div className="script-loading" role="status">正在加载短剧资料…</div> : null}
         {data && stage === 'plan' ? <PlanEditor value={data.plan} busy={busy} conceptBusy={conceptBusy} conceptPrompt={conceptPrompt} concepts={concepts} questions={planQuestions} answers={planAnswers} onChange={(plan) => { markResourceDirty('plan'); setData((current) => current ? { ...current, plan } : current); }} onConceptPromptChange={setConceptPrompt} onGenerateConcepts={() => void generateConcepts()} onAdoptConcept={adoptConcept} onSave={() => void savePlan()} onAgentPlan={() => void startPlanInterview()} onAutoComplete={() => void autoCompletePlan()} onAnswer={(field, value) => setPlanAnswers((current) => ({ ...current, [field]: { field, value } }))} onDelegate={(field) => setPlanAnswers((current) => ({ ...current, [field]: { field, delegate: true } }))} onSubmitAnswers={() => void submitPlanAnswers()} onApprove={() => void approvePlan()} /> : null}
         {data && stage === 'outline' ? <OutlineEditor value={data.outline ?? emptyOutline(projectId)} busy={busy} onChange={(outline) => { markResourceDirty('outline'); setData((current) => current ? { ...current, outline } : current); }} onSave={() => void saveOutline()} onGenerate={(regenerate) => void startMaterialJob('script_series_outline', ['plan', 'outline'], regenerate)} /> : null}
         {data && stage === 'characters' ? <CharacterEditor projectId={projectId} value={data.characters} busy={busy} onChange={(characters) => { markResourceDirty('characters'); setData((current) => current ? { ...current, characters } : current); }} onSave={() => void saveCharacters()} onGenerate={(regenerate) => void startMaterialJob('script_bible', ['plan', 'outline', 'characters', 'world'], regenerate)} /> : null}
-        {data && stage === 'episodes' ? <EpisodeBatchPanel data={data} busy={busy} batchStart={selectedBatchStart} batchEpisodes={batchEpisodes} batchLoading={batchLoading} episode={selectedEpisode} episodeLoading={episodeLoading} onStart={(start, count, regenerate) => void startEpisodeBatch(start, count, regenerate)} onResume={(jobId) => void resumeJob(jobId)} onCancel={(jobId) => void cancelJob(jobId)} onOpenEpisode={(episodeNumber) => void openEpisode(episodeNumber)} onEpisodeChange={editSelectedEpisode} onSaveEpisode={() => void saveEpisode()} onReviewEpisode={(episodeNumber) => void reviewEpisode(episodeNumber)} onReviewBatch={(episodeNumbers) => void reviewCurrentBatch(episodeNumbers)} onReviewStatus={(issueId, status) => void updateReviewStatus(issueId, status)} onExport={(format, range) => void exportScript(format, range)} /> : null}
+        {data && stage === 'episodes' ? <EpisodeBatchPanel data={data} busy={busy} batchStart={selectedBatchStart} batchEpisodes={batchEpisodes} batchLoading={batchLoading} episode={selectedEpisode} episodeLoading={episodeLoading} onStart={(start, count, regenerate) => void startEpisodeBatch(start, count, regenerate)} onResume={(jobId) => void resumeJob(jobId)} onCancel={(jobId) => void cancelJob(jobId)} onTrash={(jobId) => void trashJob(jobId)} onOpenEpisode={(episodeNumber) => void openEpisode(episodeNumber)} onEpisodeChange={editSelectedEpisode} onSaveEpisode={() => void saveEpisode()} onReviewEpisode={(episodeNumber) => void reviewEpisode(episodeNumber)} onReviewBatch={(episodeNumbers) => void reviewCurrentBatch(episodeNumbers)} onReviewStatus={(issueId, status) => void updateReviewStatus(issueId, status)} onExport={(format, range) => void exportScript(format, range)} /> : null}
         {data && stage === 'world' ? <WorldEditor value={data.world ?? emptyWorld(projectId)} busy={busy} onChange={(world) => { markResourceDirty('world'); setData((current) => current ? { ...current, world } : current); }} onSave={() => void saveWorld()} onGenerate={(regenerate) => void startMaterialJob('script_bible', ['plan', 'outline', 'characters', 'world'], regenerate)} /> : null}
       </main>
     </div>

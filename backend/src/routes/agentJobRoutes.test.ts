@@ -125,6 +125,77 @@ describe('agent job routes', () => {
     await app.close();
   });
 
+  it('moves completed jobs through trash, restore, and permanent deletion', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-job-route-trash-'));
+    const store = await AgentRunStore.create(join(directory, 'runs.json'));
+    const completed = await store.create(CLIENT_A, {
+      task: 'script_episode_batch',
+      mode: 'draft',
+      prompt: '',
+      projectId: 'project-a',
+      scriptBatchOptions: { startEpisode: 1, episodeCount: 5, expectedPlanRevision: 1 },
+    });
+    await store.complete(completed.id, {
+      task: 'script_episode_batch', mode: 'draft', projectId: 'project-a',
+      summary: '完成', steps: [], artifacts: [],
+    });
+    const active = await store.create(CLIENT_A, {
+      task: 'script_bible', mode: 'draft', prompt: '', projectId: 'project-a',
+    });
+    const runner = new AgentJobRunner(store, { run: vi.fn() });
+    const app = Fastify();
+    registerClientScope(app);
+    registerRequestModelConfig(app);
+    registerAgentJobRoutes(app, store, runner);
+
+    const activeDelete = await app.inject({
+      method: 'DELETE', url: `/api/agent/jobs/${active.id}`,
+      headers: { 'x-agentxin-client-id': CLIENT_A },
+    });
+    expect(activeDelete.statusCode).toBe(409);
+
+    const moved = await app.inject({
+      method: 'DELETE', url: `/api/agent/jobs/${completed.id}`,
+      headers: { 'x-agentxin-client-id': CLIENT_A },
+    });
+    expect(moved.statusCode).toBe(200);
+    expect(moved.json()).toMatchObject({ id: completed.id, trashedAt: expect.any(String) });
+
+    const activeList = await app.inject({
+      method: 'GET', url: '/api/projects/project-a/agent-jobs',
+      headers: { 'x-agentxin-client-id': CLIENT_A },
+    });
+    expect(activeList.json()).toEqual([expect.objectContaining({ id: active.id })]);
+    const trashList = await app.inject({
+      method: 'GET', url: '/api/projects/project-a/agent-jobs?trashed=true',
+      headers: { 'x-agentxin-client-id': CLIENT_A },
+    });
+    expect(trashList.json()).toEqual([expect.objectContaining({ id: completed.id })]);
+
+    const restored = await app.inject({
+      method: 'POST', url: `/api/agent/jobs/${completed.id}/restore`,
+      headers: { 'x-agentxin-client-id': CLIENT_A },
+    });
+    expect(restored.statusCode).toBe(200);
+    expect(restored.json().trashedAt).toBeUndefined();
+
+    await app.inject({
+      method: 'DELETE', url: `/api/agent/jobs/${completed.id}`,
+      headers: { 'x-agentxin-client-id': CLIENT_A },
+    });
+    const removed = await app.inject({
+      method: 'DELETE', url: `/api/agent/jobs/${completed.id}/permanent`,
+      headers: { 'x-agentxin-client-id': CLIENT_A },
+    });
+    expect(removed.statusCode).toBe(204);
+    const missing = await app.inject({
+      method: 'DELETE', url: `/api/agent/jobs/${completed.id}/permanent`,
+      headers: { 'x-agentxin-client-id': CLIENT_A },
+    });
+    expect(missing.statusCode).toBe(404);
+    await app.close();
+  });
+
   it('marks interrupted long-form novel jobs as continuable', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'agentxin-job-route-novel-resume-'));
     const file = join(directory, 'runs.json');

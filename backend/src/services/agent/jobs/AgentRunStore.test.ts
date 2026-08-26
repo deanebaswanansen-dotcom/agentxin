@@ -99,6 +99,45 @@ describe('AgentRunStore', () => {
     expect(reloaded.get(target.id)).toBeUndefined();
   });
 
+  it('moves only terminal jobs to trash, restores them, and permanently deletes them', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-runs-trash-'));
+    const file = join(directory, 'runs.json');
+    const store = await AgentRunStore.create(file);
+    const active = await store.create(CLIENT_A, scriptRequest('script_bible'));
+    await expect(store.moveToTrash(CLIENT_A, active.id)).rejects.toMatchObject({
+      code: 'CONFLICT',
+    });
+
+    const completed = await store.create(CLIENT_A, scriptRequest('script_series_outline'));
+    await store.complete(completed.id, {
+      task: 'script_series_outline', mode: 'draft', projectId: 'project-a',
+      summary: '完成', steps: [], artifacts: [],
+    });
+    const trashed = await store.moveToTrash(CLIENT_A, completed.id);
+
+    expect(trashed?.trashedAt).toBeTruthy();
+    expect(store.getForClient(CLIENT_A, completed.id)).toBeUndefined();
+    expect(store.listForClient(CLIENT_A, 'project-a')).not.toContainEqual(
+      expect.objectContaining({ id: completed.id }),
+    );
+    expect(store.listForClient(CLIENT_A, 'project-a', { trashed: true })).toEqual([
+      expect.objectContaining({ id: completed.id, status: 'completed', trashedAt: expect.any(String) }),
+    ]);
+    expect(await store.moveToTrash(CLIENT_B, completed.id)).toBeUndefined();
+
+    const restored = await store.restoreFromTrash(CLIENT_A, completed.id);
+    expect(restored?.trashedAt).toBeUndefined();
+    expect(store.listForClient(CLIENT_A, 'project-a')).toContainEqual(
+      expect.objectContaining({ id: completed.id }),
+    );
+
+    await store.moveToTrash(CLIENT_A, completed.id);
+    expect(await store.deletePermanently(CLIENT_B, completed.id)).toBe(false);
+    expect(await store.deletePermanently(CLIENT_A, completed.id)).toBe(true);
+    expect(store.get(completed.id)).toBeUndefined();
+    expect((await AgentRunStore.create(file)).get(completed.id)).toBeUndefined();
+  });
+
   it('atomically rejects active duplicate outline and bible jobs', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'agentxin-runs-script-dedup-'));
     const store = await AgentRunStore.create(join(directory, 'runs.json'));
