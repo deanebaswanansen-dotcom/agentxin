@@ -419,7 +419,7 @@ function scriptLengthInstruction(
     : `当前正文已有 ${currentChars} 个可见字符，只需从现有结尾自然续写，不得复述或重写。`;
   return [
     current,
-    `整集正文写在 ${minimum}—${maximum} 个可见字符之间；${targetChars} 是目标值，${maximum} 是允许浮动后的上限，不得超出，也不要机械凑数；`,
+    `整集正文以 ${targetChars} 个可见字符为目标，尽量控制在 ${minimum}—${maximum} 字，也不要机械凑数；字数是软目标，必须优先写完当前剧情、动作和每一句对白，绝不能把一句话写一半后用省略号代替未写内容；`,
     `当前 ${safeSceneCount} 场可按戏剧任务自然分配，平均约 ${charsPerScene} 字，重要冲突场可以更长；`,
     `对白目标约 ${dialogueDensityPercent}%，允许按剧情自然波动，不得为了比例重复台词或灌水；`,
     '每个 blocks.text 写完整、可拍摄的动作或有信息量的对白，不要用四五字短句机械凑块数；',
@@ -2795,7 +2795,7 @@ export class ScriptDirector {
       );
       episodeUpstreamRefs.push(scenePlanRef);
       const draftInputRevisionRefs = buildScriptInputRevisionRefs(state, episodeNumber);
-      const draftPromptVersion = 'episode-draft-v8';
+      const draftPromptVersion = 'episode-draft-v9';
       const currentEpisodeRevision = state.episodes.find(
         (episode) => episode.episodeNumber === episodeNumber,
       )?.revision ?? 0;
@@ -2873,7 +2873,7 @@ export class ScriptDirector {
             outline.plannedScenes.length,
             plan.dialogueDensityPercent,
           ),
-          `所有 blocks.text 去除空白后的总字符数以 ${plan.targetCharsPerEpisode} 为目标，允许上下浮动约 400 字，但不得超过 ${scriptEpisodeLengthRange(plan.targetCharsPerEpisode).maximum}；优先保留关键冲突、行动过程与结尾卡点。`,
+          `所有 blocks.text 去除空白后的总字符数以 ${plan.targetCharsPerEpisode} 为目标，尽量在上下浮动约 400 字内完成；优先保留关键冲突、行动过程与结尾卡点。任何情况下都必须写完句子，不得用省略号代替被截掉的正文。`,
           scriptCreativeWritingInstruction(plan),
           `对白只能使用这些已登记人物：${JSON.stringify(state.characters.map((character) => ({ id: character.id, name: character.name })))}`,
           this.assembleEpisodeContext(state, plan, outline, episodeNumber),
@@ -3000,7 +3000,7 @@ export class ScriptDirector {
             '严格顶层模板：{"blocks":[...]}。每项只允许 action 或 dialogue，并必须包含 sceneOrdinal、type、text；dialogue 还必须包含本场人物的 characterId、speaker，可选 delivery、mode(normal|os|vo)。',
             'action.text 不带“△”；dialogue.text 不重复说话人或冒号。每条写成完整、可拍摄的动作或推动冲突的对白。',
             `当前已有 ${continuationRequest.current.visibleChars} 字，本轮最多自然续写约 ${continuationRequest.requestedVisibleChars} 字；续写后至少达到 ${continuationRequest.minimumVisibleChars} 字（目标的 75%）。这是唯一一次续写，请把尚未完成的冲突、行动过程和结尾卡点写完整，但不要为了凑数重复内容。`,
-            `续写后整集不得超过 ${scriptEpisodeLengthRange(plan.targetCharsPerEpisode).maximum} 个可见字符；对白倾向约 ${plan.dialogueDensityPercent}%，允许按剧情自然波动。`,
+            `续写后整集尽量不超过 ${scriptEpisodeLengthRange(plan.targetCharsPerEpisode).maximum} 个可见字符；对白倾向约 ${plan.dialogueDensityPercent}%，允许按剧情自然波动。必须写完当前句子和动作，不得用省略号代替未完成内容。`,
             `对白人物白名单：${JSON.stringify(knownCharacters)}`,
             rejectedDraftFeedback.length > 0
               ? `上一轮续写反馈：${JSON.stringify(rejectedDraftFeedback)}`
@@ -4044,7 +4044,7 @@ export class ScriptDirector {
       );
     const canonicalDirectCandidate = (value: ScriptEpisode): ScriptEpisode =>
       reconcileDirectSceneCast(canonicalStoredDirectCandidate(value));
-    const promptVersion = 'direct-draft-v4';
+    const promptVersion = 'direct-draft-v5';
     const draftFingerprint = computeScriptCheckpointInputFingerprint({
       node: 'direct_draft',
       inputRevisionRefs,
@@ -4325,7 +4325,7 @@ export class ScriptDirector {
     const episodeUpstreamRefs: ScriptUpstreamArtifactRef[] = [outlineRef, directDraftRef];
     const continuationThreshold = Math.max(150, Math.round(plan.targetCharsPerEpisode * 0.58));
     if (writerCallsUsed <= 1 && scriptVisibleChars(draft) < continuationThreshold) {
-      const continuationPromptVersion = 'direct-continuation-v2';
+      const continuationPromptVersion = 'direct-continuation-v3';
       const continuationFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'continuation',
         inputRevisionRefs,
