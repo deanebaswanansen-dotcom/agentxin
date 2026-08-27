@@ -104,7 +104,7 @@ function directLengthInstruction(context: Record<string, unknown>): string {
   const targetChars = targetCharsFromContext(context);
   if (!targetChars) return '正文保持紧凑完整，不要靠重复台词凑字。';
   const { minimum, maximum } = scriptEpisodeLengthRange(targetChars);
-  return `正文以 ${targetChars} 个可见字符为目标，允许约 ${minimum}—${maximum} 字；${maximum} 是浮动后的上限，绝不能超过。不要靠重复台词凑字。`;
+  return `正文以 ${targetChars} 个可见字符为目标，尽量控制在约 ${minimum}—${maximum} 字。字数是软目标，必须优先保证剧情和每句话完整；绝不能把一句话写一半后用省略号代替未写内容。不要靠重复台词凑字。`;
 }
 
 export function reconcileDirectReviewBoundary(
@@ -253,7 +253,7 @@ export function buildDirectContinuationPrompt(
     '下面是一集已经写完但明显偏短的中文短剧。请从现有结尾自然继续，补充冲突、行动与对白。',
     '不要重写已有内容，不要复述已经发生的事件，不要再次制造“首次发现”同一证物。',
     '可以继续最后一场或增加下一场；只输出新增的标准剧本文本，不要输出解释、JSON或Markdown围栏。',
-    `当前约 ${currentChars} 字，最多新增约 ${suggestedAddition} 字；续写后整集不得超过 ${scriptEpisodeLengthRange(targetChars).maximum} 个可见字符。`,
+    `当前约 ${currentChars} 字，建议最多新增约 ${suggestedAddition} 字，并尽量让整集不超过 ${scriptEpisodeLengthRange(targetChars).maximum} 个可见字符；但必须写完每句话和当前动作，不得用省略号代替未完成内容。`,
     `创作资料：${JSON.stringify(context)}`,
     `已有完整正文：\n${rawText}`,
   ].join('\n');

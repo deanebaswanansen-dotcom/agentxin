@@ -53,7 +53,8 @@ describe('ScriptDirectWriting', () => {
     expect(prompt).toContain('直接写出本集完整中文短剧正文');
     expect(prompt).toContain('1200 个可见字符为目标');
     expect(prompt).toContain('800—1600 字');
-    expect(prompt).toContain('1600 是浮动后的上限，绝不能超过');
+    expect(prompt).toContain('字数是软目标');
+    expect(prompt).toContain('绝不能把一句话写一半后用省略号代替未写内容');
     expect(prompt).not.toContain('恰好');
     expect(prompt).toContain('不要输出 JSON');
     expect(prompt).toContain('必须在 endingHook 处停住');

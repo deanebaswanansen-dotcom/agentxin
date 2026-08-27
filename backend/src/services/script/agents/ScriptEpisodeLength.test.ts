@@ -40,7 +40,7 @@ function episodeWith(blocksByScene: string[][], targetChars = 120): ScriptEpisod
 }
 
 describe('ScriptEpisodeLength', () => {
-  it('caps generated body text at the configured tolerance and preserves the ending beat', () => {
+  it('preserves an overlong generated episode byte-for-byte and reports the soft-limit overage', () => {
     const source = episodeWith([
       ['开场冲突发生。'.repeat(80), '调查过程推进。'.repeat(80)],
       ['证人交出线索。'.repeat(80), '门外突然传来敲门声。'.repeat(80)],
@@ -48,13 +48,11 @@ describe('ScriptEpisodeLength', () => {
 
     const result = capGeneratedEpisodeLength(source);
 
-    expect(result.trimmed).toBe(true);
+    expect(result.trimmed).toBe(false);
     expect(result.beforeVisibleChars).toBeGreaterThan(1_600);
-    expect(result.afterVisibleChars).toBeGreaterThanOrEqual(800);
-    expect(result.afterVisibleChars).toBeLessThanOrEqual(1_600);
-    expect(result.episode.scenes.at(-1)?.blocks.at(-1)?.text).toContain('门外突然传来敲门声');
-    expect(result.episode.scenes.map((scene) => scene.ordinal)).toEqual([1, 2]);
-    expect(result.episode.scenes.every((scene) => scene.blocks.length > 0)).toBe(true);
+    expect(result.afterVisibleChars).toBe(result.beforeVisibleChars);
+    expect(result.episode).toBe(source);
+    expect(result.episode.scenes).toEqual(source.scenes);
   });
 
   it('returns the original episode unchanged when it is already within the target', () => {
@@ -66,7 +64,7 @@ describe('ScriptEpisodeLength', () => {
     expect(scriptEpisodeVisibleChars(result.episode)).toBeLessThanOrEqual(1_200);
   });
 
-  it('keeps every scene and block non-empty when all blocks need proportional shortening', () => {
+  it('never rewrites blocks or introduces ellipses when many blocks exceed the target', () => {
     const source = episodeWith([
       ['第一场完整动作。'.repeat(40)],
       ['第二场完整动作。'.repeat(40)],
@@ -75,10 +73,15 @@ describe('ScriptEpisodeLength', () => {
 
     const result = capGeneratedEpisodeLength(source);
 
-    expect(result.afterVisibleChars).toBeLessThanOrEqual(700);
-    expect(result.episode.scenes).toHaveLength(3);
-    expect(result.episode.scenes.every((scene) => scene.blocks[0]!.text.length > 0)).toBe(true);
-    expect(result.episode.scenes.map((scene) => scene.ordinal)).toEqual([1, 2, 3]);
+    expect(result.beforeVisibleChars).toBeGreaterThan(scriptEpisodeLengthRange(300).maximum);
+    expect(result.episode).toBe(source);
+    expect(result.episode.scenes.flatMap((scene) => scene.blocks).map((block) => block.text)).toEqual([
+      '第一场完整动作。'.repeat(40),
+      '第二场完整动作。'.repeat(40),
+      '结尾钩子落下。'.repeat(40),
+    ]);
+    expect(result.episode.scenes.flatMap((scene) => scene.blocks)
+      .every((block) => !block.text.endsWith('…'))).toBe(true);
   });
 
   it('uses an exact 800 to 1600 tolerance window for a 1200-character target', () => {

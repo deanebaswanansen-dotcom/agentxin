@@ -1912,7 +1912,7 @@ describe('ScriptDirector', () => {
         artifactRevision: 0, promptVersion: 'episode-draft-v3', status: 'stale',
       }),
       expect.objectContaining({
-        artifactRevision: 1, promptVersion: 'episode-draft-v8', status: 'succeeded',
+        artifactRevision: 1, promptVersion: 'episode-draft-v9', status: 'succeeded',
       }),
     ]));
   });
@@ -2169,7 +2169,7 @@ describe('ScriptDirector', () => {
       expect.objectContaining({
         artifactRevision: 1,
         status: 'succeeded',
-        promptVersion: 'episode-draft-v8',
+        promptVersion: 'episode-draft-v9',
       }),
     ]));
   });
@@ -3250,7 +3250,7 @@ describe('ScriptDirector', () => {
     ]));
   });
 
-  it('caps a generated direct-text episode within 1200 plus 400 characters without another model call', async () => {
+  it('preserves a complete overlong direct-text episode without truncating blocks or adding another model call', async () => {
     const state = readySingleEpisodeState();
     state.plan = { ...state.plan!, targetCharsPerEpisode: 1_200 };
     const store = new MemoryScriptStore(state);
@@ -3290,11 +3290,16 @@ describe('ScriptDirector', () => {
       .map((block) => block.text)
       .join('')
       .replace(/\s/gu, '').length;
-    expect(visibleChars).toBeGreaterThanOrEqual(800);
-    expect(visibleChars).toBeLessThanOrEqual(1_600);
-    expect(saved.scenes.at(-1)?.blocks.at(-1)?.text).toContain('门外的新证人敲响玻璃门');
+    expect(visibleChars).toBeGreaterThan(1_600);
+    expect(saved.scenes[0]?.blocks.map((block) => block.text)).toEqual([
+      '沈清核对桌上的采访记录。'.repeat(40),
+      '证据还差最后一环，现在不能停。'.repeat(100),
+      '门外的新证人敲响玻璃门。'.repeat(35),
+    ]);
+    expect(saved.scenes[0]?.blocks.every((block) => !block.text.endsWith('…'))).toBe(true);
     expect(calls.map((call) => call.node)).toEqual(['draft', 'review']);
     expect(calls[0]?.prompt).toContain('800—1600 字');
+    expect(calls[0]?.prompt).toContain('绝不能把一句话写一半后用省略号代替未写内容');
   });
 
   it('repairs duplicate scene ordinals and saves the direct draft without a format-repair call', async () => {
