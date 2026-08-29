@@ -158,6 +158,53 @@ describe('agent routes', () => {
     })).toThrow('短剧正文批次必须从第 1、6、11……集开始。');
   });
 
+  it('accepts an instructed rewrite for one arbitrary episode and trims the instruction', () => {
+    expect(parseAgentBody({
+      task: 'script_episode_batch',
+      projectId: 'script-project',
+      regenerate: true,
+      scriptBatchOptions: {
+        startEpisode: 13,
+        episodeCount: 1,
+        expectedPlanRevision: 3,
+        draftMode: 'direct_text',
+        rewriteInstruction: '  保留第一场，只修改结尾冲突。  ',
+      },
+    })).toMatchObject({
+      regenerate: true,
+      scriptBatchOptions: {
+        startEpisode: 13,
+        episodeCount: 1,
+        expectedPlanRevision: 3,
+        draftMode: 'direct_text',
+        rewriteInstruction: '保留第一场，只修改结尾冲突。',
+      },
+    });
+  });
+
+  it('rejects an arbitrary single episode or rewrite instruction without regeneration', () => {
+    expect(() => parseAgentBody({
+      task: 'script_episode_batch',
+      projectId: 'script-project',
+      scriptBatchOptions: {
+        startEpisode: 13,
+        episodeCount: 1,
+        expectedPlanRevision: 3,
+      },
+    })).toThrow('只有重写已生成的单集可以从任意集数开始。');
+
+    expect(() => parseAgentBody({
+      task: 'script_episode_batch',
+      projectId: 'script-project',
+      scriptBatchOptions: {
+        startEpisode: 1,
+        episodeCount: 1,
+        expectedPlanRevision: 3,
+        rewriteInstruction: '修改结尾。',
+      },
+    })).toThrow('单集修改要求必须与重新写作一起提交。');
+  });
+
   it('accepts direct screenplay writing mode and rejects unknown draft modes', () => {
     expect(parseAgentBody({
       task: 'script_episode_batch',

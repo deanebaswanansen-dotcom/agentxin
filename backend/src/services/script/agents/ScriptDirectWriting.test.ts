@@ -77,6 +77,22 @@ describe('ScriptDirectWriting', () => {
     expect(prompt).toContain('允许说话的临时角色称谓');
   });
 
+  it('makes a user single-episode rewrite instruction higher priority than blind regeneration', () => {
+    const prompt = buildDirectDraftPrompt({
+      episode: { targetChars: 1_200, dialogueDensityPercent: 60 },
+      userRewrite: {
+        instruction: '保留前两场，只修改第三场，让女主先发现账本。',
+        existingEpisodeText: '第1集\n1-1 办公室 日/内\n人物：沈清\n△沈清推门进入。',
+      },
+    });
+
+    expect(prompt).toContain('必须优先执行：保留前两场，只修改第三场，让女主先发现账本。');
+    expect(prompt).toContain('输出修改后的完整一集');
+    expect(prompt).toContain('明确要求保留的部分尽量原样保留');
+    expect(prompt).toContain('existingEpisodeText');
+    expect(prompt).toContain('△沈清推门进入。');
+  });
+
   it('tells the lightweight reviewer to reject events reserved for later episode cards', () => {
     const prompt = buildDirectReviewPrompt({
       episode: { endingHook: '公开挑战正式成立' },

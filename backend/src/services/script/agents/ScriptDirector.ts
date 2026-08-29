@@ -257,6 +257,8 @@ export type ScriptDirectorRequest =
       episodeCount: number;
       expectedPlanRevision: number;
       draftMode?: 'structured_legacy' | 'direct_text';
+      /** User requirements for rewriting this one existing episode. */
+      rewriteInstruction?: string;
       /** User explicitly requested fresh episode bodies for this batch. */
       regenerate?: boolean;
       regenerationRunId?: string;
@@ -2128,20 +2130,36 @@ export class ScriptDirector {
     if (!validatedPlan) throw new ScriptModelOutputError('生成正文前必须先确认策划。');
     let state: ScriptProjectState = initialState;
     const endEpisode = request.startEpisode + request.episodeCount - 1;
+    const singleEpisodeRegeneration = Boolean(request.regenerate && request.episodeCount === 1);
     if (endEpisode > validatedPlan.totalEpisodes) {
       throw new ScriptModelOutputError('批次范围超过策划总集数。');
     }
-    if ((request.startEpisode - 1) % 5 !== 0) {
+    if ((request.startEpisode - 1) % 5 !== 0 && !singleEpisodeRegeneration) {
       throw new ScriptModelOutputError('正文批次起始集必须是 1、6、11……');
     }
     const expectedBatchCount = Math.min(
       5,
       validatedPlan.totalEpisodes - request.startEpisode + 1,
     );
-    if (request.episodeCount !== expectedBatchCount) {
+    if (!singleEpisodeRegeneration && request.episodeCount !== expectedBatchCount) {
       throw new ScriptModelOutputError(
         `第 ${request.startEpisode} 集批次必须包含 ${expectedBatchCount} 集。`,
       );
+    }
+    if (singleEpisodeRegeneration && !state.episodes.some(
+      (episode) => episode.episodeNumber === request.startEpisode,
+    )) {
+      throw new ScriptModelOutputError(`第 ${request.startEpisode} 集尚未生成，不能单独重写。`);
+    }
+    const rewriteInstruction = request.rewriteInstruction?.trim();
+    if (rewriteInstruction && !singleEpisodeRegeneration) {
+      throw new ScriptModelOutputError('自定义修改要求只能用于单独重写一集。');
+    }
+    if (rewriteInstruction && rewriteInstruction.length > 2_000) {
+      throw new ScriptModelOutputError('单集修改要求不能超过 2000 字。');
+    }
+    if (rewriteInstruction && request.draftMode === 'structured_legacy') {
+      throw new ScriptModelOutputError('按要求重写单集只支持直接正文模式。');
     }
     const hasCanonicalContinuity = (
       projectState: ScriptProjectState,
@@ -4038,7 +4056,19 @@ export class ScriptDirector {
     const baseEpisodeRevision = currentEpisode?.revision ?? 0;
     const inputRevisionRefs = buildScriptInputRevisionRefs(state, episodeNumber);
     const outlineRef = buildScriptUpstreamArtifactRef('episode_outline', outline.revision, outline);
-    const context = directWritingContext(state, plan, outline);
+    const baseContext = directWritingContext(state, plan, outline);
+    const rewriteInstruction = request.rewriteInstruction?.trim();
+    const context = rewriteInstruction
+      ? {
+          ...baseContext,
+          userRewrite: {
+            instruction: rewriteInstruction,
+            existingEpisodeText: currentEpisode
+              ? directEpisodeText(currentEpisode, state.characters)
+              : '',
+          },
+        }
+      : baseContext;
     const directValidationPlan = planForDirectDraftValidation(plan);
     const canonicalStoredDirectCandidate = (value: ScriptEpisode): ScriptEpisode =>
       this.canonicalEpisodeCandidate(

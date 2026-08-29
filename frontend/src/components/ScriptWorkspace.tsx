@@ -6,6 +6,7 @@ import type {
   ScriptBatchSummary,
   ScriptCharacter,
   ScriptConceptProposal,
+  ScriptBlock,
   ScriptEpisode,
   ScriptEpisodeSummary,
   ScriptPlan,
@@ -943,6 +944,44 @@ function fixedBatchStartForEpisode(episodeNumber: number): number {
   return Math.floor((Math.max(1, episodeNumber) - 1) / 5) * 5 + 1;
 }
 
+let fallbackScriptBlockId = 0;
+
+function createScriptBlockId(episode: ScriptEpisode): Id {
+  const existingIds = new Set(episode.scenes.flatMap((scene) => scene.blocks.map((block) => block.id)));
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const randomId = globalThis.crypto?.randomUUID?.();
+    if (randomId) {
+      const candidate = `${episode.id}-block-${randomId}`;
+      if (!existingIds.has(candidate)) return candidate;
+    }
+  }
+  let candidate: string;
+  do {
+    fallbackScriptBlockId += 1;
+    candidate = `${episode.id}-block-local-${fallbackScriptBlockId}`;
+  } while (existingIds.has(candidate));
+  return candidate;
+}
+
+function newScriptBlock(
+  type: ScriptBlock['type'],
+  episode: ScriptEpisode,
+  sceneCharacterIds: readonly Id[],
+  characters: readonly ScriptCharacter[],
+): ScriptBlock {
+  const id = createScriptBlockId(episode);
+  if (type === 'caption') return { id, type, text: '' };
+  if (type === 'action') return { id, type, text: '' };
+  const character = characters.find((item) => sceneCharacterIds.includes(item.id)) ?? characters[0];
+  return {
+    id,
+    type,
+    ...(character ? { characterId: character.id, speaker: character.name } : { speaker: '' }),
+    mode: 'normal',
+    text: '',
+  };
+}
+
 function jobBatchStart(job: ScriptAgentJobSnapshot): number | undefined {
   if (job.task !== 'script_episode_batch') return undefined;
   const episodeNumber = job.scriptBatchOptions?.startEpisode ?? job.checkpoint?.episodeNumber;
@@ -962,6 +1001,7 @@ function EpisodeBatchPanel({
   onCancel,
   onTrash,
   onOpenEpisode,
+  onRegenerateEpisode,
   onEpisodeChange,
   onSaveEpisode,
   onReviewEpisode,
@@ -981,6 +1021,7 @@ function EpisodeBatchPanel({
   onCancel: (jobId: string) => void;
   onTrash: (jobId: string) => void;
   onOpenEpisode: (episodeNumber: number) => void;
+  onRegenerateEpisode: (episodeNumber: number, instruction: string) => Promise<boolean>;
   onEpisodeChange: (episode: ScriptEpisode) => void;
   onSaveEpisode: () => void;
   onReviewEpisode: (episodeNumber: number) => void;
@@ -991,6 +1032,8 @@ function EpisodeBatchPanel({
   const [exportScope, setExportScope] = useState<'all' | 'batch'>('all');
   const [contentMode, setContentMode] = useState<'read' | 'edit'>('read');
   const [fullscreen, setFullscreen] = useState(false);
+  const [rewriteTarget, setRewriteTarget] = useState<number>();
+  const [rewriteInstruction, setRewriteInstruction] = useState('');
   useEffect(() => {
     if (!fullscreen) return undefined;
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -1059,7 +1102,7 @@ function EpisodeBatchPanel({
           <h3>分集进度</h3>
           {batchSummaries.length === 0 ? <p className="script-muted">本批尚未生成正文。每批最多 5 集，完成一集立即保存。</p> : (
             <ol className="script-episode-list">
-              {batchSummaries.map((item) => <li key={item.episodeNumber}><button type="button" className="script-episode-open" aria-label={`打开第 ${item.episodeNumber} 集`} onClick={() => { setContentMode('edit'); onOpenEpisode(item.episodeNumber); }}>打开第 {item.episodeNumber} 集<span>{item.title}</span></button><span>{JOB_STATUS_LABEL[item.status === 'generating' || item.status === 'reviewing' ? 'running' : item.status === 'planned' ? 'queued' : item.status]} · {item.visibleChars} 字</span></li>)}
+              {batchSummaries.map((item) => <li key={item.episodeNumber}><button type="button" className="script-episode-open" aria-label={`打开第 ${item.episodeNumber} 集`} onClick={() => { setContentMode('edit'); onOpenEpisode(item.episodeNumber); }}>打开第 {item.episodeNumber} 集<span>{item.title}</span></button><div className="script-episode-list__actions"><span>{JOB_STATUS_LABEL[item.status === 'generating' || item.status === 'reviewing' ? 'running' : item.status === 'planned' ? 'queued' : item.status]} · {item.visibleChars} 字</span><button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={busy} onClick={() => { setRewriteTarget(item.episodeNumber); setRewriteInstruction(''); }}>按要求重写第 {item.episodeNumber} 集</button></div></li>)}
             </ol>
           )}
         </div>
@@ -1137,7 +1180,7 @@ function EpisodeBatchPanel({
         <section className="script-episode-editor" aria-label={`第 ${episode.episodeNumber} 集编辑器`}>
           <header>
             <div><span>第 {episode.episodeNumber} 集</span><input aria-label={`第 ${episode.episodeNumber} 集标题`} value={episode.title} onChange={(event) => onEpisodeChange({ ...episode, title: event.target.value })} /></div>
-            <button type="button" className="nwa-button" disabled={busy} onClick={onSaveEpisode}>保存第 {episode.episodeNumber} 集</button>
+            <div className="script-episode-editor__actions"><button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => { setRewriteTarget(episode.episodeNumber); setRewriteInstruction(''); }}>按要求重写第 {episode.episodeNumber} 集</button><button type="button" className="nwa-button" disabled={busy} onClick={onSaveEpisode}>保存第 {episode.episodeNumber} 集</button></div>
           </header>
           {episode.scenes.map((scene, sceneIndex) => (
             <article className="script-scene-editor" key={scene.id}>
@@ -1151,7 +1194,46 @@ function EpisodeBatchPanel({
                 {scene.blocks.map((block, blockIndex) => (
                   <div className="script-block-editor" key={block.id}>
                     <div className="script-block-editor__meta">
-                      <span>{block.type === 'caption' ? '字幕' : block.type === 'action' ? '动作' : `${block.speaker}${block.delivery ? `（${block.delivery}）` : ''}`}</span>
+                      <select
+                        aria-label={`第 ${episode.episodeNumber} 集场景 ${scene.ordinal} 第 ${blockIndex + 1} 行类型`}
+                        value={block.type}
+                        disabled={busy}
+                        onChange={(event) => {
+                          const type = event.target.value as ScriptBlock['type'];
+                          const converted = type === block.type
+                            ? block
+                            : type === 'dialogue'
+                              ? { ...newScriptBlock('dialogue', episode, scene.characterIds, data.characters), id: block.id, text: block.text }
+                              : { id: block.id, type, text: block.text } as ScriptBlock;
+                          onEpisodeChange({
+                            ...episode,
+                            scenes: episode.scenes.map((item, index) => index === sceneIndex
+                              ? { ...item, blocks: item.blocks.map((part, partIndex) => partIndex === blockIndex ? converted : part) }
+                              : item),
+                          });
+                        }}
+                      ><option value="action">动作</option><option value="dialogue">对白</option><option value="caption">字幕</option></select>
+                      {block.type === 'dialogue' ? <input
+                        aria-label={`第 ${episode.episodeNumber} 集场景 ${scene.ordinal} 第 ${blockIndex + 1} 行说话人`}
+                        value={block.speaker}
+                        placeholder="说话人"
+                        onChange={(event) => {
+                          const speaker = event.target.value;
+                          const character = data.characters.find((item) => item.name === speaker.trim());
+                          onEpisodeChange({
+                            ...episode,
+                            scenes: episode.scenes.map((item, index) => index === sceneIndex
+                              ? {
+                                  ...item,
+                                  ...(character ? { characterIds: [...new Set([...item.characterIds, character.id])] } : {}),
+                                  blocks: item.blocks.map((part, partIndex) => partIndex === blockIndex && part.type === 'dialogue'
+                                    ? { ...part, speaker, ...(character ? { characterId: character.id } : { characterId: undefined }) }
+                                    : part),
+                                }
+                              : item),
+                          });
+                        }}
+                      /> : null}
                       <button
                         type="button"
                         className="script-block-editor__delete"
@@ -1179,11 +1261,42 @@ function EpisodeBatchPanel({
                     />
                   </div>
                 ))}
+                <div className="script-block-add" aria-label={`第 ${episode.episodeNumber} 集场景 ${scene.ordinal} 添加一行`}>
+                  <span>添加一行</span>
+                  {(['action', 'dialogue', 'caption'] as const).map((type) => <button
+                    key={type}
+                    type="button"
+                    className="nwa-button nwa-button--ghost nwa-button--sm"
+                    disabled={busy}
+                    onClick={() => onEpisodeChange({
+                      ...episode,
+                      scenes: episode.scenes.map((item, index) => index === sceneIndex
+                        ? { ...item, blocks: [...item.blocks, newScriptBlock(type, episode, item.characterIds, data.characters)] }
+                        : item),
+                    })}
+                  >{type === 'action' ? '添加动作' : type === 'dialogue' ? '添加对白' : '添加字幕'}</button>)}
+                </div>
               </div>
             </article>
           ))}
         </section>
       ) : null}
+      {rewriteTarget !== undefined ? <div className="script-rewrite-dialog-backdrop">
+        <section className="script-rewrite-dialog" role="dialog" aria-modal="true" aria-labelledby="script-rewrite-dialog-title">
+          <header><div><span>单集重写</span><h3 id="script-rewrite-dialog-title">告诉 AI 第 {rewriteTarget} 集怎么改</h3></div><button type="button" className="script-rewrite-dialog__close" aria-label="关闭单集重写要求" onClick={() => { setRewriteTarget(undefined); setRewriteInstruction(''); }}>×</button></header>
+          <p>写清楚要保留什么、删除什么、哪一场怎么改。AI 会参考当前旧稿，只重写这一集。</p>
+          <textarea
+            autoFocus
+            maxLength={2_000}
+            aria-label={`第 ${rewriteTarget} 集修改要求`}
+            value={rewriteInstruction}
+            placeholder="例如：保留前两场，只重写第三场；女主应先发现账本，再与反派正面对质，不要再次出现检查人员。"
+            onChange={(event) => setRewriteInstruction(event.target.value)}
+          />
+          <div className="script-rewrite-dialog__count">{rewriteInstruction.length}/2000</div>
+          <footer><button type="button" className="nwa-button nwa-button--ghost" onClick={() => { setRewriteTarget(undefined); setRewriteInstruction(''); }}>取消</button><button type="button" className="nwa-button" disabled={busy || !rewriteInstruction.trim()} onClick={() => { const instruction = rewriteInstruction.trim(); const episodeNumber = rewriteTarget; void onRegenerateEpisode(episodeNumber, instruction).then((started) => { if (started) { setRewriteTarget(undefined); setRewriteInstruction(''); } }); }}>按这个要求重写</button></footer>
+        </section>
+      </div> : null}
     </section>
   );
 }
@@ -1774,23 +1887,29 @@ export function ScriptWorkspace({
     startEpisode: number,
     episodeCount: number,
     regenerate = false,
+    rewriteInstruction = '',
   ) => {
-    if (!data) return;
+    if (!data) return false;
     const fixedBatchStart = fixedBatchStartForEpisode(startEpisode);
     const fixedBatchCount = Math.min(5, Math.max(0, data.plan.totalEpisodes - fixedBatchStart + 1));
-    if (startEpisode !== fixedBatchStart || episodeCount !== fixedBatchCount) {
+    const singleEpisodeRewrite = regenerate && episodeCount === 1;
+    if (!singleEpisodeRewrite && (startEpisode !== fixedBatchStart || episodeCount !== fixedBatchCount)) {
       setNotice(`正文只能按固定批次生成：第 ${fixedBatchStart}–${fixedBatchStart + fixedBatchCount - 1} 集`);
-      return;
+      return false;
+    }
+    if (singleEpisodeRewrite && !data.episodes.some((item) => item.episodeNumber === startEpisode)) {
+      setNotice(`第 ${startEpisode} 集尚未生成，不能单独重写`);
+      return false;
     }
     const unsavedResources = (Object.keys(dirtyResources.current) as EditableScriptResource[])
       .filter((resource) => dirtyResources.current[resource]);
     if (unsavedResources.length > 0) {
       setNotice(`请先保存${unsavedResources.map((resource) => SCRIPT_RESOURCE_LABEL[resource]).join('、')}，再生成正文`);
-      return;
+      return false;
     }
     if (selectedEpisodeDirty.current) {
       setNotice('请先保存当前集');
-      return;
+      return false;
     }
     const endEpisode = startEpisode + episodeCount - 1;
     const hasOverlappingBatch = data.jobs.some((job) => {
@@ -1802,7 +1921,7 @@ export function ScriptWorkspace({
     });
     if (hasOverlappingBatch) {
       setNotice(`第 ${startEpisode}–${endEpisode} 集已有生成任务正在运行`);
-      return;
+      return false;
     }
     setBusy(true);
     setNotice('');
@@ -1816,12 +1935,17 @@ export function ScriptWorkspace({
           episodeCount,
           expectedPlanRevision: data.plan.revision,
           draftMode: 'direct_text',
+          ...(rewriteInstruction.trim() ? { rewriteInstruction: rewriteInstruction.trim() } : {}),
         },
       });
       setData((current) => current ? { ...current, jobs: [job, ...current.jobs.filter((item) => item.id !== job.id)] } : current);
-      setNotice(`已提交第 ${startEpisode}–${startEpisode + episodeCount - 1} 集${regenerate ? '重新写作' : '生成'}任务`);
+      setNotice(singleEpisodeRewrite
+        ? `已提交第 ${startEpisode} 集按要求重写任务，旧稿会保留到新稿成功保存`
+        : `已提交第 ${startEpisode}–${startEpisode + episodeCount - 1} 集${regenerate ? '重新写作' : '生成'}任务`);
+      return true;
     } catch (error) {
       onError?.(error);
+      return false;
     } finally {
       setBusy(false);
     }
@@ -2508,7 +2632,7 @@ export function ScriptWorkspace({
         {data && stage === 'plan' ? <PlanEditor value={data.plan} busy={busy} conceptBusy={conceptBusy} conceptPrompt={conceptPrompt} concepts={concepts} questions={planQuestions} answers={planAnswers} onChange={(plan) => { markResourceDirty('plan'); setData((current) => current ? { ...current, plan } : current); }} onConceptPromptChange={setConceptPrompt} onGenerateConcepts={() => void generateConcepts()} onAdoptConcept={adoptConcept} onSave={() => void savePlan()} onAgentPlan={() => void startPlanInterview()} onAutoComplete={() => void autoCompletePlan()} onAnswer={(field, value) => setPlanAnswers((current) => ({ ...current, [field]: { field, value } }))} onDelegate={(field) => setPlanAnswers((current) => ({ ...current, [field]: { field, delegate: true } }))} onSubmitAnswers={() => void submitPlanAnswers()} onApprove={() => void approvePlan()} /> : null}
         {data && stage === 'outline' ? <OutlineEditor value={data.outline ?? emptyOutline(projectId)} busy={busy} onChange={(outline) => { markResourceDirty('outline'); setData((current) => current ? { ...current, outline } : current); }} onSave={() => void saveOutline()} onGenerate={(regenerate) => void (regenerate ? startMaterialJob('script_series_outline', ['plan', 'outline'], true) : startOutlineCompletion())} /> : null}
         {data && stage === 'characters' ? <CharacterEditor projectId={projectId} value={data.characters} busy={busy} onChange={(characters) => { markResourceDirty('characters'); setData((current) => current ? { ...current, characters } : current); }} onSave={() => void saveCharacters()} onGenerate={(regenerate) => void startMaterialJob('script_bible', ['plan', 'outline', 'characters', 'world'], regenerate)} /> : null}
-        {data && stage === 'episodes' ? <EpisodeBatchPanel data={data} busy={busy} batchStart={selectedBatchStart} batchEpisodes={batchEpisodes} batchLoading={batchLoading} episode={selectedEpisode} episodeLoading={episodeLoading} onStart={(start, count, regenerate) => void startEpisodeBatch(start, count, regenerate)} onResume={(jobId) => void resumeJob(jobId)} onCancel={(jobId) => void cancelJob(jobId)} onTrash={(jobId) => void trashJob(jobId)} onOpenEpisode={(episodeNumber) => void openEpisode(episodeNumber)} onEpisodeChange={editSelectedEpisode} onSaveEpisode={() => void saveEpisode()} onReviewEpisode={(episodeNumber) => void reviewEpisode(episodeNumber)} onReviewBatch={(episodeNumbers) => void reviewCurrentBatch(episodeNumbers)} onReviewStatus={(issueId, status) => void updateReviewStatus(issueId, status)} onExport={(format, range) => void exportScript(format, range)} /> : null}
+        {data && stage === 'episodes' ? <EpisodeBatchPanel data={data} busy={busy} batchStart={selectedBatchStart} batchEpisodes={batchEpisodes} batchLoading={batchLoading} episode={selectedEpisode} episodeLoading={episodeLoading} onStart={(start, count, regenerate) => void startEpisodeBatch(start, count, regenerate)} onResume={(jobId) => void resumeJob(jobId)} onCancel={(jobId) => void cancelJob(jobId)} onTrash={(jobId) => void trashJob(jobId)} onOpenEpisode={(episodeNumber) => void openEpisode(episodeNumber)} onRegenerateEpisode={(episodeNumber, instruction) => startEpisodeBatch(episodeNumber, 1, true, instruction)} onEpisodeChange={editSelectedEpisode} onSaveEpisode={() => void saveEpisode()} onReviewEpisode={(episodeNumber) => void reviewEpisode(episodeNumber)} onReviewBatch={(episodeNumbers) => void reviewCurrentBatch(episodeNumbers)} onReviewStatus={(issueId, status) => void updateReviewStatus(issueId, status)} onExport={(format, range) => void exportScript(format, range)} /> : null}
         {data && stage === 'world' ? <WorldEditor value={data.world ?? emptyWorld(projectId)} busy={busy} onChange={(world) => { markResourceDirty('world'); setData((current) => current ? { ...current, world } : current); }} onSave={() => void saveWorld()} onGenerate={(regenerate) => void startMaterialJob('script_bible', ['plan', 'outline', 'characters', 'world'], regenerate)} /> : null}
       </main>
     </div>
