@@ -9,6 +9,7 @@ import type {
   ScriptReviewIssue,
   ScriptReviewSource,
 } from '../domain.js';
+import { scriptEpisodeLengthRange } from '../agents/ScriptEpisodeLength.js';
 import { looksLikeUnattributedDialogueAction } from './ScriptDialogueFormat.js';
 
 export type ScriptGateSeverity = 'hard' | 'soft';
@@ -426,19 +427,20 @@ export function validateScriptEpisode(
   if (episode.scenes.some((scene, index) => scene.ordinal !== index + 1)) {
     addHard('SCENES_OUT_OF_ORDER', '场景必须按场号升序排列。', 'scenes');
   }
-  if (episode.scenes.length > 0 && visibleChars < Math.ceil(plan.targetCharsPerEpisode * 0.75)) {
+  const episodeLengthRange = scriptEpisodeLengthRange(plan.targetCharsPerEpisode);
+  if (episode.scenes.length > 0 && visibleChars < episodeLengthRange.minimum) {
     issues.push({
       code: 'TOO_SHORT',
       severity: 'soft',
-      message: `可见字符 ${visibleChars}，低于建议目标的 75%；正文仍可完成，但建议补写。`,
+      message: `可见字符 ${visibleChars}，低于建议范围 ${episodeLengthRange.minimum}—${episodeLengthRange.maximum}；正文仍可完成，但建议补写。`,
       path: 'scenes',
     });
   }
-  if (visibleChars > Math.floor(plan.targetCharsPerEpisode * 1.25)) {
+  if (visibleChars > episodeLengthRange.maximum) {
     issues.push({
       code: 'TOO_LONG',
       severity: 'soft',
-      message: `可见字符 ${visibleChars}，超过建议目标的 125%；正文仍可完成，可按节奏精简。`,
+      message: `可见字符 ${visibleChars}，超过建议范围 ${episodeLengthRange.minimum}—${episodeLengthRange.maximum}；正文仍可完成，可按节奏精简。`,
       path: 'scenes',
     });
   }

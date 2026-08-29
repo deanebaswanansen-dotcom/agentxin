@@ -148,7 +148,7 @@ describe('validateScriptEpisode', () => {
     const longReport = validateScriptEpisode(episode({
       scenes: [{
         ...validScene(),
-        blocks: [{ id: 'long', type: 'action', text: '长'.repeat(130) }],
+        blocks: [{ id: 'long', type: 'action', text: '长'.repeat(330) }],
       }],
     }), plan, { expectedEpisodeNumber: 1 });
 

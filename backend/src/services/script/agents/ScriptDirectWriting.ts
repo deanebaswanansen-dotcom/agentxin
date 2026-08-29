@@ -24,6 +24,7 @@ export const SCRIPT_DIRECT_ISSUE_CODES = [
   'CHARACTER_IDENTITY_CONFLICT',
   'DIALOGUE_FORMAT_ERROR',
   'DUPLICATE_MAJOR_EVENT',
+  'LENGTH_OUT_OF_RANGE',
   'CAUSAL_CONTRADICTION',
   'PROP_STATE_CONTRADICTION',
 ] as const;
@@ -106,7 +107,7 @@ function directLengthInstruction(context: Record<string, unknown>): string {
   const targetChars = targetCharsFromContext(context);
   if (!targetChars) return '正文保持紧凑完整，不要靠重复台词凑字。';
   const { minimum, maximum } = scriptEpisodeLengthRange(targetChars);
-  return `正文以 ${targetChars} 个可见字符为目标，尽量控制在约 ${minimum}—${maximum} 字。字数是软目标，必须优先保证剧情和每句话完整；绝不能把一句话写一半后用省略号代替未写内容。不要靠重复台词凑字。`;
+  return `正文以 ${targetChars} 个可见字符为目标，必须控制在 ${minimum}—${maximum} 字。素材较多时精简次要动作和重复信息，但必须保证剧情闭合、每句话完整；绝不能把一句话写一半后用省略号代替未写内容。不要靠重复台词凑字。`;
 }
 
 const REPEATED_PLOT_ACTIONS = [
@@ -502,6 +503,9 @@ export function buildDirectRewritePrompt(
   const dialogueFormatInstruction = issues.some((issue) => issue.code === 'DIALOGUE_FORMAT_ERROR')
     ? '存在 DIALOGUE_FORMAT_ERROR：逐行确认真正的说话人；每句说出口的话必须单独写成“说话人：完整台词”，△只保留无对白动作。禁止猜成被称呼者在说话，也禁止继续把台词写成△。'
     : '';
+  const lengthInstruction = issues.some((issue) => issue.code === 'LENGTH_OUT_OF_RANGE')
+    ? '存在 LENGTH_OUT_OF_RANGE：必须重新组织并压缩完整一集，精简重复解释、重复动作和不推进剧情的对白；必须保留开端、冲突升级、关键转折和 endingHook。禁止截断原稿，禁止删除结尾，禁止用省略号代替任何未写完的台词或动作。'
+    : '';
   if (options.rewriteFromOutline) {
     return [
       '上一版正文已被明确拒绝。请完全从分集卡重新写出本集完整中文短剧正文。',
@@ -510,6 +514,7 @@ export function buildDirectRewritePrompt(
       offOutlineInstruction,
       duplicateInstruction,
       dialogueFormatInstruction,
+      lengthInstruction,
       directLengthInstruction(context),
       '完整稿中每句说出口的话必须带“说话人：”；△只能表示无对白的可见动作。',
       '输出完整标准剧本文本，不要解释，不要JSON，不要Markdown围栏。',
@@ -524,6 +529,7 @@ export function buildDirectRewritePrompt(
     offOutlineInstruction,
     duplicateInstruction,
     dialogueFormatInstruction,
+    lengthInstruction,
     directLengthInstruction(context),
     '完整稿中每句说出口的话必须带“说话人：”；△只能表示无对白的可见动作。',
     '输出完整标准剧本文本，不要解释，不要JSON，不要Markdown围栏。',

@@ -565,7 +565,7 @@ describe('ScriptDirector offline ten-episode full-book diagnostic', () => {
     expect(model.calls.filter((call) => call.node === 'episode_outline')).toHaveLength(1);
   });
 
-  it('rebuilds a mixed legacy 1-5 batch instead of reusing v1 empty-fingerprint candidates', async () => {
+  it('repairs a legacy mid-batch resume and rebuilds candidates without canonical continuity', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'agentxin-fullbook-legacy-resume-'));
     directories.push(directory);
     const projectRoot = join(directory, 'projects');
@@ -666,8 +666,10 @@ describe('ScriptDirector offline ten-episode full-book diagnostic', () => {
     const resumed = await director.run({
       task: 'script_episode_batch',
       projectId: PROJECT_ID,
-      startEpisode: 1,
-      episodeCount: 5,
+      // Old deployments persisted a remaining-range request after a pause.
+      // Resuming 2-5 must restore the canonical 1-5 batch before continuity checks.
+      startEpisode: 2,
+      episodeCount: 4,
       expectedPlanRevision: savedPlan.revision,
     });
 
