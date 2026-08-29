@@ -1149,8 +1149,24 @@ function EpisodeBatchPanel({
               </div>
               <div className="script-block-list">
                 {scene.blocks.map((block, blockIndex) => (
-                  <label className="script-block-editor" key={block.id}>
-                    <span>{block.type === 'caption' ? '字幕' : block.type === 'action' ? '动作' : `${block.speaker}${block.delivery ? `（${block.delivery}）` : ''}`}</span>
+                  <div className="script-block-editor" key={block.id}>
+                    <div className="script-block-editor__meta">
+                      <span>{block.type === 'caption' ? '字幕' : block.type === 'action' ? '动作' : `${block.speaker}${block.delivery ? `（${block.delivery}）` : ''}`}</span>
+                      <button
+                        type="button"
+                        className="script-block-editor__delete"
+                        aria-label={`删除第 ${episode.episodeNumber} 集场景 ${scene.ordinal} 第 ${blockIndex + 1} 行`}
+                        disabled={busy}
+                        onClick={() => {
+                          const scenes = episode.scenes.flatMap((item, index) => {
+                            if (index !== sceneIndex) return [item];
+                            const blocks = item.blocks.filter((_, partIndex) => partIndex !== blockIndex);
+                            return blocks.length > 0 ? [{ ...item, blocks }] : [];
+                          }).map((item, index) => ({ ...item, ordinal: index + 1 }));
+                          onEpisodeChange({ ...episode, scenes });
+                        }}
+                      >删除本行</button>
+                    </div>
                     <textarea
                       aria-label={`第 ${episode.episodeNumber} 集场景 ${scene.ordinal} 块 ${blockIndex + 1}`}
                       value={block.text}
@@ -1161,7 +1177,7 @@ function EpisodeBatchPanel({
                           : item),
                       })}
                     />
-                  </label>
+                  </div>
                 ))}
               </div>
             </article>

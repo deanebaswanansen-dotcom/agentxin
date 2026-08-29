@@ -1437,6 +1437,44 @@ describe('ScriptWorkspace', () => {
     await waitFor(() => expect(screen.getAllByText('3 字').length).toBeGreaterThan(0));
   });
 
+  it('deletes a screenplay row together with its speaker and saves the remaining blocks', async () => {
+    const client = createClient();
+    const episode = {
+      ...buildEpisode('陆霆骁走进客厅。', 7),
+      scenes: [{
+        ...buildEpisode().scenes[0],
+        blocks: [
+          { id: 'block-1', type: 'action' as const, text: '陆霆骁走进客厅。' },
+          { id: 'block-2', type: 'dialogue' as const, speaker: '陆霆骁', mode: 'normal' as const, text: '走吧，爸妈在等。' },
+        ],
+      }],
+    };
+    vi.mocked(client.script.episodes.list).mockResolvedValue([summarizeEpisode(episode)]);
+    vi.mocked(client.script.episodes.get).mockResolvedValue(episode);
+    vi.mocked(client.script.episodes.save).mockImplementation((_projectId, _episodeNumber, value) => (
+      Promise.resolve({ ...value, revision: 8 })
+    ));
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
+    fireEvent.click(screen.getByRole('button', { name: '打开第 1 集' }));
+    expect(await screen.findByText('陆霆骁')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '删除第 1 集场景 1 第 2 行' }));
+
+    expect(screen.queryByText('陆霆骁')).not.toBeInTheDocument();
+    expect(screen.queryByDisplayValue('走吧，爸妈在等。')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '保存第 1 集' }));
+
+    await waitFor(() => expect(client.script.episodes.save).toHaveBeenCalledWith(
+      'project-1', 1, expect.objectContaining({
+        scenes: [expect.objectContaining({
+          blocks: [{ id: 'block-1', type: 'action', text: '陆霆骁走进客厅。' }],
+        })],
+      }), 7,
+    ));
+  });
+
   it('keeps a dirty episode open when reopening it, switching episodes or batches, and blocks stale review', async () => {
     const client = createClient();
     const episode1 = { ...buildNumberedEpisode(1, '第一集正文', 3), status: 'reviewing' as const };

@@ -9,6 +9,7 @@ import {
   buildDirectDraftPrompt,
   buildDirectRewritePrompt,
   buildDirectReviewPrompt,
+  detectRepeatedDirectPlotEvents,
   decodeDirectHandoffReview,
   createLocalDirectHandoffReview,
   mergeDirectHandoffContinuity,
@@ -65,6 +66,8 @@ describe('ScriptDirectWriting', () => {
     expect(prompt).toContain('【闪回】和【闪回结束】');
     expect(prompt).toContain('OS必须跟人物心里所想的话');
     expect(prompt).toContain('VO只用于画外能听见但看不到人物');
+    expect(prompt).toContain('同一道具动作链只能完整演一次');
+    expect(prompt).toContain('打开抽屉—拿起照片—看完放回');
   });
 
   it('tells the lightweight reviewer to reject events reserved for later episode cards', () => {
@@ -76,6 +79,8 @@ describe('ScriptDirectWriting', () => {
     expect(prompt).toContain('逐项比较本集 endingHook 与 nextEpisodeDirection');
     expect(prompt).toContain('提前完成下一集、后续高潮或结局');
     expect(prompt).toContain('OFF_OUTLINE');
+    expect(prompt).toContain('具体道具动作链重复发生');
+    expect(prompt).toContain('换了人物、措辞或位置');
   });
 
   it('keeps custom quality checks advisory and separate from rewrite issues', () => {
@@ -114,6 +119,63 @@ describe('ScriptDirectWriting', () => {
     expect(prompt).toContain('彻底删除 evidence 涉及的越界人物、道具、证据和后续事件');
     expect(prompt).toContain('不能只换说法或换地点保留');
     expect(prompt).toContain('精确停在本集 endingHook');
+  });
+
+  it('tells a duplicate-event rewrite to remove the replay instead of paraphrasing it', () => {
+    const prompt = buildDirectRewritePrompt({
+      episode: { endingHook: '照片背面的日期被确认' },
+    }, '两个人先后打开抽屉查看同一张照片。', [{
+      code: 'DUPLICATE_MAJOR_EVENT',
+      sceneNumber: 1,
+      evidence: '后段再次打开抽屉查看同一照片',
+      expected: '后段直接写新的发现',
+    }]);
+
+    expect(prompt).toContain('保留第一次完整动作链');
+    expect(prompt).toContain('删除后面重复的开端和过程');
+    expect(prompt).toContain('不能只换人物、地点或近义词');
+  });
+
+  it('detects a repeated prop-action chain even when the actor and wording change', () => {
+    const repeatedEpisode = {
+      ...episode,
+      scenes: [{
+        ...episode.scenes[0],
+        blocks: [
+          { id: 'a1', type: 'action' as const, text: '林薇薇拉开书桌抽屉，拿起里面的旧相框。' },
+          { id: 'a2', type: 'action' as const, text: '她盯着照片背面的字，随后把相框放回并关上抽屉。' },
+          { id: 'd1', type: 'dialogue' as const, speaker: '陆霆骁', text: '你在找什么？' },
+          { id: 'a3', type: 'action' as const, text: '林薇薇没有回答，径直走出书房。' },
+          { id: 'a4', type: 'action' as const, text: '陆霆骁走到桌前打开抽屉，取出那张照片。' },
+          { id: 'a5', type: 'action' as const, text: '他看着相框里的两个人，眉头紧锁。' },
+        ],
+      }],
+    } as unknown as ScriptEpisode;
+
+    expect(detectRepeatedDirectPlotEvents(repeatedEpisode)).toEqual([
+      expect.objectContaining({
+        code: 'DUPLICATE_MAJOR_EVENT',
+        sceneNumber: 1,
+        evidence: expect.stringContaining('重复演了抽屉或柜子、照片或相框'),
+      }),
+    ]);
+  });
+
+  it('does not flag one recurring prop when the later action advances the plot', () => {
+    const advancingEpisode = {
+      ...episode,
+      scenes: [{
+        ...episode.scenes[0],
+        blocks: [
+          { id: 'a1', type: 'action' as const, text: '林薇薇打开抽屉，拿出一张照片。' },
+          { id: 'a2', type: 'action' as const, text: '她把照片交给律师作为证据。' },
+          { id: 'a3', type: 'action' as const, text: '律师核对照片上的日期并联系证人。' },
+          { id: 'a4', type: 'action' as const, text: '证人接过照片，当众承认自己改过日期。' },
+        ],
+      }],
+    } as unknown as ScriptEpisode;
+
+    expect(detectRepeatedDirectPlotEvents(advancingEpisode)).toEqual([]);
   });
 
   it('drops the rejected original when retrying an off-outline rewrite', () => {

@@ -1818,7 +1818,7 @@ describe('ScriptDirector', () => {
     }
   });
 
-  it('stales an episode-draft-v3 checkpoint after the lightweight v8 prompt upgrade', async () => {
+  it('stales an episode-draft-v3 checkpoint after the lightweight v10 prompt upgrade', async () => {
     const state = readySingleEpisodeState();
     let draftCalls = 0;
     const store = new MemoryScriptStore(state);
@@ -1912,7 +1912,7 @@ describe('ScriptDirector', () => {
         artifactRevision: 0, promptVersion: 'episode-draft-v3', status: 'stale',
       }),
       expect.objectContaining({
-        artifactRevision: 1, promptVersion: 'episode-draft-v9', status: 'succeeded',
+        artifactRevision: 1, promptVersion: 'episode-draft-v10', status: 'succeeded',
       }),
     ]));
   });
@@ -2169,7 +2169,7 @@ describe('ScriptDirector', () => {
       expect.objectContaining({
         artifactRevision: 1,
         status: 'succeeded',
-        promptVersion: 'episode-draft-v9',
+        promptVersion: 'episode-draft-v10',
       }),
     ]));
   });
@@ -3627,6 +3627,54 @@ describe('ScriptDirector', () => {
     expect(calls).toEqual(['draft', 'review', 'revision', 'review']);
     expect(store.state.episodes[0]?.scenes[0]?.location).toBe('校报社');
     expect(JSON.stringify(store.state.episodes[0])).not.toContain('篮球');
+    expect(store.atomicCommitCalls).toHaveLength(1);
+  });
+
+  it('rewrites a repeated prop-action chain once even when the AI review passes', async () => {
+    const state = readySingleEpisodeState();
+    const store = new MemoryScriptStore(state);
+    const calls: string[] = [];
+    const revisionPrompts: string[] = [];
+    const repeatedDraft = [
+      '第1集',
+      '1-1 校报社 日/内',
+      '人物：沈清',
+      '△沈清打开档案柜抽屉，取出一张旧照片。',
+      '△她检查照片和旁边的登记表，随后把照片放回并关上抽屉。',
+      `沈清：${'这张照片能证明当年还有第三个人在场。'.repeat(10)}`,
+      '△沈清接到电话后走到窗边，背对长桌。',
+      '△校报记者走到桌前，重新打开档案柜抽屉，拿出同一张照片。',
+      '△他盯着照片和登记表看了许久，又把照片收回抽屉。',
+      `沈清：${'先查清登记表上的日期，再去找照片里的人。'.repeat(10)}`,
+    ].join('\n');
+    const model: ScriptModelAdapter = {
+      async complete(request) {
+        calls.push(request.node);
+        if (request.node === 'draft') return repeatedDraft;
+        if (request.node === 'revision') {
+          revisionPrompts.push(request.prompt);
+          return directScriptText({ dialogue: '登记表上的日期指向了下一名证人。'.repeat(14) });
+        }
+        return directReviewJson();
+      },
+      async getModelConfigFingerprint() { return 'direct-model-v1'; },
+    };
+    const director = new ScriptDirector({
+      model,
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+    });
+
+    await director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    });
+
+    expect(calls).toEqual(['draft', 'review', 'revision', 'review']);
+    expect(revisionPrompts[0]).toContain('DUPLICATE_MAJOR_EVENT');
+    expect(revisionPrompts[0]).toContain('保留第一次完整动作链');
+    expect(JSON.stringify(store.state.episodes[0])).not.toContain('重新打开档案柜抽屉');
     expect(store.atomicCommitCalls).toHaveLength(1);
   });
 
