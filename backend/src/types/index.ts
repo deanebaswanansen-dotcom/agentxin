@@ -252,6 +252,8 @@ export interface AgentRunRequest {
     episodeCount: number;
     expectedPlanRevision: number;
     draftMode?: 'structured_legacy' | 'direct_text';
+    /** Optional user-authored requirements for regenerating exactly one existing episode. */
+    rewriteInstruction?: string;
   };
   options?: {
     targetWords?: number;

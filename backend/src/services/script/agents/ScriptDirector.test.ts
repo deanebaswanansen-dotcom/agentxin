@@ -3082,7 +3082,7 @@ describe('ScriptDirector', () => {
     expect(state.reviewIssues).toEqual(originalIssues);
   });
 
-  it('uses the current series card instead of an old detailed outline for an explicit rewrite', async () => {
+  it('uses the current series card and user instruction instead of blindly repeating an old episode', async () => {
     const state = readySingleEpisodeState();
     state.episodeOutlines[0] = {
       ...state.episodeOutlines[0]!,
@@ -3108,9 +3108,11 @@ describe('ScriptDirector', () => {
       summary: '旧稿摘要',
     }];
     const draftPrompts: string[] = [];
+    const modelNodes: string[] = [];
     const director = new ScriptDirector({
       model: {
         async complete(request) {
+          modelNodes.push(request.node);
           if (request.node === 'draft') {
             draftPrompts.push(request.prompt);
             return directScriptText();
@@ -3131,13 +3133,101 @@ describe('ScriptDirector', () => {
       expectedPlanRevision: 1,
       draftMode: 'direct_text',
       regenerate: true,
+      rewriteInstruction: '保留第一场，只把结尾改成沈清发现手机里的录音。',
     });
 
+    expect(modelNodes).toEqual(['draft', 'review']);
     expect(draftPrompts).toHaveLength(1);
     expect(draftPrompts[0]).toContain('新总纲事件：证人在直播前交出手机');
     expect(draftPrompts[0]).toContain('新总纲钩子：手机自动播放录音');
+    expect(draftPrompts[0]).toContain('保留第一场，只把结尾改成沈清发现手机里的录音。');
+    expect(draftPrompts[0]).toContain('旧正文必须在新稿成功前保留。');
     expect(draftPrompts[0]).not.toContain('旧详细大纲目标：寻找旧账本');
     expect(draftPrompts[0]).not.toContain('旧详细大纲冲突：保安锁门');
+  });
+
+  it('rewrites one existing episode outside a five-episode boundary', async () => {
+    const state = readySingleEpisodeState();
+    state.plan = approvedPlan(2);
+    state.seriesOutline = {
+      ...state.seriesOutline!,
+      episodeCards: [
+        state.seriesOutline!.episodeCards[0]!,
+        { episodeNumber: 2, title: '第二集', logline: '核验证词。', mainEvent: '沈清找到矛盾证词。', endingHook: '证人改口。' },
+      ],
+    };
+    state.episodeOutlines.push({
+      ...state.episodeOutlines[0]!,
+      id: 'outline-2',
+      episodeNumber: 2,
+      title: '第二集',
+      goal: '核验证词',
+      endingHook: '证人改口',
+    });
+    const firstEpisode = {
+      ...reviewingEpisode(state, '第一集已经发生的调查。'.repeat(20), { revision: 1 }),
+      status: 'completed' as const,
+      summary: '沈清取得第一份证据。',
+    };
+    const secondEpisode = {
+      ...reviewingEpisode(state, '第二集需要修改的旧正文。'.repeat(20), { revision: 2 }),
+      id: 'candidate-episode-2',
+      episodeNumber: 2,
+      outlineId: 'outline-2',
+      title: '第二集',
+      status: 'completed' as const,
+      summary: '旧稿里证人直接认罪。',
+      scenes: reviewingEpisode(state, '第二集需要修改的旧正文。'.repeat(20)).scenes.map((scene) => ({
+        ...scene,
+        id: 'candidate-scene-2',
+        blocks: scene.blocks.map((block) => ({ ...block, id: 'candidate-block-2' })),
+      })),
+    };
+    state.episodes = [firstEpisode, secondEpisode];
+    state.continuityCommits = [{
+      id: 'continuity-1',
+      schemaVersion: 1,
+      projectId: state.projectId,
+      episodeNumber: 1,
+      episodeRevision: 1,
+      revision: 1,
+      status: 'current',
+      inputFingerprint: 'a'.repeat(64),
+      characterUpdates: [], factsAdded: [], props: [], threads: [], timelineEvents: [],
+      nextEpisodeMustInherit: [],
+      createdAt: state.updatedAt,
+      updatedAt: state.updatedAt,
+    }];
+    const prompts: string[] = [];
+    const director = new ScriptDirector({
+      model: {
+        async complete(request) {
+          if (request.node === 'draft') {
+            prompts.push(request.prompt);
+            return directScriptText({ episodeNumber: 2 });
+          }
+          if (request.node === 'review') return directReviewJson({ summary: '沈清找到证词矛盾，证人突然改口。' });
+          throw new Error(`unexpected node: ${request.node}`);
+        },
+      },
+      store: new MemoryScriptStore(state),
+      checkpoints: new InMemoryScriptCheckpointStore(),
+    });
+
+    await expect(director.run({
+      task: 'script_episode_batch',
+      projectId: 'project-1',
+      startEpisode: 2,
+      episodeCount: 1,
+      expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+      regenerate: true,
+      rewriteInstruction: '保留调查结果，把证人认罪改成证人突然改口。',
+    })).resolves.toMatchObject({ kind: 'episode_batch' });
+
+    expect(prompts[0]).toContain('把证人认罪改成证人突然改口');
+    expect(prompts[0]).toContain('第二集需要修改的旧正文');
+    expect(state.episodes.find((episode) => episode.episodeNumber === 2)?.revision).toBe(3);
   });
 
   it('does not replace the review ledger when the episode CAS fails', async () => {

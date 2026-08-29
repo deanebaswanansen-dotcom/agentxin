@@ -881,6 +881,62 @@ describe('ScriptWorkspace', () => {
     }));
   });
 
+  it('rewrites one arbitrary completed episode with the user instruction in the same job', async () => {
+    const client = createClient();
+    const completedEpisodes = Array.from({ length: 3 }, (_, index) => (
+      buildNumberedEpisode(index + 1, `第${index + 1}集旧正文`)
+    ));
+    Object.assign(client.script, {
+      workspace: {
+        get: vi.fn().mockResolvedValue(buildWorkspaceSnapshot({
+          episodeSummaries: completedEpisodes.map(summarizeEpisode),
+          batchSummaries: [{
+            startEpisode: 1,
+            endEpisode: 5,
+            status: 'generating',
+            completedEpisodes: 3,
+            visibleChars: 21,
+            unresolvedHardIssues: 0,
+            unresolvedSoftIssues: 0,
+          }],
+        })),
+      },
+    });
+    vi.mocked(client.script.jobs.create).mockResolvedValue({
+      id: 'rewrite-episode-3',
+      projectId: 'project-1',
+      task: 'script_episode_batch',
+      status: 'queued',
+      continuable: false,
+    });
+
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
+    fireEvent.click(await screen.findByRole('button', { name: '按要求重写第 3 集' }));
+
+    const instruction = screen.getByLabelText('第 3 集修改要求');
+    expect(screen.getByRole('button', { name: '按这个要求重写' })).toBeDisabled();
+    fireEvent.change(instruction, {
+      target: { value: '保留前两场，只把第三场改成女主先发现账本，不要再次出现检查人员。' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '按这个要求重写' }));
+
+    await waitFor(() => expect(client.script.jobs.create).toHaveBeenLastCalledWith({
+      projectId: 'project-1',
+      task: 'script_episode_batch',
+      regenerate: true,
+      scriptBatchOptions: {
+        startEpisode: 3,
+        episodeCount: 1,
+        expectedPlanRevision: 2,
+        draftMode: 'direct_text',
+        rewriteInstruction: '保留前两场，只把第三场改成女主先发现账本，不要再次出现检查人员。',
+      },
+    }));
+    expect(screen.getByRole('status')).toHaveTextContent('旧稿会保留到新稿成功保存');
+  });
+
   it('does not start material Agents from unsaved source data', async () => {
     const client = createClient();
     render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
@@ -1459,10 +1515,10 @@ describe('ScriptWorkspace', () => {
     await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
     fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
     fireEvent.click(screen.getByRole('button', { name: '打开第 1 集' }));
-    expect(await screen.findByText('陆霆骁')).toBeInTheDocument();
+    expect(await screen.findByDisplayValue('陆霆骁')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '删除第 1 集场景 1 第 2 行' }));
 
-    expect(screen.queryByText('陆霆骁')).not.toBeInTheDocument();
+    expect(screen.queryByDisplayValue('陆霆骁')).not.toBeInTheDocument();
     expect(screen.queryByDisplayValue('走吧，爸妈在等。')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '保存第 1 集' }));
 
@@ -1470,6 +1526,52 @@ describe('ScriptWorkspace', () => {
       'project-1', 1, expect.objectContaining({
         scenes: [expect.objectContaining({
           blocks: [{ id: 'block-1', type: 'action', text: '陆霆骁走进客厅。' }],
+        })],
+      }), 7,
+    ));
+  });
+
+  it('adds an editable action, dialogue, or caption row and saves the new dialogue speaker', async () => {
+    const client = createClient();
+    const character = buildCharacter();
+    const episode = {
+      ...buildEpisode('沈清推门进入。', 7),
+      scenes: [{
+        ...buildEpisode().scenes[0],
+        characterIds: [character.id],
+        blocks: [{ id: 'block-1', type: 'action' as const, text: '沈清推门进入。' }],
+      }],
+    };
+    vi.mocked(client.script.characters.list).mockResolvedValue([character]);
+    vi.mocked(client.script.episodes.list).mockResolvedValue([summarizeEpisode(episode)]);
+    vi.mocked(client.script.episodes.get).mockResolvedValue(episode);
+    vi.mocked(client.script.episodes.save).mockImplementation((_projectId, _episodeNumber, value) => (
+      Promise.resolve({ ...value, revision: 8 })
+    ));
+
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
+    fireEvent.click(screen.getByRole('button', { name: '打开第 1 集' }));
+    fireEvent.click(await screen.findByRole('button', { name: '添加对白' }));
+
+    expect(screen.getByLabelText('第 1 集场景 1 第 2 行类型')).toHaveValue('dialogue');
+    expect(screen.getByLabelText('第 1 集场景 1 第 2 行说话人')).toHaveValue('服务器角色');
+    fireEvent.change(screen.getByLabelText('第 1 集场景 1 块 2'), {
+      target: { value: '账本就在这里。' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '保存第 1 集' }));
+
+    await waitFor(() => expect(client.script.episodes.save).toHaveBeenCalledWith(
+      'project-1', 1, expect.objectContaining({
+        scenes: [expect.objectContaining({
+          characterIds: ['character-1'],
+          blocks: [
+            { id: 'block-1', type: 'action', text: '沈清推门进入。' },
+            expect.objectContaining({
+              type: 'dialogue', characterId: 'character-1', speaker: '服务器角色', text: '账本就在这里。',
+            }),
+          ],
         })],
       }), 7,
     ));

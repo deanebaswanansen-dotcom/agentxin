@@ -404,11 +404,20 @@ export function buildDirectDraftPrompt(context: Record<string, unknown>): string
   const boundaryInstruction = hasNextEpisodeDirection(context)
     ? '本集必须在 endingHook 处停住；nextEpisodeDirection 是下一集边界，只能做铺垫，绝不能提前完成下一集事件、后续决赛或全剧结局。'
     : '这是全剧最后一集，nextEpisodeDirection 为空；必须完成本集分集卡、endingHook 与已确认的全剧结局，不得凭空保留到不存在的下一集。';
+  const userRewrite = context.userRewrite && typeof context.userRewrite === 'object' && !Array.isArray(context.userRewrite)
+    ? context.userRewrite as Record<string, unknown>
+    : undefined;
+  const rewriteInstruction = typeof userRewrite?.instruction === 'string'
+    ? userRewrite.instruction.trim()
+    : '';
   return [
     '请严格照已确认的当前分集卡，直接写出本集完整中文短剧正文。',
     '这是创作任务，不是数据填表；不要解释，不要分析，不要输出 JSON 或 Markdown 围栏。',
     '必须保持项目题材、人物身份、职业、关系和证物状态一致，不能把项目换成另一种题材。',
     '必须落实本集 goal、conflict、beats 与 endingHook；forbiddenFacts 和 forbiddenElements 不得出现。',
+    rewriteInstruction
+      ? `这是用户指定的单集修改，必须优先执行：${rewriteInstruction}。userRewrite.existingEpisodeText 是当前旧稿；输出修改后的完整一集，明确要求保留的部分尽量原样保留，只改用户指出的剧情。不得无视要求照旧重写。`
+      : '',
     boundaryInstruction,
     directLengthInstruction(context),
     '创作资料中的 priorEpisodeHistory 是前面已经演完的剧情：allEpisodeSummaries 覆盖全部前集，recentSceneEvents 补充最近12集细节。只能承接其结果，绝不能换人物、地点或措辞后把其中一场重新演一遍。',
@@ -428,7 +437,7 @@ export function buildDirectDraftPrompt(context: Record<string, unknown>): string
     '回忆段落分别用【闪回】和【闪回结束】包住；OS必须跟人物心里所想的话，VO只用于画外能听见但看不到人物的声音。',
     '场号从1连续递增；所有普通对白的说话人必须列在本场人物行，OS/VO人物必须是登记人物。',
     `创作资料：${JSON.stringify(context)}`,
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 }
 
 export function buildDirectContinuationPrompt(

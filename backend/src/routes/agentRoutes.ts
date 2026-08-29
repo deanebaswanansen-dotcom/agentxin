@@ -155,14 +155,23 @@ function parseScriptBatchOptions(raw: unknown): AgentRunRequest['scriptBatchOpti
   const episodeCount = asOptionalPositiveInt(value.episodeCount);
   const expectedPlanRevision = asOptionalPositiveInt(value.expectedPlanRevision);
   const draftMode = value.draftMode;
+  const rewriteInstruction = typeof value.rewriteInstruction === 'string'
+    ? value.rewriteInstruction.trim()
+    : '';
   if (startEpisode === undefined || episodeCount === undefined || expectedPlanRevision === undefined) {
     throw ServiceError.validation('短剧批次必须包含起始集、1–5 集数量和策划版本。');
   }
   if (episodeCount > 5) {
     throw ServiceError.validation('短剧每批最多生成 5 集。');
   }
-  if ((startEpisode - 1) % 5 !== 0) {
+  if ((startEpisode - 1) % 5 !== 0 && episodeCount !== 1) {
     throw ServiceError.validation('短剧正文批次必须从第 1、6、11……集开始。');
+  }
+  if (rewriteInstruction.length > 2_000) {
+    throw ServiceError.validation('单集修改要求不能超过 2000 字。');
+  }
+  if (rewriteInstruction && episodeCount !== 1) {
+    throw ServiceError.validation('自定义修改要求只能用于单独重写一集。');
   }
   if (
     draftMode !== undefined &&
@@ -176,6 +185,7 @@ function parseScriptBatchOptions(raw: unknown): AgentRunRequest['scriptBatchOpti
     episodeCount,
     expectedPlanRevision,
     ...(draftMode ? { draftMode } : {}),
+    ...(rewriteInstruction ? { rewriteInstruction } : {}),
   };
 }
 
@@ -214,6 +224,23 @@ export function parseAgentBody(raw: RunAgentBody): AgentRunRequest {
   const scriptBatchOptions = raw.task === 'script_episode_batch'
     ? parseScriptBatchOptions(raw.scriptBatchOptions)
     : undefined;
+  if (
+    scriptBatchOptions &&
+    scriptBatchOptions.episodeCount === 1 &&
+    (scriptBatchOptions.startEpisode - 1) % 5 !== 0 &&
+    raw.regenerate !== true
+  ) {
+    throw ServiceError.validation('只有重写已生成的单集可以从任意集数开始。');
+  }
+  if (scriptBatchOptions?.rewriteInstruction && raw.regenerate !== true) {
+    throw ServiceError.validation('单集修改要求必须与重新写作一起提交。');
+  }
+  if (
+    scriptBatchOptions?.rewriteInstruction &&
+    scriptBatchOptions.draftMode === 'structured_legacy'
+  ) {
+    throw ServiceError.validation('按要求重写单集只支持直接正文模式。');
+  }
   return {
     task: raw.task,
     mode: scriptTask ? 'draft' : raw.mode as AgentRunMode,
