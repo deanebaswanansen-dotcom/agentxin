@@ -2642,7 +2642,7 @@ describe('ScriptDirector', () => {
   });
   it('keeps an overlong but structurally valid episode as advisory instead of rewriting it', async () => {
     const state = readySingleEpisodeState();
-    state.episodes = [reviewingEpisode(state, '超长'.repeat(200), { title: '偏长候选' })];
+    state.episodes = [reviewingEpisode(state, '超长'.repeat(300), { title: '偏长候选' })];
     let reviewCalls = 0;
     let revisionCalls = 0;
     const store = new MemoryScriptStore(state);
@@ -3340,7 +3340,7 @@ describe('ScriptDirector', () => {
     ]));
   });
 
-  it('preserves a complete overlong direct-text episode without truncating blocks or adding another model call', async () => {
+  it('asks the model to rewrite a complete overlong episode instead of clipping it', async () => {
     const state = readySingleEpisodeState();
     state.plan = { ...state.plan!, targetCharsPerEpisode: 1_200 };
     const store = new MemoryScriptStore(state);
@@ -3353,13 +3353,23 @@ describe('ScriptDirector', () => {
       `沈清：${'证据还差最后一环，现在不能停。'.repeat(100)}`,
       `△${'门外的新证人敲响玻璃门。'.repeat(35)}`,
     ].join('\n');
+    const conciseCompleteDraft = [
+      '第1集',
+      '1-1 校报社 日/内',
+      '人物：沈清',
+      `△${'沈清核对桌上的采访记录。'.repeat(25)}`,
+      `沈清：${'证据还差最后一环，现在不能停。'.repeat(30)}`,
+      `△${'门外的新证人敲响玻璃门。'.repeat(25)}`,
+    ].join('\n');
     const director = new ScriptDirector({
       store,
       checkpoints: new InMemoryScriptCheckpointStore(),
       model: {
         async complete(request) {
           calls.push({ node: request.node, prompt: request.prompt });
-          return request.node === 'review' ? directReviewJson() : overlongDraft;
+          if (request.node === 'review') return directReviewJson();
+          if (request.node === 'revision') return conciseCompleteDraft;
+          return overlongDraft;
         },
       },
     });
@@ -3380,16 +3390,14 @@ describe('ScriptDirector', () => {
       .map((block) => block.text)
       .join('')
       .replace(/\s/gu, '').length;
-    expect(visibleChars).toBeGreaterThan(1_600);
-    expect(saved.scenes[0]?.blocks.map((block) => block.text)).toEqual([
-      '沈清核对桌上的采访记录。'.repeat(40),
-      '证据还差最后一环，现在不能停。'.repeat(100),
-      '门外的新证人敲响玻璃门。'.repeat(35),
-    ]);
+    expect(visibleChars).toBeGreaterThanOrEqual(1_000);
+    expect(visibleChars).toBeLessThanOrEqual(1_400);
     expect(saved.scenes[0]?.blocks.every((block) => !block.text.endsWith('…'))).toBe(true);
-    expect(calls.map((call) => call.node)).toEqual(['draft', 'review']);
-    expect(calls[0]?.prompt).toContain('800—1600 字');
+    expect(calls.map((call) => call.node)).toEqual(['draft', 'review', 'revision', 'review']);
+    expect(calls[0]?.prompt).toContain('1000—1400 字');
     expect(calls[0]?.prompt).toContain('绝不能把一句话写一半后用省略号代替未写内容');
+    expect(calls[2]?.prompt).toContain('LENGTH_OUT_OF_RANGE');
+    expect(calls[2]?.prompt).toContain('禁止截断原稿');
   });
 
   it('repairs duplicate scene ordinals and saves the direct draft without a format-repair call', async () => {
@@ -3431,7 +3439,7 @@ describe('ScriptDirector', () => {
     });
 
     expect(result.kind).toBe('episode_batch');
-    expect(calls).toEqual(['draft', 'review']);
+    expect(calls).toEqual(['draft', 'review', 'revision', 'review']);
     expect(store.state.episodes[0]?.scenes.map((scene) => scene.ordinal)).toEqual([1, 2, 3]);
     expect(store.atomicCommitCalls).toHaveLength(1);
     const directDraft = (await checkpoints.list('project-1', 'script_episode_batch:1:1'))

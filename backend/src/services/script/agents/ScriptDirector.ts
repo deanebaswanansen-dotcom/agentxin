@@ -423,7 +423,7 @@ function scriptLengthInstruction(
     : `当前正文已有 ${currentChars} 个可见字符，只需从现有结尾自然续写，不得复述或重写。`;
   return [
     current,
-    `整集正文以 ${targetChars} 个可见字符为目标，尽量控制在 ${minimum}—${maximum} 字，也不要机械凑数；字数是软目标，必须优先写完当前剧情、动作和每一句对白，绝不能把一句话写一半后用省略号代替未写内容；`,
+    `整集正文以 ${targetChars} 个可见字符为目标，必须控制在 ${minimum}—${maximum} 字，也不要机械凑数；素材较多时精简次要动作和重复信息，但必须写完当前剧情、动作和每一句对白，绝不能把一句话写一半后用省略号代替未写内容；`,
     `当前 ${safeSceneCount} 场可按戏剧任务自然分配，平均约 ${charsPerScene} 字，重要冲突场可以更长；`,
     `对白目标约 ${dialogueDensityPercent}%，允许按剧情自然波动，不得为了比例重复台词或灌水；`,
     '每个 blocks.text 写完整、可拍摄的动作或有信息量的对白，不要用四五字短句机械凑块数；',
@@ -860,7 +860,7 @@ function revisionPolicyPromptContext(
     `目标总字数：${JSON.stringify({
       current: currentChars,
       target: targetChars,
-      minimum: Math.ceil(targetChars * 0.75),
+      minimum: scriptEpisodeLengthRange(targetChars).minimum,
       maximum: scriptEpisodeLengthRange(targetChars).maximum,
       idealNetChange: targetChars - currentChars,
     })}`,
@@ -2129,6 +2129,32 @@ export class ScriptDirector {
     const validatedPlan = initialState.plan;
     if (!validatedPlan) throw new ScriptModelOutputError('生成正文前必须先确认策划。');
     let state: ScriptProjectState = initialState;
+    const intentionalSingleEpisodeRegeneration = Boolean(
+      request.regenerate && request.episodeCount === 1,
+    );
+    // Old frontends persisted only the unfinished suffix after a pause (for
+    // example 29-30 instead of the canonical 26-30 batch). Such jobs survive
+    // deployment and bypass today's route validation when the user resumes
+    // them. Restore the whole fixed batch so earlier reviewing bodies can be
+    // reprocessed into a valid continuity chain instead of failing forever on
+    // "episode 26 must have a matching continuity commit".
+    if (
+      (request.startEpisode - 1) % 5 !== 0 &&
+      request.startEpisode <= validatedPlan.totalEpisodes &&
+      !intentionalSingleEpisodeRegeneration
+    ) {
+      const legacyStartEpisode = request.startEpisode;
+      const fixedStartEpisode = Math.floor((legacyStartEpisode - 1) / 5) * 5 + 1;
+      const fixedEpisodeCount = Math.min(
+        5,
+        validatedPlan.totalEpisodes - fixedStartEpisode + 1,
+      );
+      request = {
+        ...request,
+        startEpisode: fixedStartEpisode,
+        episodeCount: fixedEpisodeCount,
+      };
+    }
     const endEpisode = request.startEpisode + request.episodeCount - 1;
     const singleEpisodeRegeneration = Boolean(request.regenerate && request.episodeCount === 1);
     if (endEpisode > validatedPlan.totalEpisodes) {
@@ -4078,7 +4104,7 @@ export class ScriptDirector {
       );
     const canonicalDirectCandidate = (value: ScriptEpisode): ScriptEpisode =>
       reconcileDirectSceneCast(canonicalStoredDirectCandidate(value));
-    const promptVersion = 'direct-draft-v8';
+    const promptVersion = 'direct-draft-v9';
     const draftFingerprint = computeScriptCheckpointInputFingerprint({
       node: 'direct_draft',
       inputRevisionRefs,
@@ -4632,7 +4658,17 @@ export class ScriptDirector {
     ];
     let deterministicReport = validateDraft(draft);
     let report = validateDraft(draft, aiIssues);
+    const directLengthRange = scriptEpisodeLengthRange(plan.targetCharsPerEpisode);
+    const directVisibleChars = scriptVisibleChars(draftForReview);
+    const lengthRewriteIssues: ScriptDirectReviewIssue[] = directVisibleChars > directLengthRange.maximum
+      ? [{
+          code: 'LENGTH_OUT_OF_RANGE',
+          evidence: `当前正文约 ${directVisibleChars} 个可见字符，超过本集 ${directLengthRange.minimum}—${directLengthRange.maximum} 字范围。`,
+          expected: `将完整故事重写到 ${directLengthRange.minimum}—${directLengthRange.maximum} 字；保留开端、冲突、转折和结尾卡点，不得截断台词或剧情。`,
+        }]
+      : [];
     const rewriteIssues: ScriptDirectReviewIssue[] = [
+      ...lengthRewriteIssues,
       ...dialogueFormatIssues,
       ...repeatedPlotIssues,
       ...review.issues,
@@ -4651,8 +4687,8 @@ export class ScriptDirector {
       );
       const rewriteFromOutline = storedRewrite?.status === 'stale';
       const rewritePromptVersion = rewriteFromOutline
-        ? 'direct-rewrite-from-outline-v5'
-        : 'direct-rewrite-v8';
+        ? 'direct-rewrite-from-outline-v6'
+        : 'direct-rewrite-v9';
       const rewriteFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'direct_rewrite',
         inputRevisionRefs,
