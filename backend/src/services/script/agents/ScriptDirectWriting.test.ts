@@ -12,6 +12,7 @@ import {
   detectRepeatedDirectPlotEvents,
   decodeDirectHandoffReview,
   createLocalDirectHandoffReview,
+  directWritingContext,
   mergeDirectHandoffContinuity,
   reconcileDirectReviewBoundary,
 } from './ScriptDirectWriting.js';
@@ -82,7 +83,7 @@ describe('ScriptDirectWriting', () => {
     expect(prompt).toContain('OFF_OUTLINE');
     expect(prompt).toContain('具体道具动作链重复发生');
     expect(prompt).toContain('换了人物、措辞或位置');
-    expect(prompt).toContain('与 priorEpisodeHistory 的前集场景对照');
+    expect(prompt).toContain('与 priorEpisodeHistory.allEpisodeSummaries 的全部前集对照');
   });
 
   it('keeps custom quality checks advisory and separate from rewrite issues', () => {
@@ -212,6 +213,50 @@ describe('ScriptDirectWriting', () => {
         expected: expect.stringContaining('前面集数已经发生'),
       }),
     ]);
+  });
+
+  it('keeps all fifty-nine earlier episode summaries while limiting detailed scene history', () => {
+    const previousEpisodes = Array.from({ length: 59 }, (_, index) => ({
+      ...episode,
+      id: `episode-${index + 1}`,
+      episodeNumber: index + 1,
+      title: `第${index + 1}集`,
+      summary: `第${index + 1}集发生了不可重复的关键事件。`,
+      newFacts: [`第${index + 1}集关键事实`],
+      scenes: [{
+        ...episode.scenes[0],
+        id: `scene-${index + 1}`,
+        blocks: [{ id: `block-${index + 1}`, type: 'action' as const, text: `第${index + 1}集具体场景。` }],
+      }],
+    })) as ScriptEpisode[];
+    const context = directWritingContext({
+      projectId: 'project-1',
+      characters: [character],
+      episodes: previousEpisodes,
+      worldBible: {
+        era: '当代', primaryLocations: ['校报社'], worldState: '调查中', rules: [],
+        organizations: [], recurringProps: [], forbiddenAnachronisms: [],
+      },
+      seriesOutline: { episodeCards: [] },
+    } as unknown as Parameters<typeof directWritingContext>[0], {
+      title: '六十集短剧', theme: '真相', genres: ['悬疑'], highlights: [],
+      coreConflict: '调查真相', coreRequirements: '', forbiddenElements: [],
+      maxScenesPerEpisode: 3, targetCharsPerEpisode: 1_200, dialogueDensityPercent: 60,
+    } as unknown as Parameters<typeof directWritingContext>[1], {
+      episodeNumber: 60,
+      characterIds: [character.id],
+    } as unknown as Parameters<typeof directWritingContext>[2]);
+    const history = context.priorEpisodeHistory as {
+      allEpisodeSummaries: Array<{ episodeNumber: number }>;
+      recentSceneEvents: Array<{ episodeNumber: number }>;
+    };
+
+    expect(history.allEpisodeSummaries).toHaveLength(59);
+    expect(history.allEpisodeSummaries[0]?.episodeNumber).toBe(1);
+    expect(history.allEpisodeSummaries.at(-1)?.episodeNumber).toBe(59);
+    expect(history.recentSceneEvents).toHaveLength(12);
+    expect(history.recentSceneEvents[0]?.episodeNumber).toBe(48);
+    expect(history.recentSceneEvents.at(-1)?.episodeNumber).toBe(59);
   });
 
   it('drops the rejected original when retrying an off-outline rewrite', () => {

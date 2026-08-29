@@ -305,24 +305,29 @@ function previousEpisodeContext(state: ScriptProjectState, episodeNumber: number
 function priorEpisodeHistory(
   state: ScriptProjectState,
   episodeNumber: number,
-): Array<Record<string, unknown>> {
-  return state.episodes
+): Record<string, unknown> {
+  const previousEpisodes = state.episodes
     .filter((episode) => episode.episodeNumber < episodeNumber)
-    .sort((left, right) => left.episodeNumber - right.episodeNumber)
-    .slice(-20)
-    .map((episode) => ({
+    .sort((left, right) => left.episodeNumber - right.episodeNumber);
+  return {
+    allEpisodeSummaries: previousEpisodes.map((episode) => ({
       episodeNumber: episode.episodeNumber,
       title: episode.title,
-      summary: episode.summary.slice(0, 180),
+      summary: episode.summary.slice(0, 120),
+      newFacts: episode.newFacts.slice(-3).map((fact) => fact.slice(0, 80)),
+    })),
+    recentSceneEvents: previousEpisodes.slice(-12).map((episode) => ({
+      episodeNumber: episode.episodeNumber,
       sceneEvents: episode.scenes.slice(0, 5).map((scene) => ({
         location: scene.location,
         event: scene.blocks
           .map((block) => block.text.trim())
           .filter(Boolean)
           .join(' ')
-          .slice(0, 100),
+          .slice(0, 80),
       })),
-    }));
+    })),
+  };
 }
 
 export function directWritingContext(
@@ -383,7 +388,7 @@ export function buildDirectDraftPrompt(context: Record<string, unknown>): string
     '必须落实本集 goal、conflict、beats 与 endingHook；forbiddenFacts 和 forbiddenElements 不得出现。',
     boundaryInstruction,
     directLengthInstruction(context),
-    '创作资料中的 priorEpisodeHistory 是前面已经演完的剧情，只能承接其结果，绝不能换人物、地点或措辞后把其中一场重新演一遍。',
+    '创作资料中的 priorEpisodeHistory 是前面已经演完的剧情：allEpisodeSummaries 覆盖全部前集，recentSceneEvents 补充最近12集细节。只能承接其结果，绝不能换人物、地点或措辞后把其中一场重新演一遍。',
     '同一道具动作链只能完整演一次。例如已经写过“打开抽屉—拿起照片—看完放回”，后面不能换个人再次从打开同一抽屉、查看同一照片重新演起，必须直接写新的发现、冲突或后果。',
     '对白比例允许按剧情自然波动，对白要用冲突推进。',
     scriptCreativeWritingInstruction({ creativeRules: creativeRulesFromContext(context) }),
@@ -430,7 +435,7 @@ export function buildDirectReviewPrompt(
   return [
     '你是短剧明显错误检查员，同时为下一集提取极简交接状态。',
     '只检查：跑出当前大纲、题材或场景类型错误、人物身份关系冲突、主要事件或具体道具动作链重复发生、明显因果倒置、重要道具状态矛盾。',
-    '必须将本集与 priorEpisodeHistory 的前集场景对照；前面某一集已经完整发生的场景若在本集换措辞重演，使用 DUPLICATE_MAJOR_EVENT。',
+    '必须将本集与 priorEpisodeHistory.allEpisodeSummaries 的全部前集对照，并用 recentSceneEvents 核验近12集细节；前面某一集已经完整发生的场景若在本集换措辞重演，使用 DUPLICATE_MAJOR_EVENT。',
     '必须对照正文前段、中段和后段：换了人物、措辞或位置，仍再次完整演“打开同一抽屉—拿取/查看同一照片（或手机、文件）—收回”的，使用 DUPLICATE_MAJOR_EVENT；后段若直接核验、转交或产生新后果则不算重复。',
     boundaryInstruction,
     '不要评论服装丰富度、文学性、节奏、镜头、表演和普通台词润色。没有明显错误必须 verdict=pass、issues=[]。',
