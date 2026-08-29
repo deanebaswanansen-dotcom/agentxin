@@ -1818,7 +1818,7 @@ describe('ScriptDirector', () => {
     }
   });
 
-  it('stales an episode-draft-v3 checkpoint after the lightweight v10 prompt upgrade', async () => {
+  it('stales an episode-draft-v3 checkpoint after the lightweight v11 prompt upgrade', async () => {
     const state = readySingleEpisodeState();
     let draftCalls = 0;
     const store = new MemoryScriptStore(state);
@@ -1912,7 +1912,7 @@ describe('ScriptDirector', () => {
         artifactRevision: 0, promptVersion: 'episode-draft-v3', status: 'stale',
       }),
       expect.objectContaining({
-        artifactRevision: 1, promptVersion: 'episode-draft-v10', status: 'succeeded',
+        artifactRevision: 1, promptVersion: 'episode-draft-v11', status: 'succeeded',
       }),
     ]));
   });
@@ -2169,7 +2169,7 @@ describe('ScriptDirector', () => {
       expect.objectContaining({
         artifactRevision: 1,
         status: 'succeeded',
-        promptVersion: 'episode-draft-v10',
+        promptVersion: 'episode-draft-v11',
       }),
     ]));
   });
@@ -3675,6 +3675,115 @@ describe('ScriptDirector', () => {
     expect(revisionPrompts[0]).toContain('DUPLICATE_MAJOR_EVENT');
     expect(revisionPrompts[0]).toContain('保留第一次完整动作链');
     expect(JSON.stringify(store.state.episodes[0])).not.toContain('重新打开档案柜抽屉');
+    expect(store.atomicCommitCalls).toHaveLength(1);
+  });
+
+  it('rewrites a scene replayed from an earlier episode without adding a review call', async () => {
+    const state = readySingleEpisodeState();
+    state.plan = { ...state.plan!, totalEpisodes: 6 };
+    state.seriesOutline = {
+      ...state.seriesOutline!,
+      episodeCards: Array.from({ length: 6 }, (_, index) => ({
+        episodeNumber: index + 1,
+        title: `第${index + 1}集`,
+        logline: index === 5 ? '继续调查。' : '推进已有调查。',
+        mainEvent: index === 5 ? '找到新证人。' : `取得第${index + 1}份证据。`,
+        endingHook: index === 5 ? '证人现身。' : `第${index + 1}条线索出现。`,
+      })),
+    };
+    state.episodeOutlines = [{
+      ...state.episodeOutlines[0]!,
+      id: 'outline-6',
+      episodeNumber: 6,
+      title: '第六集',
+      goal: '找到新证人',
+      endingHook: '证人现身',
+    }];
+    state.episodes = Array.from({ length: 5 }, (_, index): ScriptEpisode => {
+      const episodeNumber = index + 1;
+      const baseEpisode = reviewingEpisode(state, `第${episodeNumber}集旧正文`);
+      return {
+        ...baseEpisode,
+        id: `episode-${episodeNumber}`,
+        episodeNumber,
+        title: `第${episodeNumber}集`,
+        outlineId: `outline-${episodeNumber}`,
+        status: 'completed',
+        summary: episodeNumber === 1
+          ? '沈清从档案柜取出旧照片和登记表，确认照片上的时间。'
+          : `第${episodeNumber}集推进新的调查。`,
+        scenes: [{
+          ...baseEpisode.scenes[0]!,
+          id: `old-scene-${episodeNumber}`,
+          blocks: episodeNumber === 1
+            ? [
+                { id: 'old-1', type: 'action', text: '沈清打开档案柜抽屉，取出一张旧照片。' },
+                { id: 'old-2', type: 'action', text: '她检查照片和旁边的登记表，随后把照片放回并关上抽屉。' },
+              ]
+            : [{ id: `old-${episodeNumber}`, type: 'action', text: `沈清完成第${episodeNumber}步调查并前往新地点。` }],
+        }],
+      };
+    });
+    state.continuityCommits = state.episodes.map((episode, index) => ({
+      id: `continuity-${episode.episodeNumber}`,
+      schemaVersion: 1 as const,
+      projectId: state.projectId,
+      episodeNumber: episode.episodeNumber,
+      episodeRevision: episode.revision,
+      revision: index + 1,
+      status: 'current' as const,
+      inputFingerprint: `${index + 1}`.repeat(64).slice(0, 64),
+      ...(index > 0 ? {
+        previousContinuityCommitId: `continuity-${index}`,
+        previousContinuityRevision: index,
+      } : {}),
+      characterUpdates: [], factsAdded: [], props: [], threads: [], timelineEvents: [],
+      nextEpisodeMustInherit: [],
+      createdAt: state.updatedAt,
+      updatedAt: state.updatedAt,
+    }));
+    const store = new MemoryScriptStore(state);
+    const calls: string[] = [];
+    const revisionPrompts: string[] = [];
+    const replayedDraft = [
+      '第6集',
+      '6-1 校报社 日/内',
+      '人物：沈清',
+      '△沈清重新打开档案柜抽屉，拿出那张旧照片。',
+      '△她再次查看照片和登记表，随后把照片收回并关上抽屉。',
+      `沈清：${'照片上的时间能证明当晚还有其他人在场。'.repeat(12)}`,
+    ].join('\n');
+    const director = new ScriptDirector({
+      store,
+      checkpoints: new InMemoryScriptCheckpointStore(),
+      model: {
+        async complete(request) {
+          calls.push(request.node);
+          if (request.node === 'draft') return replayedDraft;
+          if (request.node === 'revision') {
+            revisionPrompts.push(request.prompt);
+            return directScriptText({
+              episodeNumber: 6,
+              dialogue: '沿着登记表的新地址，我们现在去找证人。'.repeat(14),
+            });
+          }
+          return directReviewJson();
+        },
+        async getModelConfigFingerprint() { return 'direct-model-v1'; },
+      },
+    });
+
+    await director.run({
+      task: 'script_episode_batch', projectId: 'project-1',
+      startEpisode: 6, episodeCount: 1, expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+    });
+
+    expect(calls).toEqual(['draft', 'review', 'revision', 'review']);
+    expect(revisionPrompts[0]).toContain('重复了第 1 集');
+    expect(revisionPrompts[0]).toContain('priorEpisodeHistory');
+    expect(JSON.stringify(store.state.episodes.find((item) => item.episodeNumber === 6)))
+      .not.toContain('重新打开档案柜抽屉');
     expect(store.atomicCommitCalls).toHaveLength(1);
   });
 

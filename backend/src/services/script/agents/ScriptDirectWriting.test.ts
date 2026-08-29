@@ -12,6 +12,7 @@ import {
   detectRepeatedDirectPlotEvents,
   decodeDirectHandoffReview,
   createLocalDirectHandoffReview,
+  directWritingContext,
   mergeDirectHandoffContinuity,
   reconcileDirectReviewBoundary,
 } from './ScriptDirectWriting.js';
@@ -68,6 +69,7 @@ describe('ScriptDirectWriting', () => {
     expect(prompt).toContain('VO只用于画外能听见但看不到人物');
     expect(prompt).toContain('同一道具动作链只能完整演一次');
     expect(prompt).toContain('打开抽屉—拿起照片—看完放回');
+    expect(prompt).toContain('priorEpisodeHistory 是前面已经演完的剧情');
   });
 
   it('tells the lightweight reviewer to reject events reserved for later episode cards', () => {
@@ -81,6 +83,7 @@ describe('ScriptDirectWriting', () => {
     expect(prompt).toContain('OFF_OUTLINE');
     expect(prompt).toContain('具体道具动作链重复发生');
     expect(prompt).toContain('换了人物、措辞或位置');
+    expect(prompt).toContain('与 priorEpisodeHistory.allEpisodeSummaries 的全部前集对照');
   });
 
   it('keeps custom quality checks advisory and separate from rewrite issues', () => {
@@ -176,6 +179,84 @@ describe('ScriptDirectWriting', () => {
     } as unknown as ScriptEpisode;
 
     expect(detectRepeatedDirectPlotEvents(advancingEpisode)).toEqual([]);
+  });
+
+  it('detects an action chain replayed from an earlier episode', () => {
+    const previousEpisode = {
+      ...episode,
+      episodeNumber: 3,
+      scenes: [{
+        ...episode.scenes[0],
+        blocks: [
+          { id: 'p1', type: 'action' as const, text: '古代集市上，醉汉掀开木箱，里面装着食材和饲料。' },
+          { id: 'p2', type: 'action' as const, text: '他踩中捕鼠夹后摔倒，撞翻油桶，鼠群从箱底窜出。' },
+        ],
+      }],
+    } as unknown as ScriptEpisode;
+    const currentEpisode = {
+      ...episode,
+      episodeNumber: 14,
+      scenes: [{
+        ...episode.scenes[0],
+        blocks: [
+          { id: 'c1', type: 'action' as const, text: '夜里的集市空无一人，古代醉汉抬起木箱盖，查看食材和饲料。' },
+          { id: 'c2', type: 'action' as const, text: '他踩到捕鼠夹滑倒，打翻油桶，老鼠从木箱下扑出。' },
+        ],
+      }],
+    } as unknown as ScriptEpisode;
+
+    expect(detectRepeatedDirectPlotEvents(currentEpisode, [previousEpisode])).toEqual([
+      expect.objectContaining({
+        code: 'DUPLICATE_MAJOR_EVENT',
+        sceneNumber: 1,
+        evidence: expect.stringMatching(/第 14 集.*重复了第 3 集/u),
+        expected: expect.stringContaining('前面集数已经发生'),
+      }),
+    ]);
+  });
+
+  it('keeps all fifty-nine earlier episode summaries while limiting detailed scene history', () => {
+    const previousEpisodes = Array.from({ length: 59 }, (_, index) => ({
+      ...episode,
+      id: `episode-${index + 1}`,
+      episodeNumber: index + 1,
+      title: `第${index + 1}集`,
+      summary: `第${index + 1}集发生了不可重复的关键事件。`,
+      newFacts: [`第${index + 1}集关键事实`],
+      scenes: [{
+        ...episode.scenes[0],
+        id: `scene-${index + 1}`,
+        blocks: [{ id: `block-${index + 1}`, type: 'action' as const, text: `第${index + 1}集具体场景。` }],
+      }],
+    })) as ScriptEpisode[];
+    const context = directWritingContext({
+      projectId: 'project-1',
+      characters: [character],
+      episodes: previousEpisodes,
+      worldBible: {
+        era: '当代', primaryLocations: ['校报社'], worldState: '调查中', rules: [],
+        organizations: [], recurringProps: [], forbiddenAnachronisms: [],
+      },
+      seriesOutline: { episodeCards: [] },
+    } as unknown as Parameters<typeof directWritingContext>[0], {
+      title: '六十集短剧', theme: '真相', genres: ['悬疑'], highlights: [],
+      coreConflict: '调查真相', coreRequirements: '', forbiddenElements: [],
+      maxScenesPerEpisode: 3, targetCharsPerEpisode: 1_200, dialogueDensityPercent: 60,
+    } as unknown as Parameters<typeof directWritingContext>[1], {
+      episodeNumber: 60,
+      characterIds: [character.id],
+    } as unknown as Parameters<typeof directWritingContext>[2]);
+    const history = context.priorEpisodeHistory as {
+      allEpisodeSummaries: Array<{ episodeNumber: number }>;
+      recentSceneEvents: Array<{ episodeNumber: number }>;
+    };
+
+    expect(history.allEpisodeSummaries).toHaveLength(59);
+    expect(history.allEpisodeSummaries[0]?.episodeNumber).toBe(1);
+    expect(history.allEpisodeSummaries.at(-1)?.episodeNumber).toBe(59);
+    expect(history.recentSceneEvents).toHaveLength(12);
+    expect(history.recentSceneEvents[0]?.episodeNumber).toBe(48);
+    expect(history.recentSceneEvents.at(-1)?.episodeNumber).toBe(59);
   });
 
   it('drops the rejected original when retrying an off-outline rewrite', () => {

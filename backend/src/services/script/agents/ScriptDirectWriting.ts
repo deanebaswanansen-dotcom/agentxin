@@ -114,6 +114,9 @@ const REPEATED_PLOT_ACTIONS = [
   { key: 'store', pattern: /放回|收起|关上|合上|锁上|藏进/u },
   { key: 'handoff', pattern: /递给|交给|交出|接过/u },
   { key: 'destroy', pattern: /撕碎|烧掉|销毁|摔碎/u },
+  { key: 'fall', pattern: /踩到|踩中|绊倒|摔倒|滑倒|跌倒/u },
+  { key: 'spill', pattern: /打翻|掀翻|倾倒|泼洒|滚落|洒出/u },
+  { key: 'release', pattern: /放出|扑出|窜出|逃出/u },
 ] as const;
 
 const REPEATED_PLOT_OBJECTS = [
@@ -127,9 +130,15 @@ const REPEATED_PLOT_OBJECTS = [
   { key: 'box', label: '箱盒', pattern: /纸箱|木箱|盒子|首饰盒/u },
   { key: 'jewelry', label: '首饰', pattern: /项链|戒指|手镯|玉佩/u },
   { key: 'weapon', label: '武器', pattern: /匕首|刀|手枪|枪支/u },
+  { key: 'market', label: '集市或摊位', pattern: /集市|市场|摊位|摊车/u },
+  { key: 'barrel', label: '桶罐', pattern: /油桶|木桶|水桶|瓦罐|陶罐/u },
+  { key: 'food', label: '食材或饲料', pattern: /食材|粮食|饲料|食物/u },
+  { key: 'trap', label: '陷阱或捕鼠夹', pattern: /陷阱|捕鼠夹|机关/u },
+  { key: 'animal', label: '鼠虫或动物', pattern: /老鼠|鼠群|蟑螂|毒虫|蛇群/u },
 ] as const;
 
 interface DirectPlotWindow {
+  episodeNumber: number;
   sceneNumber: number;
   text: string;
   objects: Set<string>;
@@ -137,7 +146,7 @@ interface DirectPlotWindow {
 }
 
 function directPlotWindow(
-  blocks: Array<{ sceneNumber: number; text: string }>,
+  blocks: Array<{ episodeNumber: number; sceneNumber: number; text: string }>,
   start: number,
   size: number,
 ): DirectPlotWindow {
@@ -153,11 +162,29 @@ function directPlotWindow(
     });
   }
   return {
+    episodeNumber: selected[0]?.episodeNumber ?? 1,
     sceneNumber: selected[0]?.sceneNumber ?? 1,
     text: selected.map((item) => item.text).join(' '),
     objects,
     anchors,
   };
+}
+
+function directPlotWindows(episode: ScriptEpisode): DirectPlotWindow[] {
+  const narrativeBlocks = episode.scenes.flatMap((scene) => scene.blocks
+    .filter((block) => block.type === 'action' || block.type === 'caption')
+    .map((block) => ({
+      episodeNumber: episode.episodeNumber,
+      sceneNumber: scene.ordinal,
+      text: block.text.trim(),
+    }))
+    .filter((block) => block.text.length > 0));
+  const windowSize = 2;
+  return narrativeBlocks.map((_, index) => directPlotWindow(
+    narrativeBlocks,
+    index,
+    windowSize,
+  ));
 }
 
 /**
@@ -167,17 +194,10 @@ function directPlotWindow(
  */
 export function detectRepeatedDirectPlotEvents(
   episode: ScriptEpisode,
+  previousEpisodes: readonly ScriptEpisode[] = [],
 ): ScriptDirectReviewIssue[] {
-  const narrativeBlocks = episode.scenes.flatMap((scene) => scene.blocks
-    .filter((block) => block.type === 'action' || block.type === 'caption')
-    .map((block) => ({ sceneNumber: scene.ordinal, text: block.text.trim() }))
-    .filter((block) => block.text.length > 0));
   const windowSize = 2;
-  const windows = narrativeBlocks.map((_, index) => directPlotWindow(
-    narrativeBlocks,
-    index,
-    windowSize,
-  ));
+  const windows = directPlotWindows(episode);
 
   for (let leftIndex = 0; leftIndex < windows.length; leftIndex += 1) {
     const left = windows[leftIndex]!;
@@ -198,6 +218,26 @@ export function detectRepeatedDirectPlotEvents(
       }];
     }
   }
+
+  const previousWindows = previousEpisodes.flatMap(directPlotWindows);
+  for (const current of windows) {
+    if (current.objects.size < 2 || current.anchors.size === 0) continue;
+    for (const previous of previousWindows) {
+      const commonObjects = [...current.objects].filter((key) => previous.objects.has(key));
+      const commonAnchors = [...current.anchors].filter((key) => previous.anchors.has(key));
+      if (commonObjects.length < 2 || commonAnchors.length < 1) continue;
+      const objectLabels = commonObjects
+        .map((key) => REPEATED_PLOT_OBJECTS.find((item) => item.key === key)?.label ?? key)
+        .join('、');
+      return [{
+        code: 'DUPLICATE_MAJOR_EVENT',
+        sceneNumber: current.sceneNumber,
+        evidence: `当前第 ${episode.episodeNumber} 集“${current.text.slice(0, 160)}”重复了第 ${previous.episodeNumber} 集的${objectLabels}动作链“${previous.text.slice(0, 160)}”`,
+        expected: '该场景在前面集数已经发生；当前集必须删除重演段落，直接承接旧事件的后果并推进新剧情。',
+      }];
+    }
+  }
+
   return [];
 }
 
@@ -262,6 +302,34 @@ function previousEpisodeContext(state: ScriptProjectState, episodeNumber: number
   };
 }
 
+function priorEpisodeHistory(
+  state: ScriptProjectState,
+  episodeNumber: number,
+): Record<string, unknown> {
+  const previousEpisodes = state.episodes
+    .filter((episode) => episode.episodeNumber < episodeNumber)
+    .sort((left, right) => left.episodeNumber - right.episodeNumber);
+  return {
+    allEpisodeSummaries: previousEpisodes.map((episode) => ({
+      episodeNumber: episode.episodeNumber,
+      title: episode.title,
+      summary: episode.summary.slice(0, 120),
+      newFacts: episode.newFacts.slice(-3).map((fact) => fact.slice(0, 80)),
+    })),
+    recentSceneEvents: previousEpisodes.slice(-12).map((episode) => ({
+      episodeNumber: episode.episodeNumber,
+      sceneEvents: episode.scenes.slice(0, 5).map((scene) => ({
+        location: scene.location,
+        event: scene.blocks
+          .map((block) => block.text.trim())
+          .filter(Boolean)
+          .join(' ')
+          .slice(0, 80),
+      })),
+    })),
+  };
+}
+
 export function directWritingContext(
   state: ScriptProjectState,
   plan: ScriptPlan,
@@ -301,6 +369,7 @@ export function directWritingContext(
     characters: involvedCharacters.map(compactCharacter),
     world: compactWorld(state.worldBible!),
     previousEpisode: previousEpisodeContext(state, outline.episodeNumber),
+    priorEpisodeHistory: priorEpisodeHistory(state, outline.episodeNumber),
     continuity: projectScriptContinuity(state, outline.episodeNumber),
     nextEpisodeDirection: nextCard
       ? { title: nextCard.title, logline: nextCard.logline, mainEvent: nextCard.mainEvent }
@@ -319,6 +388,7 @@ export function buildDirectDraftPrompt(context: Record<string, unknown>): string
     '必须落实本集 goal、conflict、beats 与 endingHook；forbiddenFacts 和 forbiddenElements 不得出现。',
     boundaryInstruction,
     directLengthInstruction(context),
+    '创作资料中的 priorEpisodeHistory 是前面已经演完的剧情：allEpisodeSummaries 覆盖全部前集，recentSceneEvents 补充最近12集细节。只能承接其结果，绝不能换人物、地点或措辞后把其中一场重新演一遍。',
     '同一道具动作链只能完整演一次。例如已经写过“打开抽屉—拿起照片—看完放回”，后面不能换个人再次从打开同一抽屉、查看同一照片重新演起，必须直接写新的发现、冲突或后果。',
     '对白比例允许按剧情自然波动，对白要用冲突推进。',
     scriptCreativeWritingInstruction({ creativeRules: creativeRulesFromContext(context) }),
@@ -346,6 +416,7 @@ export function buildDirectContinuationPrompt(
   const suggestedAddition = Math.max(200, Math.min(900, targetChars - currentChars));
   return [
     '下面是一集已经写完但明显偏短的中文短剧。请从现有结尾自然继续，补充冲突、行动与对白。',
+    'priorEpisodeHistory 中的前集场景也不得重演；新增内容只能承接其后果并推进新事件。',
     '不要重写已有内容，不要复述已经发生的事件，不要再次制造“首次发现”同一证物；同一抽屉、照片、手机或文件的打开—拿取—查看动作链已经演过，就直接续写新的信息或后果。',
     '可以继续最后一场或增加下一场；只输出新增的标准剧本文本，不要输出解释、JSON或Markdown围栏。',
     `当前约 ${currentChars} 字，建议最多新增约 ${suggestedAddition} 字，并尽量让整集不超过 ${scriptEpisodeLengthRange(targetChars).maximum} 个可见字符；但必须写完每句话和当前动作，不得用省略号代替未完成内容。`,
@@ -364,6 +435,7 @@ export function buildDirectReviewPrompt(
   return [
     '你是短剧明显错误检查员，同时为下一集提取极简交接状态。',
     '只检查：跑出当前大纲、题材或场景类型错误、人物身份关系冲突、主要事件或具体道具动作链重复发生、明显因果倒置、重要道具状态矛盾。',
+    '必须将本集与 priorEpisodeHistory.allEpisodeSummaries 的全部前集对照，并用 recentSceneEvents 核验近12集细节；前面某一集已经完整发生的场景若在本集换措辞重演，使用 DUPLICATE_MAJOR_EVENT。',
     '必须对照正文前段、中段和后段：换了人物、措辞或位置，仍再次完整演“打开同一抽屉—拿取/查看同一照片（或手机、文件）—收回”的，使用 DUPLICATE_MAJOR_EVENT；后段若直接核验、转交或产生新后果则不算重复。',
     boundaryInstruction,
     '不要评论服装丰富度、文学性、节奏、镜头、表演和普通台词润色。没有明显错误必须 verdict=pass、issues=[]。',
