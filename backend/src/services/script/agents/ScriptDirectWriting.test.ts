@@ -10,6 +10,7 @@ import {
   buildDirectRewritePrompt,
   buildDirectReviewPrompt,
   detectRepeatedDirectPlotEvents,
+  detectUnattributedDialogueActions,
   decodeDirectHandoffReview,
   createLocalDirectHandoffReview,
   directWritingContext,
@@ -70,6 +71,10 @@ describe('ScriptDirectWriting', () => {
     expect(prompt).toContain('同一道具动作链只能完整演一次');
     expect(prompt).toContain('打开抽屉—拿起照片—看完放回');
     expect(prompt).toContain('priorEpisodeHistory 是前面已经演完的剧情');
+    expect(prompt).toContain('每一句都必须单独写成“说话人：完整台词”');
+    expect(prompt).toContain('禁止写“△林老板，我们来检查”');
+    expect(prompt).toContain('不能把去掉说话人的原台词塞进△动作');
+    expect(prompt).toContain('允许说话的临时角色称谓');
   });
 
   it('tells the lightweight reviewer to reject events reserved for later episode cards', () => {
@@ -84,6 +89,8 @@ describe('ScriptDirectWriting', () => {
     expect(prompt).toContain('具体道具动作链重复发生');
     expect(prompt).toContain('换了人物、措辞或位置');
     expect(prompt).toContain('与 priorEpisodeHistory.allEpisodeSummaries 的全部前集对照');
+    expect(prompt).toContain('至少两个相同的有序核心动作');
+    expect(prompt).toContain('仅地点、人物、道具或“检查”行为重合');
   });
 
   it('keeps custom quality checks advisory and separate from rewrite issues', () => {
@@ -179,6 +186,70 @@ describe('ScriptDirectWriting', () => {
     } as unknown as ScriptEpisode;
 
     expect(detectRepeatedDirectPlotEvents(advancingEpisode)).toEqual([]);
+  });
+
+  it('does not confuse a later inspection in the same market with a repeated event', () => {
+    const previousEpisode = {
+      ...episode,
+      episodeNumber: 12,
+      scenes: [{
+        ...episode.scenes[0],
+        blocks: [
+          { id: 'p1', type: 'action' as const, text: '古代集市的摊位旁，林悦把沾泥的食材放回木箱。' },
+          { id: 'p2', type: 'action' as const, text: '她检查食材标签，把摊车重新擦净。' },
+        ],
+      }],
+    } as unknown as ScriptEpisode;
+    const inspectionEpisode = {
+      ...episode,
+      episodeNumber: 13,
+      scenes: [{
+        ...episode.scenes[0],
+        blocks: [
+          { id: 'c1', type: 'action' as const, text: '林悦在古代集市摆正食材和木箱，等检查人员进店。' },
+          { id: 'c2', type: 'action' as const, text: '检查人员翻看台账，核对食材标签后确认卫生合格。' },
+        ],
+      }],
+    } as unknown as ScriptEpisode;
+
+    expect(detectRepeatedDirectPlotEvents(inspectionEpisode, [previousEpisode])).toEqual([]);
+  });
+
+  it('flags spoken sentences emitted as triangle action lines without guessing the speaker', () => {
+    const malformedEpisode = {
+      ...episode,
+      scenes: [{
+        ...episode.scenes[0],
+        blocks: [
+          { id: 'a1', type: 'action' as const, text: '林悦迎上去，神色平静。' },
+          { id: 'a2', type: 'action' as const, text: '林老板，我们是市场监督管理所的，来核查一下。' },
+          { id: 'a3', type: 'action' as const, text: '您请，随便看。证照都在墙上。' },
+        ],
+      }],
+    } as unknown as ScriptEpisode;
+
+    expect(detectUnattributedDialogueActions(malformedEpisode)).toEqual([
+      expect.objectContaining({
+        code: 'DIALOGUE_FORMAT_ERROR',
+        sceneNumber: 1,
+        evidence: expect.stringContaining('林老板，我们是市场监督管理所的'),
+      }),
+    ]);
+  });
+
+  it('keeps ordinary visible action out of dialogue-format findings', () => {
+    const actionEpisode = {
+      ...episode,
+      scenes: [{
+        ...episode.scenes[0],
+        blocks: [
+          { id: 'a1', type: 'action' as const, text: '清晨，林悦把账本摆在柜台上。' },
+          { id: 'a2', type: 'action' as const, text: '现代学徒从门口探进头来，手里拎着两杯豆浆。' },
+        ],
+      }],
+    } as unknown as ScriptEpisode;
+
+    expect(detectUnattributedDialogueActions(actionEpisode)).toEqual([]);
   });
 
   it('detects an action chain replayed from an earlier episode', () => {
