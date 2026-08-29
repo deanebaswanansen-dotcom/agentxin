@@ -114,6 +114,7 @@ import {
   createLocalDirectHandoffReview,
   createMinimalDirectDraftFallback,
   decodeDirectHandoffReview,
+  detectRepeatedDirectPlotEvents,
   directEpisodeText,
   directWritingContext,
   mergeDirectHandoffContinuity,
@@ -2795,7 +2796,7 @@ export class ScriptDirector {
       );
       episodeUpstreamRefs.push(scenePlanRef);
       const draftInputRevisionRefs = buildScriptInputRevisionRefs(state, episodeNumber);
-      const draftPromptVersion = 'episode-draft-v9';
+      const draftPromptVersion = 'episode-draft-v10';
       const currentEpisodeRevision = state.episodes.find(
         (episode) => episode.episodeNumber === episodeNumber,
       )?.revision ?? 0;
@@ -2865,7 +2866,7 @@ export class ScriptDirector {
           'scene.characterIds 必须列出本场所有实际出场或说话人物，且对白 speaker 与 characterId 必须一一匹配。普通对白 mode 使用 normal；只有画外音和内心独白才使用 vo/os。',
           '正文必须是可拍摄的竖屏短剧：前三个正文块内出现人物、处境与冲突；动作使用镜头可见行为，避免小说式心理概述；单句对白简洁、有对抗性，不写大段说教。',
           '未登记的路人、记者、警察等不能借用已登记人物的 characterId 或 speaker 代替说话；若不是正式人物，用 action 或 caption 表达其反应。',
-          '同一证据、照片、电话或动作在本集只能首次发现一次；后续只能写核验、转交、追查或产生的新后果。事件必须按“触发—反应—结果”的可见顺序发生，禁止先有结果后补原因。',
+          '同一证据、照片、电话或动作在本集只能首次发现一次；后续只能写核验、转交、追查或产生的新后果。同一道具动作链只完整演一次：例如已经写过“打开抽屉—拿起照片—看完放回”，后面不能换个人再次从打开同一抽屉、查看同一照片重新演起。事件必须按“触发—反应—结果”的可见顺序发生，禁止先有结果后补原因。',
           '首次出现的重要人物或地点可用 caption 交代身份；后续不得机械重复字幕。最后一至两个正文块必须兑现本集 endingHook，以反转、证据、人物闯入或未完成动作收尾。',
           '严格遵守大纲 requiredFacts 与 forbiddenFacts；继承上一集结尾状态、服装、道具、人物已知信息和未回收伏笔，禁止让角色无理由换装、瞬移或提前知道秘密。',
           scriptLengthInstruction(
@@ -3302,7 +3303,7 @@ export class ScriptDirector {
       }> => {
         const inputRevisionRefs = buildScriptInputRevisionRefs(reviewState, episodeNumber);
         const upstreamArtifactRefs = [candidateRef];
-        const promptVersion = 'script-sanity-review-v2';
+        const promptVersion = 'script-sanity-review-v3';
         const inputFingerprint = computeScriptCheckpointInputFingerprint({
           node: 'review',
           inputRevisionRefs,
@@ -3314,7 +3315,7 @@ export class ScriptDirector {
           '你是 ScriptSanityReviewAgent。只检查会让观众明显困惑的剧情、人物和连续性错误，并返回记忆写回。',
           '只返回 JSON，字段：issues, qualityNotes, summary, newFacts, openedThreads, closedThreads, wardrobe。',
           '严格模板：{"issues":[{"code":"CHARACTER_PRESENCE|SPEAKER_ATTRIBUTION|PROP_CUSTODY|KNOWLEDGE_TIMING|CAUSAL_ORDER|CONTINUITY_CONTRADICTION|REPEATED_ACTION","severity":"hard|soft","message":"字符串","sceneId":"可选","blockId":"可选","path":"可选"}],"qualityNotes":["可选优化建议"],"summary":"150—300字摘要","newFacts":["字符串"],"openedThreads":["字符串"],"closedThreads":["字符串"],"wardrobe":[{"characterId":"人物id","outfit":"服装"}]}。没有明显错误时 issues 返回空数组，不得改名任何键。',
-          'issues 最多返回 3 条，只保留高置信度且能指出正文证据的明显问题：人物未在场却行动或说话、说话人错配、道具归属前后矛盾、角色提前知道信息、因果或行动顺序矛盾、与前集状态直接冲突、同一动作被当成新事件重复发生。',
+          'issues 最多返回 3 条，只保留高置信度且能指出正文证据的明显问题：人物未在场却行动或说话、说话人错配、道具归属前后矛盾、角色提前知道信息、因果或行动顺序矛盾、与前集状态直接冲突、同一动作被当成新事件重复发生。必须比较不相邻的前中后段；若只是换了人物或措辞，却再次完整演“打开同一抽屉—拿取/查看同一照片或文件—收回”，报 REPEATED_ACTION；后段直接核验、转交或产生新后果不算重复。',
           '不要评价文风、措辞、节奏、爽点强弱、对白密度、字数、服装审美、反转力度或是否足够精彩；这些不是明显逻辑错误。每条问题必须尽量给出 sceneId 和精确 path。',
           '只有能由正文与连续性材料直接证明的矛盾才标 hard；hard 必须给 sceneId，能定位到正文块时必须给 blockId；拿不准或无法定位就不报。',
           scriptQualityReviewInstruction(plan),
@@ -4044,7 +4045,7 @@ export class ScriptDirector {
       );
     const canonicalDirectCandidate = (value: ScriptEpisode): ScriptEpisode =>
       reconcileDirectSceneCast(canonicalStoredDirectCandidate(value));
-    const promptVersion = 'direct-draft-v5';
+    const promptVersion = 'direct-draft-v6';
     const draftFingerprint = computeScriptCheckpointInputFingerprint({
       node: 'direct_draft',
       inputRevisionRefs,
@@ -4325,7 +4326,7 @@ export class ScriptDirector {
     const episodeUpstreamRefs: ScriptUpstreamArtifactRef[] = [outlineRef, directDraftRef];
     const continuationThreshold = Math.max(150, Math.round(plan.targetCharsPerEpisode * 0.58));
     if (writerCallsUsed <= 1 && scriptVisibleChars(draft) < continuationThreshold) {
-      const continuationPromptVersion = 'direct-continuation-v3';
+      const continuationPromptVersion = 'direct-continuation-v4';
       const continuationFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'continuation',
         inputRevisionRefs,
@@ -4430,7 +4431,7 @@ export class ScriptDirector {
       episodeUpstreamRefs.push(currentCandidateRef);
     }
 
-    const reviewPromptVersion = 'direct-handoff-review-v4';
+    const reviewPromptVersion = 'direct-handoff-review-v5';
     const reviewFingerprint = computeScriptCheckpointInputFingerprint({
       node: 'handoff_review',
       inputRevisionRefs,
@@ -4556,7 +4557,18 @@ export class ScriptDirector {
       });
     };
     const draftForReview = draft;
+    const repeatedPlotIssues = detectRepeatedDirectPlotEvents(draftForReview);
     const aiIssues: ScriptGateIssue[] = [
+      ...repeatedPlotIssues.map((issue) => ({
+        code: 'DIRECT_DUPLICATE_MAJOR_EVENT',
+        severity: 'soft' as const,
+        source: 'ai' as const,
+        message: `${issue.evidence}；应为：${issue.expected}`,
+        ...(issue.sceneNumber
+          ? { sceneId: draftForReview.scenes.find((scene) => scene.ordinal === issue.sceneNumber)?.id }
+          : {}),
+        path: 'scenes',
+      })),
       ...review.issues.map((issue) => ({
         code: `DIRECT_${issue.code}`,
         severity: 'soft' as const,
@@ -4572,6 +4584,7 @@ export class ScriptDirector {
     let deterministicReport = validateDraft(draft);
     let report = validateDraft(draft, aiIssues);
     const rewriteIssues: ScriptDirectReviewIssue[] = [
+      ...repeatedPlotIssues,
       ...review.issues,
       ...deterministicReport.blockingIssues.map((issue) => ({
         code: 'CHARACTER_IDENTITY_CONFLICT' as const,
@@ -4588,8 +4601,8 @@ export class ScriptDirector {
       );
       const rewriteFromOutline = storedRewrite?.status === 'stale';
       const rewritePromptVersion = rewriteFromOutline
-        ? 'direct-rewrite-from-outline-v2'
-        : 'direct-rewrite-v5';
+        ? 'direct-rewrite-from-outline-v3'
+        : 'direct-rewrite-v6';
       const rewriteFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'direct_rewrite',
         inputRevisionRefs,
@@ -4685,7 +4698,7 @@ export class ScriptDirector {
         rewriteArtifact,
       );
       episodeUpstreamRefs.push(currentCandidateRef);
-      const postRewriteReviewPromptVersion = 'direct-handoff-review-after-rewrite-v4';
+      const postRewriteReviewPromptVersion = 'direct-handoff-review-after-rewrite-v5';
       const postRewriteReviewFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'handoff_review',
         inputRevisionRefs,
@@ -4795,16 +4808,28 @@ export class ScriptDirector {
         updatedAt: this.now(),
       });
       draft = postRewriteDraft;
-      const postRewriteBlockingIssues: ScriptGateIssue[] = review.issues.map((issue) => ({
-        code: `DIRECT_RECHECK_${issue.code}`,
-        severity: 'soft',
-        source: 'ai',
-        message: `${issue.evidence}；应为：${issue.expected}`,
-        ...(issue.sceneNumber
-          ? { sceneId: postRewriteDraft.scenes.find((scene) => scene.ordinal === issue.sceneNumber)?.id }
-          : {}),
-        path: 'scenes',
-      }));
+      const postRewriteBlockingIssues: ScriptGateIssue[] = [
+        ...detectRepeatedDirectPlotEvents(postRewriteDraft).map((issue) => ({
+          code: 'DIRECT_RECHECK_DUPLICATE_MAJOR_EVENT',
+          severity: 'soft' as const,
+          source: 'ai' as const,
+          message: `${issue.evidence}；应为：${issue.expected}`,
+          ...(issue.sceneNumber
+            ? { sceneId: postRewriteDraft.scenes.find((scene) => scene.ordinal === issue.sceneNumber)?.id }
+            : {}),
+          path: 'scenes',
+        })),
+        ...review.issues.map((issue) => ({
+          code: `DIRECT_RECHECK_${issue.code}`,
+          severity: 'soft' as const,
+          source: 'ai' as const,
+          message: `${issue.evidence}；应为：${issue.expected}`,
+          ...(issue.sceneNumber
+            ? { sceneId: postRewriteDraft.scenes.find((scene) => scene.ordinal === issue.sceneNumber)?.id }
+            : {}),
+          path: 'scenes',
+        })),
+      ];
       deterministicReport = validateDraft(postRewriteDraft, postRewriteBlockingIssues);
       report = deterministicReport;
       }

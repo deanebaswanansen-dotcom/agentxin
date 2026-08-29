@@ -107,6 +107,100 @@ function directLengthInstruction(context: Record<string, unknown>): string {
   return `正文以 ${targetChars} 个可见字符为目标，尽量控制在约 ${minimum}—${maximum} 字。字数是软目标，必须优先保证剧情和每句话完整；绝不能把一句话写一半后用省略号代替未写内容。不要靠重复台词凑字。`;
 }
 
+const REPEATED_PLOT_ACTIONS = [
+  { key: 'open', pattern: /打开|拉开|推开|掀开|翻开/u },
+  { key: 'take', pattern: /拿起|取出|掏出|捡起|抽出/u },
+  { key: 'inspect', pattern: /看着|查看|盯着|看向|端详|翻看|检查/u },
+  { key: 'store', pattern: /放回|收起|关上|合上|锁上|藏进/u },
+  { key: 'handoff', pattern: /递给|交给|交出|接过/u },
+  { key: 'destroy', pattern: /撕碎|烧掉|销毁|摔碎/u },
+] as const;
+
+const REPEATED_PLOT_OBJECTS = [
+  { key: 'drawer', label: '抽屉或柜子', pattern: /抽屉|柜子|工具柜|保险柜/u },
+  { key: 'photo', label: '照片或相框', pattern: /相框|照片|合影/u },
+  { key: 'phone', label: '手机', pattern: /手机|电话|来电/u },
+  { key: 'document', label: '文件或账本', pattern: /文件|档案|合同|账本|登记表|名单/u },
+  { key: 'recording', label: '录音或数据', pattern: /录音笔|录音|录像|数据卡|存储卡|U盘/u },
+  { key: 'letter', label: '信件', pattern: /信封|信件|遗书|纸条/u },
+  { key: 'key', label: '钥匙', pattern: /钥匙|门卡/u },
+  { key: 'box', label: '箱盒', pattern: /纸箱|木箱|盒子|首饰盒/u },
+  { key: 'jewelry', label: '首饰', pattern: /项链|戒指|手镯|玉佩/u },
+  { key: 'weapon', label: '武器', pattern: /匕首|刀|手枪|枪支/u },
+] as const;
+
+interface DirectPlotWindow {
+  sceneNumber: number;
+  text: string;
+  objects: Set<string>;
+  anchors: Set<string>;
+}
+
+function directPlotWindow(
+  blocks: Array<{ sceneNumber: number; text: string }>,
+  start: number,
+  size: number,
+): DirectPlotWindow {
+  const selected = blocks.slice(start, start + size);
+  const objects = new Set<string>();
+  const anchors = new Set<string>();
+  for (const block of selected) {
+    const blockActions = REPEATED_PLOT_ACTIONS.filter((item) => item.pattern.test(block.text));
+    const blockObjects = REPEATED_PLOT_OBJECTS.filter((item) => item.pattern.test(block.text));
+    blockObjects.forEach((item) => objects.add(item.key));
+    blockActions.forEach((action) => {
+      blockObjects.forEach((object) => anchors.add(`${action.key}:${object.key}`));
+    });
+  }
+  return {
+    sceneNumber: selected[0]?.sceneNumber ?? 1,
+    text: selected.map((item) => item.text).join(' '),
+    objects,
+    anchors,
+  };
+}
+
+/**
+ * Finds only high-confidence replays of a concrete prop/action chain. It is
+ * deliberately narrower than semantic similarity so ordinary callbacks and
+ * recurring props do not trigger another model pass.
+ */
+export function detectRepeatedDirectPlotEvents(
+  episode: ScriptEpisode,
+): ScriptDirectReviewIssue[] {
+  const narrativeBlocks = episode.scenes.flatMap((scene) => scene.blocks
+    .filter((block) => block.type === 'action' || block.type === 'caption')
+    .map((block) => ({ sceneNumber: scene.ordinal, text: block.text.trim() }))
+    .filter((block) => block.text.length > 0));
+  const windowSize = 2;
+  const windows = narrativeBlocks.map((_, index) => directPlotWindow(
+    narrativeBlocks,
+    index,
+    windowSize,
+  ));
+
+  for (let leftIndex = 0; leftIndex < windows.length; leftIndex += 1) {
+    const left = windows[leftIndex]!;
+    if (left.objects.size < 2 || left.anchors.size === 0) continue;
+    for (let rightIndex = leftIndex + windowSize; rightIndex < windows.length; rightIndex += 1) {
+      const right = windows[rightIndex]!;
+      const commonObjects = [...left.objects].filter((key) => right.objects.has(key));
+      const commonAnchors = [...left.anchors].filter((key) => right.anchors.has(key));
+      if (commonObjects.length < 2 || commonAnchors.length < 1) continue;
+      const objectLabels = commonObjects
+        .map((key) => REPEATED_PLOT_OBJECTS.find((item) => item.key === key)?.label ?? key)
+        .join('、');
+      return [{
+        code: 'DUPLICATE_MAJOR_EVENT',
+        sceneNumber: right.sceneNumber,
+        evidence: `前段“${left.text.slice(0, 160)}”与后段“${right.text.slice(0, 160)}”重复演了${objectLabels}的同一动作链`,
+        expected: '同一道具动作链只完整演一次；后段应删除重复铺垫，直接增加新的发现、冲突或后果。',
+      }];
+    }
+  }
+  return [];
+}
+
 export function reconcileDirectReviewBoundary(
   context: Record<string, unknown>,
   review: ScriptDirectHandoffReview,
@@ -225,6 +319,7 @@ export function buildDirectDraftPrompt(context: Record<string, unknown>): string
     '必须落实本集 goal、conflict、beats 与 endingHook；forbiddenFacts 和 forbiddenElements 不得出现。',
     boundaryInstruction,
     directLengthInstruction(context),
+    '同一道具动作链只能完整演一次。例如已经写过“打开抽屉—拿起照片—看完放回”，后面不能换个人再次从打开同一抽屉、查看同一照片重新演起，必须直接写新的发现、冲突或后果。',
     '对白比例允许按剧情自然波动，对白要用冲突推进。',
     scriptCreativeWritingInstruction({ creativeRules: creativeRulesFromContext(context) }),
     '若创作要求禁止临时角色对白，就让路人用动作表达；否则前台、保安、快递员等临时角色必须用自己的称谓署名，绝不能把他们的台词挂到主角或其他登记人物名下。',
@@ -251,7 +346,7 @@ export function buildDirectContinuationPrompt(
   const suggestedAddition = Math.max(200, Math.min(900, targetChars - currentChars));
   return [
     '下面是一集已经写完但明显偏短的中文短剧。请从现有结尾自然继续，补充冲突、行动与对白。',
-    '不要重写已有内容，不要复述已经发生的事件，不要再次制造“首次发现”同一证物。',
+    '不要重写已有内容，不要复述已经发生的事件，不要再次制造“首次发现”同一证物；同一抽屉、照片、手机或文件的打开—拿取—查看动作链已经演过，就直接续写新的信息或后果。',
     '可以继续最后一场或增加下一场；只输出新增的标准剧本文本，不要输出解释、JSON或Markdown围栏。',
     `当前约 ${currentChars} 字，建议最多新增约 ${suggestedAddition} 字，并尽量让整集不超过 ${scriptEpisodeLengthRange(targetChars).maximum} 个可见字符；但必须写完每句话和当前动作，不得用省略号代替未完成内容。`,
     `创作资料：${JSON.stringify(context)}`,
@@ -268,7 +363,8 @@ export function buildDirectReviewPrompt(
     : '这是全剧最后一集，nextEpisodeDirection 为空：正文应完成本集分集卡、endingHook 与已确认结局，禁止虚构“应留到下一集”并据此判错。';
   return [
     '你是短剧明显错误检查员，同时为下一集提取极简交接状态。',
-    '只检查：跑出当前大纲、题材或场景类型错误、人物身份关系冲突、主要事件重复发生、明显因果倒置、重要道具状态矛盾。',
+    '只检查：跑出当前大纲、题材或场景类型错误、人物身份关系冲突、主要事件或具体道具动作链重复发生、明显因果倒置、重要道具状态矛盾。',
+    '必须对照正文前段、中段和后段：换了人物、措辞或位置，仍再次完整演“打开同一抽屉—拿取/查看同一照片（或手机、文件）—收回”的，使用 DUPLICATE_MAJOR_EVENT；后段若直接核验、转交或产生新后果则不算重复。',
     boundaryInstruction,
     '不要评论服装丰富度、文学性、节奏、镜头、表演和普通台词润色。没有明显错误必须 verdict=pass、issues=[]。',
     '只返回 JSON：',
@@ -292,12 +388,16 @@ export function buildDirectRewritePrompt(
   const offOutlineInstruction = issues.some((issue) => issue.code === 'OFF_OUTLINE')
     ? '存在 OFF_OUTLINE：必须彻底删除 evidence 涉及的越界人物、道具、证据和后续事件，不能只换说法或换地点保留；必要时整场重写，并精确停在本集 endingHook。'
     : '';
+  const duplicateInstruction = issues.some((issue) => issue.code === 'DUPLICATE_MAJOR_EVENT')
+    ? '存在 DUPLICATE_MAJOR_EVENT：保留第一次完整动作链，删除后面重复的开端和过程，把后段直接改成新的信息、冲突或后果；不能只换人物、地点或近义词后继续重复。'
+    : '';
   if (options.rewriteFromOutline) {
     return [
       '上一版正文已被明确拒绝。请完全从分集卡重新写出本集完整中文短剧正文。',
       '不要参考、延续或改写上一版正文，只使用创作资料和下面列出的问题边界。',
       boundaryInstruction,
       offOutlineInstruction,
+      duplicateInstruction,
       directLengthInstruction(context),
       '输出完整标准剧本文本，不要解释，不要JSON，不要Markdown围栏。',
       `禁止边界：${JSON.stringify(issues.slice(0, 3))}`,
@@ -309,6 +409,7 @@ export function buildDirectRewritePrompt(
     '只修列出的大问题，保留原稿中没有问题的事件、人物关系和可用对白。',
     boundaryInstruction,
     offOutlineInstruction,
+    duplicateInstruction,
     directLengthInstruction(context),
     '输出完整标准剧本文本，不要解释，不要JSON，不要Markdown围栏。',
     `问题：${JSON.stringify(issues.slice(0, 3))}`,
