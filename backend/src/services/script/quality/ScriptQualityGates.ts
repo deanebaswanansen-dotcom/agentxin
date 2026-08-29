@@ -9,6 +9,7 @@ import type {
   ScriptReviewIssue,
   ScriptReviewSource,
 } from '../domain.js';
+import { looksLikeUnattributedDialogueAction } from './ScriptDialogueFormat.js';
 
 export type ScriptGateSeverity = 'hard' | 'soft';
 
@@ -308,6 +309,16 @@ export function validateScriptEpisode(
           code: 'ACTION_STRUCTURE_POLLUTION',
           severity: 'soft',
           message: '动作块混入了动作标记、字幕包装或对白前缀。',
+          sceneId: scene.id,
+          blockId: block.id,
+          path: 'blocks.text',
+        });
+      }
+      if (block.type === 'action' && looksLikeUnattributedDialogueAction(block.text)) {
+        issues.push({
+          code: 'UNATTRIBUTED_DIALOGUE_ACTION',
+          severity: 'soft',
+          message: '动作块疑似包含人物说出口的话，但没有“说话人：”标识；△只能用于无对白动作。',
           sceneId: scene.id,
           blockId: block.id,
           path: 'blocks.text',

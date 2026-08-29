@@ -435,6 +435,34 @@ describe('validateScriptEpisode', () => {
     ]));
   });
 
+  it('reports unattributed dialogue hidden inside an action without blocking the workflow', () => {
+    const scene = {
+      ...validScene(),
+      characterIds: ['character-1'],
+      blocks: [
+        { id: 'filler', type: 'action' as const, text: '剧情'.repeat(40) },
+        {
+          id: 'spoken-as-action',
+          type: 'action' as const,
+          text: '林老板，我们是市场监督管理所的，来核查一下。',
+        },
+      ],
+    };
+    const report = validateScriptEpisode(episode({ scenes: [scene], summary: '摘要' }), plan, {
+      registeredCharacterNames: new Set(['沈清']),
+    });
+
+    expect(report.hardFailed).toBe(false);
+    expect(report.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'UNATTRIBUTED_DIALOGUE_ACTION',
+        severity: 'soft',
+        sceneId: 'scene-1',
+        blockId: 'spoken-as-action',
+      }),
+    ]));
+  });
+
   it.each([
     '△沈清转身离开。',
     '【字幕：三天后】',

@@ -115,6 +115,7 @@ import {
   createMinimalDirectDraftFallback,
   decodeDirectHandoffReview,
   detectRepeatedDirectPlotEvents,
+  detectUnattributedDialogueActions,
   directEpisodeText,
   directWritingContext,
   mergeDirectHandoffContinuity,
@@ -2796,7 +2797,7 @@ export class ScriptDirector {
       );
       episodeUpstreamRefs.push(scenePlanRef);
       const draftInputRevisionRefs = buildScriptInputRevisionRefs(state, episodeNumber);
-      const draftPromptVersion = 'episode-draft-v11';
+      const draftPromptVersion = 'episode-draft-v12';
       const currentEpisodeRevision = state.episodes.find(
         (episode) => episode.episodeNumber === episodeNumber,
       )?.revision ?? 0;
@@ -2863,6 +2864,7 @@ export class ScriptDirector {
           '严格顶层模板：{"episodeNumber":1,"title":"字符串","scenes":[...],"summary":"可为空字符串","newFacts":[],"openedThreads":[],"closedThreads":[]}。',
           '每个 scene 严格包含 ordinal, location, timeOfDay(day|night|dawn|dusk), interiorExterior(interior|exterior), characterIds, blocks。每个 block 的 type 只能是 caption/action/dialogue 且必须有 text；dialogue 还必须有已登记人物的 characterId、speaker，可选 delivery 和 mode(normal|os|vo)。不得改名任何键。',
           'blocks.text 只写内容本身：caption 不要包“【字幕：】”，action 不要带“△”，dialogue 不要重复说话人或冒号；这些格式由序列化器统一添加。',
+          '格式P0：凡是人物说出口的话都必须使用 dialogue，并填写真正的 characterId 与 speaker；action 只能写无对白的可见动作。禁止把“林老板，我们来检查”“您请，随便看”等台词放进 action；人物边做边说必须拆成 action 与 dialogue 两个块。',
           'scene.characterIds 必须列出本场所有实际出场或说话人物，且对白 speaker 与 characterId 必须一一匹配。普通对白 mode 使用 normal；只有画外音和内心独白才使用 vo/os。',
           '正文必须是可拍摄的竖屏短剧：前三个正文块内出现人物、处境与冲突；动作使用镜头可见行为，避免小说式心理概述；单句对白简洁、有对抗性，不写大段说教。',
           '未登记的路人、记者、警察等不能借用已登记人物的 characterId 或 speaker 代替说话；若不是正式人物，用 action 或 caption 表达其反应。',
@@ -3000,6 +3002,7 @@ export class ScriptDirector {
             '你是 ScriptWriterAgent。已有正文必须全部保留；只返回接在现有正文中的新增 blocks，不得重写、复述或总结整集。',
             '严格顶层模板：{"blocks":[...]}。每项只允许 action 或 dialogue，并必须包含 sceneOrdinal、type、text；dialogue 还必须包含本场人物的 characterId、speaker，可选 delivery、mode(normal|os|vo)。',
             'action.text 不带“△”；dialogue.text 不重复说话人或冒号。每条写成完整、可拍摄的动作或推动冲突的对白。',
+            '凡是人物说出口的话都必须使用 dialogue，并填写真正的 characterId 与 speaker；action 只能写无对白动作。人物边做边说必须拆成两个块。',
             `当前已有 ${continuationRequest.current.visibleChars} 字，本轮最多自然续写约 ${continuationRequest.requestedVisibleChars} 字；续写后至少达到 ${continuationRequest.minimumVisibleChars} 字（目标的 75%）。这是唯一一次续写，请把尚未完成的冲突、行动过程和结尾卡点写完整，但不要为了凑数重复内容。`,
             `续写后整集尽量不超过 ${scriptEpisodeLengthRange(plan.targetCharsPerEpisode).maximum} 个可见字符；对白倾向约 ${plan.dialogueDensityPercent}%，允许按剧情自然波动。必须写完当前句子和动作，不得用省略号代替未完成内容。`,
             `对白人物白名单：${JSON.stringify(knownCharacters)}`,
@@ -4045,7 +4048,7 @@ export class ScriptDirector {
       );
     const canonicalDirectCandidate = (value: ScriptEpisode): ScriptEpisode =>
       reconcileDirectSceneCast(canonicalStoredDirectCandidate(value));
-    const promptVersion = 'direct-draft-v7';
+    const promptVersion = 'direct-draft-v8';
     const draftFingerprint = computeScriptCheckpointInputFingerprint({
       node: 'direct_draft',
       inputRevisionRefs,
@@ -4326,7 +4329,7 @@ export class ScriptDirector {
     const episodeUpstreamRefs: ScriptUpstreamArtifactRef[] = [outlineRef, directDraftRef];
     const continuationThreshold = Math.max(150, Math.round(plan.targetCharsPerEpisode * 0.58));
     if (writerCallsUsed <= 1 && scriptVisibleChars(draft) < continuationThreshold) {
-      const continuationPromptVersion = 'direct-continuation-v5';
+      const continuationPromptVersion = 'direct-continuation-v6';
       const continuationFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'continuation',
         inputRevisionRefs,
@@ -4431,7 +4434,7 @@ export class ScriptDirector {
       episodeUpstreamRefs.push(currentCandidateRef);
     }
 
-    const reviewPromptVersion = 'direct-handoff-review-v6';
+    const reviewPromptVersion = 'direct-handoff-review-v7';
     const reviewFingerprint = computeScriptCheckpointInputFingerprint({
       node: 'handoff_review',
       inputRevisionRefs,
@@ -4563,7 +4566,18 @@ export class ScriptDirector {
       draftForReview,
       previousEpisodesForRepeatCheck,
     );
+    const dialogueFormatIssues = detectUnattributedDialogueActions(draftForReview);
     const aiIssues: ScriptGateIssue[] = [
+      ...dialogueFormatIssues.map((issue) => ({
+        code: 'DIRECT_DIALOGUE_FORMAT_ERROR',
+        severity: 'soft' as const,
+        source: 'ai' as const,
+        message: `${issue.evidence}；应为：${issue.expected}`,
+        ...(issue.sceneNumber
+          ? { sceneId: draftForReview.scenes.find((scene) => scene.ordinal === issue.sceneNumber)?.id }
+          : {}),
+        path: 'scenes',
+      })),
       ...repeatedPlotIssues.map((issue) => ({
         code: 'DIRECT_DUPLICATE_MAJOR_EVENT',
         severity: 'soft' as const,
@@ -4589,6 +4603,7 @@ export class ScriptDirector {
     let deterministicReport = validateDraft(draft);
     let report = validateDraft(draft, aiIssues);
     const rewriteIssues: ScriptDirectReviewIssue[] = [
+      ...dialogueFormatIssues,
       ...repeatedPlotIssues,
       ...review.issues,
       ...deterministicReport.blockingIssues.map((issue) => ({
@@ -4606,8 +4621,8 @@ export class ScriptDirector {
       );
       const rewriteFromOutline = storedRewrite?.status === 'stale';
       const rewritePromptVersion = rewriteFromOutline
-        ? 'direct-rewrite-from-outline-v4'
-        : 'direct-rewrite-v7';
+        ? 'direct-rewrite-from-outline-v5'
+        : 'direct-rewrite-v8';
       const rewriteFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'direct_rewrite',
         inputRevisionRefs,
@@ -4703,7 +4718,7 @@ export class ScriptDirector {
         rewriteArtifact,
       );
       episodeUpstreamRefs.push(currentCandidateRef);
-      const postRewriteReviewPromptVersion = 'direct-handoff-review-after-rewrite-v6';
+      const postRewriteReviewPromptVersion = 'direct-handoff-review-after-rewrite-v7';
       const postRewriteReviewFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'handoff_review',
         inputRevisionRefs,
@@ -4814,6 +4829,16 @@ export class ScriptDirector {
       });
       draft = postRewriteDraft;
       const postRewriteBlockingIssues: ScriptGateIssue[] = [
+        ...detectUnattributedDialogueActions(postRewriteDraft).map((issue) => ({
+          code: 'DIRECT_RECHECK_DIALOGUE_FORMAT_ERROR',
+          severity: 'soft' as const,
+          source: 'ai' as const,
+          message: `${issue.evidence}；应为：${issue.expected}`,
+          ...(issue.sceneNumber
+            ? { sceneId: postRewriteDraft.scenes.find((scene) => scene.ordinal === issue.sceneNumber)?.id }
+            : {}),
+          path: 'scenes',
+        })),
         ...detectRepeatedDirectPlotEvents(
           postRewriteDraft,
           previousEpisodesForRepeatCheck,

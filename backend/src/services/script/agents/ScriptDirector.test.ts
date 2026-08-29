@@ -1818,7 +1818,7 @@ describe('ScriptDirector', () => {
     }
   });
 
-  it('stales an episode-draft-v3 checkpoint after the lightweight v11 prompt upgrade', async () => {
+  it('stales an episode-draft-v3 checkpoint after the dialogue-safe v12 prompt upgrade', async () => {
     const state = readySingleEpisodeState();
     let draftCalls = 0;
     const store = new MemoryScriptStore(state);
@@ -1912,7 +1912,7 @@ describe('ScriptDirector', () => {
         artifactRevision: 0, promptVersion: 'episode-draft-v3', status: 'stale',
       }),
       expect.objectContaining({
-        artifactRevision: 1, promptVersion: 'episode-draft-v11', status: 'succeeded',
+        artifactRevision: 1, promptVersion: 'episode-draft-v12', status: 'succeeded',
       }),
     ]));
   });
@@ -2169,7 +2169,7 @@ describe('ScriptDirector', () => {
       expect.objectContaining({
         artifactRevision: 1,
         status: 'succeeded',
-        promptVersion: 'episode-draft-v11',
+        promptVersion: 'episode-draft-v12',
       }),
     ]));
   });

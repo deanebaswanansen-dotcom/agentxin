@@ -11,6 +11,7 @@ import type {
 } from '../domain.js';
 import { projectScriptContinuity } from '../ScriptContinuityCommit.js';
 import type { ScriptTextParseWarning } from '../parsers/chineseShortDramaText.js';
+import { looksLikeUnattributedDialogueAction } from '../quality/ScriptDialogueFormat.js';
 import {
   scriptCreativeWritingInstruction,
   scriptQualityReviewInstruction,
@@ -21,6 +22,7 @@ export const SCRIPT_DIRECT_ISSUE_CODES = [
   'OFF_OUTLINE',
   'WRONG_GENRE_OR_SETTING',
   'CHARACTER_IDENTITY_CONFLICT',
+  'DIALOGUE_FORMAT_ERROR',
   'DUPLICATE_MAJOR_EVENT',
   'CAUSAL_CONTRADICTION',
   'PROP_STATE_CONTRADICTION',
@@ -142,6 +144,7 @@ interface DirectPlotWindow {
   sceneNumber: number;
   text: string;
   objects: Set<string>;
+  actions: Set<string>;
   anchors: Set<string>;
 }
 
@@ -152,11 +155,13 @@ function directPlotWindow(
 ): DirectPlotWindow {
   const selected = blocks.slice(start, start + size);
   const objects = new Set<string>();
+  const actions = new Set<string>();
   const anchors = new Set<string>();
   for (const block of selected) {
     const blockActions = REPEATED_PLOT_ACTIONS.filter((item) => item.pattern.test(block.text));
     const blockObjects = REPEATED_PLOT_OBJECTS.filter((item) => item.pattern.test(block.text));
     blockObjects.forEach((item) => objects.add(item.key));
+    blockActions.forEach((item) => actions.add(item.key));
     blockActions.forEach((action) => {
       blockObjects.forEach((object) => anchors.add(`${action.key}:${object.key}`));
     });
@@ -166,6 +171,7 @@ function directPlotWindow(
     sceneNumber: selected[0]?.sceneNumber ?? 1,
     text: selected.map((item) => item.text).join(' '),
     objects,
+    actions,
     anchors,
   };
 }
@@ -201,12 +207,13 @@ export function detectRepeatedDirectPlotEvents(
 
   for (let leftIndex = 0; leftIndex < windows.length; leftIndex += 1) {
     const left = windows[leftIndex]!;
-    if (left.objects.size < 2 || left.anchors.size === 0) continue;
+    if (left.objects.size < 2 || left.actions.size < 2 || left.anchors.size < 2) continue;
     for (let rightIndex = leftIndex + windowSize; rightIndex < windows.length; rightIndex += 1) {
       const right = windows[rightIndex]!;
       const commonObjects = [...left.objects].filter((key) => right.objects.has(key));
+      const commonActions = [...left.actions].filter((key) => right.actions.has(key));
       const commonAnchors = [...left.anchors].filter((key) => right.anchors.has(key));
-      if (commonObjects.length < 2 || commonAnchors.length < 1) continue;
+      if (commonObjects.length < 2 || commonActions.length < 2 || commonAnchors.length < 2) continue;
       const objectLabels = commonObjects
         .map((key) => REPEATED_PLOT_OBJECTS.find((item) => item.key === key)?.label ?? key)
         .join('、');
@@ -221,11 +228,12 @@ export function detectRepeatedDirectPlotEvents(
 
   const previousWindows = previousEpisodes.flatMap(directPlotWindows);
   for (const current of windows) {
-    if (current.objects.size < 2 || current.anchors.size === 0) continue;
+    if (current.objects.size < 2 || current.actions.size < 2 || current.anchors.size < 2) continue;
     for (const previous of previousWindows) {
       const commonObjects = [...current.objects].filter((key) => previous.objects.has(key));
+      const commonActions = [...current.actions].filter((key) => previous.actions.has(key));
       const commonAnchors = [...current.anchors].filter((key) => previous.anchors.has(key));
-      if (commonObjects.length < 2 || commonAnchors.length < 1) continue;
+      if (commonObjects.length < 2 || commonActions.length < 2 || commonAnchors.length < 2) continue;
       const objectLabels = commonObjects
         .map((key) => REPEATED_PLOT_OBJECTS.find((item) => item.key === key)?.label ?? key)
         .join('、');
@@ -239,6 +247,21 @@ export function detectRepeatedDirectPlotEvents(
   }
 
   return [];
+}
+
+/** Flags spoken sentences that the text model formatted as △ action lines. */
+export function detectUnattributedDialogueActions(
+  episode: ScriptEpisode,
+): ScriptDirectReviewIssue[] {
+  return episode.scenes.flatMap((scene) => scene.blocks
+    .filter((block) => block.type === 'action' && looksLikeUnattributedDialogueAction(block.text))
+    .slice(0, 1)
+    .map((block): ScriptDirectReviewIssue => ({
+      code: 'DIALOGUE_FORMAT_ERROR',
+      sceneNumber: scene.ordinal,
+      evidence: `动作行“△${block.text.slice(0, 120)}”实际包含人物说出口的话，但缺少说话人`,
+      expected: '确认真正的说话人，并把每句台词单独写成“人物：完整台词”；△只保留无对白的可见动作。',
+    }))).slice(0, 3);
 }
 
 export function reconcileDirectReviewBoundary(
@@ -392,17 +415,18 @@ export function buildDirectDraftPrompt(context: Record<string, unknown>): string
     '同一道具动作链只能完整演一次。例如已经写过“打开抽屉—拿起照片—看完放回”，后面不能换个人再次从打开同一抽屉、查看同一照片重新演起，必须直接写新的发现、冲突或后果。',
     '对白比例允许按剧情自然波动，对白要用冲突推进。',
     scriptCreativeWritingInstruction({ creativeRules: creativeRulesFromContext(context) }),
-    '若创作要求禁止临时角色对白，就让路人用动作表达；否则前台、保安、快递员等临时角色必须用自己的称谓署名，绝不能把他们的台词挂到主角或其他登记人物名下。',
+    '若创作要求禁止临时角色对白，就让路人只做无对白动作，不能把去掉说话人的原台词塞进△动作；否则前台、保安、快递员等临时角色必须用自己的称谓署名，绝不能把他们的台词挂到主角或其他登记人物名下。',
     '通常控制在 maxScenes 场；如完整讲清本集确有需要，最多可以写5场，不要因场数限制截断主要事件。',
     '只使用以下格式：',
     '第N集：',
     'N-1 日或夜 内或外 具体地点',
-    '人物：登记人物名（人物在全剧第一次出场时，在姓名后用括号写明身份或角色；之后不重复）',
+    '人物：本场登记人物名或允许说话的临时角色称谓（正式人物在全剧第一次出场时，在姓名后用括号写明身份或角色；之后不重复）',
     '【字幕：文字】',
     '△可拍摄的无对白动作或神态；景别写成△【特写】动作',
     '人物（可选语气、OS或VO）：对白',
+    '格式P0：凡是人物说出口的话，每一句都必须单独写成“说话人：完整台词”。△只允许写没有台词的可见动作。禁止写“△林老板，我们来检查”或“△您请，随便看”；人物先做动作再说话时，必须拆成一行△动作和一行人物对白。无法确认说话人就改写，不得把对白伪装成△动作。',
     '回忆段落分别用【闪回】和【闪回结束】包住；OS必须跟人物心里所想的话，VO只用于画外能听见但看不到人物的声音。',
-    '场号从1连续递增；普通对白人物必须列在本场人物行，OS/VO人物必须是登记人物。',
+    '场号从1连续递增；所有普通对白的说话人必须列在本场人物行，OS/VO人物必须是登记人物。',
     `创作资料：${JSON.stringify(context)}`,
   ].join('\n');
 }
@@ -419,6 +443,7 @@ export function buildDirectContinuationPrompt(
     'priorEpisodeHistory 中的前集场景也不得重演；新增内容只能承接其后果并推进新事件。',
     '不要重写已有内容，不要复述已经发生的事件，不要再次制造“首次发现”同一证物；同一抽屉、照片、手机或文件的打开—拿取—查看动作链已经演过，就直接续写新的信息或后果。',
     '可以继续最后一场或增加下一场；只输出新增的标准剧本文本，不要输出解释、JSON或Markdown围栏。',
+    '每句说出口的话必须写“说话人：完整台词”；△只写无对白动作。禁止给台词加△，人物边做边说必须拆成动作行和对白行。',
     `当前约 ${currentChars} 字，建议最多新增约 ${suggestedAddition} 字，并尽量让整集不超过 ${scriptEpisodeLengthRange(targetChars).maximum} 个可见字符；但必须写完每句话和当前动作，不得用省略号代替未完成内容。`,
     `创作资料：${JSON.stringify(context)}`,
     `已有完整正文：\n${rawText}`,
@@ -437,10 +462,12 @@ export function buildDirectReviewPrompt(
     '只检查：跑出当前大纲、题材或场景类型错误、人物身份关系冲突、主要事件或具体道具动作链重复发生、明显因果倒置、重要道具状态矛盾。',
     '必须将本集与 priorEpisodeHistory.allEpisodeSummaries 的全部前集对照，并用 recentSceneEvents 核验近12集细节；前面某一集已经完整发生的场景若在本集换措辞重演，使用 DUPLICATE_MAJOR_EVENT。',
     '必须对照正文前段、中段和后段：换了人物、措辞或位置，仍再次完整演“打开同一抽屉—拿取/查看同一照片（或手机、文件）—收回”的，使用 DUPLICATE_MAJOR_EVENT；后段若直接核验、转交或产生新后果则不算重复。',
+    'DUPLICATE_MAJOR_EVENT 必须有同一对象上至少两个相同的有序核心动作，并且再次得到相同结果；仅地点、人物、道具或“检查”行为重合，以及承接前情后产生新信息、新冲突或新结果，都不是重复，必须 pass。',
+    '若人物说出口的话被写成△动作且缺少“说话人：”，使用 DIALOGUE_FORMAT_ERROR；普通动作行不得因此误报。',
     boundaryInstruction,
     '不要评论服装丰富度、文学性、节奏、镜头、表演和普通台词润色。没有明显错误必须 verdict=pass、issues=[]。',
     '只返回 JSON：',
-    '{"verdict":"pass|major_issue","issues":[{"code":"OFF_OUTLINE|WRONG_GENRE_OR_SETTING|CHARACTER_IDENTITY_CONFLICT|DUPLICATE_MAJOR_EVENT|CAUSAL_CONTRADICTION|PROP_STATE_CONTRADICTION","sceneNumber":1,"evidence":"正文证据","expected":"大纲或连续性要求"}],"qualityNotes":["可选优化建议"],"handoff":{"summary":"本集摘要","characterStates":[{"characterId":"登记ID","location":"最后地点","state":"当前状态","knows":["已知信息"]}],"props":[{"name":"道具","holder":"人物ID","location":"地点","state":"状态"}],"openThreads":["未解决悬念"],"ending":"本集最后状态"}}',
+    '{"verdict":"pass|major_issue","issues":[{"code":"OFF_OUTLINE|WRONG_GENRE_OR_SETTING|CHARACTER_IDENTITY_CONFLICT|DIALOGUE_FORMAT_ERROR|DUPLICATE_MAJOR_EVENT|CAUSAL_CONTRADICTION|PROP_STATE_CONTRADICTION","sceneNumber":1,"evidence":"正文证据","expected":"大纲或连续性要求"}],"qualityNotes":["可选优化建议"],"handoff":{"summary":"本集摘要","characterStates":[{"characterId":"登记ID","location":"最后地点","state":"当前状态","knows":["已知信息"]}],"props":[{"name":"道具","holder":"人物ID","location":"地点","state":"状态"}],"openThreads":["未解决悬念"],"ending":"本集最后状态"}}',
     'issues 最多3条；不得虚构未在资料或正文中出现的信息。',
     scriptQualityReviewInstruction({ creativeRules: creativeRulesFromContext(context) }),
     `创作资料：${JSON.stringify(context)}`,
@@ -463,6 +490,9 @@ export function buildDirectRewritePrompt(
   const duplicateInstruction = issues.some((issue) => issue.code === 'DUPLICATE_MAJOR_EVENT')
     ? '存在 DUPLICATE_MAJOR_EVENT：保留第一次完整动作链，删除后面重复的开端和过程，把后段直接改成新的信息、冲突或后果；不能只换人物、地点或近义词后继续重复。'
     : '';
+  const dialogueFormatInstruction = issues.some((issue) => issue.code === 'DIALOGUE_FORMAT_ERROR')
+    ? '存在 DIALOGUE_FORMAT_ERROR：逐行确认真正的说话人；每句说出口的话必须单独写成“说话人：完整台词”，△只保留无对白动作。禁止猜成被称呼者在说话，也禁止继续把台词写成△。'
+    : '';
   if (options.rewriteFromOutline) {
     return [
       '上一版正文已被明确拒绝。请完全从分集卡重新写出本集完整中文短剧正文。',
@@ -470,7 +500,9 @@ export function buildDirectRewritePrompt(
       boundaryInstruction,
       offOutlineInstruction,
       duplicateInstruction,
+      dialogueFormatInstruction,
       directLengthInstruction(context),
+      '完整稿中每句说出口的话必须带“说话人：”；△只能表示无对白的可见动作。',
       '输出完整标准剧本文本，不要解释，不要JSON，不要Markdown围栏。',
       `禁止边界：${JSON.stringify(issues.slice(0, 3))}`,
       `创作资料：${JSON.stringify(context)}`,
@@ -482,7 +514,9 @@ export function buildDirectRewritePrompt(
     boundaryInstruction,
     offOutlineInstruction,
     duplicateInstruction,
+    dialogueFormatInstruction,
     directLengthInstruction(context),
+    '完整稿中每句说出口的话必须带“说话人：”；△只能表示无对白的可见动作。',
     '输出完整标准剧本文本，不要解释，不要JSON，不要Markdown围栏。',
     `问题：${JSON.stringify(issues.slice(0, 3))}`,
     `创作资料：${JSON.stringify(context)}`,
