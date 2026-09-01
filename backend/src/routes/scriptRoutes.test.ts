@@ -234,6 +234,76 @@ describe('scriptRoutes', () => {
     expect(response.json().error.code).toBe('VALIDATION_ERROR');
   });
 
+  it('does not shrink the plan below persisted episode or detailed-outline content', async () => {
+    const savedPlan = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-plan`,
+      payload: { expectedRevision: 0, value: planInput() },
+    });
+    expect(savedPlan.statusCode).toBe(200);
+
+    const savedOutline = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/episode-outlines/9`,
+      payload: { expectedRevision: 0, value: episodeOutlineInput(9) },
+    });
+    expect(savedOutline.statusCode).toBe(200);
+
+    const outlineBoundary = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-plan`,
+      payload: {
+        expectedRevision: 1,
+        value: { ...planInput(), totalEpisodes: 8 },
+      },
+    });
+
+    expect(outlineBoundary.statusCode).toBe(400);
+    expect(outlineBoundary.json()).toEqual({
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: '总集数不能少于已保存的第9集正文或详细大纲；本次修改未保存，也不会删除已有内容。',
+        details: {
+          requestedTotalEpisodes: 8,
+          minimumTotalEpisodes: 9,
+        },
+      },
+    });
+
+    const savedEpisode = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-episodes/10`,
+      payload: {
+        expectedRevision: 0,
+        value: { ...episodeInput(10), status: 'reviewing' },
+      },
+    });
+    expect(savedEpisode.statusCode).toBe(200);
+    const episodeBoundary = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-plan`,
+      payload: {
+        expectedRevision: 1,
+        value: { ...planInput(), totalEpisodes: 9 },
+      },
+    });
+    expect(episodeBoundary.statusCode).toBe(400);
+    expect(episodeBoundary.json()).toMatchObject({
+      error: {
+        code: 'VALIDATION_ERROR',
+        details: {
+          requestedTotalEpisodes: 9,
+          minimumTotalEpisodes: 10,
+        },
+      },
+    });
+    const unchanged = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${projectId}/script-plan`,
+    });
+    expect(unchanged.json()).toMatchObject({ totalEpisodes: 10, revision: 1 });
+  });
+
   it('round-trips characters, world, series outline and episode outline', async () => {
     const resources = [
       ['script-characters', { expectedRevision: 0, items: charactersInput() }],
@@ -801,5 +871,53 @@ describe('scriptRoutes', () => {
       revision: 6,
       item: { id: 'ai-hard-advisory', status: 'ignored', source: 'ai' },
     });
+  });
+
+  it('blocks only batches whose episode cards are missing after the plan grows', async () => {
+    await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-plan`,
+      payload: { expectedRevision: 0, value: planInput() },
+    });
+    await app.inject({
+      method: 'POST',
+      url: `/api/projects/${projectId}/script-plan/approve`,
+      payload: { expectedRevision: 1 },
+    });
+    await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-characters`,
+      payload: { expectedRevision: 0, items: charactersInput() },
+    });
+    await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-world`,
+      payload: { expectedRevision: 0, value: worldInput() },
+    });
+    await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-outline`,
+      payload: { expectedRevision: 0, value: outlineInput() },
+    });
+    const grownPlan = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-plan`,
+      payload: {
+        expectedRevision: 2,
+        value: { ...planInput(), totalEpisodes: 12 },
+      },
+    });
+    expect(grownPlan.statusCode).toBe(200);
+
+    const workspace = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${projectId}/script-workspace`,
+    });
+    expect(workspace.statusCode).toBe(200);
+    expect(workspace.json().batchSummaries).toMatchObject([
+      { startEpisode: 1, endEpisode: 5, status: 'ready' },
+      { startEpisode: 6, endEpisode: 10, status: 'ready' },
+      { startEpisode: 11, endEpisode: 12, status: 'blocked' },
+    ]);
   });
 });

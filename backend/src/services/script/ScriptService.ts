@@ -219,6 +219,9 @@ function batchSummaries(
     state.worldBible &&
     state.seriesOutline,
   );
+  const outlinedEpisodes = new Set(
+    (state?.seriesOutline?.episodeCards ?? []).map((card) => card.episodeNumber),
+  );
   const result: ScriptBatchSummary[] = [];
   for (let startEpisode = 1; startEpisode <= totalEpisodes; startEpisode += 5) {
     const endEpisode = Math.min(startEpisode + 4, totalEpisodes);
@@ -235,6 +238,10 @@ function batchSummaries(
     const unresolvedSoftIssues = unresolved.length - unresolvedHardIssues;
     const completedEpisodes = episodes.filter((item) => item.status === 'completed').length;
     const batchSize = endEpisode - startEpisode + 1;
+    const batchOutlineReady = frontMatterReady && Array.from(
+      { length: batchSize },
+      (_, index) => startEpisode + index,
+    ).every((episodeNumber) => outlinedEpisodes.has(episodeNumber));
     let status: ScriptBatchSummary['status'];
     if (episodes.some((item) => item.status === 'generating')) status = 'generating';
     else if (episodes.some((item) => item.status === 'failed') || unresolvedHardIssues > 0) status = 'failed';
@@ -243,7 +250,7 @@ function batchSummaries(
       unresolvedSoftIssues > 0
     ) status = 'proofreading';
     else if (completedEpisodes === batchSize) status = 'completed';
-    else status = frontMatterReady ? 'ready' : 'blocked';
+    else status = batchOutlineReady ? 'ready' : 'blocked';
     result.push({
       startEpisode,
       endEpisode,
@@ -312,7 +319,22 @@ export class ScriptService {
   async savePlan(projectId: string, value: unknown, expectedRevision: number): Promise<ScriptPlan> {
     await this.assertProject(projectId);
     const input = decodeScriptPlanInput(value);
-    const current = (await this.store.getProjectState(projectId))?.plan;
+    const state = await this.store.getProjectState(projectId);
+    const current = state?.plan;
+    const highestPersistedEpisode = Math.max(
+      0,
+      ...(state?.episodes ?? []).map((episode) => episode.episodeNumber),
+      ...(state?.episodeOutlines ?? []).map((outline) => outline.episodeNumber),
+    );
+    if (input.totalEpisodes < highestPersistedEpisode) {
+      throw ScriptServiceError.validation(
+        `总集数不能少于已保存的第${highestPersistedEpisode}集正文或详细大纲；本次修改未保存，也不会删除已有内容。`,
+        {
+          requestedTotalEpisodes: input.totalEpisodes,
+          minimumTotalEpisodes: highestPersistedEpisode,
+        },
+      );
+    }
     const now = new Date().toISOString();
     const plan: ScriptPlan = {
       ...input,
