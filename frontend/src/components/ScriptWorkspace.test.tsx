@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { ApiClient } from '../api/apiClient.js';
+import { ApiClientError, type ApiClient } from '../api/apiClient.js';
 import type {
   ScriptAgentJobSnapshot,
   ScriptCharacter,
@@ -512,6 +512,38 @@ describe('ScriptWorkspace', () => {
         2,
       );
     });
+    expect(await screen.findByText('策划已保存')).toBeInTheDocument();
+  });
+
+  it('refreshes a stale plan revision and retries saving once without losing the episode-count edit', async () => {
+    const client = createClient();
+    const conflict = new ApiClientError({
+      error: { code: 'CONFLICT', message: '数据已被其他任务更新' },
+    }, 409);
+    vi.mocked(client.script.plan.save)
+      .mockRejectedValueOnce(conflict)
+      .mockImplementationOnce((_projectId, value) => Promise.resolve({ ...value, revision: 5 }));
+    vi.mocked(client.script.plan.get)
+      .mockResolvedValueOnce(buildPlan())
+      .mockResolvedValueOnce({
+        ...buildPlan(),
+        status: 'locked',
+        revision: 4,
+        updatedAt: '2026-08-15T00:02:00.000Z',
+      });
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    fireEvent.change(await screen.findByLabelText('总集数'), { target: { value: '36' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存策划' }));
+
+    await waitFor(() => expect(client.script.plan.save).toHaveBeenCalledTimes(2));
+    expect(client.script.plan.get).toHaveBeenCalledWith('project-1');
+    expect(client.script.plan.save).toHaveBeenNthCalledWith(
+      2,
+      'project-1',
+      expect.objectContaining({ totalEpisodes: 36, status: 'locked', revision: 4 }),
+      4,
+    );
     expect(await screen.findByText('策划已保存')).toBeInTheDocument();
   });
 

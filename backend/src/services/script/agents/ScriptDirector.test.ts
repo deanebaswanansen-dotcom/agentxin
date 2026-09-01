@@ -3061,8 +3061,9 @@ describe('ScriptDirector', () => {
     }];
     const originalEpisode = structuredClone(oldEpisode);
     const originalIssues = structuredClone(state.reviewIssues);
+    let draftCalls = 0;
     const director = new ScriptDirector({
-      model: { complete: async () => '' },
+      model: { complete: async () => { draftCalls += 1; return ''; } },
       store: new MemoryScriptStore(state),
       checkpoints: new InMemoryScriptCheckpointStore(),
     });
@@ -3080,6 +3081,47 @@ describe('ScriptDirector', () => {
     expect(state.episodes).toEqual([originalEpisode]);
     expect(state.reviewRevision).toBe(1);
     expect(state.reviewIssues).toEqual(originalIssues);
+    expect(draftCalls).toBe(2);
+  });
+
+  it('automatically retries an unrecognized explicit rewrite once with strict screenplay formatting', async () => {
+    const state = readySingleEpisodeState();
+    state.episodes = [{
+      ...reviewingEpisode(state, '旧正文必须在新稿成功前保留。'.repeat(20), { revision: 3 }),
+      status: 'completed',
+      summary: '旧稿摘要',
+    }];
+    const draftPrompts: string[] = [];
+    const director = new ScriptDirector({
+      model: {
+        async complete(request) {
+          if (request.node === 'draft') {
+            draftPrompts.push(request.prompt);
+            return draftPrompts.length === 1 ? '' : directScriptText();
+          }
+          if (request.node === 'review') return directReviewJson();
+          throw new Error(`unexpected node: ${request.node}`);
+        },
+      },
+      store: new MemoryScriptStore(state),
+      checkpoints: new InMemoryScriptCheckpointStore(),
+    });
+
+    await director.run({
+      task: 'script_episode_batch',
+      projectId: 'project-1',
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+      regenerate: true,
+    });
+
+    expect(draftPrompts).toHaveLength(2);
+    expect(draftPrompts[1]).toContain('单集重写格式恢复');
+    expect(draftPrompts[1]).toContain('第1集\n1-1 地点 日/内\n人物：角色名');
+    expect(state.episodes[0]?.summary).not.toBe('旧稿摘要');
+    expect(state.episodes[0]?.revision).toBeGreaterThan(3);
   });
 
   it('uses the current series card and user instruction instead of blindly repeating an old episode', async () => {

@@ -4279,27 +4279,50 @@ export class ScriptDirector {
             buildDirectDraftPrompt(context),
           ].join('\n')
         : buildDirectDraftPrompt(context);
-      let providerFailureMessage = '';
-      try {
-        rawText = await this.dependencies.model.complete({
-          node: 'draft',
-          projectId: request.projectId,
-          episodeNumber,
-          prompt: directDraftPrompt,
-          responseFormat: 'text',
-          signal: request.signal,
-        });
-      } catch (error) {
-        if (request.signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw error;
-        providerFailureMessage = error instanceof Error ? error.message : String(error);
-        rawText = '';
+      const explicitRewrite = Boolean(request.regenerate && currentEpisode);
+      const maxDraftCalls = explicitRewrite ? 2 : 1;
+      const providerFailureMessages: string[] = [];
+      let parsed = parseCandidate('');
+      let callsUsed = 0;
+      while (callsUsed < maxDraftCalls && !parsed.episode) {
+        const isStrictRetry = callsUsed > 0;
+        const prompt = isStrictRetry
+          ? [
+              '单集重写格式恢复：上一轮没有返回可保存的完整正文。',
+              '请重新写完整一集，不要解释原因，不得只返回摘要、JSON、提纲或省略号占位。',
+              '必须严格用下面三行开头：',
+              `第${episodeNumber}集`,
+              `${episodeNumber}-1 地点 日/内`,
+              '人物：角色名',
+              '后续每句对白写成“角色名：完整台词”，动作行以“△”开头。',
+              '',
+              buildDirectDraftPrompt(context),
+            ].join('\n')
+          : directDraftPrompt;
+        callsUsed += 1;
+        try {
+          rawText = await this.dependencies.model.complete({
+            node: 'draft',
+            projectId: request.projectId,
+            episodeNumber,
+            prompt,
+            responseFormat: 'text',
+            signal: request.signal,
+          });
+        } catch (error) {
+          if (request.signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw error;
+          providerFailureMessages.push(error instanceof Error ? error.message : String(error));
+          rawText = '';
+        }
+        parsed = parseCandidate(rawText);
       }
-      let parsed = parseCandidate(rawText);
-      const callsUsed = 1;
       if (!parsed.episode) {
-        if (request.regenerate && currentEpisode) {
+        if (explicitRewrite) {
+          recordCall('draft', 'ChineseShortDramaText@v1', callsUsed, 'needs_review');
+          const parseReason = parsed.warnings.at(-1)?.message;
+          const failureReason = providerFailureMessages.at(-1) ?? parseReason;
           throw new ScriptModelOutputError(
-            `第 ${episodeNumber} 集重新写作没有返回可识别正文，已完整保留旧稿；可再次点击重新写。`,
+            `第 ${episodeNumber} 集重新写作已自动尝试 ${callsUsed} 次，但仍未返回可识别的完整正文，已完整保留旧稿${failureReason ? `；最后一次失败原因：${failureReason}` : ''}。`,
           );
         }
         const localDraft = createMinimalDirectDraftFallback(
@@ -4315,6 +4338,7 @@ export class ScriptDirector {
           revision: baseEpisodeRevision,
           createdAt: currentEpisode?.createdAt ?? localDraft.createdAt,
         });
+        const providerFailureMessage = providerFailureMessages.at(-1);
         const fallbackMessage = providerFailureMessage
           ? `正文模型调用失败，已保存本地可编辑分场稿：${providerFailureMessage}`
           : '正文模型未返回可见正文，已保存本地可编辑分场稿。';

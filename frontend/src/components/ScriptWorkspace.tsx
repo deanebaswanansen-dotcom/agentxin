@@ -1788,10 +1788,36 @@ export function ScriptWorkspace({
   const savePlan = useCallback(async () => {
     if (!data) return;
     const editVersion = resourceEditVersions.current.plan;
+    const submittedPlan = data.plan;
     setBusy(true);
     setNotice('');
     try {
-      const saved = await client.script.plan.save(projectId, data.plan, data.plan.revision);
+      let saved: ScriptPlan;
+      try {
+        saved = await client.script.plan.save(projectId, submittedPlan, submittedPlan.revision);
+      } catch (error) {
+        if (!(isApiClientError(error) && error.status === 409)) throw error;
+        const latest = await client.script.plan.get(projectId);
+        if (resourceEditVersions.current.plan !== editVersion) {
+          setData((current) => current ? {
+            ...current,
+            plan: {
+              ...current.plan,
+              status: latest.status,
+              revision: latest.revision,
+              updatedAt: latest.updatedAt,
+            },
+          } : current);
+          setNotice('策划保存时又有新修改，已同步最新版本，请再点一次保存');
+          return;
+        }
+        saved = await client.script.plan.save(projectId, {
+          ...submittedPlan,
+          status: latest.status,
+          revision: latest.revision,
+          updatedAt: latest.updatedAt,
+        }, latest.revision);
+      }
       const unchangedWhileSaving = resourceEditVersions.current.plan === editVersion;
       if (unchangedWhileSaving) dirtyResources.current.plan = false;
       setData((current) => current ? {
