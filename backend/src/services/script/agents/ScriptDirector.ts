@@ -257,6 +257,8 @@ export type ScriptDirectorRequest =
       episodeCount: number;
       expectedPlanRevision: number;
       draftMode?: 'structured_legacy' | 'direct_text';
+      /** Revise against the old body, or write a replacement without exposing it to the model. */
+      rewriteMode?: 'revise' | 'replace';
       /** User requirements for rewriting this one existing episode. */
       rewriteInstruction?: string;
       /** User explicitly requested fresh episode bodies for this batch. */
@@ -2189,6 +2191,12 @@ export class ScriptDirector {
     if (rewriteInstruction && request.draftMode === 'structured_legacy') {
       throw new ScriptModelOutputError('按要求重写单集只支持直接正文模式。');
     }
+    if (request.rewriteMode && !singleEpisodeRegeneration) {
+      throw new ScriptModelOutputError('单集重写方式只能用于单独重写一集。');
+    }
+    if (request.rewriteMode && request.draftMode === 'structured_legacy') {
+      throw new ScriptModelOutputError('单集重写方式只支持直接正文模式。');
+    }
     const hasCanonicalContinuity = (
       projectState: ScriptProjectState,
       episode: ScriptEpisode,
@@ -4090,14 +4098,16 @@ export class ScriptDirector {
     const outlineRef = buildScriptUpstreamArtifactRef('episode_outline', outline.revision, outline);
     const baseContext = directWritingContext(state, plan, outline);
     const rewriteInstruction = request.rewriteInstruction?.trim();
-    const context = rewriteInstruction
+    const rewriteMode = request.rewriteMode ?? (rewriteInstruction ? 'revise' : 'replace');
+    const context = explicitRewrite
       ? {
           ...baseContext,
           userRewrite: {
-            instruction: rewriteInstruction,
-            existingEpisodeText: currentEpisode
-              ? directEpisodeText(currentEpisode, state.characters)
-              : '',
+            mode: rewriteMode,
+            ...(rewriteInstruction ? { instruction: rewriteInstruction } : {}),
+            ...(rewriteMode === 'revise' && currentEpisode ? {
+              existingEpisodeText: directEpisodeText(currentEpisode, state.characters),
+            } : {}),
           },
         }
       : baseContext;
@@ -4110,7 +4120,7 @@ export class ScriptDirector {
       );
     const canonicalDirectCandidate = (value: ScriptEpisode): ScriptEpisode =>
       reconcileDirectSceneCast(canonicalStoredDirectCandidate(value));
-    const promptVersion = 'direct-draft-v9';
+    const promptVersion = 'direct-draft-v10';
     const draftFingerprint = computeScriptCheckpointInputFingerprint({
       node: 'direct_draft',
       inputRevisionRefs,

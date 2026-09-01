@@ -1493,6 +1493,7 @@ export interface ScriptBatchOptions {
   episodeCount: number;
   expectedPlanRevision: number;
   draftMode?: 'structured_legacy' | 'direct_text';
+  rewriteMode?: 'revise' | 'replace';
   rewriteInstruction?: string;
 }
 

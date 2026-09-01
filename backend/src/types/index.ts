@@ -252,6 +252,8 @@ export interface AgentRunRequest {
     episodeCount: number;
     expectedPlanRevision: number;
     draftMode?: 'structured_legacy' | 'direct_text';
+    /** Whether an existing episode should be revised in place or replaced from its episode card. */
+    rewriteMode?: 'revise' | 'replace';
     /** Optional user-authored requirements for regenerating exactly one existing episode. */
     rewriteInstruction?: string;
   };
