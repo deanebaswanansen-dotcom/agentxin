@@ -168,6 +168,7 @@ describe('agent routes', () => {
         episodeCount: 1,
         expectedPlanRevision: 3,
         draftMode: 'direct_text',
+        rewriteMode: 'revise',
         rewriteInstruction: '  保留第一场，只修改结尾冲突。  ',
       },
     })).toMatchObject({
@@ -177,9 +178,45 @@ describe('agent routes', () => {
         episodeCount: 1,
         expectedPlanRevision: 3,
         draftMode: 'direct_text',
+        rewriteMode: 'revise',
         rewriteInstruction: '保留第一场，只修改结尾冲突。',
       },
     });
+  });
+
+  it('accepts an old-body-free replacement for one existing episode', () => {
+    expect(parseAgentBody({
+      task: 'script_episode_batch',
+      projectId: 'script-project',
+      regenerate: true,
+      scriptBatchOptions: {
+        startEpisode: 13,
+        episodeCount: 1,
+        expectedPlanRevision: 3,
+        draftMode: 'direct_text',
+        rewriteMode: 'replace',
+      },
+    })).toMatchObject({
+      regenerate: true,
+      scriptBatchOptions: {
+        startEpisode: 13,
+        episodeCount: 1,
+        expectedPlanRevision: 3,
+        rewriteMode: 'replace',
+      },
+    });
+
+    expect(() => parseAgentBody({
+      task: 'script_episode_batch',
+      projectId: 'script-project',
+      regenerate: true,
+      scriptBatchOptions: {
+        startEpisode: 1,
+        episodeCount: 1,
+        expectedPlanRevision: 3,
+        rewriteMode: 'overwrite',
+      },
+    })).toThrow('单集重写方式必须是 revise 或 replace。');
   });
 
   it('rejects an arbitrary single episode or rewrite instruction without regeneration', () => {

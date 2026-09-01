@@ -411,14 +411,17 @@ export function buildDirectDraftPrompt(context: Record<string, unknown>): string
   const rewriteInstruction = typeof userRewrite?.instruction === 'string'
     ? userRewrite.instruction.trim()
     : '';
+  const rewriteMode = userRewrite?.mode === 'replace' ? 'replace' : 'revise';
   return [
     '请严格照已确认的当前分集卡，直接写出本集完整中文短剧正文。',
     '这是创作任务，不是数据填表；不要解释，不要分析，不要输出 JSON 或 Markdown 围栏。',
     '必须保持项目题材、人物身份、职业、关系和证物状态一致，不能把项目换成另一种题材。',
     '必须落实本集 goal、conflict、beats 与 endingHook；forbiddenFacts 和 forbiddenElements 不得出现。',
-    rewriteInstruction
-      ? `这是用户指定的单集修改，必须优先执行：${rewriteInstruction}。userRewrite.existingEpisodeText 是当前旧稿；输出修改后的完整一集，明确要求保留的部分尽量原样保留，只改用户指出的剧情。不得无视要求照旧重写。`
-      : '',
+    userRewrite && rewriteMode === 'replace'
+      ? `这是用户指定的整集换稿${rewriteInstruction ? `，必须优先执行补充要求：${rewriteInstruction}` : ''}。请完全从当前分集卡重新创作一份完整新稿；不得复用、改写或猜测旧正文。旧稿只由系统留作失败回退，并未提供给你。`
+      : rewriteInstruction
+        ? `这是用户指定的单集修改，必须优先执行：${rewriteInstruction}。userRewrite.existingEpisodeText 是当前旧稿；输出修改后的完整一集，明确要求保留的部分尽量原样保留，只改用户指出的剧情。不得无视要求照旧重写。`
+        : '',
     boundaryInstruction,
     directLengthInstruction(context),
     '创作资料中的 priorEpisodeHistory 是前面已经演完的剧情：allEpisodeSummaries 覆盖全部前集，recentSceneEvents 补充最近12集细节。只能承接其结果，绝不能换人物、地点或措辞后把其中一场重新演一遍。',

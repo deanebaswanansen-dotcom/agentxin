@@ -93,6 +93,21 @@ describe('ScriptDirectWriting', () => {
     expect(prompt).toContain('△沈清推门进入。');
   });
 
+  it('writes a full replacement without exposing the old episode body', () => {
+    const prompt = buildDirectDraftPrompt({
+      episode: { targetChars: 1_200, dialogueDensityPercent: 60 },
+      userRewrite: {
+        mode: 'replace',
+        instruction: '换成雨夜追车开场，保留本集结尾卡点。',
+      },
+    });
+
+    expect(prompt).toContain('用户指定的整集换稿');
+    expect(prompt).toContain('完全从当前分集卡重新创作');
+    expect(prompt).toContain('旧稿只由系统留作失败回退，并未提供给你');
+    expect(prompt).not.toContain('existingEpisodeText');
+  });
+
   it('tells the lightweight reviewer to reject events reserved for later episode cards', () => {
     const prompt = buildDirectReviewPrompt({
       episode: { endingHook: '公开挑战正式成立' },

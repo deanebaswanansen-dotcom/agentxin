@@ -983,14 +983,14 @@ describe('ScriptWorkspace', () => {
     render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
     await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
     fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
-    fireEvent.click(await screen.findByRole('button', { name: '按要求重写第 3 集' }));
+    fireEvent.click(await screen.findByRole('button', { name: '修改 / 换稿第 3 集' }));
 
     const instruction = screen.getByLabelText('第 3 集修改要求');
-    expect(screen.getByRole('button', { name: '按这个要求重写' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '按这个要求修改' })).toBeDisabled();
     fireEvent.change(instruction, {
       target: { value: '保留前两场，只把第三场改成女主先发现账本，不要再次出现检查人员。' },
     });
-    fireEvent.click(screen.getByRole('button', { name: '按这个要求重写' }));
+    fireEvent.click(screen.getByRole('button', { name: '按这个要求修改' }));
 
     await waitFor(() => expect(client.script.jobs.create).toHaveBeenLastCalledWith({
       projectId: 'project-1',
@@ -1001,9 +1001,64 @@ describe('ScriptWorkspace', () => {
         episodeCount: 1,
         expectedPlanRevision: 2,
         draftMode: 'direct_text',
+        rewriteMode: 'revise',
         rewriteInstruction: '保留前两场，只把第三场改成女主先发现账本，不要再次出现检查人员。',
       },
     }));
+    expect(screen.getByRole('status')).toHaveTextContent('旧稿会保留到新稿成功保存');
+  });
+
+  it('replaces an existing episode without deleting or sending its old body', async () => {
+    const client = createClient();
+    const completedEpisode = buildNumberedEpisode(3, '不应发送给模型的旧正文');
+    Object.assign(client.script, {
+      workspace: {
+        get: vi.fn().mockResolvedValue(buildWorkspaceSnapshot({
+          episodeSummaries: [summarizeEpisode(completedEpisode)],
+          batchSummaries: [{
+            startEpisode: 1,
+            endEpisode: 5,
+            status: 'generating',
+            completedEpisodes: 1,
+            visibleChars: 12,
+            unresolvedHardIssues: 0,
+            unresolvedSoftIssues: 0,
+          }],
+        })),
+      },
+    });
+    vi.mocked(client.script.jobs.create).mockResolvedValue({
+      id: 'replace-episode-3',
+      projectId: 'project-1',
+      task: 'script_episode_batch',
+      status: 'queued',
+      continuable: false,
+    });
+
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
+    fireEvent.click(await screen.findByRole('button', { name: '修改 / 换稿第 3 集' }));
+    fireEvent.click(screen.getByRole('button', { name: '整集换稿' }));
+
+    expect(screen.getByText(/无需删除原正文/)).toBeInTheDocument();
+    const submit = screen.getByRole('button', { name: '生成整集新稿' });
+    expect(submit).toBeEnabled();
+    fireEvent.click(submit);
+
+    await waitFor(() => expect(client.script.jobs.create).toHaveBeenLastCalledWith({
+      projectId: 'project-1',
+      task: 'script_episode_batch',
+      regenerate: true,
+      scriptBatchOptions: {
+        startEpisode: 3,
+        episodeCount: 1,
+        expectedPlanRevision: 2,
+        draftMode: 'direct_text',
+        rewriteMode: 'replace',
+      },
+    }));
+    expect(screen.getByRole('status')).toHaveTextContent('整集换稿');
     expect(screen.getByRole('status')).toHaveTextContent('旧稿会保留到新稿成功保存');
   });
 

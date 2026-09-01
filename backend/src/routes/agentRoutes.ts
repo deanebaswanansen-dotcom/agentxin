@@ -155,6 +155,7 @@ function parseScriptBatchOptions(raw: unknown): AgentRunRequest['scriptBatchOpti
   const episodeCount = asOptionalPositiveInt(value.episodeCount);
   const expectedPlanRevision = asOptionalPositiveInt(value.expectedPlanRevision);
   const draftMode = value.draftMode;
+  const rewriteMode = value.rewriteMode;
   const rewriteInstruction = typeof value.rewriteInstruction === 'string'
     ? value.rewriteInstruction.trim()
     : '';
@@ -173,6 +174,12 @@ function parseScriptBatchOptions(raw: unknown): AgentRunRequest['scriptBatchOpti
   if (rewriteInstruction && episodeCount !== 1) {
     throw ServiceError.validation('自定义修改要求只能用于单独重写一集。');
   }
+  if (rewriteMode !== undefined && rewriteMode !== 'revise' && rewriteMode !== 'replace') {
+    throw ServiceError.validation('单集重写方式必须是 revise 或 replace。');
+  }
+  if (rewriteMode !== undefined && episodeCount !== 1) {
+    throw ServiceError.validation('单集重写方式只能用于单独重写一集。');
+  }
   if (
     draftMode !== undefined &&
     draftMode !== 'structured_legacy' &&
@@ -185,6 +192,7 @@ function parseScriptBatchOptions(raw: unknown): AgentRunRequest['scriptBatchOpti
     episodeCount,
     expectedPlanRevision,
     ...(draftMode ? { draftMode } : {}),
+    ...(rewriteMode ? { rewriteMode } : {}),
     ...(rewriteInstruction ? { rewriteInstruction } : {}),
   };
 }
@@ -232,11 +240,14 @@ export function parseAgentBody(raw: RunAgentBody): AgentRunRequest {
   ) {
     throw ServiceError.validation('只有重写已生成的单集可以从任意集数开始。');
   }
-  if (scriptBatchOptions?.rewriteInstruction && raw.regenerate !== true) {
+  if (
+    (scriptBatchOptions?.rewriteInstruction || scriptBatchOptions?.rewriteMode) &&
+    raw.regenerate !== true
+  ) {
     throw ServiceError.validation('单集修改要求必须与重新写作一起提交。');
   }
   if (
-    scriptBatchOptions?.rewriteInstruction &&
+    (scriptBatchOptions?.rewriteInstruction || scriptBatchOptions?.rewriteMode) &&
     scriptBatchOptions.draftMode === 'structured_legacy'
   ) {
     throw ServiceError.validation('按要求重写单集只支持直接正文模式。');

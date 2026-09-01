@@ -277,6 +277,8 @@
 .script-rewrite-dialog > header span { color: var(--nwa-muted, #796f67); font-size: .75rem; }
 .script-rewrite-dialog h3 { margin: .15rem 0 0; font-size: 1.1rem; }
 .script-rewrite-dialog p { margin: .85rem 0 .55rem; color: var(--nwa-muted, #796f67); line-height: 1.6; }
+.script-rewrite-dialog__modes { display: grid; grid-template-columns: 1fr 1fr; gap: .55rem; margin-top: 1rem; }
+.script-rewrite-dialog__modes .nwa-button[aria-pressed="true"] { border-color: var(--nwa-accent, #7c3aed); background: rgba(124,58,237,.1); color: var(--nwa-accent, #6d28d9); }
 .script-rewrite-dialog textarea { box-sizing: border-box; width: 100%; min-height: 9rem; padding: .75rem; border: 1px solid rgba(122,104,151,.25); border-radius: .6rem; background: #fff; color: inherit; font: inherit; line-height: 1.6; resize: vertical; }
 .script-rewrite-dialog__close { padding: .1rem .35rem; border: 0; background: transparent; color: var(--nwa-muted, #796f67); font-size: 1.35rem; cursor: pointer; }
 .script-rewrite-dialog__count { margin-top: .3rem; color: var(--nwa-muted, #796f67); font-size: .72rem; text-align: right; }

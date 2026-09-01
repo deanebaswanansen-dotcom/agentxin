@@ -3358,6 +3358,52 @@ describe('ScriptDirector', () => {
     expect(draftPrompts[0]).not.toContain('旧详细大纲冲突：保安锁门');
   });
 
+  it('replaces one episode without deleting or exposing its old body before the new draft succeeds', async () => {
+    const state = readySingleEpisodeState();
+    const oldText = '绝密旧正文不能发送给模型。';
+    const oldEpisode: ScriptEpisode = {
+      ...reviewingEpisode(state, oldText.repeat(60), { revision: 3 }),
+      status: 'completed',
+      summary: '旧稿摘要',
+    };
+    state.episodes = [oldEpisode];
+    let draftPrompt = '';
+    let oldBodyPresentDuringDraft = false;
+    const director = new ScriptDirector({
+      model: {
+        async complete(request) {
+          if (request.node === 'draft') {
+            draftPrompt = request.prompt;
+            oldBodyPresentDuringDraft = state.episodes[0]?.revision === 3 &&
+              state.episodes[0]?.scenes.some((scene) => scene.blocks.some((block) => block.text.includes(oldText))) === true;
+            return directScriptText();
+          }
+          if (request.node === 'review') return directReviewJson();
+          throw new Error(`unexpected node: ${request.node}`);
+        },
+      },
+      store: new MemoryScriptStore(state),
+      checkpoints: new InMemoryScriptCheckpointStore(),
+    });
+
+    await expect(director.run({
+      task: 'script_episode_batch',
+      projectId: 'project-1',
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+      regenerate: true,
+      rewriteMode: 'replace',
+    })).resolves.toMatchObject({ kind: 'episode_batch' });
+
+    expect(oldBodyPresentDuringDraft).toBe(true);
+    expect(draftPrompt).toContain('用户指定的整集换稿');
+    expect(draftPrompt).not.toContain(oldText);
+    expect(state.episodes[0]?.revision).toBeGreaterThan(3);
+    expect(state.episodes[0]?.summary).not.toBe('旧稿摘要');
+  });
+
   it('rewrites one existing episode outside a five-episode boundary', async () => {
     const state = readySingleEpisodeState();
     state.plan = approvedPlan(2);
