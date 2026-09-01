@@ -233,7 +233,7 @@ function PlanEditor({
         <label className="script-field script-field--wide">核心冲突<textarea value={value.coreConflict} onChange={(e) => patch('coreConflict', e.target.value)} /></label>
         <label className="script-field script-field--wide">核心亮点（每行一项）<textarea value={value.highlights.join('\n')} onChange={(e) => patch('highlights', e.target.value.split('\n').map((item) => item.trim()).filter(Boolean))} /></label>
         <label className="script-field">总集数<input type="number" min={1} max={200} value={value.totalEpisodes} onChange={(e) => patch('totalEpisodes', Number(e.target.value))} /></label>
-        <label className="script-field">单集目标字数（约±400）<input type="number" min={300} max={3000} value={value.targetCharsPerEpisode} onChange={(e) => patch('targetCharsPerEpisode', Number(e.target.value))} /></label>
+        <label className="script-field">单集目标字数（约±200）<input type="number" min={300} max={3000} value={value.targetCharsPerEpisode} onChange={(e) => patch('targetCharsPerEpisode', Number(e.target.value))} /></label>
         <label className="script-field">对白目标比例（%）<input type="number" min={20} max={90} value={value.dialogueDensityPercent} onChange={(e) => patch('dialogueDensityPercent', Number(e.target.value))} /></label>
         <label className="script-field">单集时长下限（秒）<input type="number" min={30} max={180} value={value.episodeDurationSeconds.min} onChange={(e) => patch('episodeDurationSeconds', { ...value.episodeDurationSeconds, min: Number(e.target.value) })} /></label>
         <label className="script-field">单集时长上限（秒）<input type="number" min={30} max={180} value={value.episodeDurationSeconds.max} onChange={(e) => patch('episodeDurationSeconds', { ...value.episodeDurationSeconds, max: Number(e.target.value) })} /></label>
@@ -365,6 +365,58 @@ const POLLING_JOB_STATUSES = new Set<ScriptAgentJobSnapshot['status']>([
   'running',
   'retrying',
 ]);
+
+type CasSaveOutcome<TSaved, TLatest> =
+  | { kind: 'saved'; saved: TSaved }
+  | { kind: 'local_changed'; latest: TLatest }
+  | { kind: 'retry_blocked'; latest: TLatest; reason: string };
+
+/**
+ * Makes at most two writes. A 409 refreshes the authoritative revision once,
+ * preserves the submitted local value, and retries only when no newer local
+ * edit or caller-specific safety condition blocks it.
+ */
+async function saveWithOneCasConflictRecovery<TSubmitted, TLatest, TSaved>({
+  submitted,
+  expectedRevision,
+  save,
+  loadLatest,
+  editIsCurrent,
+  rebase,
+  latestRevision,
+  retryBlockReason,
+}: {
+  submitted: TSubmitted;
+  expectedRevision: number;
+  save: (value: TSubmitted, revision: number) => Promise<TSaved>;
+  loadLatest: () => Promise<TLatest>;
+  editIsCurrent: () => boolean;
+  rebase: (value: TSubmitted, latest: TLatest) => TSubmitted;
+  latestRevision: (latest: TLatest) => number;
+  retryBlockReason?: (latest: TLatest) => Promise<string | undefined>;
+}): Promise<CasSaveOutcome<TSaved, TLatest>> {
+  try {
+    return { kind: 'saved', saved: await save(submitted, expectedRevision) };
+  } catch (error) {
+    if (!(isApiClientError(error) && error.status === 409)) throw error;
+  }
+
+  const latest = await loadLatest();
+  if (!editIsCurrent()) return { kind: 'local_changed', latest };
+
+  const blocked = await retryBlockReason?.(latest);
+  if (blocked) return { kind: 'retry_blocked', latest, reason: blocked };
+  if (!editIsCurrent()) return { kind: 'local_changed', latest };
+
+  return {
+    kind: 'saved',
+    saved: await save(rebase(submitted, latest), latestRevision(latest)),
+  };
+}
+
+function activeScriptJobs(jobs: ScriptAgentJobSnapshot[]): ScriptAgentJobSnapshot[] {
+  return jobs.filter((job) => POLLING_JOB_STATUSES.has(job.status));
+}
 
 const BLOCKING_JOB_STATUSES = new Set<ScriptAgentJobSnapshot['status']>([
   ...POLLING_JOB_STATUSES,
@@ -1788,10 +1840,53 @@ export function ScriptWorkspace({
   const savePlan = useCallback(async () => {
     if (!data) return;
     const editVersion = resourceEditVersions.current.plan;
+    const submittedPlan = data.plan;
     setBusy(true);
     setNotice('');
     try {
-      const saved = await client.script.plan.save(projectId, data.plan, data.plan.revision);
+      const refreshJobs = async (): Promise<ScriptAgentJobSnapshot[]> => {
+        const jobs = await client.script.jobs.list(projectId);
+        setData((current) => current ? { ...current, jobs } : current);
+        return jobs;
+      };
+      const jobsBeforeSave = await refreshJobs();
+      if (activeScriptJobs(jobsBeforeSave).length > 0) {
+        setNotice('后台短剧任务正在排队或运行，未覆盖任务使用的策划；当前修改已保留，请等任务暂停或结束后再保存');
+        return;
+      }
+      const outcome = await saveWithOneCasConflictRecovery({
+        submitted: submittedPlan,
+        expectedRevision: submittedPlan.revision,
+        save: (value, revision) => client.script.plan.save(projectId, value, revision),
+        loadLatest: () => client.script.plan.get(projectId),
+        editIsCurrent: () => resourceEditVersions.current.plan === editVersion,
+        rebase: (value, latest) => ({
+          ...value,
+          status: latest.status,
+          revision: latest.revision,
+          updatedAt: latest.updatedAt,
+        }),
+        latestRevision: (latest) => latest.revision,
+        retryBlockReason: async () => activeScriptJobs(await refreshJobs()).length > 0
+          ? '后台短剧任务刚刚开始，未覆盖任务使用的策划；当前修改已保留，请等任务暂停或结束后再保存'
+          : undefined,
+      });
+      if (outcome.kind !== 'saved') {
+        setData((current) => current ? {
+          ...current,
+          plan: {
+            ...current.plan,
+            status: outcome.latest.status,
+            revision: outcome.latest.revision,
+            updatedAt: outcome.latest.updatedAt,
+          },
+        } : current);
+        setNotice(outcome.kind === 'retry_blocked'
+          ? outcome.reason
+          : '策划保存时又有新修改，已同步最新版本，请再点一次保存');
+        return;
+      }
+      const saved = outcome.saved;
       const unchangedWhileSaving = resourceEditVersions.current.plan === editVersion;
       if (unchangedWhileSaving) dirtyResources.current.plan = false;
       setData((current) => current ? {
@@ -1815,7 +1910,24 @@ export function ScriptWorkspace({
     setBusy(true);
     setNotice('');
     try {
-      const saved = await client.script.outline.save(projectId, outline, outline.revision);
+      const outcome = await saveWithOneCasConflictRecovery({
+        submitted: outline,
+        expectedRevision: outline.revision,
+        save: (value, revision) => client.script.outline.save(projectId, value, revision),
+        loadLatest: () => client.script.outline.get(projectId),
+        editIsCurrent: () => resourceEditVersions.current.outline === editVersion,
+        rebase: (value, latest) => ({ ...value, revision: latest.revision }),
+        latestRevision: (latest) => latest.revision,
+      });
+      if (outcome.kind !== 'saved') {
+        setData((current) => current ? {
+          ...current,
+          outline: { ...(current.outline ?? emptyOutline(projectId)), revision: outcome.latest.revision },
+        } : current);
+        setNotice('大纲保存时又有新修改，已同步最新版本，请再点一次保存');
+        return;
+      }
+      const saved = outcome.saved;
       const unchangedWhileSaving = resourceEditVersions.current.outline === editVersion;
       if (unchangedWhileSaving) dirtyResources.current.outline = false;
       setData((current) => current ? {
@@ -1835,11 +1947,43 @@ export function ScriptWorkspace({
   const saveCharacters = useCallback(async () => {
     if (!data) return;
     const editVersion = resourceEditVersions.current.characters;
+    const submittedCharacters = data.characters;
+    const revision = submittedCharacters.reduce((max, item) => Math.max(max, item.revision), 0);
     setBusy(true);
     setNotice('');
     try {
-      const revision = data.characters.reduce((max, item) => Math.max(max, item.revision), 0);
-      const saved = await client.script.characters.save(projectId, data.characters, revision);
+      const outcome = await saveWithOneCasConflictRecovery({
+        submitted: submittedCharacters,
+        expectedRevision: revision,
+        save: (value, expectedRevision) => client.script.characters.save(projectId, value, expectedRevision),
+        loadLatest: () => client.script.characters.list(projectId),
+        editIsCurrent: () => resourceEditVersions.current.characters === editVersion,
+        rebase: (value, latest) => {
+          const latestRevision = Math.max(0, ...latest.map((item) => item.revision));
+          const latestById = new Map(latest.map((item) => [item.id, item]));
+          return value.map((item) => ({
+            ...item,
+            revision: latestRevision,
+            updatedAt: latestById.get(item.id)?.updatedAt ?? item.updatedAt,
+          }));
+        },
+        latestRevision: (latest) => Math.max(0, ...latest.map((item) => item.revision)),
+      });
+      if (outcome.kind !== 'saved') {
+        const latestRevision = Math.max(0, ...outcome.latest.map((item) => item.revision));
+        const latestById = new Map(outcome.latest.map((item) => [item.id, item]));
+        setData((current) => current ? {
+          ...current,
+          characters: current.characters.map((item) => ({
+            ...item,
+            revision: latestRevision,
+            updatedAt: latestById.get(item.id)?.updatedAt ?? item.updatedAt,
+          })),
+        } : current);
+        setNotice('角色设定保存时又有新修改，已同步最新版本，请再点一次保存');
+        return;
+      }
+      const saved = outcome.saved;
       const unchangedWhileSaving = resourceEditVersions.current.characters === editVersion;
       if (unchangedWhileSaving) dirtyResources.current.characters = false;
       setData((current) => current ? {
@@ -1866,7 +2010,32 @@ export function ScriptWorkspace({
     setBusy(true);
     setNotice('');
     try {
-      const saved = await client.script.world.save(projectId, world, world.revision);
+      const outcome = await saveWithOneCasConflictRecovery({
+        submitted: world,
+        expectedRevision: world.revision,
+        save: (value, revision) => client.script.world.save(projectId, value, revision),
+        loadLatest: () => client.script.world.get(projectId),
+        editIsCurrent: () => resourceEditVersions.current.world === editVersion,
+        rebase: (value, latest) => ({
+          ...value,
+          revision: latest.revision,
+          updatedAt: latest.updatedAt,
+        }),
+        latestRevision: (latest) => latest.revision,
+      });
+      if (outcome.kind !== 'saved') {
+        setData((current) => current ? {
+          ...current,
+          world: {
+            ...(current.world ?? emptyWorld(projectId)),
+            revision: outcome.latest.revision,
+            updatedAt: outcome.latest.updatedAt,
+          },
+        } : current);
+        setNotice('世界设定保存时又有新修改，已同步最新版本，请再点一次保存');
+        return;
+      }
+      const saved = outcome.saved;
       const unchangedWhileSaving = resourceEditVersions.current.world === editVersion;
       if (unchangedWhileSaving) dirtyResources.current.world = false;
       setData((current) => current ? {
@@ -2214,10 +2383,46 @@ export function ScriptWorkspace({
   const saveEpisode = useCallback(async () => {
     if (!selectedEpisode) return;
     const editVersion = selectedEpisodeEditVersion.current;
+    const submittedEpisode = selectedEpisode;
     setBusy(true);
     setNotice('');
     try {
-      const saved = await client.script.episodes.save(projectId, selectedEpisode.episodeNumber, selectedEpisode, selectedEpisode.revision);
+      const outcome = await saveWithOneCasConflictRecovery({
+        submitted: submittedEpisode,
+        expectedRevision: submittedEpisode.revision,
+        save: (value, revision) => client.script.episodes.save(
+          projectId,
+          submittedEpisode.episodeNumber,
+          value,
+          revision,
+        ),
+        loadLatest: () => client.script.episodes.get(projectId, submittedEpisode.episodeNumber),
+        editIsCurrent: () => selectedEpisodeEditVersion.current === editVersion,
+        rebase: (value, latest) => ({
+          ...value,
+          revision: latest.revision,
+          updatedAt: latest.updatedAt,
+        }),
+        latestRevision: (latest) => latest.revision,
+      });
+      if (outcome.kind !== 'saved') {
+        const latest = outcome.latest;
+        if (selectedEpisodeRef.current?.episodeNumber === submittedEpisode.episodeNumber) {
+          const editorEpisode = {
+            ...selectedEpisodeRef.current,
+            revision: latest.revision,
+            updatedAt: latest.updatedAt,
+          };
+          selectedEpisodeRef.current = editorEpisode;
+          setSelectedEpisode(editorEpisode);
+          setBatchEpisodes((current) => current.map((item) => (
+            item.episodeNumber === editorEpisode.episodeNumber ? editorEpisode : item
+          )));
+        }
+        setNotice(`第 ${submittedEpisode.episodeNumber} 集保存时又有新修改，已同步最新版本，请再点一次保存`);
+        return;
+      }
+      const saved = outcome.saved;
       const summary = summarizeEpisode(saved);
       const sameEpisodeStillSelected = selectedEpisodeRef.current?.episodeNumber === saved.episodeNumber;
       const unchangedWhileSaving = selectedEpisodeEditVersion.current === editVersion;

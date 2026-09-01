@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { ApiClient } from '../api/apiClient.js';
+import { ApiClientError, type ApiClient } from '../api/apiClient.js';
 import type {
   ScriptAgentJobSnapshot,
   ScriptCharacter,
@@ -512,6 +512,76 @@ describe('ScriptWorkspace', () => {
         2,
       );
     });
+    expect(await screen.findByText('策划已保存')).toBeInTheDocument();
+  });
+
+  it('refreshes a stale plan revision and retries saving once without losing the episode-count edit', async () => {
+    const client = createClient();
+    const conflict = new ApiClientError({
+      error: { code: 'CONFLICT', message: '数据已被其他任务更新' },
+    }, 409);
+    vi.mocked(client.script.plan.save)
+      .mockRejectedValueOnce(conflict)
+      .mockImplementationOnce((_projectId, value) => Promise.resolve({ ...value, revision: 5 }));
+    vi.mocked(client.script.plan.get)
+      .mockResolvedValueOnce(buildPlan())
+      .mockResolvedValueOnce({
+        ...buildPlan(),
+        status: 'locked',
+        revision: 4,
+        updatedAt: '2026-08-15T00:02:00.000Z',
+      });
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    fireEvent.change(await screen.findByLabelText('总集数'), { target: { value: '36' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存策划' }));
+
+    await waitFor(() => expect(client.script.plan.save).toHaveBeenCalledTimes(2));
+    expect(client.script.plan.get).toHaveBeenCalledWith('project-1');
+    expect(client.script.plan.save).toHaveBeenNthCalledWith(
+      2,
+      'project-1',
+      expect.objectContaining({ totalEpisodes: 36, status: 'locked', revision: 4 }),
+      4,
+    );
+    expect(await screen.findByText('策划已保存')).toBeInTheDocument();
+  });
+
+  it('keeps plan edits unsaved while a background script job is queued or running', async () => {
+    const client = createClient();
+    vi.mocked(client.script.jobs.list)
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{
+        id: 'job-running', projectId: 'project-1', task: 'script_episode_batch',
+        status: 'running', continuable: false,
+      }]);
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    const title = await screen.findByLabelText('剧本名称');
+    fireEvent.change(title, { target: { value: '任务期间不能覆盖的策划' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存策划' }));
+
+    expect(await screen.findByText(/后台短剧任务正在排队或运行/)).toBeInTheDocument();
+    expect(title).toHaveValue('任务期间不能覆盖的策划');
+    expect(client.script.plan.save).not.toHaveBeenCalled();
+  });
+
+  it('allows saving a plan when the only background job is waiting for the user', async () => {
+    const client = createClient();
+    vi.mocked(client.script.jobs.list)
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{
+        id: 'job-waiting', projectId: 'project-1', task: 'script_episode_batch',
+        status: 'waiting_user', continuable: true,
+      }]);
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    fireEvent.change(await screen.findByLabelText('剧本名称'), { target: { value: '暂停后可以保存' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存策划' }));
+
+    await waitFor(() => expect(client.script.plan.save).toHaveBeenCalledWith(
+      'project-1', expect.objectContaining({ title: '暂停后可以保存' }), 2,
+    ));
     expect(await screen.findByText('策划已保存')).toBeInTheDocument();
   });
 
@@ -1300,6 +1370,32 @@ describe('ScriptWorkspace', () => {
     ));
   });
 
+  it('rebases a locally edited outline on the latest revision and retries a 409 once', async () => {
+    const client = createClient();
+    const original = buildOutline('服务器旧大纲');
+    const latest = { ...original, synopsis: '后台刚保存的大纲', revision: 6 };
+    const conflict = new ApiClientError({ error: { code: 'CONFLICT', message: '版本冲突' } }, 409);
+    vi.mocked(client.script.outline.get)
+      .mockResolvedValueOnce(original)
+      .mockResolvedValueOnce(latest);
+    vi.mocked(client.script.outline.save)
+      .mockRejectedValueOnce(conflict)
+      .mockImplementationOnce((_projectId, value) => Promise.resolve({ ...value, revision: 7 }));
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '剧本大纲' }));
+    fireEvent.click(screen.getByRole('button', { name: '编辑模式' }));
+    fireEvent.change(screen.getByLabelText('全剧梗概'), { target: { value: '必须保留的本地新大纲' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存大纲' }));
+
+    await waitFor(() => expect(client.script.outline.save).toHaveBeenCalledTimes(2));
+    expect(client.script.outline.save).toHaveBeenNthCalledWith(
+      2, 'project-1', expect.objectContaining({ synopsis: '必须保留的本地新大纲', revision: 6 }), 6,
+    );
+    expect(await screen.findByText('大纲已保存')).toBeInTheDocument();
+  });
+
   it('locally rejects an incomplete character, then saves every canonical field from the editor', async () => {
     const client = createClient();
     vi.mocked(client.script.characters.save).mockImplementation((_projectId, items) => Promise.resolve(items));
@@ -1461,6 +1557,47 @@ describe('ScriptWorkspace', () => {
     ));
   });
 
+  it('rebases characters and world settings on their latest revisions after 409 conflicts', async () => {
+    const client = createClient();
+    const character = buildCharacter('服务器旧角色');
+    const latestCharacter = { ...character, name: '后台新角色', revision: 5 };
+    const world = buildWorld('服务器旧时代');
+    const latestWorld = { ...world, era: '后台新时代', revision: 6 };
+    const conflict = () => new ApiClientError({ error: { code: 'CONFLICT', message: '版本冲突' } }, 409);
+    vi.mocked(client.script.characters.list)
+      .mockResolvedValueOnce([character])
+      .mockResolvedValueOnce([latestCharacter]);
+    vi.mocked(client.script.characters.save)
+      .mockRejectedValueOnce(conflict())
+      .mockImplementationOnce((_projectId, items) => Promise.resolve(items.map((item) => ({ ...item, revision: 6 }))));
+    vi.mocked(client.script.world.get)
+      .mockResolvedValueOnce(world)
+      .mockResolvedValueOnce(latestWorld);
+    vi.mocked(client.script.world.save)
+      .mockRejectedValueOnce(conflict())
+      .mockImplementationOnce((_projectId, value) => Promise.resolve({ ...value, revision: 7 }));
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '角色设定' }));
+    fireEvent.click(screen.getByRole('button', { name: '编辑模式' }));
+    fireEvent.change(screen.getByLabelText('角色姓名 1'), { target: { value: '本地新角色' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存角色设定' }));
+    await waitFor(() => expect(client.script.characters.save).toHaveBeenCalledTimes(2));
+    expect(client.script.characters.save).toHaveBeenNthCalledWith(
+      2, 'project-1', expect.arrayContaining([expect.objectContaining({ name: '本地新角色', revision: 5 })]), 5,
+    );
+
+    fireEvent.click(screen.getByRole('tab', { name: '世界设定' }));
+    fireEvent.click(screen.getByRole('button', { name: '编辑模式' }));
+    fireEvent.change(screen.getByLabelText('时代'), { target: { value: '本地新时代' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存世界设定' }));
+    await waitFor(() => expect(client.script.world.save).toHaveBeenCalledTimes(2));
+    expect(client.script.world.save).toHaveBeenNthCalledWith(
+      2, 'project-1', expect.objectContaining({ era: '本地新时代', revision: 6 }), 6,
+    );
+  });
+
   it('opens a generated episode, edits a script block, and saves its revision', async () => {
     const client = createClient();
     vi.mocked(client.script.episodes.list).mockResolvedValue([{
@@ -1491,6 +1628,82 @@ describe('ScriptWorkspace', () => {
       'project-1', 1, expect.objectContaining({ scenes: [expect.objectContaining({ blocks: [expect.objectContaining({ text: ' 新 动作\n' })] })] }), 7,
     ));
     await waitFor(() => expect(screen.getAllByText('3 字').length).toBeGreaterThan(0));
+  });
+
+  it('rebases an edited episode on the latest revision and retries a 409 once', async () => {
+    const client = createClient();
+    const oldEpisode = buildEpisode('服务器旧正文', 7);
+    const latestEpisode = { ...oldEpisode, revision: 8, updatedAt: '2026-08-15T00:02:00.000Z' };
+    const conflict = new ApiClientError({ error: { code: 'CONFLICT', message: '版本冲突' } }, 409);
+    vi.mocked(client.script.episodes.list).mockResolvedValue([summarizeEpisode(oldEpisode)]);
+    vi.mocked(client.script.episodes.get)
+      .mockResolvedValueOnce(oldEpisode)
+      .mockResolvedValueOnce(oldEpisode)
+      .mockResolvedValueOnce(latestEpisode);
+    vi.mocked(client.script.episodes.save)
+      .mockRejectedValueOnce(conflict)
+      .mockImplementationOnce((_projectId, _episodeNumber, value) => Promise.resolve({ ...value, revision: 9 }));
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
+    fireEvent.click(await screen.findByRole('button', { name: '编辑本集' }));
+    fireEvent.change(await screen.findByLabelText('第 1 集场景 1 块 1'), {
+      target: { value: '冲突后仍要保存的本地正文' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '保存第 1 集' }));
+
+    await waitFor(() => expect(client.script.episodes.save).toHaveBeenCalledTimes(2));
+    expect(client.script.episodes.save).toHaveBeenNthCalledWith(
+      2, 'project-1', 1,
+      expect.objectContaining({
+        revision: 8,
+        scenes: [expect.objectContaining({ blocks: [expect.objectContaining({ text: '冲突后仍要保存的本地正文' })] })],
+      }),
+      8,
+    );
+    expect(await screen.findByText('第 1 集已保存')).toBeInTheDocument();
+  });
+
+  it('does not retry a stale episode save when the user edits again during conflict refresh', async () => {
+    const client = createClient();
+    const oldEpisode = buildEpisode('服务器旧正文', 7);
+    const latestEpisode = { ...oldEpisode, revision: 8, updatedAt: '2026-08-15T00:02:00.000Z' };
+    const conflict = new ApiClientError({ error: { code: 'CONFLICT', message: '版本冲突' } }, 409);
+    let resolveLatest!: (episode: ScriptEpisode) => void;
+    vi.mocked(client.script.episodes.list).mockResolvedValue([summarizeEpisode(oldEpisode)]);
+    vi.mocked(client.script.episodes.get)
+      .mockResolvedValueOnce(oldEpisode)
+      .mockResolvedValueOnce(oldEpisode)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveLatest = resolve; }));
+    vi.mocked(client.script.episodes.save)
+      .mockRejectedValueOnce(conflict)
+      .mockImplementationOnce((_projectId, _episodeNumber, value) => Promise.resolve({ ...value, revision: 9 }));
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
+    fireEvent.click(await screen.findByRole('button', { name: '编辑本集' }));
+    const editor = await screen.findByLabelText('第 1 集场景 1 块 1');
+    fireEvent.change(editor, { target: { value: '第一次本地修改' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存第 1 集' }));
+    await waitFor(() => expect(client.script.episodes.get).toHaveBeenCalledTimes(3));
+    fireEvent.change(editor, { target: { value: '冲突刷新期间的更新修改' } });
+    await act(async () => { resolveLatest(latestEpisode); });
+
+    expect(client.script.episodes.save).toHaveBeenCalledTimes(1);
+    expect(editor).toHaveValue('冲突刷新期间的更新修改');
+    expect(screen.getByText(/保存时又有新修改，已同步最新版本/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '保存第 1 集' }));
+    await waitFor(() => expect(client.script.episodes.save).toHaveBeenCalledTimes(2));
+    expect(client.script.episodes.save).toHaveBeenNthCalledWith(
+      2, 'project-1', 1,
+      expect.objectContaining({
+        revision: 8,
+        scenes: [expect.objectContaining({ blocks: [expect.objectContaining({ text: '冲突刷新期间的更新修改' })] })],
+      }),
+      8,
+    );
   });
 
   it('deletes a screenplay row together with its speaker and saves the remaining blocks', async () => {

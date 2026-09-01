@@ -615,6 +615,8 @@ interface ScriptDraftExpansion {
 const SCRIPT_DRAFT_PREFERRED_MIN_RATIO = 0.75;
 const SCRIPT_DRAFT_MAX_CONTINUATIONS = 1;
 const SCRIPT_DRAFT_CONTINUATION_MAX_CHARS = 700;
+const SCRIPT_DIRECT_REWRITE_MAX_FORMAT_ATTEMPTS = 2;
+const SCRIPT_DIRECT_TEXT_MAX_CONTINUATIONS = 1;
 const SCRIPT_SANITY_REVIEW_MAX_ISSUES = 3;
 const SCRIPT_SANITY_REVIEW_CODES = new Set([
   'CHARACTER_PRESENCE',
@@ -2920,7 +2922,7 @@ export class ScriptDirector {
             outline.plannedScenes.length,
             plan.dialogueDensityPercent,
           ),
-          `所有 blocks.text 去除空白后的总字符数以 ${plan.targetCharsPerEpisode} 为目标，尽量在上下浮动约 400 字内完成；优先保留关键冲突、行动过程与结尾卡点。任何情况下都必须写完句子，不得用省略号代替被截掉的正文。`,
+          `所有 blocks.text 去除空白后的总字符数以 ${plan.targetCharsPerEpisode} 为目标，必须控制在 ${scriptEpisodeLengthRange(plan.targetCharsPerEpisode).minimum}—${scriptEpisodeLengthRange(plan.targetCharsPerEpisode).maximum} 字；优先保留关键冲突、行动过程与结尾卡点。任何情况下都必须写完句子，不得用省略号代替被截掉的正文。`,
           scriptCreativeWritingInstruction(plan),
           `对白只能使用这些已登记人物：${JSON.stringify(state.characters.map((character) => ({ id: character.id, name: character.name })))}`,
           this.assembleEpisodeContext(state, plan, outline, episodeNumber),
@@ -4079,6 +4081,10 @@ export class ScriptDirector {
     const { request, state, plan, outline, runKey, configRevision, recordStructuredCall } = input;
     const episodeNumber = outline.episodeNumber;
     const currentEpisode = state.episodes.find((episode) => episode.episodeNumber === episodeNumber);
+    const explicitRewrite = Boolean(request.regenerate && currentEpisode);
+    const maxDirectDraftCalls = explicitRewrite
+      ? SCRIPT_DIRECT_REWRITE_MAX_FORMAT_ATTEMPTS
+      : 1;
     const baseEpisodeRevision = currentEpisode?.revision ?? 0;
     const inputRevisionRefs = buildScriptInputRevisionRefs(state, episodeNumber);
     const outlineRef = buildScriptUpstreamArtifactRef('episode_outline', outline.revision, outline);
@@ -4180,6 +4186,42 @@ export class ScriptDirector {
       })),
     });
 
+    const saveRejectedDirectDraftCheckpoint = async (input: {
+      artifact: unknown;
+      attempt: number;
+      message: string;
+    }): Promise<number> => {
+      const artifactRevision = await this.nextCheckpointArtifactRevision(
+        request.projectId,
+        runKey,
+        { node: 'direct_draft', episodeNumber },
+      );
+      await this.saveCheckpoint(request, {
+        projectId: request.projectId,
+        runKey,
+        node: 'direct_draft',
+        status: 'needs_review',
+        attempt: input.attempt,
+        artifactRevision,
+        episodeNumber,
+        artifact: input.artifact,
+        inputRevisionRefs,
+        upstreamArtifactRefs: [outlineRef],
+        promptVersion,
+        configRevision,
+        inputFingerprint: draftFingerprint,
+        validationErrors: [{
+          code: 'DIRECT_DRAFT_REJECTED',
+          message: redactStructuredValidationMessage(
+            'DIRECT_DRAFT_REJECTED',
+            input.message,
+          ),
+        }],
+        updatedAt: this.now(),
+      }, `第 ${episodeNumber} 集候选未替换旧稿；从检查点继续会重新生成。`);
+      return artifactRevision;
+    };
+
     const decodeDraftArtifact = (
       value: unknown,
       expectedStage: ScriptDirectDraftArtifact['stage'],
@@ -4214,6 +4256,7 @@ export class ScriptDirector {
     let draftWarnings: ReturnType<typeof parseChineseShortDramaText>['warnings'] = [];
     let directDraftRevision: number | undefined;
     let writerCallsUsed = 0;
+    let directRecoveryAttempt = 0;
     let rejectedDirectDraft: ScriptPipelineCheckpoint | undefined;
     const storedDirectDraft = await this.latestCheckpoint(
       request.projectId,
@@ -4267,6 +4310,7 @@ export class ScriptDirector {
         : request.resumeRejectedCandidates
           ? 1
           : 0;
+      directRecoveryAttempt = recoveryAttempt;
       const directDraftPrompt = recoveryAttempt > 0
         ? [
             `显式恢复重写（第 ${recoveryAttempt} 次）：上一份正文和排版修正结果都无法识别。`,
@@ -4279,27 +4323,64 @@ export class ScriptDirector {
             buildDirectDraftPrompt(context),
           ].join('\n')
         : buildDirectDraftPrompt(context);
-      let providerFailureMessage = '';
-      try {
-        rawText = await this.dependencies.model.complete({
-          node: 'draft',
-          projectId: request.projectId,
-          episodeNumber,
-          prompt: directDraftPrompt,
-          responseFormat: 'text',
-          signal: request.signal,
-        });
-      } catch (error) {
-        if (request.signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw error;
-        providerFailureMessage = error instanceof Error ? error.message : String(error);
-        rawText = '';
+      let parsed = parseCandidate('');
+      let callsUsed = 0;
+      let lastAttemptFailureReason: string | undefined;
+      while (callsUsed < maxDirectDraftCalls && !parsed.episode) {
+        const isStrictRetry = callsUsed > 0;
+        const prompt = isStrictRetry
+          ? [
+              '单集重写格式恢复：上一轮没有返回可保存的完整正文。',
+              '请重新写完整一集，不要解释原因，不得只返回摘要、JSON、提纲或省略号占位。',
+              '必须严格用下面三行开头：',
+              `第${episodeNumber}集`,
+              `${episodeNumber}-1 地点 日/内`,
+              '人物：角色名',
+              '后续每句对白写成“角色名：完整台词”，动作行以“△”开头。',
+              '',
+              buildDirectDraftPrompt(context),
+            ].join('\n')
+          : directDraftPrompt;
+        callsUsed += 1;
+        let providerFailureMessage: string | undefined;
+        try {
+          rawText = await this.dependencies.model.complete({
+            node: 'draft',
+            projectId: request.projectId,
+            episodeNumber,
+            prompt,
+            responseFormat: 'text',
+            signal: request.signal,
+          });
+        } catch (error) {
+          if (request.signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw error;
+          providerFailureMessage = error instanceof Error ? error.message : String(error);
+          rawText = '';
+        }
+        parsed = parseCandidate(rawText);
+        if (!parsed.episode) {
+          const unparsed = parsed.unparsedLines.at(-1);
+          lastAttemptFailureReason = providerFailureMessage
+            ?? parsed.warnings.at(-1)?.message
+            ?? (unparsed ? `第 ${unparsed.line} 行无法识别：${unparsed.text}` : undefined);
+        }
       }
-      let parsed = parseCandidate(rawText);
-      const callsUsed = 1;
       if (!parsed.episode) {
-        if (request.regenerate && currentEpisode) {
+        if (explicitRewrite) {
+          recordCall('draft', 'ChineseShortDramaText@v1', callsUsed, 'needs_review');
+          await saveRejectedDirectDraftCheckpoint({
+            artifact: {
+              schemaVersion: 1,
+              stage: 'direct_draft_rejected',
+              recoveryAttempt,
+              failureReason: lastAttemptFailureReason ?? '模型没有返回可识别的完整正文。',
+              createdAt: this.now(),
+            },
+            attempt: callsUsed,
+            message: lastAttemptFailureReason ?? '模型没有返回可识别的完整正文。',
+          });
           throw new ScriptModelOutputError(
-            `第 ${episodeNumber} 集重新写作没有返回可识别正文，已完整保留旧稿；可再次点击重新写。`,
+            `第 ${episodeNumber} 集重新写作已自动尝试 ${callsUsed} 次，但仍未返回可识别的完整正文，已完整保留旧稿${lastAttemptFailureReason ? `；最后一次失败原因：${lastAttemptFailureReason}` : ''}。`,
           );
         }
         const localDraft = createMinimalDirectDraftFallback(
@@ -4315,8 +4396,8 @@ export class ScriptDirector {
           revision: baseEpisodeRevision,
           createdAt: currentEpisode?.createdAt ?? localDraft.createdAt,
         });
-        const fallbackMessage = providerFailureMessage
-          ? `正文模型调用失败，已保存本地可编辑分场稿：${providerFailureMessage}`
+        const fallbackMessage = lastAttemptFailureReason
+          ? `正文模型调用失败，已保存本地可编辑分场稿：${lastAttemptFailureReason}`
           : '正文模型未返回可见正文，已保存本地可编辑分场稿。';
         rawText = directEpisodeText(fallback, state.characters);
         parsed = {
@@ -4384,7 +4465,12 @@ export class ScriptDirector {
     let currentCandidateRef = directDraftRef;
     const episodeUpstreamRefs: ScriptUpstreamArtifactRef[] = [outlineRef, directDraftRef];
     const continuationThreshold = Math.max(150, Math.round(plan.targetCharsPerEpisode * 0.58));
-    if (writerCallsUsed <= 1 && scriptVisibleChars(draft) < continuationThreshold) {
+    const maxDirectDraftAndContinuationCalls = maxDirectDraftCalls +
+      SCRIPT_DIRECT_TEXT_MAX_CONTINUATIONS;
+    if (
+      writerCallsUsed < maxDirectDraftAndContinuationCalls &&
+      scriptVisibleChars(draft) < continuationThreshold
+    ) {
       const continuationPromptVersion = 'direct-continuation-v6';
       const continuationFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'continuation',
@@ -4436,6 +4522,7 @@ export class ScriptDirector {
             text: '',
           });
         }
+        writerCallsUsed += 1;
         recordCall('draft', 'ChineseShortDramaContinuation@v1', 1);
         const addition = parseCandidate(additionText);
         if (addition.episode) {
@@ -4488,6 +4575,27 @@ export class ScriptDirector {
         continued,
       );
       episodeUpstreamRefs.push(currentCandidateRef);
+    }
+
+    if (explicitRewrite && scriptVisibleChars(draft) < continuationThreshold) {
+      const rejectedArtifact = {
+        schemaVersion: 1 as const,
+        stage: 'direct_draft' as const,
+        rawText,
+        episode: draft,
+        candidateHash: computeScriptEpisodeCandidateHash(draft),
+        parseWarnings: draftWarnings,
+        recoveryAttempt: directRecoveryAttempt,
+        createdAt: this.now(),
+      } satisfies ScriptDirectDraftArtifact & { recoveryAttempt: number };
+      await saveRejectedDirectDraftCheckpoint({
+        artifact: rejectedArtifact,
+        attempt: writerCallsUsed,
+        message: `正文只有 ${scriptVisibleChars(draft)} 个可见字符，仍低于安全续写阈值 ${continuationThreshold}。`,
+      });
+      throw new ScriptModelOutputError(
+        `第 ${episodeNumber} 集重新写作在 ${maxDirectDraftCalls} 次格式尝试和最多 ${SCRIPT_DIRECT_TEXT_MAX_CONTINUATIONS} 次自然续写后仍明显偏短，已完整保留旧稿。`,
+      );
     }
 
     const reviewPromptVersion = 'direct-handoff-review-v7';

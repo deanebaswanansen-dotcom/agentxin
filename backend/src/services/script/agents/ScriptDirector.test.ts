@@ -2086,6 +2086,8 @@ describe('ScriptDirector', () => {
             expect(request.prompt).toContain('未登记的路人、记者、警察');
             expect(request.prompt).toContain('同一证据、照片、电话或动作在本集只能首次发现一次');
             expect(request.prompt).toContain('触发—反应—结果');
+            expect(request.prompt).toContain('1000—1400 字');
+            expect(request.prompt).not.toContain('上下浮动约 400');
             return JSON.stringify({
               episodeNumber: 1,
               title: '第一集',
@@ -3061,8 +3063,9 @@ describe('ScriptDirector', () => {
     }];
     const originalEpisode = structuredClone(oldEpisode);
     const originalIssues = structuredClone(state.reviewIssues);
+    let draftCalls = 0;
     const director = new ScriptDirector({
-      model: { complete: async () => '' },
+      model: { complete: async () => { draftCalls += 1; return ''; } },
       store: new MemoryScriptStore(state),
       checkpoints: new InMemoryScriptCheckpointStore(),
     });
@@ -3080,6 +3083,215 @@ describe('ScriptDirector', () => {
     expect(state.episodes).toEqual([originalEpisode]);
     expect(state.reviewRevision).toBe(1);
     expect(state.reviewIssues).toEqual(originalIssues);
+    expect(draftCalls).toBe(2);
+  });
+
+  it('automatically retries an unrecognized explicit rewrite once with strict screenplay formatting', async () => {
+    const state = readySingleEpisodeState();
+    state.episodes = [{
+      ...reviewingEpisode(state, '旧正文必须在新稿成功前保留。'.repeat(20), { revision: 3 }),
+      status: 'completed',
+      summary: '旧稿摘要',
+    }];
+    const draftPrompts: string[] = [];
+    const director = new ScriptDirector({
+      model: {
+        async complete(request) {
+          if (request.node === 'draft') {
+            draftPrompts.push(request.prompt);
+            return draftPrompts.length === 1 ? '' : directScriptText();
+          }
+          if (request.node === 'review') return directReviewJson();
+          throw new Error(`unexpected node: ${request.node}`);
+        },
+      },
+      store: new MemoryScriptStore(state),
+      checkpoints: new InMemoryScriptCheckpointStore(),
+    });
+
+    await director.run({
+      task: 'script_episode_batch',
+      projectId: 'project-1',
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+      regenerate: true,
+    });
+
+    expect(draftPrompts).toHaveLength(2);
+    expect(draftPrompts[1]).toContain('单集重写格式恢复');
+    expect(draftPrompts[1]).toContain('第1集\n1-1 地点 日/内\n人物：角色名');
+    expect(state.episodes[0]?.summary).not.toBe('旧稿摘要');
+    expect(state.episodes[0]?.revision).toBeGreaterThan(3);
+  });
+
+  it('continues a short strict-retry draft once before replacing the old episode', async () => {
+    const state = readySingleEpisodeState();
+    state.plan = { ...state.plan!, targetCharsPerEpisode: 1_200 };
+    state.episodes = [{
+      ...reviewingEpisode(state, '旧正文必须在完整新稿成功前保留。'.repeat(70), { revision: 3 }),
+      status: 'completed',
+      summary: '旧稿摘要',
+    }];
+    const draftPrompts: string[] = [];
+    const director = new ScriptDirector({
+      model: {
+        async complete(request) {
+          if (request.node === 'review') return directReviewJson();
+          if (request.node !== 'draft') throw new Error(`unexpected node: ${request.node}`);
+          draftPrompts.push(request.prompt);
+          if (draftPrompts.length === 1) return '';
+          if (draftPrompts.length === 2) {
+            return directScriptText({ actionChars: 90, dialogueChars: 110 });
+          }
+          return [
+            '1-1 校报社 日/内',
+            '人物：沈清',
+            `△${'沈清沿着时间戳继续核对每一页采访记录。'.repeat(50).slice(0, 450)}`,
+            `沈清：${'证据链已经补齐，现在必须让所有人看见真相。'.repeat(50).slice(0, 550)}`,
+          ].join('\n');
+        },
+      },
+      store: new MemoryScriptStore(state),
+      checkpoints: new InMemoryScriptCheckpointStore(),
+    });
+
+    const result = await director.run({
+      task: 'script_episode_batch',
+      projectId: 'project-1',
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+      regenerate: true,
+    });
+
+    expect(result.kind).toBe('episode_batch');
+    if (result.kind !== 'episode_batch') throw new Error('unexpected result');
+    expect(result.callSummary).toMatchObject({
+      totalCalls: 4,
+      byNode: { draft: 3, review: 1 },
+      byEpisode: [{ episodeNumber: 1, calls: 4 }],
+    });
+    expect(draftPrompts).toHaveLength(3);
+    expect(draftPrompts[1]).toContain('单集重写格式恢复');
+    expect(draftPrompts[2]).toContain('从现有结尾自然继续');
+    const saved = state.episodes[0]!;
+    const visibleChars = saved.scenes
+      .flatMap((scene) => scene.blocks)
+      .map((block) => block.text)
+      .join('')
+      .replace(/\s/gu, '')
+      .length;
+    expect(visibleChars).toBeGreaterThanOrEqual(1_000);
+    expect(visibleChars).toBeLessThanOrEqual(1_400);
+    expect(saved.summary).not.toBe('旧稿摘要');
+    expect(saved.revision).toBeGreaterThan(3);
+  });
+
+  it('reports the final rewrite attempt failure and keeps the old episode', async () => {
+    const state = readySingleEpisodeState();
+    const oldEpisode: ScriptEpisode = {
+      ...reviewingEpisode(state, '这是必须保留的旧正文。'.repeat(20), { revision: 3 }),
+      status: 'completed',
+      summary: '旧稿摘要',
+    };
+    state.episodes = [oldEpisode];
+    const originalEpisode = structuredClone(oldEpisode);
+    let draftCalls = 0;
+    const director = new ScriptDirector({
+      model: {
+        async complete() {
+          draftCalls += 1;
+          throw new Error(draftCalls === 1 ? '第一次暂时失败' : '第二次最终失败');
+        },
+      },
+      store: new MemoryScriptStore(state),
+      checkpoints: new InMemoryScriptCheckpointStore(),
+    });
+
+    await expect(director.run({
+      task: 'script_episode_batch',
+      projectId: 'project-1',
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+      regenerate: true,
+    })).rejects.toMatchObject({
+      code: 'SCRIPT_MODEL_OUTPUT_INVALID',
+      message: expect.stringContaining('最后一次失败原因：第二次最终失败'),
+    });
+
+    expect(draftCalls).toBe(2);
+    expect(state.episodes).toEqual([originalEpisode]);
+  });
+
+  it('keeps the old episode when the strict retry and its only continuation remain clearly short', async () => {
+    const state = readySingleEpisodeState();
+    state.plan = { ...state.plan!, targetCharsPerEpisode: 1_200 };
+    const oldEpisode: ScriptEpisode = {
+      ...reviewingEpisode(state, '这是必须保留的完整旧正文。'.repeat(70), { revision: 3 }),
+      status: 'completed',
+      summary: '旧稿摘要',
+    };
+    state.episodes = [oldEpisode];
+    const originalEpisode = structuredClone(oldEpisode);
+    const checkpoints = new InMemoryScriptCheckpointStore();
+    let draftCalls = 0;
+    const draftPrompts: string[] = [];
+    const director = new ScriptDirector({
+      model: {
+        async complete(request) {
+          if (request.node !== 'draft') throw new Error(`unexpected node: ${request.node}`);
+          draftCalls += 1;
+          draftPrompts.push(request.prompt);
+          if (draftCalls === 1) return '';
+          if (draftCalls === 2) return directScriptText({ actionChars: 80, dialogueChars: 100 });
+          return directScriptText({ actionChars: 45, dialogueChars: 55 });
+        },
+      },
+      store: new MemoryScriptStore(state),
+      checkpoints,
+    });
+
+    const request = {
+      task: 'script_episode_batch',
+      projectId: 'project-1',
+      startEpisode: 1,
+      episodeCount: 1,
+      expectedPlanRevision: 1,
+      draftMode: 'direct_text',
+      regenerate: true,
+    } as const;
+    await expect(director.run(request)).rejects.toMatchObject({
+      code: 'SCRIPT_MODEL_OUTPUT_INVALID',
+      message: expect.stringContaining('最多 1 次自然续写后仍明显偏短'),
+    });
+
+    expect(draftCalls).toBe(3);
+    expect(state.episodes).toEqual([originalEpisode]);
+    let rejected = (await checkpoints.list('project-1', 'script_episode_batch:1:1'))
+      .filter((checkpoint) => checkpoint.node === 'direct_draft')
+      .sort((left, right) => right.artifactRevision - left.artifactRevision)[0];
+    expect(rejected).toMatchObject({ status: 'needs_review' });
+    expect(rejected?.artifact).toMatchObject({ recoveryAttempt: 0 });
+
+    await expect(director.run({ ...request, resumeRejectedCandidates: true }))
+      .rejects.toMatchObject({
+        code: 'SCRIPT_MODEL_OUTPUT_INVALID',
+        message: expect.stringContaining('最多 1 次自然续写后仍明显偏短'),
+      });
+
+    expect(draftCalls).toBe(5);
+    expect(draftPrompts[3]).toContain('显式恢复重写（第 1 次）');
+    expect(state.episodes).toEqual([originalEpisode]);
+    rejected = (await checkpoints.list('project-1', 'script_episode_batch:1:1'))
+      .filter((checkpoint) => checkpoint.node === 'direct_draft')
+      .sort((left, right) => right.artifactRevision - left.artifactRevision)[0];
+    expect(rejected).toMatchObject({ status: 'needs_review' });
+    expect(rejected?.artifact).toMatchObject({ recoveryAttempt: 1 });
   });
 
   it('uses the current series card and user instruction instead of blindly repeating an old episode', async () => {
