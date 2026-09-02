@@ -220,6 +220,67 @@ function phaseFor(plan: ScriptPlan, episodeNumber: number): string {
   return '结局兑现';
 }
 
+const OUTLINE_FALLBACK_BEATS = [
+  ['异状落地', '让异常造成一项无法回避的现实损失', '一件能追溯损失来源的物证出现'],
+  ['目标锁定', '从混乱信息中锁定当下必须解决的具体目标', '目标背后牵出一个更难处理的关联人'],
+  ['线索核验', '用行动核验已有线索的真伪并排除一个误判', '被排除的误判反而暴露出人为遮掩'],
+  ['对手试探', '主动试探对手底线并观察其异常反应', '对手突然改变策略，抢先封住一条路'],
+  ['证人争取', '争取关键知情者开口并处理其现实顾虑', '知情者刚准备交代就遭到外部干预'],
+  ['证据保全', '抢在证据被毁前完成保存、转移或公开留痕', '保全的材料里出现一处不该存在的细节'],
+  ['公开质疑', '把私人怀疑变成可当面对质的问题', '对方拿出一份表面完整的反证'],
+  ['反咬受挫', '承受对手反咬并找出指控中的逻辑缺口', '缺口指向主角身边一个未表态的人'],
+  ['关系裂缝', '处理盟友之间因利益或隐瞒产生的裂缝', '一名盟友作出出人意料的选择'],
+  ['关键转移', '转移关键人物或物件，打破对手原有布置', '转移途中出现只有内鬼才知道的阻截'],
+  ['诱敌露底', '设置一个可控诱饵迫使对手提前行动', '对手虽然上钩，却留下更危险的后手'],
+  ['主动权争夺', '利用新信息抢回一次谈判或行动主动权', '胜利条件被临时改变，主角必须重新选择'],
+  ['假象拆穿', '拆穿一条看似完整的假线索及其制造目的', '假象背后露出真正受益者的痕迹'],
+  ['立场逼问', '逼迫摇摆人物在公开场合明确站队', '站队结果让原有同盟关系彻底改写'],
+  ['代价兑现', '让主角为此前选择承担具体代价但不放弃目标', '这份代价换来一个只有主角能利用的机会'],
+  ['规则反击', '利用规则、流程或公开监督反制暗箱操作', '规则执行者中有人突然阻止程序继续'],
+  ['身份揭层', '揭开一层身份或关系真相并重估人物动机', '新身份与早先一处细节发生矛盾'],
+  ['链条锁定', '把分散的人证物证串成可验证的因果链', '因果链还缺最后一环，而持有者主动现身'],
+  ['正面对决', '把核心矛盾推入无法回避的正面对决', '对决现场出现足以改变胜负的新变量'],
+  ['阶段兑现', '兑现本阶段目标并把结果转化为下一步优势', '阶段胜利同时打开更深一层冲突'],
+] as const;
+
+const OUTLINE_FALLBACK_RESULTS = [
+  '主角取得一项可核验的新事实',
+  '对手被迫暴露一次真实反应',
+  '原有优势转化为必须承担的代价',
+  '一名关键人物的立场发生变化',
+  '私人冲突开始受到外界关注',
+  '被掩盖的因果链向前推进一环',
+  '下一步行动获得明确时间窗口',
+  '看似解决的问题显露出更深来源',
+] as const;
+
+function fallbackEpisodeCard(
+  plan: ScriptPlan,
+  episodeNumber: number,
+  previousHook?: unknown,
+): UnknownRecord {
+  const phase = phaseFor(plan, episodeNumber);
+  const beat = OUTLINE_FALLBACK_BEATS[(episodeNumber - 1) % OUTLINE_FALLBACK_BEATS.length]!;
+  const result = OUTLINE_FALLBACK_RESULTS[
+    Math.floor((episodeNumber - 1) / OUTLINE_FALLBACK_BEATS.length) % OUTLINE_FALLBACK_RESULTS.length
+  ]!;
+  const focuses = plan.highlights.length > 0 ? plan.highlights : [plan.theme];
+  const focus = focuses[(episodeNumber - 1) % focuses.length] ?? plan.coreConflict;
+  const bridge = typeof previousHook === 'string' && previousHook.trim()
+    ? `承接上一集“${previousHook.trim()}”，`
+    : '';
+  const isLastEpisode = episodeNumber === plan.totalEpisodes;
+  return {
+    episodeNumber,
+    title: `${phase}·${beat[0]}`,
+    logline: `${bridge}主角围绕“${focus}”${beat[1]}，使“${plan.coreConflict}”在${phase}阶段产生新的因果变化。`,
+    mainEvent: `本集通过一次可拍摄的行动、阻碍与结果推进主线：${beat[1]}，随后${result}，人物关系和证据状态随之更新。`,
+    endingHook: isLastEpisode
+      ? plan.endingDirection
+      : `${beat[2]}，迫使主角在下一集采取不同于本集的新行动。`,
+  };
+}
+
 export interface CoerceOutlineChunkOptions {
   plan: ScriptPlan;
   start: number;
@@ -249,21 +310,19 @@ export function coerceSeriesOutlineChunk(
   const cards = Array.from({ length: options.end - options.start + 1 }, (_, offset) => {
     const episodeNumber = options.start + offset;
     const candidate = cardsByNumber.get(episodeNumber) ?? unnumberedCards.shift() ?? {};
-    const phase = phaseFor(options.plan, episodeNumber);
-    const bridge = offset === 0 && typeof previousHook === 'string' && previousHook.trim()
-      ? `承接上一集“${previousHook.trim()}”，`
-      : '';
-    const defaultEvent = `主角围绕“${options.plan.coreConflict}”推进到${phase}阶段，并形成一次可见结果。`;
+    const fallback = fallbackEpisodeCard(
+      options.plan,
+      episodeNumber,
+      offset === 0 ? previousHook : undefined,
+    );
     return {
       episodeNumber,
-      title: text(firstValue(candidate, ['title', 'name', '标题']), `第${episodeNumber}集 ${phase}`, 200),
-      logline: text(firstValue(candidate, ['logline', 'summary', '概要']), `${bridge}${defaultEvent}`, 2_000),
-      mainEvent: text(firstValue(candidate, ['mainEvent', 'main_event', 'event', '主要事件']), defaultEvent, 2_000),
+      title: text(firstValue(candidate, ['title', 'name', '标题']), String(fallback.title), 200),
+      logline: text(firstValue(candidate, ['logline', 'summary', '概要']), String(fallback.logline), 2_000),
+      mainEvent: text(firstValue(candidate, ['mainEvent', 'main_event', 'event', '主要事件']), String(fallback.mainEvent), 2_000),
       endingHook: text(
         firstValue(candidate, ['endingHook', 'ending_hook', 'hook', '结尾卡点']),
-        episodeNumber === options.plan.totalEpisodes
-          ? options.plan.endingDirection
-          : `新的阻力或线索出现，把剧情推向${phaseFor(options.plan, episodeNumber + 1)}阶段。`,
+        String(fallback.endingHook),
         2_000,
       ),
     };

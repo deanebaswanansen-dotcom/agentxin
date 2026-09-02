@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import type { ScriptPlan } from '../domain.js';
+import type { ScriptPlan, ScriptSeriesOutline } from '../domain.js';
 import { FileScriptStore } from '../FileScriptStore.js';
 import {
   InMemoryScriptCheckpointStore,
@@ -116,6 +116,9 @@ describe('ScriptDirector series outline resilience', () => {
     );
     expect(result.outline.episodeCards[0]?.logline).toContain('物资');
     expect(result.outline.episodeCards.at(-1)?.endingHook).toContain('公开分配制度');
+    expect(new Set(result.outline.episodeCards.map((card) => (
+      `${card.logline}|${card.mainEvent}|${card.endingHook}`
+    ))).size).toBe(60);
     expect(result.outline.synopsis.length).toBeGreaterThanOrEqual(450);
     expect(result.outline.synopsis.length).toBeLessThan(800);
     const persistedState = await store.getProjectState('project-1');
@@ -129,6 +132,93 @@ describe('ScriptDirector series outline resilience', () => {
     ).toBe(true);
     expect(progress.at(-1)).toMatchObject({ current: 60, total: 60 });
     expect(progress.some((event) => event.message.includes('保底方案'))).toBe(true);
+  });
+
+  it('repairs repeated model cards locally without another provider call', async () => {
+    const { store, checkpoints } = await setup(5);
+    let modelCalls = 0;
+    const director = new ScriptDirector({
+      store,
+      checkpoints,
+      model: {
+        async complete(request) {
+          modelCalls += 1;
+          const start = request.chunkStart ?? 1;
+          const end = request.chunkEnd ?? start;
+          return JSON.stringify({
+            synopsis: '寒潮中，主角守住救命物资并揭开幕后利益链。',
+            openingState: '仓库被围。',
+            midpointTurn: '账本曝光。',
+            climax: '仓库攻防全面爆发。',
+            endingState: '公开分配制度建立。',
+            mainArc: ['守住仓库', '揭穿黑手'],
+            subplotArcs: ['街坊互助'],
+            episodeCards: Array.from({ length: end - start + 1 }, (_, offset) => ({
+              episodeNumber: start + offset,
+              title: `第${start + offset}集 危机显现`,
+              logline: '主角发现仓库物资被人盯上，决定追查同一条线索。',
+              mainEvent: '主角检查仓库并发现异常，随后与幕后势力第一次交锋。',
+              endingHook: '新的证据出现，把剧情推向下一阶段。',
+            })),
+          });
+        },
+      },
+    });
+
+    const result = await director.run({ task: 'script_series_outline', projectId: 'project-1' });
+
+    expect(result.kind).toBe('series_outline');
+    if (result.kind !== 'series_outline') throw new Error('expected series outline');
+    expect(modelCalls).toBe(1);
+    expect(result.outline.episodeCards[0]?.logline).toContain('仓库物资被人盯上');
+    expect(new Set(result.outline.episodeCards.map((card) => (
+      `${card.logline}|${card.mainEvent}|${card.endingHook}`
+    ))).size).toBe(5);
+    expect(result.outline.episodeCards[1]?.logline).not.toBe(result.outline.episodeCards[0]?.logline);
+  });
+
+  it('repairs a previously saved duplicated outline without calling the model', async () => {
+    const { store, checkpoints } = await setup(4);
+    const duplicated: ScriptSeriesOutline = {
+      projectId: 'project-1',
+      synopsis: '旧大纲已经保存，但四张分集卡被错误复制。',
+      openingState: '仓库被围。',
+      midpointTurn: '账本曝光。',
+      climax: '攻防全面爆发。',
+      endingState: '公开分配制度建立。',
+      mainArc: ['守住仓库', '揭穿黑手'],
+      subplotArcs: ['街坊互助'],
+      episodeCards: Array.from({ length: 4 }, (_, index) => ({
+        episodeNumber: index + 1,
+        title: `第${index + 1}集 危机显现`,
+        logline: '主角围绕同一危机展开同样的调查。',
+        mainEvent: '主角重复检查仓库，没有形成新的结果。',
+        endingHook: '同一个线索再次出现。',
+      })),
+      revision: 0,
+    };
+    const savedDuplicate = await store.saveSeriesOutline(duplicated, 0);
+    let modelCalls = 0;
+    const director = new ScriptDirector({
+      store,
+      checkpoints,
+      model: {
+        async complete() {
+          modelCalls += 1;
+          throw new Error('existing duplicate repair must stay local');
+        },
+      },
+    });
+
+    const result = await director.run({ task: 'script_series_outline', projectId: 'project-1' });
+
+    expect(result.kind).toBe('series_outline');
+    if (result.kind !== 'series_outline') throw new Error('expected series outline');
+    expect(modelCalls).toBe(0);
+    expect(result.outline.revision).toBeGreaterThan(savedDuplicate.revision);
+    expect(new Set(result.outline.episodeCards.map((card) => (
+      `${card.logline}|${card.mainEvent}|${card.endingHook}`
+    ))).size).toBe(4);
   });
 
   it('persists and reports the first running chunk before waiting for the provider', async () => {
