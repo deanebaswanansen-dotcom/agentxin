@@ -575,7 +575,7 @@ describe('scriptRoutes', () => {
     expect(list.json()).toEqual([]);
   });
 
-  it('stales continuity after editing a completed episode and atomically reactivates it after proofreading', async () => {
+  it('immediately completes a manual edit and rechains completed successor episodes', async () => {
     await app.inject({
       method: 'PUT',
       url: `/api/projects/${projectId}/script-plan`,
@@ -613,6 +613,36 @@ describe('scriptRoutes', () => {
     expect(completed.statusCode).toBe(200);
     expect(completed.json()).toMatchObject({ status: 'completed', revision: 1 });
 
+    const outlineTwoResponse = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/episode-outlines/2`,
+      payload: { expectedRevision: 0, value: episodeOutlineInput(2) },
+    });
+    const completedTwo = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-episodes/2`,
+      payload: {
+        expectedRevision: 0,
+        value: {
+          ...episodeInput(2),
+          outlineId: outlineTwoResponse.json().id,
+          title: '旧规反扑',
+          targetChars: 300,
+          scenes: [{
+            ...episodeInput(2).scenes[0],
+            id: 'scene-2',
+            characterIds: ['character-1'],
+            blocks: [{ id: 'block-long-2', type: 'action' as const, text: '后续剧情'.repeat(68) }],
+          }],
+          summary: '沈清面对旧规反扑并找到新的证据。',
+          newFacts: ['沈清找到新证据'],
+          openedThreads: ['证据将指向谁'],
+        },
+      },
+    });
+    expect(completedTwo.statusCode).toBe(200);
+    expect(completedTwo.json()).toMatchObject({ status: 'completed', revision: 1 });
+
     const edited = await app.inject({
       method: 'PUT',
       url: `/api/projects/${projectId}/script-episodes/1`,
@@ -635,24 +665,21 @@ describe('scriptRoutes', () => {
       },
     });
     expect(edited.statusCode).toBe(200);
-    expect(edited.json()).toMatchObject({ status: 'reviewing', revision: 2 });
-    expect((await store.getProjectState(projectId))?.continuityCommits).toEqual([
-      expect.objectContaining({ episodeNumber: 1, status: 'stale', episodeRevision: 1 }),
-    ]);
-
-    const reviewed = await app.inject({
-      method: 'POST',
-      url: `/api/projects/${projectId}/script-episodes/1/review`,
-      payload: { expectedRevision: 0 },
-    });
-    expect(reviewed.statusCode).toBe(200);
-    expect(reviewed.json()).toMatchObject({ report: { hardFailed: false } });
+    expect(edited.json()).toMatchObject({ status: 'completed', revision: 2 });
     const reactivatedState = await store.getProjectState(projectId);
-    expect(reactivatedState?.episodes[0]).toMatchObject({ status: 'completed', revision: 3 });
-    expect(reactivatedState?.continuityCommits).toEqual([
-      expect.objectContaining({ status: 'stale', episodeRevision: 1 }),
-      expect.objectContaining({ status: 'current', episodeRevision: 3 }),
+    expect(reactivatedState?.episodes).toEqual([
+      expect.objectContaining({ episodeNumber: 1, status: 'completed', revision: 2 }),
+      expect.objectContaining({ episodeNumber: 2, status: 'completed', revision: 2 }),
     ]);
+    const currentCommits = reactivatedState?.continuityCommits?.filter((item) => item.status === 'current') ?? [];
+    expect(currentCommits).toHaveLength(2);
+    expect(currentCommits[0]).toMatchObject({ episodeNumber: 1, episodeRevision: 2 });
+    expect(currentCommits[1]).toMatchObject({
+      episodeNumber: 2,
+      episodeRevision: 2,
+      previousContinuityCommitId: currentCommits[0]?.id,
+      previousContinuityRevision: currentCommits[0]?.revision,
+    });
   });
 
   it('does not block proofreading on disposable speakers without character cards', async () => {

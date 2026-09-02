@@ -950,6 +950,10 @@ const PLAN_LOCK_CONFIG_REVISION = createHash('sha256')
   .update('agentxin:script-plan-lock:v1', 'utf8')
   .digest('hex');
 
+const CONTINUITY_REPAIR_CONFIG_REVISION = createHash('sha256')
+  .update('agentxin:script-continuity-local-repair:v1', 'utf8')
+  .digest('hex');
+
 const SERIES_SYNOPSIS_MIN_CHARS = 450;
 
 function synopsisFragment(value: string): string {
@@ -2144,6 +2148,83 @@ export class ScriptDirector {
       };
   }
 
+  /**
+   * Repairs legacy/manual-edit gaps in an existing Episode chain without a
+   * provider call. This lets an explicit single-Episode rewrite operate on the
+   * requested Episode instead of making the user revisit every earlier batch.
+   */
+  private async repairExistingContinuityThrough(
+    projectId: string,
+    throughEpisodeNumber: number,
+    plan: ScriptPlan,
+    initialState: ScriptProjectState,
+  ): Promise<ScriptProjectState> {
+    const commitEpisodeWithContinuity = this.dependencies.store.commitEpisodeWithContinuity;
+    if (!commitEpisodeWithContinuity) return initialState;
+    let state = initialState;
+
+    for (let episodeNumber = 1; episodeNumber <= throughEpisodeNumber; episodeNumber += 1) {
+      const episode = state.episodes.find((item) => item.episodeNumber === episodeNumber);
+      if (!episode || (episode.status !== 'completed' && episode.status !== 'reviewing')) return state;
+      const alreadyCanonical = currentScriptContinuityCommits(state).some((commit) =>
+        commit.episodeNumber === episodeNumber && commit.episodeRevision === episode.revision,
+      );
+      if (alreadyCanonical) continue;
+
+      const charactersById = new Map(state.characters.map((item) => [item.id, item.name]));
+      const registeredCharacterNames = new Set(charactersById.values());
+      const outline = state.episodeOutlines.find((item) => item.episodeNumber === episodeNumber);
+      const report = validateScriptEpisode(episode, plan, {
+        expectedEpisodeNumber: episodeNumber,
+        existingEpisodeNumbers: state.episodes
+          .filter((item) => item.episodeNumber !== episodeNumber)
+          .map((item) => item.episodeNumber),
+        registeredCharacterIds: new Set(charactersById.keys()),
+        registeredCharacterNames,
+        temporarySpeakers: collectTemporaryDialogueSpeakers(
+          episode,
+          plan,
+          registeredCharacterNames,
+        ),
+        characterNamesById: charactersById,
+        ...(outline ? { outline } : {}),
+        previousEpisode: state.episodes.find((item) => item.episodeNumber === episodeNumber - 1),
+        continuity: projectScriptContinuity(state, episodeNumber),
+      });
+      if (report.hardFailed) return state;
+
+      const previousCommit = [...(state.continuityCommits ?? [])]
+        .filter((item) => item.episodeNumber === episodeNumber)
+        .sort((left, right) => right.revision - left.revision)[0];
+      const wardrobe = previousCommit?.characterUpdates.flatMap((update) =>
+        update.outfit ? [{ characterId: update.characterId, outfit: update.outfit }] : [],
+      ) ?? [];
+      const continuity = buildScriptContinuityCandidate(state, episode, wardrobe);
+      const commitInput = buildScriptAtomicCommitInput(state, episode, continuity, {
+        promptVersion: 'script-director-local-continuity-repair-v1',
+        modelConfigFingerprint: CONTINUITY_REPAIR_CONFIG_REVISION,
+      });
+      commitInput.reviewUpdate = {
+        sources: ['deterministic'],
+        items: createScriptReviewIssues(
+          projectId,
+          episodeNumber,
+          'deterministic',
+          report.issues,
+        ),
+      };
+      try {
+        await commitEpisodeWithContinuity.call(this.dependencies.store, commitInput);
+      } catch {
+        // Keep the original actionable prerequisite message below. The repair
+        // is best-effort and must never turn a single rewrite into a deadlock.
+        return (await this.dependencies.store.getProjectState(projectId)) ?? state;
+      }
+      state = (await this.dependencies.store.getProjectState(projectId)) ?? state;
+    }
+    return state;
+  }
+
   private async generateEpisodeBatch(
     request: Extract<ScriptDirectorRequest, { task: 'script_episode_batch' }>,
   ): Promise<ScriptDirectorResult> {
@@ -2223,6 +2304,14 @@ export class ScriptDirector {
     }
     if (request.rewriteMode && request.draftMode === 'structured_legacy') {
       throw new ScriptModelOutputError('单集重写方式只支持直接正文模式。');
+    }
+    if (singleEpisodeRegeneration && request.startEpisode > 1) {
+      state = await this.repairExistingContinuityThrough(
+        request.projectId,
+        request.startEpisode - 1,
+        validatedPlan,
+        state,
+      );
     }
     const hasCanonicalContinuity = (
       projectState: ScriptProjectState,
@@ -4064,6 +4153,15 @@ export class ScriptDirector {
         this.dependencies.store,
         commitInput,
       );
+      if (singleEpisodeRegeneration) {
+        const committedState = (await this.dependencies.store.getProjectState(request.projectId)) ?? reviewState;
+        await this.repairExistingContinuityThrough(
+          request.projectId,
+          validatedPlan.totalEpisodes,
+          validatedPlan,
+          committedState,
+        );
+      }
       episodes.push(saved);
       reports.push({ episodeNumber, report });
       await this.saveCheckpoint(request, {
@@ -5173,6 +5271,15 @@ export class ScriptDirector {
       this.dependencies.store,
       commitInput,
     );
+    if (request.regenerate && request.episodeCount === 1) {
+      const committedState = (await this.dependencies.store.getProjectState(request.projectId)) ?? reviewState;
+      await this.repairExistingContinuityThrough(
+        request.projectId,
+        plan.totalEpisodes,
+        plan,
+        committedState,
+      );
+    }
     await this.saveCheckpoint(request, {
       projectId: request.projectId,
       runKey,
