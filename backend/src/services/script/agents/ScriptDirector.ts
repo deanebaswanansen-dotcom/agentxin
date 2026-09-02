@@ -1136,43 +1136,57 @@ function directSeriesOutlineChunk(
   end: number,
   previousBoundary: readonly Record<string, unknown>[],
 ): Record<string, unknown> {
-  const phaseFor = (episodeNumber: number): string => {
-    const progress = episodeNumber / plan.totalEpisodes;
-    if (progress <= 0.2) return '危机显现';
-    if (progress <= 0.45) return '主动破局';
-    if (progress <= 0.7) return '局势逆转';
-    if (progress <= 0.9) return '终局逼近';
-    return '结局兑现';
-  };
-  const previousHook = previousBoundary.at(-1)?.endingHook;
-  const episodeCards = Array.from({ length: end - start + 1 }, (_, offset) => {
-    const episodeNumber = start + offset;
-    const phase = phaseFor(episodeNumber);
-    const isLastEpisode = episodeNumber === plan.totalEpisodes;
-    const nextPhase = phaseFor(Math.min(plan.totalEpisodes, episodeNumber + 1));
-    const bridge = offset === 0 && typeof previousHook === 'string' && previousHook.trim()
-      ? `承接上一集“${previousHook.trim()}”，`
-      : '';
-    return {
-      episodeNumber,
-      title: `第${episodeNumber}集 ${phase}`,
-      logline: `${bridge}主角围绕“${plan.coreConflict}”推进到${phase}阶段。`,
-      mainEvent: `在${plan.theme}主题下，主线完成第${episodeNumber}步推进，并形成一次可见的行动结果。`,
-      endingHook: isLastEpisode
-        ? plan.endingDirection
-        : `新的证据或阻力出现，把剧情推向下一阶段“${nextPhase}”。`,
-    };
+  return coerceSeriesOutlineChunk({}, { plan, start, end, previousBoundary });
+}
+
+function normalizedEpisodeCardSignature(card: ScriptEpisodeCard): string {
+  return [card.logline, card.mainEvent, card.endingHook]
+    .join('|')
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/第\s*\d+\s*集/gu, '')
+    .replace(/\d+/gu, '')
+    .replace(/[^\p{L}|]+/gu, '');
+}
+
+/**
+ * Replaces only the repeated copies after the first occurrence. The repair is
+ * local and deterministic, so a weak/fallback outline never needs another
+ * provider call and cannot stall the workflow.
+ */
+function diversifyDuplicateEpisodeCards(
+  plan: ScriptPlan,
+  cards: readonly ScriptEpisodeCard[],
+): ScriptEpisodeCard[] {
+  const fallbackChunk = coerceSeriesOutlineChunk({}, {
+    plan,
+    start: 1,
+    end: plan.totalEpisodes,
   });
-  return {
-    synopsis: plan.logline,
-    openingState: `故事从“${plan.coreConflict}”全面显现开始。`,
-    midpointTurn: `主角取得关键证据或盟友，围绕“${plan.coreConflict}”转守为攻。`,
-    climax: `核心冲突在终局正面爆发，${plan.highlights.at(-1) ?? plan.theme}成为胜负关键。`,
-    endingState: plan.endingDirection,
-    mainArc: [plan.coreConflict, plan.endingDirection],
-    subplotArcs: plan.highlights.length > 0 ? [...plan.highlights] : [...plan.genres],
-    episodeCards,
-  };
+  const fallbackCards = new Map(
+    (fallbackChunk.episodeCards as unknown[]).map((candidate) => {
+      const card = recordField(candidate, 'fallbackEpisodeCard');
+      const episodeNumber = numberField(card.episodeNumber, 'episodeNumber');
+      return [episodeNumber, {
+        episodeNumber,
+        title: stringField(card.title, 'title'),
+        logline: stringField(card.logline, 'logline'),
+        mainEvent: stringField(card.mainEvent, 'mainEvent'),
+        endingHook: stringField(card.endingHook, 'endingHook'),
+      } satisfies ScriptEpisodeCard] as const;
+    }),
+  );
+  const seen = new Set<string>();
+  return cards.map((card) => {
+    const signature = normalizedEpisodeCardSignature(card);
+    if (!seen.has(signature)) {
+      seen.add(signature);
+      return card;
+    }
+    const replacement = fallbackCards.get(card.episodeNumber) ?? card;
+    seen.add(normalizedEpisodeCardSignature(replacement));
+    return replacement;
+  });
 }
 
 export class ScriptDirector {
@@ -1324,6 +1338,14 @@ export class ScriptDirector {
     }
     const completionSeed = !regenerate ? parseOutlineCompletionSeed(sourceOutline) : undefined;
     if (!regenerate && !completionSeed && state?.seriesOutline?.episodeCards.length === plan.totalEpisodes) {
+      const repairedCards = diversifyDuplicateEpisodeCards(plan, state.seriesOutline.episodeCards);
+      if (repairedCards.some((card, index) => card !== state.seriesOutline!.episodeCards[index])) {
+        const repaired = await this.dependencies.store.saveSeriesOutline({
+          ...state.seriesOutline,
+          episodeCards: repairedCards,
+        }, state.seriesOutline.revision);
+        return { kind: 'series_outline', outline: repaired };
+      }
       return { kind: 'series_outline', outline: state.seriesOutline };
     }
 
@@ -1586,7 +1608,7 @@ export class ScriptDirector {
     }
     const first = chunks[0];
     if (!first) throw new ScriptModelOutputError('全剧大纲未生成任何分段。');
-    const cards: ScriptEpisodeCard[] = chunks.flatMap((chunk) => {
+    let cards: ScriptEpisodeCard[] = chunks.flatMap((chunk) => {
       if (!Array.isArray(chunk.episodeCards)) {
         throw new ScriptModelOutputError('分集卡 episodeCards 必须是数组。');
       }
@@ -1602,6 +1624,7 @@ export class ScriptDirector {
       });
     });
     cards.sort((left, right) => left.episodeNumber - right.episodeNumber);
+    cards = diversifyDuplicateEpisodeCards(plan, cards);
     if (
       cards.length !== plan.totalEpisodes ||
       cards.some((card, index) => card.episodeNumber !== index + 1)
@@ -1635,7 +1658,11 @@ export class ScriptDirector {
       episodeCards: cards,
       revision: state?.seriesOutline?.revision ?? 0,
     };
-    const candidateOutline = mergeOutlineCompletionSeed(generatedOutline, completionSeed);
+    const mergedOutline = mergeOutlineCompletionSeed(generatedOutline, completionSeed);
+    const candidateOutline: ScriptSeriesOutline = {
+      ...mergedOutline,
+      episodeCards: diversifyDuplicateEpisodeCards(plan, mergedOutline.episodeCards),
+    };
     const canonicalOutline = canonicalModelCandidate(() => {
       const parsed = decodeScriptSeriesOutlineInput(candidateOutline);
       validateScriptSeriesOutlineInput(parsed, { totalEpisodes: plan.totalEpisodes });
