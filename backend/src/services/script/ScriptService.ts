@@ -608,6 +608,48 @@ export class ScriptService {
     };
   }
 
+  /**
+   * Rebuild the immutable continuity chain after a user changes an earlier
+   * completed Episode. The successor scripts themselves are not rewritten and
+   * no model is called; only their deterministic continuity commits are rebased
+   * onto the newly confirmed predecessor.
+   */
+  private async rechainCompletedSuccessors(
+    projectId: string,
+    afterEpisodeNumber: number,
+  ): Promise<void> {
+    const commitEpisodeWithContinuity = this.store.commitEpisodeWithContinuity;
+    if (!commitEpisodeWithContinuity) return;
+
+    for (let episodeNumber = afterEpisodeNumber + 1; ; episodeNumber += 1) {
+      const state = await this.requireState(projectId);
+      const episode = state.episodes.find(
+        (item) => item.episodeNumber === episodeNumber && item.status === 'completed',
+      );
+      if (!episode) return;
+
+      const previousCommit = [...(state.continuityCommits ?? [])]
+        .filter((item) => item.episodeNumber === episodeNumber)
+        .sort((left, right) => right.revision - left.revision)[0];
+      const wardrobe = previousCommit?.characterUpdates.flatMap((update) =>
+        update.outfit ? [{ characterId: update.characterId, outfit: update.outfit }] : [],
+      ) ?? [];
+      const continuity = buildScriptContinuityCandidate(state, episode, wardrobe);
+      const commitInput = buildScriptAtomicCommitInput(state, episode, continuity, {
+        promptVersion: 'script-service-manual-edit-rechain-v1',
+        modelConfigFingerprint: DETERMINISTIC_REVIEW_CONFIG_FINGERPRINT,
+      });
+      try {
+        await commitEpisodeWithContinuity.call(this.store, commitInput);
+      } catch {
+        // The edited Episode has already been committed successfully. A racing
+        // successor edit must not make the UI report that the user's save
+        // failed; the next save/rewrite will retry this local chain repair.
+        return;
+      }
+    }
+  }
+
   async saveEpisode(
     projectId: string,
     episodeNumber: number,
@@ -634,13 +676,6 @@ export class ScriptService {
       createdAt: current?.createdAt ?? now,
       updatedAt: now,
     };
-    // Saving any user edit to an already completed Episode must invalidate the
-    // old continuity boundary first. The store performs the Episode downgrade
-    // and continuity stale transition in one mutation; proofreading is the
-    // only path that can reactivate the edited revision as completed.
-    if (current?.status === 'completed') {
-      return this.store.saveEpisode({ ...episode, status: 'reviewing' }, expectedRevision);
-    }
     if (episode.status === 'completed') {
       if (!plan) {
         throw ScriptServiceError.validation('完成正文前必须先保存并确认短剧策划');
@@ -664,6 +699,11 @@ export class ScriptService {
           .map((item) => item.episodeNumber),
         registeredCharacterIds: new Set((state?.characters ?? []).map((item) => item.id)),
         registeredCharacterNames: new Set((state?.characters ?? []).map((item) => item.name)),
+        temporarySpeakers: collectTemporaryDialogueSpeakers(
+          episode,
+          plan,
+          new Set((state?.characters ?? []).map((item) => item.name)),
+        ),
         characterNamesById: new Map((state?.characters ?? []).map((item) => [item.id, item.name])),
         outline,
         previousEpisode: (state?.episodes ?? [])
@@ -691,6 +731,7 @@ export class ScriptService {
         throw ScriptServiceError.validation('正文存储未实现原子连续性提交');
       }
       const committed = await commitEpisodeWithContinuity.call(this.store, commitInput);
+      await this.rechainCompletedSuccessors(projectId, episodeNumber);
       return committed.episode;
     }
     return this.store.saveEpisode(episode, expectedRevision);

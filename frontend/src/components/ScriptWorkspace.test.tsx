@@ -1680,9 +1680,38 @@ describe('ScriptWorkspace', () => {
     fireEvent.click(screen.getByRole('button', { name: '保存第 1 集' }));
 
     await waitFor(() => expect(client.script.episodes.save).toHaveBeenCalledWith(
-      'project-1', 1, expect.objectContaining({ scenes: [expect.objectContaining({ blocks: [expect.objectContaining({ text: ' 新 动作\n' })] })] }), 7,
+      'project-1', 1, expect.objectContaining({
+        status: 'completed',
+        scenes: [expect.objectContaining({ blocks: [expect.objectContaining({ text: ' 新 动作\n' })] })],
+      }), 7,
     ));
     await waitFor(() => expect(screen.getAllByText('3 字').length).toBeGreaterThan(0));
+  });
+
+  it('submits a previously reviewing manual edit as completed and never labels it running', async () => {
+    const client = createClient();
+    const episode = { ...buildEpisode('人工修好的正文', 7), status: 'reviewing' as const };
+    vi.mocked(client.script.episodes.list).mockResolvedValue([{
+      ...summarizeEpisode(episode),
+      status: 'reviewing',
+    }]);
+    vi.mocked(client.script.episodes.get).mockResolvedValue(episode);
+    vi.mocked(client.script.episodes.save).mockImplementation((_projectId, _episodeNumber, value) => (
+      Promise.resolve({ ...value, status: 'completed', revision: 8 })
+    ));
+    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
+    expect(screen.getByText('已保存，待确认 · 7 字')).toBeInTheDocument();
+    expect(screen.queryByText('运行中 · 7 字')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '打开第 1 集' }));
+    fireEvent.click(await screen.findByRole('button', { name: '保存第 1 集' }));
+
+    await waitFor(() => expect(client.script.episodes.save).toHaveBeenCalledWith(
+      'project-1', 1, expect.objectContaining({ status: 'completed' }), 7,
+    ));
+    expect(await screen.findByText('已完成 · 7 字')).toBeInTheDocument();
   });
 
   it('rebases an edited episode on the latest revision and retries a 409 once', async () => {

@@ -831,6 +831,14 @@ const JOB_STATUS_LABEL: Record<ScriptAgentJobSnapshot['status'], string> = {
   cancelled: '已取消',
 };
 
+const EPISODE_STATUS_LABEL: Record<ScriptEpisodeSummary['status'], string> = {
+  planned: '待生成',
+  generating: '生成中',
+  reviewing: '已保存，待确认',
+  completed: '已完成',
+  failed: '失败',
+};
+
 const JOB_TASK_LABEL: Record<ScriptAgentJobSnapshot['task'], string> = {
   script_plan: '剧本策划',
   script_series_outline: '剧本大纲',
@@ -1159,7 +1167,7 @@ function EpisodeBatchPanel({
           <h3>分集进度</h3>
           {batchSummaries.length === 0 ? <p className="script-muted">本批尚未生成正文。每批最多 5 集，完成一集立即保存。</p> : (
             <ol className="script-episode-list">
-              {batchSummaries.map((item) => <li key={item.episodeNumber}><button type="button" className="script-episode-open" aria-label={`打开第 ${item.episodeNumber} 集`} onClick={() => { setContentMode('edit'); onOpenEpisode(item.episodeNumber); }}>打开第 {item.episodeNumber} 集<span>{item.title}</span></button><div className="script-episode-list__actions"><span>{JOB_STATUS_LABEL[item.status === 'generating' || item.status === 'reviewing' ? 'running' : item.status === 'planned' ? 'queued' : item.status]} · {item.visibleChars} 字</span><button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={busy} onClick={() => { setRewriteTarget(item.episodeNumber); setRewriteInstruction(''); setRewriteMode('revise'); }}>修改 / 换稿第 {item.episodeNumber} 集</button></div></li>)}
+              {batchSummaries.map((item) => <li key={item.episodeNumber}><button type="button" className="script-episode-open" aria-label={`打开第 ${item.episodeNumber} 集`} onClick={() => { setContentMode('edit'); onOpenEpisode(item.episodeNumber); }}>打开第 {item.episodeNumber} 集<span>{item.title}</span></button><div className="script-episode-list__actions"><span>{EPISODE_STATUS_LABEL[item.status]} · {item.visibleChars} 字</span><button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={busy} onClick={() => { setRewriteTarget(item.episodeNumber); setRewriteInstruction(''); setRewriteMode('revise'); }}>修改 / 换稿第 {item.episodeNumber} 集</button></div></li>)}
             </ol>
           )}
         </div>
@@ -1237,7 +1245,7 @@ function EpisodeBatchPanel({
         <section className="script-episode-editor" aria-label={`第 ${episode.episodeNumber} 集编辑器`}>
           <header>
             <div><span>第 {episode.episodeNumber} 集</span><input aria-label={`第 ${episode.episodeNumber} 集标题`} value={episode.title} onChange={(event) => onEpisodeChange({ ...episode, title: event.target.value })} /></div>
-            <div className="script-episode-editor__actions"><button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => { setRewriteTarget(episode.episodeNumber); setRewriteInstruction(''); setRewriteMode('revise'); }}>修改 / 换稿第 {episode.episodeNumber} 集</button><button type="button" className="nwa-button" disabled={busy} onClick={onSaveEpisode}>保存第 {episode.episodeNumber} 集</button></div>
+            <div className="script-episode-editor__actions"><button type="button" className="nwa-button nwa-button--ghost" disabled={busy} onClick={() => { setRewriteTarget(episode.episodeNumber); setRewriteInstruction(''); setRewriteMode('revise'); }}>修改 / 换稿第 {episode.episodeNumber} 集</button><button type="button" className="nwa-button" aria-label={`保存第 ${episode.episodeNumber} 集`} disabled={busy} onClick={onSaveEpisode}>保存并完成第 {episode.episodeNumber} 集</button></div>
           </header>
           {episode.scenes.map((scene, sceneIndex) => (
             <article className="script-scene-editor" key={scene.id}>
@@ -2398,7 +2406,10 @@ export function ScriptWorkspace({
   const saveEpisode = useCallback(async () => {
     if (!selectedEpisode) return;
     const editVersion = selectedEpisodeEditVersion.current;
-    const submittedEpisode = selectedEpisode;
+    // Clicking Save is an explicit human confirmation. Ask the backend to run
+    // its deterministic hard checks and immediately commit the saved revision;
+    // a previous interrupted/manual edit may still carry `reviewing` here.
+    const submittedEpisode: ScriptEpisode = { ...selectedEpisode, status: 'completed' };
     setBusy(true);
     setNotice('');
     try {

@@ -3424,7 +3424,7 @@ describe('ScriptDirector', () => {
     });
     const firstEpisode = {
       ...reviewingEpisode(state, '第一集已经发生的调查。'.repeat(20), { revision: 1 }),
-      status: 'completed' as const,
+      status: 'reviewing' as const,
       summary: '沈清取得第一份证据。',
     };
     const secondEpisode = {
@@ -3449,7 +3449,7 @@ describe('ScriptDirector', () => {
       episodeNumber: 1,
       episodeRevision: 1,
       revision: 1,
-      status: 'current',
+      status: 'stale',
       inputFingerprint: 'a'.repeat(64),
       characterUpdates: [], factsAdded: [], props: [], threads: [], timelineEvents: [],
       nextEpisodeMustInherit: [],
@@ -3485,6 +3485,10 @@ describe('ScriptDirector', () => {
 
     expect(prompts[0]).toContain('把证人认罪改成证人突然改口');
     expect(prompts[0]).toContain('第二集需要修改的旧正文');
+    expect(state.episodes.find((episode) => episode.episodeNumber === 1)).toMatchObject({
+      status: 'completed',
+      revision: 2,
+    });
     expect(state.episodes.find((episode) => episode.episodeNumber === 2)?.revision).toBe(3);
   });
 
