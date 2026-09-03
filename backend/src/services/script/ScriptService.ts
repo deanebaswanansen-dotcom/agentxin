@@ -689,9 +689,6 @@ export class ScriptService {
         });
       }
       const outline = state?.episodeOutlines.find((item) => item.episodeNumber === episodeNumber);
-      if (!outline) {
-        throw ScriptServiceError.validation('完成正文前必须先保存本集详细大纲');
-      }
       const report = validateScriptEpisode(episode, plan, {
         expectedEpisodeNumber: episodeNumber,
         existingEpisodeNumbers: (state?.episodes ?? [])
@@ -705,7 +702,13 @@ export class ScriptService {
           new Set((state?.characters ?? []).map((item) => item.name)),
         ),
         characterNamesById: new Map((state?.characters ?? []).map((item) => [item.id, item.name])),
-        outline,
+        // Detailed Episode outlines are generated as part of the normal batch
+        // workflow, but legacy/imported projects and some successful rewrite
+        // runs can contain a complete Episode without that optional artifact.
+        // Manual saving must not deadlock those projects. When an outline is
+        // available we still validate against it; otherwise the plan, series
+        // outline, Episode body and continuity gates remain authoritative.
+        ...(outline ? { outline } : {}),
         previousEpisode: (state?.episodes ?? [])
           .filter((item) => item.episodeNumber < episodeNumber)
           .sort((left, right) => right.episodeNumber - left.episodeNumber)[0],

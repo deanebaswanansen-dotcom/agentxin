@@ -682,6 +682,57 @@ describe('scriptRoutes', () => {
     });
   });
 
+  it('completes a manually saved rewritten episode when its hidden detailed outline is missing', async () => {
+    await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-plan`,
+      payload: { expectedRevision: 0, value: { ...planInput(), targetCharsPerEpisode: 300 } },
+    });
+    await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-characters`,
+      payload: { expectedRevision: 0, items: charactersInput() },
+    });
+    const savedSeriesOutline = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-outline`,
+      payload: { expectedRevision: 0, value: outlineInput() },
+    });
+    expect(savedSeriesOutline.statusCode).toBe(200);
+
+    // This mirrors a legacy or rewrite result: the visible series outline was
+    // saved, but no separate episode-outlines/:number resource exists.
+    const rewrittenValue = {
+      ...episodeInput(1),
+      outlineId: 'missing-rewrite-outline',
+      targetChars: 300,
+      scenes: [{
+        ...episodeInput(1).scenes[0],
+        characterIds: ['character-1'],
+        blocks: [{ id: 'rewritten-body', type: 'action' as const, text: '完整换稿剧情'.repeat(55) }],
+      }],
+      summary: '沈清完成换稿，并保留了完整的本集故事。',
+    };
+    const saved = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${projectId}/script-episodes/1`,
+      payload: { expectedRevision: 0, value: rewrittenValue },
+    });
+
+    expect(saved.statusCode).toBe(200);
+    expect(saved.json()).toMatchObject({
+      episodeNumber: 1,
+      status: 'completed',
+      revision: 1,
+      outlineId: 'missing-rewrite-outline',
+    });
+    const state = await store.getProjectState(projectId);
+    expect(state?.episodeOutlines).toEqual([]);
+    expect(state?.continuityCommits).toEqual([
+      expect.objectContaining({ episodeNumber: 1, episodeRevision: 1, status: 'current' }),
+    ]);
+  });
+
   it('does not block proofreading on disposable speakers without character cards', async () => {
     await app.inject({
       method: 'PUT',
