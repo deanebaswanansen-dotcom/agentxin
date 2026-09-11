@@ -8,8 +8,16 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { FileScriptStore } from '../services/script/FileScriptStore.js';
 import { ScriptService } from '../services/script/ScriptService.js';
+import { directWritingContext } from '../services/script/agents/ScriptDirectWriting.js';
+import {
+  buildScriptAtomicCommitInput,
+  buildScriptContinuityCandidate,
+  currentScriptContinuityCommits,
+  projectScriptContinuity,
+} from '../services/script/ScriptContinuityCommit.js';
 import type {
   ScriptCharacterInput,
+  ScriptEpisode,
   ScriptEpisodeInput,
   ScriptEpisodeOutlineInput,
   ScriptPlanInput,
@@ -233,6 +241,241 @@ describe('scriptRoutes', () => {
     expect(response.statusCode).toBe(400);
     expect(response.json().error.code).toBe('VALIDATION_ERROR');
   });
+
+  async function seedManualContinuityEpisode(richHandoff = false) {
+    const service = new ScriptService(store);
+    await service.savePlan(projectId, { ...planInput(), targetCharsPerEpisode: 300 }, 0);
+    await service.saveCharacters(projectId, charactersInput(), 0);
+    await service.saveWorld(projectId, { ...worldInput(), recurringProps: ['原始账本'] }, 0);
+    let episode = await service.saveEpisode(projectId, 1, {
+      ...episodeInput(1),
+      targetChars: 300,
+      scenes: [{
+        ...episodeInput(1).scenes[0],
+        blocks: [{
+          id: 'ledger-action', type: 'action',
+          text: `沈清销毁了原始账本。${'窗外雨声不断，沈清看着紧闭的大门。'.repeat(15)}`,
+        }],
+      }],
+      summary: '沈清销毁了原始账本。',
+      newFacts: ['原始账本已销毁'],
+      openedThreads: ['警方会找到销毁账本的人吗'],
+      closedThreads: ['原始账本能否保全'],
+    }, 0);
+    if (richHandoff) {
+      const state = (await store.getProjectState(projectId))!;
+      const continuity = buildScriptContinuityCandidate(state, episode, [{
+        characterId: 'character-1', outfit: '灰色外套',
+      }]);
+      continuity.characterUpdates[0]!.emotionalState = '紧张';
+      continuity.props[0]!.state = '已经销毁';
+      continuity.nextEpisodeMustInherit.push('道具 原始账本：已经销毁');
+      episode = (await store.commitEpisodeWithContinuity(buildScriptAtomicCommitInput(
+        state, episode, continuity,
+        { promptVersion: 'manual-save-fixture', modelConfigFingerprint: 'a'.repeat(64) },
+      ))).episode;
+    }
+    return { service, episode };
+  }
+
+  function editLedgerBody(episode: ScriptEpisode): ScriptEpisode {
+    const edited = structuredClone(episode);
+    edited.scenes[0]!.blocks[0]!.text = edited.scenes[0]!.blocks[0]!.text
+      .replace('沈清销毁了原始账本。', '沈清将完好的原始账本交给警方保管。');
+    return edited;
+  }
+
+  it('invalidates hidden metadata after a manual body edit in both canon and next-episode context', async () => {
+    const { service, episode } = await seedManualContinuityEpisode(true);
+    const response = await app.inject({
+      method: 'PUT', url: `/api/projects/${projectId}/script-episodes/1`,
+      payload: { expectedRevision: episode.revision, value: editLedgerBody(episode) },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      status: 'completed', revision: episode.revision + 1,
+      summary: '', newFacts: [], openedThreads: [], closedThreads: [],
+    });
+    // A repeat save and deterministic proofread must not refill old metadata.
+    const saved = await service.saveEpisode(projectId, 1, response.json(), response.json().revision);
+    await service.reviewEpisode(projectId, 1, 0);
+    const state = (await store.getProjectState(projectId))!;
+    const commit = currentScriptContinuityCommits(state)[0]!;
+    expect(commit).toMatchObject({ factsAdded: [], threads: [], timelineEvents: [] });
+    expect(commit.characterUpdates[0]).not.toHaveProperty('outfit');
+    expect(JSON.stringify(commit)).not.toContain('销毁');
+    expect(projectScriptContinuity(state, 2)).toEqual({
+      currentState: [], openThreads: [], wardrobeLedger: [],
+    });
+    const context = directWritingContext(state, state.plan!, {
+      ...episodeOutlineInput(2), id: 'next-outline', projectId, revision: 1,
+    });
+    expect(context.previousEpisode).toMatchObject({ summary: '', newFacts: [], openedThreads: [] });
+    expect(context.priorEpisodeHistory).toMatchObject({
+      allEpisodeSummaries: [{ episodeNumber: 1, summary: '', newFacts: [] }],
+    });
+    expect(JSON.stringify(context)).not.toContain('销毁');
+    expect(JSON.stringify(context)).toContain('完好的原始账本交给警方保管');
+    expect(saved.status).toBe('completed');
+  });
+
+  it('keeps explicitly updated metadata fields while invalidating untouched fields independently', async () => {
+    const { service, episode } = await seedManualContinuityEpisode();
+    const edited = editLedgerBody(episode);
+    edited.summary = '沈清把完好的原始账本交给警方。';
+    edited.newFacts = ['原始账本由警方保管'];
+    const saved = await service.saveEpisode(projectId, 1, edited, episode.revision);
+    expect(saved).toMatchObject({
+      summary: edited.summary, newFacts: edited.newFacts, openedThreads: [], closedThreads: [],
+    });
+    const state = (await store.getProjectState(projectId))!;
+    const commit = currentScriptContinuityCommits(state)[0]!;
+    expect(commit.factsAdded.map((fact) => fact.text)).toEqual(edited.newFacts);
+    expect(commit.timelineEvents.map((event) => event.summary)).toEqual([edited.summary]);
+    expect(JSON.stringify(commit)).not.toContain('销毁');
+  });
+
+  it('keeps an explicit update to all four metadata fields with the edited body', async () => {
+    const { service, episode } = await seedManualContinuityEpisode();
+    const edited = editLedgerBody(episode);
+    edited.summary = '沈清把完好的原始账本交给警方。';
+    edited.newFacts = ['原始账本由警方保管'];
+    edited.openedThreads = ['警方何时公开调查结果'];
+    edited.closedThreads = ['警方能否接收证据'];
+    const saved = await service.saveEpisode(projectId, 1, edited, episode.revision);
+    for (const field of ['summary', 'newFacts', 'openedThreads', 'closedThreads'] as const) {
+      expect(saved[field]).toEqual(edited[field]);
+    }
+    const state = (await store.getProjectState(projectId))!;
+    const commit = currentScriptContinuityCommits(state)[0]!;
+    expect(commit.threads).toEqual([
+      expect.objectContaining({ action: 'opened', description: edited.openedThreads[0] }),
+      expect.objectContaining({ action: 'closed', description: edited.closedThreads[0] }),
+    ]);
+  });
+
+  it.each(['unchanged', 'title', 'formatting-and-ids'] as const)(
+    'preserves metadata, wardrobe and rich handoff for a %s save',
+    async (change) => {
+      const { service, episode } = await seedManualContinuityEpisode(true);
+      const edited = structuredClone(episode);
+      if (change === 'title') edited.title = '账本的命运';
+      if (change === 'formatting-and-ids') {
+        edited.scenes[0]!.id = 'new-scene';
+        edited.scenes[0]!.blocks[0]!.id = 'new-ledger-action';
+        edited.scenes[0]!.blocks[0]!.text = `\n ${edited.scenes[0]!.blocks[0]!.text} \n`;
+      }
+      const saved = await service.saveEpisode(projectId, 1, edited, episode.revision);
+      expect(saved).toMatchObject({
+        summary: episode.summary, newFacts: episode.newFacts,
+        openedThreads: episode.openedThreads, closedThreads: episode.closedThreads,
+      });
+      const state = (await store.getProjectState(projectId))!;
+      const commit = currentScriptContinuityCommits(state)[0]!;
+      expect(commit.characterUpdates[0]).toMatchObject({ outfit: '灰色外套', emotionalState: '紧张' });
+      expect(commit.props[0]).toMatchObject({ state: '已经销毁' });
+      expect(commit.nextEpisodeMustInherit).toContain('道具 原始账本：已经销毁');
+      for (const item of [...commit.factsAdded, ...commit.props, ...commit.threads, ...commit.timelineEvents]) {
+        expect(item.evidenceBlockIds).toEqual([saved.scenes[0]!.blocks[0]!.id]);
+      }
+    },
+  );
+
+  it('invalidates hidden metadata before draft saving and cannot recover stale wardrobe during proofread', async () => {
+    const { service, episode } = await seedManualContinuityEpisode(true);
+    const edited = editLedgerBody(episode);
+    edited.status = 'reviewing';
+    const saved = await service.saveEpisode(projectId, 1, edited, episode.revision);
+    expect(saved).toMatchObject({ status: 'reviewing', summary: '', newFacts: [], openedThreads: [], closedThreads: [] });
+    const review = await service.reviewEpisode(projectId, 1, 0);
+    expect(review.report.hardFailed).toBe(false);
+    const state = (await store.getProjectState(projectId))!;
+    expect(state.episodes[0]!.status).toBe('completed');
+    expect(JSON.stringify(currentScriptContinuityCommits(state))).not.toContain('销毁');
+    expect(projectScriptContinuity(state).wardrobeLedger).toEqual([]);
+  });
+
+  it('does not treat formatting-only metadata changes as explicit updates after a body edit', async () => {
+    const { service, episode } = await seedManualContinuityEpisode();
+    const edited = editLedgerBody(episode);
+    edited.summary = ` ${edited.summary}\n`;
+    for (const field of ['newFacts', 'openedThreads', 'closedThreads'] as const) {
+      edited[field] = edited[field].map((text) => ` ${text} `).reverse();
+    }
+    const saved = await service.saveEpisode(projectId, 1, edited, episode.revision);
+    expect(saved).toMatchObject({ summary: '', newFacts: [], openedThreads: [], closedThreads: [] });
+  });
+
+  it('rechaining preserves an unchanged successor handoff when an edited predecessor loses its old summary', async () => {
+    const { service, episode } = await seedManualContinuityEpisode();
+    const second = await service.saveEpisode(projectId, 2, {
+      ...episodeInput(2),
+      targetChars: 300,
+      scenes: [{
+        ...episodeInput(2).scenes[0],
+        id: 'second-scene',
+        blocks: [{ id: 'second-action', type: 'action', text: '沈清穿着黑色风衣走进庭院。'.repeat(24) }],
+      }],
+      summary: '沈清走进庭院。', newFacts: ['沈清已到庭院'],
+    }, 0);
+    const before = (await store.getProjectState(projectId))!;
+    const continuity = buildScriptContinuityCandidate(before, second, [{
+      characterId: 'character-1', outfit: '黑色风衣',
+    }]);
+    continuity.characterUpdates[0]!.emotionalState = '冷静';
+    expect(continuity.timelineEvents[0]!.causeEventIds).toHaveLength(1);
+    const enriched = await store.commitEpisodeWithContinuity(buildScriptAtomicCommitInput(
+      before, second, continuity,
+      { promptVersion: 'successor-fixture', modelConfigFingerprint: 'b'.repeat(64) },
+    ));
+    await service.saveEpisode(projectId, 1, editLedgerBody(episode), episode.revision);
+    const state = (await store.getProjectState(projectId))!;
+    const commits = currentScriptContinuityCommits(state);
+    expect(commits).toHaveLength(2);
+    expect(commits[0]!.timelineEvents).toEqual([]);
+    expect(commits[1]!.timelineEvents[0]).toMatchObject({ summary: second.summary, causeEventIds: [] });
+    expect(commits[1]!.characterUpdates[0]).toMatchObject({ outfit: '黑色风衣', emotionalState: '冷静' });
+    expect(state.episodes[1]!.scenes).toEqual(second.scenes);
+    expect(state.episodes[1]!.revision).toBe(enriched.episode.revision + 1);
+    expect(projectScriptContinuity(state, 3)).toMatchObject({ currentState: ['沈清已到庭院'] });
+  });
+
+  it.each(['character-update', 'prop-holder'] as const)(
+    'rebuilds a title-only save when a retained %s refers to a removed character card',
+    async (reference) => {
+      const { service, episode } = await seedManualContinuityEpisode(true);
+      const characters = charactersInput();
+      await service.saveCharacters(projectId, [
+        ...characters,
+        { ...characters[0], id: 'retired-character', name: '陆沉', aliases: [] },
+      ], 1);
+      const state = (await store.getProjectState(projectId))!;
+      const continuity = buildScriptContinuityCandidate(state, episode, [{
+        characterId: 'character-1', outfit: '灰色外套',
+      }]);
+      if (reference === 'character-update') {
+        continuity.characterUpdates.push({
+          characterId: 'retired-character', outfit: '旧制服', knownFactsAdded: [], relationshipChanges: [],
+        });
+      } else {
+        continuity.props[0]!.holderCharacterId = 'retired-character';
+      }
+      const committed = await store.commitEpisodeWithContinuity(buildScriptAtomicCommitInput(
+        state, episode, continuity,
+        { promptVersion: 'retired-character-fixture', modelConfigFingerprint: 'c'.repeat(64) },
+      ));
+      await service.saveCharacters(projectId, characters, 2);
+      const saved = await service.saveEpisode(projectId, 1, {
+        ...committed.episode, title: '换一个标题',
+      }, committed.episode.revision);
+      expect(saved.status).toBe('completed');
+      expect(saved.newFacts).toEqual(episode.newFacts);
+      const after = (await store.getProjectState(projectId))!;
+      const current = currentScriptContinuityCommits(after)[0]!;
+      expect(JSON.stringify(current)).not.toContain('retired-character');
+      expect(current.characterUpdates[0]).toMatchObject({ characterId: 'character-1', outfit: '灰色外套' });
+    },
+  );
 
   it('does not shrink the plan below persisted episode or detailed-outline content', async () => {
     const savedPlan = await app.inject({

@@ -368,15 +368,31 @@ const POLLING_JOB_STATUSES = new Set<ScriptAgentJobSnapshot['status']>([
 
 type CasSaveOutcome<TSaved, TLatest> =
   | { kind: 'saved'; saved: TSaved }
+  | { kind: 'content_conflict'; latest: TLatest }
   | { kind: 'local_changed'; latest: TLatest }
   | { kind: 'retry_blocked'; latest: TLatest; reason: string };
 
+function sameJsonValue(left: unknown, right: unknown): boolean {
+  const canonicalJson = (value: unknown) => JSON.stringify(value, (_key, item: unknown) => (
+    item && typeof item === 'object' && !Array.isArray(item)
+      ? Object.fromEntries(Object.entries(item).sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey)))
+      : item
+  ));
+  return canonicalJson(left) === canonicalJson(right);
+}
+
+function contentConflictNotice(label: string): string {
+  return `${label}在服务器上已有内容修改，已停止保存并保留本地修改；请先复制备份本地内容，再刷新页面核对后保存`;
+}
+
 /**
- * Makes at most two writes. A 409 refreshes the authoritative revision once,
- * preserves the submitted local value, and retries only when no newer local
- * edit or caller-specific safety condition blocks it.
+ * Makes at most two writes. A fresh revision is usable only if the server still
+ * contains the edit's original content. Rebase only updates caller-approved
+ * metadata; applying it to the base must reproduce the latest server value.
+ * Check this before local_changed, whose callers also adopt the new revision.
  */
 async function saveWithOneCasConflictRecovery<TSubmitted, TLatest, TSaved>({
+  base,
   submitted,
   expectedRevision,
   save,
@@ -386,6 +402,7 @@ async function saveWithOneCasConflictRecovery<TSubmitted, TLatest, TSaved>({
   latestRevision,
   retryBlockReason,
 }: {
+  base: TSubmitted;
   submitted: TSubmitted;
   expectedRevision: number;
   save: (value: TSubmitted, revision: number) => Promise<TSaved>;
@@ -402,6 +419,7 @@ async function saveWithOneCasConflictRecovery<TSubmitted, TLatest, TSaved>({
   }
 
   const latest = await loadLatest();
+  if (!sameJsonValue(rebase(base, latest), latest)) return { kind: 'content_conflict', latest };
   if (!editIsCurrent()) return { kind: 'local_changed', latest };
 
   const blocked = await retryBlockReason?.(latest);
@@ -1406,11 +1424,14 @@ export function ScriptWorkspace({
   const projectNameRef = useRef(projectName);
   const dirtyResources = useRef<ScriptResourceFlags>(cleanResourceFlags());
   const resourceEditVersions = useRef<ScriptResourceVersions>(cleanResourceVersions());
+  const resourceEditBases = useRef<Partial<Pick<ScriptWorkspaceData, EditableScriptResource>>>({});
+  const workspaceVersion = useRef(0);
   const stageRef = useRef<ScriptStage>('plan');
   const selectedBatchStartRef = useRef(1);
   const selectedEpisodeRef = useRef<ScriptEpisode>();
   const selectedEpisodeDirty = useRef(false);
   const selectedEpisodeEditVersion = useRef(0);
+  const selectedEpisodeEditBase = useRef<ScriptEpisode>();
   const outlineCompletionJob = useRef<{ id: string; editVersion: number }>();
 
   // A rename only changes the project's display metadata. Keep the newest
@@ -1424,8 +1445,10 @@ export function ScriptWorkspace({
 
   useEffect(() => {
     const controller = new AbortController();
+    workspaceVersion.current += 1;
     setStage('plan');
     setData(null);
+    setBusy(false);
     setNotice('');
     setSelectedEpisode(undefined);
     setEpisodeLoading(false);
@@ -1447,11 +1470,13 @@ export function ScriptWorkspace({
     pollErrorId.current = undefined;
     dirtyResources.current = cleanResourceFlags();
     resourceEditVersions.current = cleanResourceVersions();
+    resourceEditBases.current = {};
     stageRef.current = 'plan';
     selectedBatchStartRef.current = 1;
     selectedEpisodeRef.current = undefined;
     selectedEpisodeDirty.current = false;
     selectedEpisodeEditVersion.current = 0;
+    selectedEpisodeEditBase.current = undefined;
     outlineCompletionJob.current = undefined;
     void (async () => {
       try {
@@ -1496,6 +1521,7 @@ export function ScriptWorkspace({
       }
     })();
     return () => {
+      workspaceVersion.current += 1;
       controller.abort();
       episodeRequest.current?.abort();
       batchRequest.current?.abort();
@@ -1614,29 +1640,26 @@ export function ScriptWorkspace({
   }, [client, hasPollingJobs, onError, onErrorClear, projectId]);
 
   const markResourceDirty = useCallback((resource: EditableScriptResource) => {
+    if (!dirtyResources.current[resource]) {
+      resourceEditBases.current = { ...resourceEditBases.current, [resource]: data?.[resource] };
+    }
     dirtyResources.current[resource] = true;
     resourceEditVersions.current[resource] += 1;
-  }, []);
+  }, [data]);
 
   const applyPlanTurn = useCallback((
     result: Awaited<ReturnType<ApiClient['script']['plan']['turn']>>,
     requestEditVersion: number,
   ) => {
     if (resourceEditVersions.current.plan !== requestEditVersion) {
-      if (result.status === 'ready' && result.plan) {
-        setData((current) => current ? {
-          ...current,
-          plan: {
-            ...current.plan,
-            status: result.plan!.status,
-            revision: result.plan!.revision,
-            updatedAt: result.plan!.updatedAt,
-          },
-        } : current);
-      }
+      // A ready turn has already persisted the Agent's plan. Keep the local
+      // edit's original revision and base so a later save cannot overwrite it
+      // merely by adopting the Agent's newer revision here.
       setPlanQuestions([]);
       setPlanAnswers({});
-      setNotice('策划已修改，已保留本地内容，请保存后重新发起 Agent 策划');
+      setNotice(result.status === 'ready' && result.plan
+        ? contentConflictNotice('策划')
+        : '策划已修改，已保留本地内容，请保存后重新发起 Agent 策划');
       return;
     }
     if (result.status === 'asking') {
@@ -1860,27 +1883,32 @@ export function ScriptWorkspace({
 
   const savePlan = useCallback(async () => {
     if (!data) return;
+    const saveWorkspaceVersion = workspaceVersion.current;
+    const isCurrentWorkspace = () => workspaceVersion.current === saveWorkspaceVersion;
     const editVersion = resourceEditVersions.current.plan;
     const submittedPlan = data.plan;
+    const base = dirtyResources.current.plan ? resourceEditBases.current.plan ?? submittedPlan : submittedPlan;
     setBusy(true);
     setNotice('');
     try {
       const refreshJobs = async (): Promise<ScriptAgentJobSnapshot[]> => {
         const jobs = await client.script.jobs.list(projectId);
-        setData((current) => current ? { ...current, jobs } : current);
+        if (isCurrentWorkspace()) setData((current) => current ? { ...current, jobs } : current);
         return jobs;
       };
       const jobsBeforeSave = await refreshJobs();
+      if (!isCurrentWorkspace()) return;
       if (activeScriptJobs(jobsBeforeSave).length > 0) {
         setNotice('后台短剧任务正在排队或运行，未覆盖任务使用的策划；当前修改已保留，请等任务暂停或结束后再保存');
         return;
       }
       const outcome = await saveWithOneCasConflictRecovery({
+        base,
         submitted: submittedPlan,
         expectedRevision: submittedPlan.revision,
         save: (value, revision) => client.script.plan.save(projectId, value, revision),
         loadLatest: () => client.script.plan.get(projectId),
-        editIsCurrent: () => resourceEditVersions.current.plan === editVersion,
+        editIsCurrent: () => isCurrentWorkspace() && resourceEditVersions.current.plan === editVersion,
         rebase: (value, latest) => ({
           ...value,
           status: latest.status,
@@ -1892,6 +1920,11 @@ export function ScriptWorkspace({
           ? '后台短剧任务刚刚开始，未覆盖任务使用的策划；当前修改已保留，请等任务暂停或结束后再保存'
           : undefined,
       });
+      if (!isCurrentWorkspace()) return;
+      if (outcome.kind === 'content_conflict') {
+        setNotice(contentConflictNotice('策划'));
+        return;
+      }
       if (outcome.kind !== 'saved') {
         setData((current) => current ? {
           ...current,
@@ -1908,6 +1941,7 @@ export function ScriptWorkspace({
         return;
       }
       const saved = outcome.saved;
+      resourceEditBases.current.plan = saved;
       const unchangedWhileSaving = resourceEditVersions.current.plan === editVersion;
       if (unchangedWhileSaving) dirtyResources.current.plan = false;
       setData((current) => current ? {
@@ -1918,28 +1952,37 @@ export function ScriptWorkspace({
       } : current);
       setNotice(unchangedWhileSaving ? '策划已保存' : '策划已保存，仍有未保存修改');
     } catch (error) {
-      onError?.(error);
+      if (isCurrentWorkspace()) onError?.(error);
     } finally {
-      setBusy(false);
+      if (isCurrentWorkspace()) setBusy(false);
     }
   }, [client, data, onError, projectId]);
 
   const saveOutline = useCallback(async () => {
     if (!data) return;
+    const saveWorkspaceVersion = workspaceVersion.current;
+    const isCurrentWorkspace = () => workspaceVersion.current === saveWorkspaceVersion;
     const outline = data.outline ?? emptyOutline(projectId);
     const editVersion = resourceEditVersions.current.outline;
+    const base = dirtyResources.current.outline ? resourceEditBases.current.outline ?? emptyOutline(projectId) : outline;
     setBusy(true);
     setNotice('');
     try {
       const outcome = await saveWithOneCasConflictRecovery({
+        base,
         submitted: outline,
         expectedRevision: outline.revision,
         save: (value, revision) => client.script.outline.save(projectId, value, revision),
         loadLatest: () => client.script.outline.get(projectId),
-        editIsCurrent: () => resourceEditVersions.current.outline === editVersion,
+        editIsCurrent: () => isCurrentWorkspace() && resourceEditVersions.current.outline === editVersion,
         rebase: (value, latest) => ({ ...value, revision: latest.revision }),
         latestRevision: (latest) => latest.revision,
       });
+      if (!isCurrentWorkspace()) return;
+      if (outcome.kind === 'content_conflict') {
+        setNotice(contentConflictNotice('大纲'));
+        return;
+      }
       if (outcome.kind !== 'saved') {
         setData((current) => current ? {
           ...current,
@@ -1949,6 +1992,7 @@ export function ScriptWorkspace({
         return;
       }
       const saved = outcome.saved;
+      resourceEditBases.current.outline = saved;
       const unchangedWhileSaving = resourceEditVersions.current.outline === editVersion;
       if (unchangedWhileSaving) dirtyResources.current.outline = false;
       setData((current) => current ? {
@@ -1959,26 +2003,30 @@ export function ScriptWorkspace({
       } : current);
       setNotice(unchangedWhileSaving ? '大纲已保存' : '大纲已保存，仍有未保存修改');
     } catch (error) {
-      onError?.(error);
+      if (isCurrentWorkspace()) onError?.(error);
     } finally {
-      setBusy(false);
+      if (isCurrentWorkspace()) setBusy(false);
     }
   }, [client, data, onError, projectId]);
 
   const saveCharacters = useCallback(async () => {
     if (!data) return;
+    const saveWorkspaceVersion = workspaceVersion.current;
+    const isCurrentWorkspace = () => workspaceVersion.current === saveWorkspaceVersion;
     const editVersion = resourceEditVersions.current.characters;
     const submittedCharacters = data.characters;
+    const base = dirtyResources.current.characters ? resourceEditBases.current.characters ?? [] : submittedCharacters;
     const revision = submittedCharacters.reduce((max, item) => Math.max(max, item.revision), 0);
     setBusy(true);
     setNotice('');
     try {
       const outcome = await saveWithOneCasConflictRecovery({
+        base,
         submitted: submittedCharacters,
         expectedRevision: revision,
         save: (value, expectedRevision) => client.script.characters.save(projectId, value, expectedRevision),
         loadLatest: () => client.script.characters.list(projectId),
-        editIsCurrent: () => resourceEditVersions.current.characters === editVersion,
+        editIsCurrent: () => isCurrentWorkspace() && resourceEditVersions.current.characters === editVersion,
         rebase: (value, latest) => {
           const latestRevision = Math.max(0, ...latest.map((item) => item.revision));
           const latestById = new Map(latest.map((item) => [item.id, item]));
@@ -1990,6 +2038,11 @@ export function ScriptWorkspace({
         },
         latestRevision: (latest) => Math.max(0, ...latest.map((item) => item.revision)),
       });
+      if (!isCurrentWorkspace()) return;
+      if (outcome.kind === 'content_conflict') {
+        setNotice(contentConflictNotice('角色设定'));
+        return;
+      }
       if (outcome.kind !== 'saved') {
         const latestRevision = Math.max(0, ...outcome.latest.map((item) => item.revision));
         const latestById = new Map(outcome.latest.map((item) => [item.id, item]));
@@ -2005,6 +2058,7 @@ export function ScriptWorkspace({
         return;
       }
       const saved = outcome.saved;
+      resourceEditBases.current.characters = saved;
       const unchangedWhileSaving = resourceEditVersions.current.characters === editVersion;
       if (unchangedWhileSaving) dirtyResources.current.characters = false;
       setData((current) => current ? {
@@ -2018,25 +2072,29 @@ export function ScriptWorkspace({
       } : current);
       setNotice(unchangedWhileSaving ? '角色设定已保存' : '角色设定已保存，仍有未保存修改');
     } catch (error) {
-      onError?.(error);
+      if (isCurrentWorkspace()) onError?.(error);
     } finally {
-      setBusy(false);
+      if (isCurrentWorkspace()) setBusy(false);
     }
   }, [client, data, onError, projectId]);
 
   const saveWorld = useCallback(async () => {
     if (!data) return;
+    const saveWorkspaceVersion = workspaceVersion.current;
+    const isCurrentWorkspace = () => workspaceVersion.current === saveWorkspaceVersion;
     const world = data.world ?? emptyWorld(projectId);
     const editVersion = resourceEditVersions.current.world;
+    const base = dirtyResources.current.world ? resourceEditBases.current.world ?? emptyWorld(projectId) : world;
     setBusy(true);
     setNotice('');
     try {
       const outcome = await saveWithOneCasConflictRecovery({
+        base,
         submitted: world,
         expectedRevision: world.revision,
         save: (value, revision) => client.script.world.save(projectId, value, revision),
         loadLatest: () => client.script.world.get(projectId),
-        editIsCurrent: () => resourceEditVersions.current.world === editVersion,
+        editIsCurrent: () => isCurrentWorkspace() && resourceEditVersions.current.world === editVersion,
         rebase: (value, latest) => ({
           ...value,
           revision: latest.revision,
@@ -2044,6 +2102,11 @@ export function ScriptWorkspace({
         }),
         latestRevision: (latest) => latest.revision,
       });
+      if (!isCurrentWorkspace()) return;
+      if (outcome.kind === 'content_conflict') {
+        setNotice(contentConflictNotice('世界设定'));
+        return;
+      }
       if (outcome.kind !== 'saved') {
         setData((current) => current ? {
           ...current,
@@ -2057,6 +2120,7 @@ export function ScriptWorkspace({
         return;
       }
       const saved = outcome.saved;
+      resourceEditBases.current.world = saved;
       const unchangedWhileSaving = resourceEditVersions.current.world === editVersion;
       if (unchangedWhileSaving) dirtyResources.current.world = false;
       setData((current) => current ? {
@@ -2067,9 +2131,9 @@ export function ScriptWorkspace({
       } : current);
       setNotice(unchangedWhileSaving ? '世界设定已保存' : '世界设定已保存，仍有未保存修改');
     } catch (error) {
-      onError?.(error);
+      if (isCurrentWorkspace()) onError?.(error);
     } finally {
-      setBusy(false);
+      if (isCurrentWorkspace()) setBusy(false);
     }
   }, [client, data, onError, projectId]);
 
@@ -2394,6 +2458,7 @@ export function ScriptWorkspace({
   }, [client, onError, projectId]);
 
   const editSelectedEpisode = useCallback((episode: ScriptEpisode) => {
+    if (!selectedEpisodeDirty.current) selectedEpisodeEditBase.current = selectedEpisodeRef.current;
     selectedEpisodeRef.current = episode;
     selectedEpisodeDirty.current = true;
     selectedEpisodeEditVersion.current += 1;
@@ -2405,15 +2470,19 @@ export function ScriptWorkspace({
 
   const saveEpisode = useCallback(async () => {
     if (!selectedEpisode) return;
+    const saveWorkspaceVersion = workspaceVersion.current;
+    const isCurrentWorkspace = () => workspaceVersion.current === saveWorkspaceVersion;
     const editVersion = selectedEpisodeEditVersion.current;
     // Clicking Save is an explicit human confirmation. Ask the backend to run
     // its deterministic hard checks and immediately commit the saved revision;
     // a previous interrupted/manual edit may still carry `reviewing` here.
     const submittedEpisode: ScriptEpisode = { ...selectedEpisode, status: 'completed' };
+    const base = selectedEpisodeDirty.current ? selectedEpisodeEditBase.current ?? selectedEpisode : selectedEpisode;
     setBusy(true);
     setNotice('');
     try {
       const outcome = await saveWithOneCasConflictRecovery({
+        base,
         submitted: submittedEpisode,
         expectedRevision: submittedEpisode.revision,
         save: (value, revision) => client.script.episodes.save(
@@ -2423,7 +2492,9 @@ export function ScriptWorkspace({
           revision,
         ),
         loadLatest: () => client.script.episodes.get(projectId, submittedEpisode.episodeNumber),
-        editIsCurrent: () => selectedEpisodeEditVersion.current === editVersion,
+        editIsCurrent: () => isCurrentWorkspace()
+          && selectedEpisodeRef.current?.id === submittedEpisode.id
+          && selectedEpisodeEditVersion.current === editVersion,
         rebase: (value, latest) => ({
           ...value,
           revision: latest.revision,
@@ -2431,6 +2502,11 @@ export function ScriptWorkspace({
         }),
         latestRevision: (latest) => latest.revision,
       });
+      if (!isCurrentWorkspace()) return;
+      if (outcome.kind === 'content_conflict') {
+        setNotice(contentConflictNotice(`第 ${submittedEpisode.episodeNumber} 集`));
+        return;
+      }
       if (outcome.kind !== 'saved') {
         const latest = outcome.latest;
         if (selectedEpisodeRef.current?.episodeNumber === submittedEpisode.episodeNumber) {
@@ -2450,16 +2526,25 @@ export function ScriptWorkspace({
       }
       const saved = outcome.saved;
       const summary = summarizeEpisode(saved);
-      const sameEpisodeStillSelected = selectedEpisodeRef.current?.episodeNumber === saved.episodeNumber;
+      const sameEpisodeStillSelected = selectedEpisodeRef.current?.id === saved.id;
       const unchangedWhileSaving = selectedEpisodeEditVersion.current === editVersion;
       const editorEpisode = sameEpisodeStillSelected && !unchangedWhileSaving
         ? {
             ...selectedEpisodeRef.current!,
+            // These derived fields have no editor controls. The backend may
+            // invalidate them after a body edit; do not resurrect old facts on
+            // the next save while preserving the user's newer screenplay.
+            summary: saved.summary,
+            newFacts: saved.newFacts,
+            openedThreads: saved.openedThreads,
+            closedThreads: saved.closedThreads,
+            status: saved.status,
             revision: saved.revision,
             updatedAt: saved.updatedAt,
           }
         : saved;
       if (sameEpisodeStillSelected) {
+        selectedEpisodeEditBase.current = saved;
         selectedEpisodeRef.current = editorEpisode;
         if (unchangedWhileSaving) selectedEpisodeDirty.current = false;
         setSelectedEpisode(editorEpisode);
@@ -2477,9 +2562,9 @@ export function ScriptWorkspace({
         ? `第 ${saved.episodeNumber} 集已保存`
         : `第 ${saved.episodeNumber} 集已保存，仍有未保存修改`);
     } catch (error) {
-      onError?.(error);
+      if (isCurrentWorkspace()) onError?.(error);
     } finally {
-      setBusy(false);
+      if (isCurrentWorkspace()) setBusy(false);
     }
   }, [client, onError, projectId, selectedEpisode]);
 
