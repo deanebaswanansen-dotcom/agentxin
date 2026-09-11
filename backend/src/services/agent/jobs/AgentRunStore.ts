@@ -147,14 +147,7 @@ export class AgentRunStore {
     request: AgentRunRequest,
     requestedId = randomUUID(),
   ): Promise<StoredAgentRun> {
-    const conflict = Object.values(this.data.runs).find((run) =>
-      run.clientId === clientId &&
-      ACTIVE_STATUSES.has(run.status) &&
-      requestsConflict(run.request, request),
-    );
-    if (conflict) {
-      throw new AgentRunConflictError(conflict.id, conflictMessage(request));
-    }
+    this.assertNoConflict(clientId, request);
 
     const now = new Date().toISOString();
     if (this.data.runs[requestedId]) {
@@ -253,6 +246,9 @@ export class AgentRunStore {
 
   async markQueued(id: string): Promise<StoredAgentRun> {
     return this.update(id, (run) => {
+      // Check and reserve synchronously, just like create(). Concurrent start
+      // and resume calls must see the reservation before persistence awaits.
+      this.assertNoConflict(run.clientId, run.request, id);
       run.status = 'queued';
       delete run.error;
     });
@@ -303,6 +299,18 @@ export class AgentRunStore {
       run.status = 'cancelled';
       run.error = { code: 'RUN_CANCELLED', message: '任务已停止。' };
     });
+  }
+
+  private assertNoConflict(clientId: string, request: AgentRunRequest, ignoredId?: string): void {
+    const conflict = Object.values(this.data.runs).find((run) =>
+      run.id !== ignoredId &&
+      run.clientId === clientId &&
+      ACTIVE_STATUSES.has(run.status) &&
+      requestsConflict(run.request, request),
+    );
+    if (conflict) {
+      throw new AgentRunConflictError(conflict.id, conflictMessage(request));
+    }
   }
 
   private async update(id: string, mutate: (run: StoredAgentRun) => void): Promise<StoredAgentRun> {

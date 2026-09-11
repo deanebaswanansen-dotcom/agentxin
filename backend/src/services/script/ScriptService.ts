@@ -36,10 +36,13 @@ import {
 } from './ScriptCanonicalInput.js';
 import {
   buildScriptAtomicCommitInput,
-  buildScriptContinuityCandidate,
   currentScriptContinuityCommits,
   projectScriptContinuity,
 } from './ScriptContinuityCommit.js';
+import {
+  buildManualScriptContinuityCandidate,
+  reconcileManualEpisodeMetadata,
+} from './ScriptManualEpisodeSave.js';
 import { serializeChineseShortDrama } from './serializers/chineseShortDrama.js';
 import { serializeScriptMarkdown } from './serializers/markdown.js';
 import { serializeFountain } from './serializers/fountain.js';
@@ -584,13 +587,7 @@ export class ScriptService {
     );
     if (!report.hardFailed && blockingIssues.length === 0 && !hasCurrentCommit) {
       const latestState = (await this.store.getProjectState(projectId)) ?? state;
-      const previousEpisodeCommit = [...(latestState.continuityCommits ?? [])]
-        .filter((commit) => commit.episodeNumber === episodeNumber)
-        .sort((left, right) => right.revision - left.revision)[0];
-      const wardrobe = previousEpisodeCommit?.characterUpdates.flatMap((update) =>
-        update.outfit ? [{ characterId: update.characterId, outfit: update.outfit }] : [],
-      ) ?? [];
-      const continuity = buildScriptContinuityCandidate(latestState, episode, wardrobe);
+      const continuity = buildManualScriptContinuityCandidate(latestState, episode, episode);
       const commitInput = buildScriptAtomicCommitInput(latestState, episode, continuity, {
         promptVersion: 'script-service-proofread-v1',
         modelConfigFingerprint: DETERMINISTIC_REVIEW_CONFIG_FINGERPRINT,
@@ -611,8 +608,8 @@ export class ScriptService {
   /**
    * Rebuild the immutable continuity chain after a user changes an earlier
    * completed Episode. The successor scripts themselves are not rewritten and
-   * no model is called; only their deterministic continuity commits are rebased
-   * onto the newly confirmed predecessor.
+   * no model is called; their revision-matching continuity is rebound onto the
+   * newly confirmed predecessor, or rebuilt from the saved Episode if missing.
    */
   private async rechainCompletedSuccessors(
     projectId: string,
@@ -628,13 +625,7 @@ export class ScriptService {
       );
       if (!episode) return;
 
-      const previousCommit = [...(state.continuityCommits ?? [])]
-        .filter((item) => item.episodeNumber === episodeNumber)
-        .sort((left, right) => right.revision - left.revision)[0];
-      const wardrobe = previousCommit?.characterUpdates.flatMap((update) =>
-        update.outfit ? [{ characterId: update.characterId, outfit: update.outfit }] : [],
-      ) ?? [];
-      const continuity = buildScriptContinuityCandidate(state, episode, wardrobe);
+      const continuity = buildManualScriptContinuityCandidate(state, episode, episode);
       const commitInput = buildScriptAtomicCommitInput(state, episode, continuity, {
         promptVersion: 'script-service-manual-edit-rechain-v1',
         modelConfigFingerprint: DETERMINISTIC_REVIEW_CONFIG_FINGERPRINT,
@@ -668,14 +659,14 @@ export class ScriptService {
     });
     const current = state?.episodes.find((item) => item.episodeNumber === episodeNumber);
     const now = new Date().toISOString();
-    const episode: ScriptEpisode = {
+    const episode = reconcileManualEpisodeMetadata(current, {
       ...input,
       id: current?.id ?? input.id ?? randomUUID(),
       projectId,
       revision: current?.revision ?? 0,
       createdAt: current?.createdAt ?? now,
       updatedAt: now,
-    };
+    });
     if (episode.status === 'completed') {
       if (!plan) {
         throw ScriptServiceError.validation('完成正文前必须先保存并确认短剧策划');
@@ -724,7 +715,7 @@ export class ScriptService {
       if (expectedRevision !== actualEpisodeRevision) {
         throw new ScriptConflictError(expectedRevision, actualEpisodeRevision);
       }
-      const continuity = buildScriptContinuityCandidate(state, episode);
+      const continuity = buildManualScriptContinuityCandidate(state, episode, current);
       const commitInput = buildScriptAtomicCommitInput(state, episode, continuity, {
         promptVersion: 'script-service-save-completed-v1',
         modelConfigFingerprint: DETERMINISTIC_REVIEW_CONFIG_FINGERPRINT,

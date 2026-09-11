@@ -1,9 +1,12 @@
+import { execFile } from 'node:child_process';
 import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 
 import { describe, expect, it, vi } from 'vitest';
 
+import type { AgentProgressEvent, AgentRunRequest, AgentRunResult } from '../../../types/index.js';
 import { getCurrentClientId } from '../../client/clientScope.js';
 import { getRequestModelConfig } from '../../modelConfig/requestModelConfig.js';
 import { AgentJobRunner } from './AgentJobRunner.js';
@@ -11,7 +14,243 @@ import { AgentRunStore } from './AgentRunStore.js';
 
 const CLIENT_ID = 'a'.repeat(64);
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function batchRequest(startEpisode = 1): AgentRunRequest {
+  return {
+    task: 'script_episode_batch', mode: 'draft', prompt: '', projectId: 'p1',
+    scriptBatchOptions: { startEpisode, episodeCount: 5, expectedPlanRevision: 1 },
+  };
+}
+
+function result(summary: string, projectId = 'p1'): AgentRunResult {
+  return { task: 'script_episode_batch', mode: 'draft', projectId, summary, steps: [], artifacts: [] };
+}
+
 describe('AgentJobRunner', () => {
+  it.each(['execution', 'progress'] as const)(
+    'keeps a standalone Node process alive when %s and recovery persistence fail',
+    async (failure) => {
+      const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-unhandled-write-'));
+      const script = `
+        import assert from 'node:assert/strict';
+        import { setTimeout as delay } from 'node:timers/promises';
+        import { AgentJobRunner } from ${JSON.stringify(new URL('./AgentJobRunner.ts', import.meta.url).href)};
+        import { AgentRunStore } from ${JSON.stringify(new URL('./AgentRunStore.ts', import.meta.url).href)};
+        const store = await AgentRunStore.create(${JSON.stringify(join(directory, 'runs.json'))});
+        let failExecution;
+        let reportProgress;
+        const runner = new AgentJobRunner(store, {
+          run: (_request, _signal, onProgress) => new Promise((_resolve, reject) => {
+            failExecution = reject;
+            reportProgress = onProgress;
+          }),
+        }, { maxAttempts: 1, storageWriteTimeoutMs: 50 });
+        const clientId = 'a'.repeat(64);
+        const job = await runner.start(clientId, {
+          task: 'script_episode_batch', mode: 'draft', prompt: '', projectId: 'p1',
+        }, undefined);
+        for (let poll = 0; !failExecution && poll < 100; poll += 1) await delay(5);
+        assert.equal(typeof failExecution, 'function');
+        const originalPersist = store.persist.bind(store);
+        store.persist = async () => { throw Object.assign(new Error('disk full'), { code: 'ENOSPC' }); };
+        if (${JSON.stringify(failure)} === 'execution') failExecution(new Error('executor failed'));
+        else reportProgress({ phase: 'info', message: 'checkpoint' });
+        // Deliberately do not observe waitUntilIdle until Node has had time to
+        // report an unhandled background rejection under its strict policy.
+        await delay(100);
+        assert.equal(store.get(job.id).status, 'failed');
+        assert.equal(store.get(job.id).error.code, ${JSON.stringify(failure === 'execution' ? 'RUN_FAILED' : 'ENOSPC')});
+        await runner.waitUntilIdle(job.id);
+        store.persist = originalPersist;
+        await runner.resume(clientId, job.id, undefined);
+        await runner.cancel(clientId, job.id);
+        console.log('recovered');
+      `;
+      const child = await promisify(execFile)(process.execPath, [
+        '--unhandled-rejections=strict', '--import', 'tsx', '--input-type=module', '--eval', script,
+      ], { timeout: 5_000 });
+      expect(child.stdout).toContain('recovered');
+      expect(child.stderr).toContain('Job state was not durably saved');
+      expect(child.stderr).toContain('ENOSPC');
+    },
+  );
+
+  it.each(['cancel', 'timeout'] as const)(
+    'ignores queued progress and a late result after %s and resume of the same job',
+    async (stop) => {
+      const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-old-generation-'));
+      const store = await AgentRunStore.create(join(directory, 'runs.json'));
+      const oldExecution = deferred<AgentRunResult>();
+      const newExecution = deferred<AgentRunResult>();
+      const writeGate = deferred<void>();
+      const originalAppend = store.appendEvent.bind(store);
+      const append = vi.spyOn(store, 'appendEvent').mockImplementationOnce(async (id, event) => {
+        const stored = await originalAppend(id, event);
+        await writeGate.promise;
+        return stored;
+      });
+      const bind = vi.spyOn(store, 'bindRequestProjectId');
+      const complete = vi.spyOn(store, 'complete');
+      let oldProgress: ((event: AgentProgressEvent) => void) | undefined;
+      const execute = vi.fn((_request, _signal, onProgress) => {
+        if (!oldProgress) {
+          oldProgress = onProgress;
+          onProgress?.({ phase: 'info', message: 'first checkpoint' });
+          onProgress?.({ phase: 'info', message: 'queued old checkpoint', projectId: 'stale-project' });
+          return oldExecution.promise;
+        }
+        return newExecution.promise;
+      });
+      const runner = new AgentJobRunner(store, { run: execute }, {
+        idleTimeoutMs: stop === 'timeout' ? 100 : 5_000,
+        maxAttemptDurationMs: 5_000,
+        maxAttempts: 1,
+      });
+      const created = await runner.start(CLIENT_ID, batchRequest(), undefined);
+      await vi.waitFor(() => expect(append).toHaveBeenCalledOnce());
+      if (stop === 'cancel') await runner.cancel(CLIENT_ID, created.id);
+      await runner.waitUntilIdle(created.id);
+      expect(store.get(created.id)?.status).toBe(stop === 'cancel' ? 'cancelled' : 'failed');
+
+      await runner.resume(CLIENT_ID, created.id, undefined);
+      await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(2));
+      writeGate.resolve();
+      oldProgress?.({ phase: 'info', message: 'late old checkpoint', projectId: 'late-project' });
+      oldExecution.resolve(result('old result', 'old-project'));
+      await append.mock.results[0]?.value;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(bind).not.toHaveBeenCalled();
+      expect(complete).not.toHaveBeenCalled();
+      expect(store.get(created.id)).toMatchObject({
+        status: 'running', attempts: 2, request: { projectId: 'p1' },
+        events: [{ message: 'first checkpoint' }],
+      });
+      expect(store.get(created.id)?.events).toHaveLength(1);
+      newExecution.resolve(result('new result'));
+      await runner.waitUntilIdle(created.id);
+      expect(store.get(created.id)).toMatchObject({ status: 'completed', result: { summary: 'new result' } });
+    },
+  );
+
+  it('ignores a late needs-review rejection after cancellation and resume', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-old-rejection-'));
+    const store = await AgentRunStore.create(join(directory, 'runs.json'));
+    const oldExecution = deferred<AgentRunResult>();
+    const newExecution = deferred<AgentRunResult>();
+    const execute = vi.fn()
+      .mockImplementationOnce(() => oldExecution.promise)
+      .mockImplementationOnce(() => newExecution.promise);
+    const runner = new AgentJobRunner(store, { run: execute });
+    const created = await runner.start(CLIENT_ID, batchRequest(), undefined);
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+    await runner.cancel(CLIENT_ID, created.id);
+    await runner.resume(CLIENT_ID, created.id, undefined);
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(2));
+    oldExecution.reject(Object.assign(new Error('old review error'), { code: 'SCRIPT_STRUCTURED_NEEDS_REVIEW' }));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(store.get(created.id)).toMatchObject({ status: 'running', attempts: 2 });
+    newExecution.resolve(result('new result'));
+    await runner.waitUntilIdle(created.id);
+    expect(store.get(created.id)?.status).toBe('completed');
+  });
+
+  it.each(['start-first', 'resume-first'] as const)(
+    'atomically rejects one overlapping start/resume request (%s)',
+    async (order) => {
+      const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-resume-conflict-'));
+      const store = await AgentRunStore.create(join(directory, 'runs.json'));
+      const previous = await store.create(CLIENT_ID, batchRequest());
+      await store.fail(previous.id, { code: 'PREVIOUS_FAILURE', message: 'previous failure' });
+      const execute = vi.fn(() => new Promise<AgentRunResult>(() => undefined));
+      const runner = new AgentJobRunner(store, { run: execute });
+      const start = () => runner.start(CLIENT_ID, batchRequest(5), undefined);
+      const resume = () => runner.resume(CLIENT_ID, previous.id, undefined);
+      const outcomes = await Promise.allSettled(order === 'start-first' ? [start(), resume()] : [resume(), start()]);
+      expect(outcomes[0]?.status).toBe('fulfilled');
+      expect(outcomes[1]).toMatchObject({ status: 'rejected', reason: { code: 'CONFLICT' } });
+      await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+      if (order === 'start-first') {
+        expect(store.get(previous.id)).toMatchObject({ status: 'failed', error: { code: 'PREVIOUS_FAILURE' } });
+      }
+      const winner = outcomes[0];
+      if (winner?.status !== 'fulfilled' || !winner.value) throw new Error('missing winning reservation');
+      await runner.cancel(CLIENT_ID, winner.value.id);
+    },
+  );
+
+  it('rejects resuming an overlapping replacement but allows adjacent ranges and other clients', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-resume-isolation-'));
+    const store = await AgentRunStore.create(join(directory, 'runs.json'));
+    const previous = await store.create(CLIENT_ID, batchRequest());
+    await store.fail(previous.id, { message: 'previous failure' });
+    const adjacent = await store.create(CLIENT_ID, batchRequest(6));
+    await store.fail(adjacent.id, { message: 'previous failure' });
+    const otherClient = await store.create('b'.repeat(64), batchRequest());
+    await store.fail(otherClient.id, { message: 'previous failure' });
+    const execute = vi.fn(() => new Promise<AgentRunResult>(() => undefined));
+    const runner = new AgentJobRunner(store, { run: execute });
+    const replacement = await runner.start(CLIENT_ID, batchRequest(), undefined);
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+    await expect(runner.resume(CLIENT_ID, previous.id, undefined)).rejects.toMatchObject({
+      code: 'CONFLICT', existingJobId: replacement.id,
+    });
+    await Promise.all([
+      runner.resume(CLIENT_ID, adjacent.id, undefined),
+      runner.resume('b'.repeat(64), otherClient.id, undefined),
+    ]);
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(3));
+    await Promise.all([
+      runner.cancel(CLIENT_ID, replacement.id),
+      runner.cancel(CLIENT_ID, adjacent.id),
+      runner.cancel('b'.repeat(64), otherClient.id),
+    ]);
+  });
+
+  it.each(['resolve', 'reject'] as const)(
+    'coalesces resumes and preserves cancellation when a pending queue write later %ss',
+    async (settlement) => {
+      const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-resume-reservation-'));
+      const store = await AgentRunStore.create(join(directory, 'runs.json'));
+      const previous = await store.create(CLIENT_ID, batchRequest());
+      await store.fail(previous.id, { message: 'previous failure' });
+      const queueGate = deferred<void>();
+      const originalPersist = (store as unknown as { persist: () => Promise<void> }).persist.bind(store);
+      vi.spyOn(store as unknown as { persist: () => Promise<void> }, 'persist')
+        .mockImplementationOnce(() => queueGate.promise)
+        .mockImplementation(originalPersist);
+      const queued = vi.spyOn(store, 'markQueued');
+      const execute = vi.fn(() => new Promise<AgentRunResult>(() => undefined));
+      const runner = new AgentJobRunner(store, { run: execute });
+      const first = runner.resume(CLIENT_ID, previous.id, undefined);
+      const second = runner.resume(CLIENT_ID, previous.id, undefined);
+      const outcomes = Promise.allSettled([first, second]);
+      expect(queued).toHaveBeenCalledOnce();
+      await runner.cancel(CLIENT_ID, previous.id);
+      if (settlement === 'resolve') queueGate.resolve();
+      else queueGate.reject(Object.assign(new Error('disk full'), { code: 'ENOSPC' }));
+      const expectedOutcome = settlement === 'resolve'
+        ? { status: 'fulfilled', value: expect.objectContaining({ status: 'cancelled' }) }
+        : { status: 'rejected', reason: expect.objectContaining({ code: 'ENOSPC' }) };
+      expect(await outcomes).toEqual([expectedOutcome, expectedOutcome]);
+      expect(store.get(previous.id)?.status).toBe('cancelled');
+      expect(execute).not.toHaveBeenCalled();
+
+      await runner.resume(CLIENT_ID, previous.id, undefined);
+      await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+      await runner.cancel(CLIENT_ID, previous.id);
+    },
+  );
+
   it('continues independently, persists progress, and restores request scopes without storing the API key', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-'));
     const file = join(directory, 'runs.json');

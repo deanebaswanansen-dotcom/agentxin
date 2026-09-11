@@ -144,23 +144,32 @@ function delay(milliseconds: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-async function settleWrite<T>(write: Promise<T>, timeoutMs = 5_000): Promise<void> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
+async function settleWrite<T>(
+  write: Promise<T>,
+  id: string,
+  operation: string,
+  timeoutMs = DEFAULT_JOB_STORAGE_WRITE_TIMEOUT_MS,
+): Promise<void> {
   try {
-    await Promise.race([
-      write.then(() => undefined),
-      new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, timeoutMs);
-        timer.unref?.();
-      }),
-    ]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
+    await boundedStoreWrite(write, operation, timeoutMs);
+  } catch (error) {
+    // The store has already updated its recoverable in-memory state. A
+    // secondary persistence failure must not reject an unobserved background
+    // task, and must not be reported as a successful durable write either.
+    console.error('[AgentJobRunner] Job state was not durably saved', {
+      jobId: id,
+      operation,
+      error: safeError(error),
+    });
   }
 }
 
 export class AgentJobRunner {
   private readonly active = new Map<string, { controller: AbortController; promise: Promise<void> }>();
+  private readonly resuming = new Map<string, {
+    cancelled: boolean;
+    promise: Promise<StoredAgentRun | undefined>;
+  }>();
 
   constructor(
     private readonly store: AgentRunStore,
@@ -197,7 +206,7 @@ export class AgentJobRunner {
       // stalls or fails, make the reserved run terminal immediately so it
       // cannot become an invisible queued job that blocks every retry.
       if (this.store.get(id)) {
-        await settleWrite(this.store.fail(id, safeError(error)), storageWriteTimeoutMs);
+        await settleWrite(this.store.fail(id, safeError(error)), id, '保存创建失败状态', storageWriteTimeoutMs);
       }
       throw error;
     }
@@ -212,6 +221,8 @@ export class AgentJobRunner {
   ): Promise<StoredAgentRun | undefined> {
     const run = this.store.getForClient(clientId, id);
     if (!run) return undefined;
+    const pending = this.resuming.get(id);
+    if (pending) return pending.promise;
     const resumableScriptFailure =
       run.request.task.startsWith('script_') &&
       (run.status === 'failed' || run.status === 'cancelled');
@@ -225,27 +236,43 @@ export class AgentJobRunner {
         const context = shouldResumeRejectedCandidates(run)
           ? { resumeRejectedCandidates: true }
           : undefined;
+        const reservation = {
+          cancelled: false,
+          promise: Promise.resolve<StoredAgentRun | undefined>(undefined),
+        };
+        this.resuming.set(id, reservation);
         // Persist the hand-off before launching. The HTTP resume response must
         // be pollable even though markRunning happens in the background task's
         // next microtask.
         const storageWriteTimeoutMs = this.storageWriteTimeoutMs();
-        try {
-          await boundedStoreWrite(
-            this.store.markQueued(id),
-            '恢复任务',
-            storageWriteTimeoutMs,
-          );
-        } catch (error) {
-          // markQueued also updates memory before persistence. Restore a
-          // visible resumable state instead of leaving a runner-less queued
-          // job on the page forever.
-          await settleWrite(
-            this.store.markWaiting(id, safeError(error)),
-            storageWriteTimeoutMs,
-          );
-          throw error;
-        }
-        this.launch(id, clientId, run.request, modelConfig, context);
+        reservation.promise = (async () => {
+          try {
+            await boundedStoreWrite(
+              this.store.markQueued(id),
+              '恢复任务',
+              storageWriteTimeoutMs,
+            );
+          } catch (error) {
+            // A conflict never acquired the queued reservation. Cancellation
+            // invalidates it too; neither may be overwritten by recovery.
+            if (!(error instanceof AgentRunConflictError) && !reservation.cancelled) {
+              await settleWrite(
+                this.store.markWaiting(id, safeError(error)),
+                id,
+                '保存恢复失败状态',
+                storageWriteTimeoutMs,
+              );
+            }
+            throw error;
+          }
+          if (!reservation.cancelled) {
+            this.launch(id, clientId, run.request, modelConfig, context);
+          }
+          return this.store.getForClient(clientId, id);
+        })().finally(() => {
+          if (this.resuming.get(id) === reservation) this.resuming.delete(id);
+        });
+        return reservation.promise;
       }
     }
     return this.store.getForClient(clientId, id);
@@ -254,10 +281,14 @@ export class AgentJobRunner {
   async cancel(clientId: string, id: string): Promise<StoredAgentRun | undefined> {
     const run = this.store.getForClient(clientId, id);
     if (!run) return undefined;
-    this.active.get(id)?.controller.abort();
+    const pending = this.resuming.get(id);
+    if (pending) pending.cancelled = true;
+    const active = this.active.get(id);
+    active?.controller.abort();
     // `cancel()` mutates the in-memory terminal state before persistence. Do
     // not let a broken filesystem keep the HTTP request or active slot open.
-    await settleWrite(this.store.cancel(id));
+    await settleWrite(this.store.cancel(id), id, '保存取消状态', this.storageWriteTimeoutMs());
+    await active?.promise;
     return this.store.getForClient(clientId, id);
   }
 
@@ -289,12 +320,14 @@ export class AgentJobRunner {
     modelConfig: ModelConfig | undefined,
     context?: AgentRunExecutionContext,
   ): void {
-    if (this.active.has(id)) return;
+    if (this.active.has(id) || this.store.get(id)?.status !== 'queued') return;
     const controller = new AbortController();
+    const ownsExecution = (): boolean => this.active.get(id)?.controller === controller;
     const promise = Promise.resolve()
       .then(async () => {
         const maxAttempts = this.options.maxAttempts ?? 3;
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+          if (!ownsExecution() || controller.signal.aborted) return;
           let progressWrites: Promise<void> = Promise.resolve();
           const attemptController = new AbortController();
           const idleTimeoutMs = boundedTimeout(
@@ -308,6 +341,8 @@ export class AgentJobRunner {
             DEFAULT_JOB_MAX_ATTEMPT_DURATION_MS,
           );
           let acceptProgress = true;
+          const canWriteAttempt = (): boolean => acceptProgress &&
+            ownsExecution() && !controller.signal.aborted && !attemptController.signal.aborted;
           let idleTimer: ReturnType<typeof setTimeout> | undefined;
           let totalTimer: ReturnType<typeof setTimeout> | undefined;
           let rejectWatchdog!: (error: unknown) => void;
@@ -347,17 +382,28 @@ export class AgentJobRunner {
             // stalled write queue is still a stalled task from the user's
             // perspective and must release its active slot.
             await Promise.race([this.store.markRunning(id), watchdog]);
+            if (!canWriteAttempt()) return;
             const latestRequest = this.store.get(id)?.request ?? request;
             const execution = runWithClientId(clientId, () =>
               runWithRequestModelConfig(modelConfig, () =>
                 this.executor.run(latestRequest, attemptController.signal, (event) => {
-                  if (!acceptProgress) return;
+                  if (!canWriteAttempt()) return;
                   touchWatchdog();
                   progressWrites = progressWrites.then(async () => {
+                    if (!canWriteAttempt()) return;
                     if (typeof event.projectId === 'string' && event.projectId.trim().length > 0) {
                       await this.store.bindRequestProjectId(id, event.projectId);
                     }
+                    if (!canWriteAttempt()) return;
                     await this.store.appendEvent(id, event);
+                  });
+                  // Observe rejected progress writes immediately, even while
+                  // the executor remains pending or ignores its abort signal.
+                  void progressWrites.catch((error: unknown) => {
+                    if (!canWriteAttempt()) return;
+                    acceptProgress = false;
+                    attemptController.abort(error);
+                    rejectWatchdog(error);
                   });
                 }, context),
               ),
@@ -366,7 +412,9 @@ export class AgentJobRunner {
               // writes. A stuck storage promise must not leave the in-memory
               // run state reported as `running` forever.
               await progressWrites;
+              if (!canWriteAttempt()) return result;
               if (result.projectId) await this.store.bindRequestProjectId(id, result.projectId);
+              if (!canWriteAttempt()) return result;
               await this.store.complete(id, result);
               return result;
             });
@@ -386,6 +434,7 @@ export class AgentJobRunner {
             // Otherwise a late structured-output error can resurrect a job
             // that the user already cancelled as `waiting_user`.
             if (
+              !ownsExecution() ||
               controller.signal.aborted ||
               this.store.get(id)?.status === 'cancelled'
             ) {
@@ -421,16 +470,17 @@ export class AgentJobRunner {
         }
       })
       .catch(async (error: unknown) => {
+        if (!ownsExecution()) return;
         const current = this.store.get(id);
         if (!current || current.status === 'cancelled') return;
         if (controller.signal.aborted) {
-          await settleWrite(this.store.cancel(id));
+          await settleWrite(this.store.cancel(id), id, '保存取消状态', this.storageWriteTimeoutMs());
           return;
         }
-        await settleWrite(this.store.fail(id, safeError(error)));
+        await settleWrite(this.store.fail(id, safeError(error)), id, '保存执行失败状态', this.storageWriteTimeoutMs());
       })
       .finally(() => {
-        this.active.delete(id);
+        if (ownsExecution()) this.active.delete(id);
       });
     this.active.set(id, { controller, promise });
   }
