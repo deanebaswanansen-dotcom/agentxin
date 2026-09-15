@@ -18,6 +18,8 @@ AgentXin 是一个 AI 小说创作 Agent，不是固定步骤的工作流。用�
 
 计划模式的详细契约见 [`PLAN_MODE_SPEC.md`](PLAN_MODE_SPEC.md)。
 
+长篇一致性、可追溯记忆与失败恢复的后续增强见 [Webnovel Writer 能力接入计划](WEBNOVEL_WRITER_INTEGRATION_PLAN.md)（2026-09-15，功能待实施）。
+
 ## 2. 当前线上状态
 
 | 项目 | 当前值 |
