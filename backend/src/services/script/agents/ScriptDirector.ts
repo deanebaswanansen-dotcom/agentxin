@@ -1,4 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
+import type { ModelAttemptBudget } from '../../../proxy/ModelProxy.js';
+import { getCurrentClientId } from '../../client/clientScope.js';
+import { scriptPlanningFailureMessage } from './ScriptPlanModelContent.js';
 
 import type {
   ScriptCharacter,
@@ -8,6 +11,7 @@ import type {
   ScriptEpisodeOutline,
   ScriptPlannedScene,
   ScriptPlan,
+  ScriptPlanDraftContext,
   ScriptProjectState,
   ScriptReviewIssue,
   ScriptReviewIssueCollection,
@@ -28,6 +32,7 @@ import {
   decodeScriptEpisodeInput,
   decodeScriptEpisodeOutlineInput,
   decodeScriptPlanInput,
+  decodeScriptPlanDraftContext,
   decodeScriptSeriesOutlineInput,
   decodeScriptWorldBibleInput,
   validateScriptCharacterSet,
@@ -93,6 +98,7 @@ import {
 } from './FoundationArtifactCoercion.js';
 import {
   generateStructured,
+  STRUCTURED_TRANSPORT_ATTEMPT_LIMIT,
   type StructuredGenerationError,
   type StructuredGenerationResult,
   type StructuredModel,
@@ -167,6 +173,7 @@ export interface ScriptModelRequest {
   /** Uses another model on the same request-scoped provider credentials. */
   modelNameOverride?: string;
   signal?: AbortSignal;
+  attemptBudget?: ModelAttemptBudget;
 }
 
 export interface ScriptModelAdapter {
@@ -209,6 +216,7 @@ export interface ScriptStructuredCallMetric {
   attempts: Array<{
     stage: 'primary' | 'fixup' | 'fallback';
     outcome: 'completed' | 'call_failed' | 'parse_failed' | 'decode_failed';
+    transportAttempts?: number;
   }>;
 }
 
@@ -227,6 +235,8 @@ export type ScriptDirectorRequest =
       projectId: string;
       planningSession: ScriptPlanningSession;
       seedPrompt?: string;
+      draft?: ScriptPlanDraftContext;
+      projectContext?: { name: string; kind: 'short_drama' };
       signal?: AbortSignal;
     }
   | {
@@ -1194,6 +1204,8 @@ function diversifyDuplicateEpisodeCards(
 }
 
 export class ScriptDirector {
+  private readonly planCheckpointWrites = new Map<string, Promise<void>>();
+
   constructor(private readonly dependencies: ScriptDirectorDependencies) {}
 
   async run(request: ScriptDirectorRequest): Promise<ScriptDirectorResult> {
@@ -1231,9 +1243,11 @@ export class ScriptDirector {
       return { kind: 'planning_waiting', missingFields: assessment.missingFields };
     }
     const current = (await this.dependencies.store.getProjectState(request.projectId))?.plan;
+    const draft = request.draft ?? (current ? decodeScriptPlanDraftContext(current) : undefined);
     const prompt = [
         '你是短剧策划 Agent。根据已确认选项补全专业策划。',
         '只返回与 ScriptPlan 对应的 JSON，不输出思考过程或 Markdown 围栏。',
+        '必须返回有实际故事内容的 title、logline、coreConflict；不得用项目名称、输入说明或序列化草稿代替故事。',
         [
           '优先返回以下字段；不确定的辅助字段可以省略，系统会本地补齐：',
           'title, theme, market, channel, genres, audience, coreConflict, logline, highlights,',
@@ -1245,6 +1259,8 @@ export class ScriptDirector {
         'market 优先使用 domestic/overseas，channel 优先使用 female/male/general；中文值和少量格式偏差也可由系统转换。',
         '范围：总集数1—200，时长30—180秒，单集300—3000字，主要角色1—20，场景1—5，对话密度20—90。',
         `用户故事想法：${request.seedPrompt?.trim() || '未提供，由 Agent 原创'}`,
+        `项目元数据：${JSON.stringify(request.projectContext ?? {})}`,
+        `已有策划字段（仅供参考和补全）：${JSON.stringify(draft ?? {})}`,
         `已确认：${JSON.stringify(assessment.values)}`,
         `委托 Agent 字段：${assessment.delegatedFields.join('、') || '无'}`,
       ].join('\n');
@@ -1258,8 +1274,10 @@ export class ScriptDirector {
       values: assessment.values,
       delegatedFields: assessment.delegatedFields,
       seedPrompt: request.seedPrompt?.trim() ?? '',
+      draft,
+      projectContext: request.projectContext,
     })];
-    const promptVersion = 'script-plan-v2';
+    const promptVersion = 'script-plan-v3';
     const inputFingerprint = computeScriptCheckpointInputFingerprint({
       node: 'plan', inputRevisionRefs, upstreamArtifactRefs, promptVersion, configRevision,
     });
@@ -1270,8 +1288,8 @@ export class ScriptDirector {
         now,
         id: planId,
         ...(current ? { current } : {}),
+        ...(draft ? { draft } : {}),
         explicit,
-        seedPrompt: request.seedPrompt,
       });
       const canonical = canonicalModelCandidate(() => decodeScriptPlanInput(candidate));
       return {
@@ -1285,46 +1303,78 @@ export class ScriptDirector {
       };
     };
     let plan: ScriptPlan;
-    let planFallbackReason: string | undefined;
+    let planMetric: ScriptStructuredCallMetric | undefined;
     try {
       plan = await this.generateNodeStructured({
         node: 'plan', projectId: request.projectId, prompt, signal: request.signal,
       }, parserContract(
         'script_plan',
-        '返回可用的短剧策划即可；系统会从用户已确认选项和安全默认值补齐非关键缺项。',
+        '必须返回 title、logline、coreConflict 三个故事字段；只有非关键缺项可以由已有草稿和默认配置补齐。',
         completePlan,
-      ));
+      ), (metric) => { planMetric = metric; });
     } catch (error) {
       if (!(error instanceof ScriptStructuredNeedsReviewError)) throw error;
-      planFallbackReason = '模型未返回可解析策划，已根据用户确认项生成可编辑策划。';
-      plan = completePlan({});
+      request.signal?.throwIfAborted();
+      // The provider's diagnostic may contain response bodies or credentials.
+      // Preserve its cause internally, but expose only a controlled message.
+      error.message = scriptPlanningFailureMessage('策划', error.cause);
+      await this.appendPlanCheckpoint({
+        projectId: request.projectId, runKey: 'script_plan', node: 'plan', status: 'needs_review',
+        attempt: error.cause.attempts.length,
+        inputRevisionRefs, upstreamArtifactRefs, promptVersion, configRevision, inputFingerprint,
+        validationErrors: [
+          { code: 'script_plan.story_generation_failed', message: error.message },
+          {
+            code: 'script_plan.call_budget',
+            message: `结构调用${error.cause.attempts.length}次，实际HTTP ${error.cause.attempts.reduce((sum, attempt) => sum + (attempt.transportAttempts ?? 0), 0)}/${STRUCTURED_TRANSPORT_ATTEMPT_LIMIT}次。`,
+          },
+        ],
+        updatedAt: now,
+      }, request.signal);
+      throw error;
     }
     request.signal?.throwIfAborted();
     const saved = await this.dependencies.store.savePlan(plan, current?.revision ?? 0);
-    const planCheckpointRevision = await this.nextCheckpointArtifactRevision(
-      request.projectId,
-      'script_plan',
-      { node: 'plan' },
-    );
-    await this.dependencies.checkpoints.save({
+    await this.appendPlanCheckpoint({
       projectId: request.projectId,
       runKey: 'script_plan',
       node: 'plan',
       status: 'succeeded',
-      attempt: 1,
-      artifactRevision: planCheckpointRevision,
+      attempt: planMetric?.callsUsed ?? 1,
       artifact: saved,
       inputRevisionRefs,
       upstreamArtifactRefs,
       promptVersion,
       configRevision,
       inputFingerprint,
-      validationErrors: planFallbackReason
-        ? [{ code: 'script_plan.local_fallback', message: planFallbackReason }]
-        : [],
+      validationErrors: [],
       updatedAt: now,
     });
     return { kind: 'plan_draft', plan: saved };
+  }
+
+  private async appendPlanCheckpoint(
+    checkpoint: Omit<ScriptPipelineCheckpointWrite, 'artifactRevision'>,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const key = JSON.stringify([getCurrentClientId(), checkpoint.projectId]);
+    // Allocate and append together after generation. Holding a revision across
+    // a model call lets concurrent runs overwrite each other's provenance.
+    const write = (this.planCheckpointWrites.get(key) ?? Promise.resolve()).then(async () => {
+      signal?.throwIfAborted();
+      const artifactRevision = await this.nextCheckpointArtifactRevision(
+        checkpoint.projectId, checkpoint.runKey, { node: 'plan' },
+      );
+      signal?.throwIfAborted();
+      await this.dependencies.checkpoints.save({ ...checkpoint, artifactRevision });
+    });
+    const settled = write.catch(() => {});
+    this.planCheckpointWrites.set(key, settled);
+    try {
+      await write;
+    } finally {
+      if (this.planCheckpointWrites.get(key) === settled) this.planCheckpointWrites.delete(key);
+    }
   }
 
   private async generateSeriesOutline(
@@ -5559,11 +5609,12 @@ export class ScriptDirector {
     onMetric?: (metric: ScriptStructuredCallMetric) => void,
   ): Promise<T> {
     const asStructuredModel = (modelNameOverride?: string): StructuredModel => ({
-      complete: ({ prompt, signal }) => this.dependencies.model.complete({
+      complete: ({ prompt, signal, attemptBudget }) => this.dependencies.model.complete({
         ...request,
         prompt,
         ...(modelNameOverride ? { modelNameOverride } : {}),
         ...(signal ? { signal } : {}),
+        ...(attemptBudget ? { attemptBudget } : {}),
       }),
     });
     const fallbackModelName = await this.dependencies.model.getStructuredFallbackModelName?.();
@@ -5595,6 +5646,7 @@ export class ScriptDirector {
       attempts: result.attempts.map((attempt) => ({
         stage: attempt.stage,
         outcome: attempt.outcome,
+        ...(attempt.transportAttempts === undefined ? {} : { transportAttempts: attempt.transportAttempts }),
       })),
     };
   }

@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { Project } from '../../../types/index.js';
 import { ERROR_CODES } from '../../../types/index.js';
 import { ServiceError } from '../../ServiceError.js';
+import { getCurrentClientId } from '../../client/clientScope.js';
 import {
   ScriptStructuredNeedsReviewError,
   type ScriptCheckpointStore,
@@ -21,6 +22,9 @@ import type {
   ScriptPlanningValues,
 } from './ScriptPlanningAgent.js';
 import { SCRIPT_PLANNING_FIELDS } from './ScriptPlanningAgent.js';
+import type { ScriptPlanDraftContext } from '../domain.js';
+import { decodeScriptPlanDraftContext } from '../ScriptCanonicalInput.js';
+import { scriptPlanningFailureMessage } from './ScriptPlanModelContent.js';
 
 export type ScriptPlanAnswerValue = string | string[] | number | boolean;
 
@@ -32,6 +36,7 @@ export interface ScriptPlanTurnAnswer {
 export interface ScriptPlanTurnRequest {
   projectId: string;
   seedPrompt?: string;
+  draft?: ScriptPlanDraftContext;
   answers: ScriptPlanTurnAnswer[];
   reset?: boolean;
 }
@@ -63,6 +68,7 @@ interface StoredScriptPlanSession extends ScriptPlanningSession {
   id: string;
   projectId: string;
   seedPrompt: string;
+  draft?: ScriptPlanDraftContext;
   round: number;
   activeQuestions: ScriptPlanningQuestion[];
   createdAt: string;
@@ -73,17 +79,19 @@ interface ScriptProjectLookup {
   (projectId: string): Promise<Project | undefined>;
 }
 
-const SESSION_RUN_KEY = 'script_plan_session';
-const PLAN_GENERATION_ATTEMPTS = 3;
-
-function isRetryablePlanGeneration(error: unknown): boolean {
-  return error instanceof ScriptStructuredNeedsReviewError ||
-    error instanceof ScriptModelOutputError;
+interface PlanningOperation {
+  key: string;
+  controller: AbortController;
+  signal: AbortSignal;
 }
 
+const SESSION_RUN_KEY = 'script_plan_session';
 function rethrowPlanGeneration(error: unknown): never {
   if (error instanceof ScriptStructuredNeedsReviewError || error instanceof ScriptModelOutputError) {
-    throw new ServiceError(ERROR_CODES.PROVIDER_ERROR, error.message, { cause: error });
+    const message = error instanceof ScriptStructuredNeedsReviewError
+      ? scriptPlanningFailureMessage('策划', error.cause)
+      : 'AI 策划未生成有效故事内容，原策划已保留。请重试或手动编辑。';
+    throw new ServiceError(ERROR_CODES.PROVIDER_ERROR, message, { cause: error });
   }
   throw error;
 }
@@ -198,6 +206,9 @@ function storedSession(value: unknown): StoredScriptPlanSession | undefined {
 }
 
 export class ScriptPlanTurnService {
+  private readonly operations = new Map<string, PlanningOperation>();
+  private readonly sessionWrites = new Map<string, Promise<void>>();
+
   constructor(
     private readonly director: Pick<ScriptDirector, 'run'>,
     private readonly checkpoints: ScriptCheckpointStore,
@@ -205,12 +216,50 @@ export class ScriptPlanTurnService {
   ) {}
 
   async turn(request: ScriptPlanTurnRequest, signal?: AbortSignal): Promise<ScriptPlanTurnResponse> {
+    signal?.throwIfAborted();
+    const key = JSON.stringify([getCurrentClientId(), request.projectId]);
+    const previous = this.operations.get(key);
+    if (previous && !request.reset) {
+      throw ServiceError.conflict('当前策划请求仍在处理中，请等待完成后继续回答。');
+    }
+    // Claim ownership before any asynchronous lookup. A reset must be able to
+    // supersede an in-flight model call without waiting for that call to settle.
+    previous?.controller.abort(ServiceError.conflict('策划会话已更新，请继续当前会话。'));
+    const controller = new AbortController();
+    const operation: PlanningOperation = {
+      key,
+      controller,
+      signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
+    };
+    this.operations.set(key, operation);
+    try {
+      const response = await this.runTurn(request, operation);
+      this.assertCurrent(operation);
+      return response;
+    } finally {
+      if (this.operations.get(key) === operation) this.operations.delete(key);
+    }
+  }
+
+  private assertCurrent(operation: PlanningOperation): void {
+    operation.signal.throwIfAborted();
+    if (this.operations.get(operation.key) !== operation) {
+      throw ServiceError.conflict('策划会话已更新，请继续当前会话。');
+    }
+  }
+
+  private async runTurn(request: ScriptPlanTurnRequest, operation: PlanningOperation): Promise<ScriptPlanTurnResponse> {
     const project = await this.projectLookup(request.projectId);
+    this.assertCurrent(operation);
     if (!project) throw ServiceError.notFound(`项目 ${request.projectId} 不存在`);
     if (project.kind !== 'short_drama') {
       throw ServiceError.validation('短剧策划只能用于 short_drama 项目。');
     }
+    // Finish only pending storage work; model generation never holds this queue.
+    await this.sessionWrites.get(operation.key);
+    this.assertCurrent(operation);
     const prior = request.reset === true ? undefined : await this.load(request.projectId);
+    this.assertCurrent(operation);
     const now = new Date().toISOString();
     const session: StoredScriptPlanSession = prior ?? {
       id: randomUUID(),
@@ -228,33 +277,36 @@ export class ScriptPlanTurnService {
     if (typeof request.seedPrompt === 'string' && request.seedPrompt.trim()) {
       session.seedPrompt = request.seedPrompt.trim();
     }
+    if (request.draft !== undefined) session.draft = decodeScriptPlanDraftContext(request.draft);
     for (const answer of request.answers) applyAnswer(session, answer);
     session.round += 1;
     session.updatedAt = now;
 
-    let result: Awaited<ReturnType<ScriptDirector['run']>> | undefined;
-    for (let attempt = 1; attempt <= PLAN_GENERATION_ATTEMPTS; attempt += 1) {
-      try {
-        result = await this.director.run({
-          task: 'script_plan',
-          projectId: request.projectId,
-          seedPrompt: session.seedPrompt,
-          planningSession: session,
-          signal,
-        });
-        break;
-      } catch (error) {
-        if (!isRetryablePlanGeneration(error) || attempt >= PLAN_GENERATION_ATTEMPTS) {
-          rethrowPlanGeneration(error);
-        }
+    let result: Awaited<ReturnType<ScriptDirector['run']>>;
+    try {
+      // The Director owns the bounded primary/fixup/configured-fallback budget.
+      result = await this.director.run({
+        task: 'script_plan',
+        projectId: request.projectId,
+        seedPrompt: session.seedPrompt,
+        draft: session.draft,
+        projectContext: { name: project.name, kind: 'short_drama' },
+        planningSession: session,
+        signal: operation.signal,
+      });
+    } catch (error) {
+      this.assertCurrent(operation);
+      if (error instanceof ScriptStructuredNeedsReviewError || error instanceof ScriptModelOutputError) {
+        await this.save(session, 'needs_review', operation);
       }
+      rethrowPlanGeneration(error);
     }
-    if (!result) rethrowPlanGeneration(new ScriptModelOutputError('短剧策划未返回结果。'));
+    this.assertCurrent(operation);
     if (result.kind === 'planning_questions') {
       session.askedFields = result.askedFields;
       session.questionCount = result.questionCount;
       session.activeQuestions = result.questions;
-      await this.save(session, 'running');
+      await this.save(session, 'running', operation);
       return {
         status: 'asking',
         session: session.id,
@@ -266,7 +318,7 @@ export class ScriptPlanTurnService {
       if (session.activeQuestions.length === 0) {
         throw ServiceError.validation(`短剧策划仍缺少：${result.missingFields.join('、')}`);
       }
-      await this.save(session, 'running');
+      await this.save(session, 'running', operation);
       return {
         status: 'asking',
         session: session.id,
@@ -278,7 +330,7 @@ export class ScriptPlanTurnService {
       throw ServiceError.validation('短剧策划任务返回了不匹配的结果。');
     }
     session.activeQuestions = [];
-    await this.save(session, 'completed');
+    await this.save(session, 'completed', operation);
     return {
       status: 'ready',
       session: session.id,
@@ -296,18 +348,32 @@ export class ScriptPlanTurnService {
   private async save(
     session: StoredScriptPlanSession,
     status: ScriptPipelineCheckpointWrite['status'],
+    operation: PlanningOperation,
   ): Promise<void> {
-    const checkpoints = await this.checkpoints.list(session.projectId, SESSION_RUN_KEY);
-    const artifactRevision = nextScriptCheckpointArtifactRevision(checkpoints, { node: 'plan' });
-    await this.checkpoints.save({
-      projectId: session.projectId,
-      runKey: SESSION_RUN_KEY,
-      node: 'plan',
-      status,
-      attempt: session.round,
-      artifactRevision,
-      artifact: session,
-      updatedAt: session.updatedAt,
+    this.assertCurrent(operation);
+    const write = (this.sessionWrites.get(operation.key) ?? Promise.resolve()).then(async () => {
+      this.assertCurrent(operation);
+      const checkpoints = await this.checkpoints.list(session.projectId, SESSION_RUN_KEY);
+      this.assertCurrent(operation);
+      const artifactRevision = nextScriptCheckpointArtifactRevision(checkpoints, { node: 'plan' });
+      await this.checkpoints.save({
+        projectId: session.projectId,
+        runKey: SESSION_RUN_KEY,
+        node: 'plan',
+        status,
+        attempt: session.round,
+        artifactRevision,
+        artifact: session,
+        updatedAt: session.updatedAt,
+      });
     });
+    const settled = write.catch(() => {});
+    this.sessionWrites.set(operation.key, settled);
+    try {
+      await write;
+      this.assertCurrent(operation);
+    } finally {
+      if (this.sessionWrites.get(operation.key) === settled) this.sessionWrites.delete(operation.key);
+    }
   }
 }

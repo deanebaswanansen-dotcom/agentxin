@@ -1149,6 +1149,8 @@ export interface ScriptPlanQuestion {
 export interface ScriptPlanTurnRequest {
   projectId: Id;
   seedPrompt?: string;
+  /** Editable reference content, separate from the author's story inspiration. */
+  draft?: Partial<Omit<ScriptPlan, 'id' | 'projectId' | 'status' | 'revision' | 'createdAt' | 'updatedAt'>>;
   answers: ScriptPlanAnswer[];
   reset?: boolean;
 }

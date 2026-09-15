@@ -123,9 +123,9 @@ async function completeFromOneImperfectResponse<T>(
 }
 
 describe('screenplay leniency matrix: machine-fixable output never pauses the workflow', () => {
-  it('case 1 — concept: keeps one sparse proposal and fills every editable field locally', async () => {
+  it('case 1 — concept: keeps story content and fills optional fields locally', async () => {
     const complete = vi.fn().mockResolvedValue(JSON.stringify({
-      proposals: [{ title: '暴雪封门', genres: '灾难、悬疑', totalEpisodes: '60集' }],
+      proposals: [{ title: '暴雪封门', logline: '守库人发现制冷机被破坏，在电源耗尽前寻找内鬼。', coreConflict: '守库人与破坏救命物资的内鬼对抗', genres: '灾难、悬疑', totalEpisodes: '60集' }],
     }));
     const service = new ScriptConceptService({ complete }, async () => ({
       id: 'project-1',
@@ -148,7 +148,7 @@ describe('screenplay leniency matrix: machine-fixable output never pauses the wo
     expect(complete).toHaveBeenCalledTimes(1);
   });
 
-  it('case 2 — concept: turns unusable prose into three local choices after one failed response', async () => {
+  it('case 2 — concept: rejects unusable prose after bounded recovery', async () => {
     const complete = vi.fn().mockResolvedValue('我暂时只能给出一些想法，稍后再整理 JSON。');
     const service = new ScriptConceptService({ complete }, async () => ({
       id: 'project-1',
@@ -158,11 +158,8 @@ describe('screenplay leniency matrix: machine-fixable output never pauses the wo
       updatedAt: NOW,
     }));
 
-    const result = await service.generate('project-1', '暴雪中的密闭冰库');
-
-    expect(result.proposals).toHaveLength(3);
-    expect(new Set(result.proposals.map((item) => item.title)).size).toBe(3);
-    expect(complete).toHaveBeenCalledTimes(1);
+    await expect(service.generate('project-1', '暴雪中的密闭冰库')).rejects.toThrow('未生成有效故事方案');
+    expect(complete).toHaveBeenCalledTimes(2);
   });
 
   it('case 3 — plan: accepts aliases, scalar lists and numeric text without a fixup call', async () => {
@@ -170,6 +167,8 @@ describe('screenplay leniency matrix: machine-fixable output never pauses the wo
       'script_plan_lenient',
       {
         title: '  冰库求生  ',
+        story: '守库人为保护救命物资查出破坏备用电源的人。',
+        conflict: '守库人与破坏救命物资的内鬼对抗',
         market: '国内',
         channel: '大众',
         genres: '灾难、悬疑',
@@ -196,11 +195,8 @@ describe('screenplay leniency matrix: machine-fixable output never pauses the wo
     expect(() => decodeScriptPlanInput(completed)).not.toThrow();
   });
 
-  it('case 4 — plan: fills a nearly empty object from confirmed values and safe defaults', async () => {
-    const completed = await completeFromOneImperfectResponse(
-      'script_plan_sparse',
-      {},
-      (value) => coerceScriptPlanCandidate(value, {
+  it('case 4 — plan: confirmed values cannot make an empty model object a successful story', () => {
+    expect(() => coerceScriptPlanCandidate({}, {
         projectId: 'project-1',
         now: NOW,
         id: 'plan-new',
@@ -211,17 +207,7 @@ describe('screenplay leniency matrix: machine-fixable output never pauses the wo
           maxScenesPerEpisode: 4,
           endingDirection: '众人获救',
         },
-      }),
-    );
-
-    expect(completed).toMatchObject({
-      genres: ['灾难'],
-      coreConflict: '备用电源即将耗尽',
-      totalEpisodes: 40,
-      maxScenesPerEpisode: 4,
-      endingDirection: '众人获救',
-    });
-    expect(() => decodeScriptPlanInput(completed)).not.toThrow();
+      })).toThrow('模型结果缺少有效故事字段');
   });
 
   it('case 5 — series outline: repairs missing, duplicated and out-of-order episode cards locally', async () => {

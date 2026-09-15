@@ -1,3 +1,5 @@
+import type { ModelAttemptBudget } from '../../../proxy/ModelProxy.js';
+import { ProxyError, sanitizeProviderDetail } from '../../../proxy/ProxyError.js';
 import {
   formatStructuredFieldPath,
   type StructuredContract,
@@ -17,6 +19,9 @@ export const STRUCTURED_CALL_BUDGET = Object.freeze({
   total: 3,
 } as const);
 
+/** Physical HTTP attempts shared by all recovery stages, including retries. */
+export const STRUCTURED_TRANSPORT_ATTEMPT_LIMIT = 4;
+
 export type StructuredAttemptStage = 'primary' | 'fixup' | 'fallback';
 export type StructuredAttemptOutcome =
   | 'completed'
@@ -30,6 +35,7 @@ export interface StructuredModelRequest {
   contractName: string;
   contractVersion: number;
   signal?: AbortSignal;
+  attemptBudget: ModelAttemptBudget;
 }
 
 export interface StructuredModel {
@@ -44,6 +50,8 @@ export interface StructuredAttemptDiagnostic {
   parseMode?: StructuredModelParseResult['mode'];
   issues: readonly StructuredDecodeIssue[];
   rawOutput?: string;
+  /** Actual HTTP requests; cached or non-HTTP adapters consume none. */
+  transportAttempts?: number;
 }
 
 export interface GenerateStructuredOptions<T> {
@@ -132,8 +140,10 @@ function parseIssue(error: ScriptModelOutputError): StructuredDecodeIssue {
 function modelIssue(error: unknown): StructuredDecodeIssue {
   return {
     path: [],
-    code: 'model.call_failed',
-    message: error instanceof Error ? error.message : String(error),
+    code: error instanceof ProxyError ? 'model.provider_error' : 'model.call_failed',
+    message: error instanceof ProxyError
+      ? sanitizeProviderDetail(error.message)
+      : error instanceof Error ? error.message : String(error),
   };
 }
 
@@ -242,6 +252,10 @@ export async function generateStructured<T>(
   options: GenerateStructuredOptions<T>,
 ): Promise<StructuredGenerationResult<T>> {
   const attempts: StructuredAttemptDiagnostic[] = [];
+  const attemptBudget: ModelAttemptBudget = {
+    maxAttempts: STRUCTURED_TRANSPORT_ATTEMPT_LIMIT,
+    attemptsUsed: 0,
+  };
   let latestRaw: string | undefined;
   let latestIssues: readonly StructuredDecodeIssue[] = [];
 
@@ -251,13 +265,17 @@ export async function generateStructured<T>(
     model: StructuredModel,
     prompt: string,
   ): Promise<Evaluation<T> | undefined> => {
+    // Keep the original provider diagnostic when no recovery attempt can run.
+    if (attemptBudget.attemptsUsed >= attemptBudget.maxAttempts) return undefined;
     const attempt = attempts.length + 1;
+    const transportAttemptsBefore = attemptBudget.attemptsUsed;
     try {
       latestRaw = await model.complete({
         stage,
         prompt,
         contractName: options.contract.name,
         contractVersion: options.contract.version,
+        attemptBudget,
         ...(options.signal ? { signal: options.signal } : {}),
       });
     } catch (error) {
@@ -273,6 +291,7 @@ export async function generateStructured<T>(
         stage,
         model: modelName,
         outcome: 'call_failed',
+        transportAttempts: attemptBudget.attemptsUsed - transportAttemptsBefore,
         issues: latestIssues,
       });
       return undefined;
@@ -285,6 +304,7 @@ export async function generateStructured<T>(
         stage,
         model: modelName,
         outcome: 'completed',
+        transportAttempts: attemptBudget.attemptsUsed - transportAttemptsBefore,
         parseMode: evaluation.parseMode,
         issues: [],
         rawOutput: latestRaw,
@@ -297,6 +317,7 @@ export async function generateStructured<T>(
       stage,
       model: modelName,
       outcome: evaluation.outcome,
+      transportAttempts: attemptBudget.attemptsUsed - transportAttemptsBefore,
       ...(evaluation.parseMode ? { parseMode: evaluation.parseMode } : {}),
       issues: evaluation.issues,
       rawOutput: latestRaw,

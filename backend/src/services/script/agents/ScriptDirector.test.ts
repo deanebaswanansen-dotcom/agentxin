@@ -619,11 +619,14 @@ describe('ScriptDirector', () => {
     expect(calls).toBe(1);
   });
 
-  it('builds an editable plan from confirmed choices when the model returns an empty object', async () => {
+  it('keeps the existing plan when the model returns an empty object despite confirmed choices', async () => {
     let calls = 0;
+    const state = emptyState();
+    state.plan = approvedPlan();
+    const store = new MemoryScriptStore(state);
     const director = new ScriptDirector({
       model: { async complete() { calls += 1; return '{}'; } },
-      store: new MemoryScriptStore(emptyState()),
+      store,
       checkpoints: new InMemoryScriptCheckpointStore(),
     });
 
@@ -638,19 +641,12 @@ describe('ScriptDirector', () => {
         },
         delegatedFields: [], askedFields: [], questionCount: 0,
       },
-    })).resolves.toMatchObject({
-      kind: 'plan_draft',
-      plan: {
-        projectId: 'project-1',
-        genres: ['校园青春'],
-        totalEpisodes: 10,
-        coreConflict: '调查真相',
-      },
-    });
-    expect(calls).toBe(1);
+    })).rejects.toMatchObject({ code: 'SCRIPT_STRUCTURED_NEEDS_REVIEW' });
+    expect(calls).toBe(2);
+    expect(store.state.plan).toEqual(approvedPlan());
   });
 
-  it('falls back to confirmed choices after the fixed plan JSON budget is exhausted', async () => {
+  it('keeps a recoverable checkpoint without saving a plan after the fixed JSON budget is exhausted', async () => {
     let calls = 0;
     const checkpoints = new InMemoryScriptCheckpointStore();
     const director = new ScriptDirector({
@@ -670,15 +666,16 @@ describe('ScriptDirector', () => {
         },
         delegatedFields: [], askedFields: [], questionCount: 0,
       },
-    })).resolves.toMatchObject({
-      kind: 'plan_draft',
-      plan: { projectId: 'project-1', totalEpisodes: 12, coreConflict: '守住救援物资' },
-    });
+    })).rejects.toMatchObject({ code: 'SCRIPT_STRUCTURED_NEEDS_REVIEW' });
     expect(calls).toBe(2);
     await expect(checkpoints.list('project-1', 'script_plan')).resolves.toEqual([
       expect.objectContaining({
-        status: 'succeeded',
-        validationErrors: [expect.objectContaining({ code: 'script_plan.local_fallback' })],
+        status: 'needs_review',
+        attempt: 2,
+        validationErrors: expect.arrayContaining([
+          expect.objectContaining({ code: 'script_plan.story_generation_failed' }),
+          expect.objectContaining({ code: 'script_plan.call_budget', message: '结构调用2次，实际HTTP 0/4次。' }),
+        ]),
       }),
     ]);
   });

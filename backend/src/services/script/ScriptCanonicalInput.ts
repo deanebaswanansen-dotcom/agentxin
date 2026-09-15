@@ -6,6 +6,7 @@ import type {
   ScriptEpisodeInput,
   ScriptEpisodeOutlineInput,
   ScriptPlanInput,
+  ScriptPlanDraftContext,
   ScriptCreativeRules,
   ScriptScene,
   ScriptSeriesOutlineInput,
@@ -154,6 +155,50 @@ export function decodeScriptPlanInput(value: unknown): ScriptPlanInput {
     ...(creativeRules ? { creativeRules } : {}),
     ...(coverPrompt !== undefined ? { coverPrompt } : {}),
   };
+}
+
+/** Validate partial editor context without requiring an already complete story. */
+export function decodeScriptPlanDraftContext(value: unknown): ScriptPlanDraftContext {
+  const input = record(value, '当前策划草稿');
+  const output: ScriptPlanDraftContext = {};
+  const textFields = {
+    title: 200, theme: 1_000, audience: 1_000, coreConflict: 2_000,
+    logline: 2_000, coreRequirements: 4_000, endingDirection: 2_000, coverPrompt: 4_000,
+  } as const;
+  for (const [key, max] of Object.entries(textFields)) {
+    if (input[key] !== undefined) {
+      output[key as keyof typeof textFields] = optionalString(input[key], `draft.${key}`, max);
+    }
+  }
+  const listFields = { genres: 6, highlights: 20, forbiddenElements: 30 } as const;
+  for (const [key, max] of Object.entries(listFields)) {
+    if (input[key] !== undefined) {
+      const items = stringArray(input[key], `draft.${key}`, { max });
+      if (items.some((item) => item.length > 2_000)) throw ScriptServiceError.validation(`draft.${key}单项过长`);
+      output[key as keyof typeof listFields] = items;
+    }
+  }
+  const numericFields = {
+    totalEpisodes: [1, 200], targetCharsPerEpisode: [300, 3_000],
+    maxPrimaryCharacters: [1, 20], maxScenesPerEpisode: [1, 5], dialogueDensityPercent: [20, 90],
+  } as const;
+  for (const [key, [min, max]] of Object.entries(numericFields)) {
+    if (input[key] !== undefined) output[key as keyof typeof numericFields] = integer(input[key], `draft.${key}`, min, max);
+  }
+  if (input.market !== undefined) output.market = enumValue(input.market, 'draft.market', ['domestic', 'overseas'] as const);
+  if (input.channel !== undefined) output.channel = enumValue(input.channel, 'draft.channel', ['female', 'male', 'general'] as const);
+  if (input.language !== undefined) output.language = enumValue(input.language, 'draft.language', ['zh-CN'] as const);
+  if (input.format !== undefined) output.format = enumValue(input.format, 'draft.format', ['cn_short_drama'] as const);
+  if (input.episodeDurationSeconds !== undefined) {
+    const duration = record(input.episodeDurationSeconds, 'draft.episodeDurationSeconds');
+    const min = integer(duration.min, 'draft.episodeDurationSeconds.min', 30, 180);
+    const max = integer(duration.max, 'draft.episodeDurationSeconds.max', 30, 180);
+    if (min > max) throw ScriptServiceError.validation('最短时长不能大于最长时长');
+    output.episodeDurationSeconds = { min, max };
+  }
+  if (input.creativeRules !== undefined) output.creativeRules = optionalCreativeRules(input.creativeRules);
+  if (JSON.stringify(output).length > 40_000) throw ScriptServiceError.validation('当前策划草稿不能超过40000个字符');
+  return output;
 }
 
 export function decodeScriptCharacterInputs(value: unknown): ScriptCharacterInput[] {

@@ -1,8 +1,10 @@
 import type {
   ScriptCharacter,
   ScriptPlan,
+  ScriptPlanDraftContext,
   ScriptWorldBible,
 } from '../domain.js';
+import { requireModelStoryText } from './ScriptPlanModelContent.js';
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -84,6 +86,7 @@ export interface CoercePlanOptions {
   now: string;
   id: string;
   current?: ScriptPlan;
+  draft?: ScriptPlanDraftContext;
   explicit: Partial<Pick<
     ScriptPlan,
     | 'genres'
@@ -108,29 +111,36 @@ export function coerceScriptPlanCandidate(
   options: CoercePlanOptions,
 ): ScriptPlan {
   const source = unwrapped(value, ['script_plan', 'plan', '策划']);
-  const seed = options.seedPrompt?.trim() || '主角在困境中寻找突破并完成成长';
+  // Validate model-authored story content before filling any optional fields.
+  // A previous draft or prompt must never turn an empty response into success.
+  const title = requireModelStoryText(source, ['title', 'name', 'scriptTitle', '剧名']);
+  const logline = requireModelStoryText(source, ['logline', 'oneLineStory', 'story', 'summary', '一句话故事']);
+  const modelConflict = requireModelStoryText(source, ['coreConflict', 'core_conflict', 'conflict', '核心冲突']);
+  const field = (keys: readonly string[]): unknown => firstValue(source, keys)
+    ?? firstValue(record(options.draft), keys)
+    ?? firstValue(record(options.current), keys);
   const genres = textArray(
-    options.explicit.genres ?? firstValue(source, ['genres', 'genre', '题材']),
+    options.explicit.genres ?? field(['genres', 'genre', '题材']),
     ['都市剧情'],
     6,
   );
-  const theme = text(firstValue(source, ['theme', '主题']), genres[0] ?? '成长', 1_000);
+  const theme = text(field(['theme', '主题']), genres[0] ?? '成长', 1_000);
   const coreConflict = text(
-    options.explicit.coreConflict ?? firstValue(source, ['coreConflict', 'core_conflict', '核心冲突']),
-    seed,
+    options.explicit.coreConflict ?? modelConflict,
+    modelConflict,
     2_000,
   );
   const audience = text(
-    options.explicit.audience ?? firstValue(source, ['audience', 'targetAudience', '受众']),
+    options.explicit.audience ?? field(['audience', 'targetAudience', '受众']),
     '大众短剧观众',
     1_000,
   );
   const endingDirection = text(
-    options.explicit.endingDirection ?? firstValue(source, ['endingDirection', 'ending', '结局方向']),
+    options.explicit.endingDirection ?? field(['endingDirection', 'ending', '结局方向']),
     '核心冲突得到解决，主角完成成长',
     2_000,
   );
-  const rawDuration = record(firstValue(source, ['episodeDurationSeconds', 'episodeDuration', '单集时长']));
+  const rawDuration = record(field(['episodeDurationSeconds', 'episodeDuration', '单集时长']));
   const explicitDuration = options.explicit.episodeDurationSeconds;
   let minDuration = integer(
     explicitDuration?.min ?? firstValue(rawDuration, ['min', 'minimum']),
@@ -151,60 +161,60 @@ export function coerceScriptPlanCandidate(
     projectId: options.projectId,
     status: 'draft',
     revision: options.current?.revision ?? 0,
-    title: text(firstValue(source, ['title', 'name', 'scriptTitle', '剧名']), seed, 200),
+    title: title.slice(0, 200),
     theme,
-    market: enumValue(firstValue(source, ['market', '市场']), ['domestic', 'overseas'], {
+    market: enumValue(field(['market', '市场']), ['domestic', 'overseas'], {
       '国内': 'domestic', '内地': 'domestic', '海外': 'overseas',
     }, 'domestic'),
-    channel: enumValue(firstValue(source, ['channel', '频道']), ['female', 'male', 'general'], {
+    channel: enumValue(field(['channel', '频道']), ['female', 'male', 'general'], {
       '女频': 'female', '男频': 'male', '通用': 'general', '大众': 'general',
     }, 'general'),
     genres,
     audience,
     coreConflict,
-    logline: text(firstValue(source, ['logline', 'oneLineStory', '一句话故事']), coreConflict, 2_000),
-    highlights: textArray(firstValue(source, ['highlights', 'sellingPoints', '亮点']), [theme], 20),
+    logline: logline.slice(0, 2_000),
+    highlights: textArray(field(['highlights', 'sellingPoints', '亮点']), [theme], 20),
     totalEpisodes: integer(
-      options.explicit.totalEpisodes ?? firstValue(source, ['totalEpisodes', 'episodeCount', '总集数']),
+      options.explicit.totalEpisodes ?? field(['totalEpisodes', 'episodeCount', '总集数']),
       60,
       1,
       200,
     ),
     episodeDurationSeconds: { min: minDuration, max: maxDuration },
     targetCharsPerEpisode: integer(
-      options.explicit.targetCharsPerEpisode ?? firstValue(source, ['targetCharsPerEpisode', 'targetChars', '单集字数']),
+      options.explicit.targetCharsPerEpisode ?? field(['targetCharsPerEpisode', 'targetChars', '单集字数']),
       1_000,
       300,
       3_000,
     ),
     maxPrimaryCharacters: integer(
-      firstValue(source, ['maxPrimaryCharacters', 'maxCharacters', '主要人物上限']),
+      field(['maxPrimaryCharacters', 'maxCharacters', '主要人物上限']),
       8,
       1,
       20,
     ),
     maxScenesPerEpisode: integer(
-      options.explicit.maxScenesPerEpisode ?? firstValue(source, ['maxScenesPerEpisode', 'maxScenes', '单集场景上限']),
+      options.explicit.maxScenesPerEpisode ?? field(['maxScenesPerEpisode', 'maxScenes', '单集场景上限']),
       3,
       1,
       5,
     ),
     dialogueDensityPercent: integer(
-      options.explicit.dialogueDensityPercent ?? firstValue(source, ['dialogueDensityPercent', 'dialogueDensity', '对白密度']),
+      options.explicit.dialogueDensityPercent ?? field(['dialogueDensityPercent', 'dialogueDensity', '对白密度']),
       60,
       20,
       90,
     ),
     language: 'zh-CN',
     format: 'cn_short_drama',
-    coreRequirements: text(firstValue(source, ['coreRequirements', 'requirements', '核心要求']), seed, 4_000),
-    forbiddenElements: textArray(firstValue(source, ['forbiddenElements', 'forbidden', '禁止元素']), [], 30),
+    coreRequirements: text(field(['coreRequirements', 'requirements', '核心要求']), '', 4_000),
+    forbiddenElements: textArray(field(['forbiddenElements', 'forbidden', '禁止元素']), [], 30),
     endingDirection,
-    ...(options.current?.creativeRules
-      ? { creativeRules: structuredClone(options.current.creativeRules) }
+    ...(options.draft?.creativeRules ?? options.current?.creativeRules
+      ? { creativeRules: structuredClone((options.draft?.creativeRules ?? options.current?.creativeRules)!) }
       : {}),
-    ...(optionalText(firstValue(source, ['coverPrompt', 'cover_prompt', '封面提示词']), 4_000)
-      ? { coverPrompt: optionalText(firstValue(source, ['coverPrompt', 'cover_prompt', '封面提示词']), 4_000) }
+    ...(optionalText(field(['coverPrompt', 'cover_prompt', '封面提示词']), 4_000)
+      ? { coverPrompt: optionalText(field(['coverPrompt', 'cover_prompt', '封面提示词']), 4_000) }
       : {}),
     createdAt: options.current?.createdAt ?? options.now,
     updatedAt: options.now,

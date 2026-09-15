@@ -690,6 +690,8 @@ describe('ScriptWorkspace', () => {
 
     expect(screen.getByLabelText('剧本名称')).toHaveValue('夜班真相');
     expect(client.script.plan.save).not.toHaveBeenCalled();
+    expect(client.script.outline.save).not.toHaveBeenCalled();
+    expect(client.script.jobs.create).not.toHaveBeenCalled();
     expect(screen.getByText('已采用选题《夜班真相》，请检查后保存策划')).toBeInTheDocument();
     expect((screen.getByLabelText('核心要求') as HTMLTextAreaElement).value).toContain('主线提示：从忍气吞声到公开证据完成反击');
 
@@ -756,11 +758,24 @@ describe('ScriptWorkspace', () => {
       ...draft, title: 'AI 自动完成的策划', status: 'approved', revision: 5,
     });
 
-    render(<ScriptWorkspace projectId="project-1" projectName="短剧项目" client={client} />);
+    render(<ScriptWorkspace projectId="project-1" projectName="123" client={client} />);
     await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.change(screen.getByLabelText('选题灵感'), { target: { value: ' 西方玄幻 ' } });
     fireEvent.click(screen.getByRole('button', { name: '跳过手填，AI 自动完成策划' }));
 
     await waitFor(() => expect(client.script.plan.turn).toHaveBeenCalledTimes(2));
+    const firstRequest = vi.mocked(client.script.plan.turn).mock.calls[0]![0];
+    expect(firstRequest).toEqual({
+      projectId: 'project-1', seedPrompt: '西方玄幻', answers: [], reset: true,
+      draft: expect.objectContaining({
+        title: draft.title, logline: draft.logline, coreRequirements: draft.coreRequirements,
+        episodeDurationSeconds: draft.episodeDurationSeconds, forbiddenElements: draft.forbiddenElements,
+      }),
+    });
+    expect(firstRequest.draft).not.toHaveProperty('id');
+    expect(firstRequest.draft).not.toHaveProperty('revision');
+    expect(firstRequest.draft).not.toHaveProperty('status');
+    expect(firstRequest.draft).not.toHaveProperty('createdAt');
     expect(client.script.plan.turn).toHaveBeenNthCalledWith(2, {
       projectId: 'project-1',
       answers: [{ field: 'genres', delegate: true }],
@@ -768,6 +783,160 @@ describe('ScriptWorkspace', () => {
     expect(client.script.plan.approve).toHaveBeenCalledWith('project-1', 4);
     expect(await screen.findByRole('heading', { name: 'AI 自动完成的策划' })).toBeInTheDocument();
     expect(screen.getByText(/AI 已自动完成并确认策划/)).toBeInTheDocument();
+  });
+
+  it('keeps an unsaved manual plan and its revision after automatic planning fails', async () => {
+    const client = createClient();
+    const error = new Error('模型未返回可用策划，请检查模型配置');
+    const onError = vi.fn();
+    vi.mocked(client.script.plan.turn).mockRejectedValue(error);
+    render(<ScriptWorkspace projectId="project-1" client={client} onError={onError} />);
+    const title = await screen.findByLabelText('剧本名称');
+    fireEvent.change(title, { target: { value: '手填的有效剧名' } });
+    fireEvent.click(screen.getByRole('button', { name: 'AI 重新生成策划' }));
+
+    await screen.findByText(/AI 自动策划未完成，当前策划已保留。模型未返回可用策划/);
+    expect(onError).toHaveBeenCalledWith(error);
+    expect(title).toHaveValue('手填的有效剧名');
+    expect(client.script.plan.approve).not.toHaveBeenCalled();
+    expect(client.script.plan.save).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: '确认策划' }));
+    expect(screen.getByText('请先保存策划，再确认')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '保存策划' }));
+    await waitFor(() => expect(client.script.plan.save).toHaveBeenCalledWith(
+      'project-1', expect.objectContaining({ title: '手填的有效剧名', status: 'draft', revision: 2 }), 2,
+    ));
+  });
+
+  it.each(['ready', 'asking'] as const)('stops a late %s automatic planning turn after the author edits the plan', async (status) => {
+    const client = createClient();
+    let resolveTurn!: (result: Awaited<ReturnType<typeof client.script.plan.turn>>) => void;
+    vi.mocked(client.script.plan.turn).mockReturnValue(new Promise((resolve) => { resolveTurn = resolve; }));
+    render(<ScriptWorkspace projectId="project-1" client={client} />);
+    const title = await screen.findByLabelText('剧本名称');
+    fireEvent.click(screen.getByRole('button', { name: '跳过手填，AI 自动完成策划' }));
+    fireEvent.change(title, { target: { value: '请求期间的手改稿' } });
+    await act(async () => resolveTurn(status === 'ready'
+      ? { status, session: 'late-session', round: 1, plan: { ...buildPlan(), title: '晚到的策划', revision: 5 } }
+      : { status, session: 'late-session', round: 1, questions: [{ field: 'genres', label: '选择题材', kind: 'multi', required: true }] }));
+
+    expect(title).toHaveValue('请求期间的手改稿');
+    expect(client.script.plan.turn).toHaveBeenCalledTimes(1);
+    expect(client.script.plan.approve).not.toHaveBeenCalled();
+    expect(screen.getByText(/已保留当前内容并停止自动策划/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '确认策划' }));
+    expect(screen.getByText('请先保存策划，再确认')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '保存策划' }));
+    await waitFor(() => expect(client.script.plan.save).toHaveBeenCalledWith(
+      'project-1', expect.objectContaining({ title: '请求期间的手改稿', status: 'draft', revision: 2 }), 2,
+    ));
+  });
+
+  it('does not approve a late automatic plan after its inspiration changes', async () => {
+    const client = createClient();
+    let resolveTurn!: (result: Awaited<ReturnType<typeof client.script.plan.turn>>) => void;
+    vi.mocked(client.script.plan.turn).mockReturnValue(new Promise((resolve) => { resolveTurn = resolve; }));
+    render(<ScriptWorkspace projectId="project-1" client={client} />);
+    await screen.findByLabelText('剧本名称');
+    fireEvent.click(screen.getByRole('button', { name: '跳过手填，AI 自动完成策划' }));
+    fireEvent.change(screen.getByLabelText('选题灵感'), { target: { value: '新的故事方向' } });
+    await act(async () => resolveTurn({ status: 'ready', session: 'late-session', round: 1, plan: { ...buildPlan(), title: '旧方向', revision: 5 } }));
+    expect(client.script.plan.approve).not.toHaveBeenCalled();
+    expect(screen.getByLabelText('选题灵感')).toHaveValue('新的故事方向');
+    expect(screen.getByLabelText('剧本名称')).toHaveValue(buildPlan().title);
+  });
+
+  it('preserves local edits and the original revision when automatic approval returns late', async () => {
+    const client = createClient();
+    vi.mocked(client.script.plan.turn).mockResolvedValue({ status: 'ready', session: 'auto-session', round: 1, plan: { ...buildPlan(), title: 'AI 新策划', revision: 4 } });
+    let resolveApprove!: (result: ScriptPlan) => void;
+    vi.mocked(client.script.plan.approve).mockReturnValue(new Promise((resolve) => { resolveApprove = resolve; }));
+    render(<ScriptWorkspace projectId="project-1" client={client} />);
+    const title = await screen.findByLabelText('剧本名称');
+    fireEvent.click(screen.getByRole('button', { name: '跳过手填，AI 自动完成策划' }));
+    await waitFor(() => expect(client.script.plan.approve).toHaveBeenCalledWith('project-1', 4));
+    fireEvent.change(title, { target: { value: '批准请求期间的手改稿' } });
+    await act(async () => resolveApprove({ ...buildPlan(), title: 'AI 新策划', status: 'approved', revision: 5 }));
+    expect(title).toHaveValue('批准请求期间的手改稿');
+    expect(screen.queryByText(/AI 已自动完成并确认策划/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '保存策划' }));
+    await waitFor(() => expect(client.script.plan.save).toHaveBeenCalledWith(
+      'project-1', expect.objectContaining({ title: '批准请求期间的手改稿', status: 'draft', revision: 2 }), 2,
+    ));
+  });
+
+  it.each(['跳过手填，AI 自动完成策划', 'Agent 帮我策划'])('ignores %s results after switching projects', async (buttonName) => {
+    const client = createClient();
+    vi.mocked(client.script.plan.get).mockImplementation((id) => Promise.resolve({ ...buildPlan(id), title: `策划-${id}` }));
+    let resolveTurn!: (result: Awaited<ReturnType<typeof client.script.plan.turn>>) => void;
+    vi.mocked(client.script.plan.turn).mockReturnValue(new Promise((resolve) => { resolveTurn = resolve; }));
+    const { rerender } = render(<ScriptWorkspace projectId="project-1" client={client} />);
+    await screen.findByDisplayValue('策划-project-1');
+    fireEvent.click(screen.getByRole('button', { name: buttonName }));
+    rerender(<ScriptWorkspace projectId="project-2" client={client} />);
+    await screen.findByDisplayValue('策划-project-2');
+    await act(async () => resolveTurn({ status: 'ready', session: 'old-project', round: 1, plan: { ...buildPlan(), title: '其他项目的晚到策划', revision: 5 } }));
+    expect(screen.getByLabelText('剧本名称')).toHaveValue('策划-project-2');
+    expect(client.script.plan.approve).not.toHaveBeenCalled();
+    expect(screen.queryByText(/已生成策划草稿|已自动完成并确认策划/)).not.toBeInTheDocument();
+  });
+
+  it('reports concept generation errors without manufacturing proposals or losing the draft', async () => {
+    const client = createClient();
+    const error = new Error('模型配置错误');
+    vi.mocked(client.script.plan.concepts).mockRejectedValue(error);
+    render(<ScriptWorkspace projectId="project-1" client={client} />);
+    const title = await screen.findByLabelText('剧本名称');
+    fireEvent.change(title, { target: { value: '保留的手填策划' } });
+    fireEvent.click(screen.getByRole('button', { name: '生成 3 个选题' }));
+    await screen.findByText(/AI 选题生成未完成，当前策划已保留。模型配置错误/);
+    expect(title).toHaveValue('保留的手填策划');
+    expect(screen.queryByRole('button', { name: '采用此方案' })).not.toBeInTheDocument();
+    expect(client.script.plan.save).not.toHaveBeenCalled();
+    expect(client.script.plan.approve).not.toHaveBeenCalled();
+  });
+
+  it.each(['ready', 'asking'] as const)('ignores a late %s interview answer after its inspiration changes', async (status) => {
+    const client = createClient();
+    const questions = [{ field: 'genres', label: '选择题材', kind: 'multi' as const, required: true }];
+    let resolveTurn!: (result: Awaited<ReturnType<typeof client.script.plan.turn>>) => void;
+    vi.mocked(client.script.plan.turn)
+      .mockResolvedValueOnce({ status: 'asking', session: 'interview', round: 1, questions })
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveTurn = resolve; }));
+    render(<ScriptWorkspace projectId="project-1" client={client} />);
+    await screen.findByLabelText('剧本名称');
+    fireEvent.click(screen.getByRole('button', { name: 'Agent 帮我策划' }));
+    fireEvent.click(await screen.findByRole('button', { name: '交给 Agent' }));
+    fireEvent.click(screen.getByRole('button', { name: '提交本轮答案' }));
+    await waitFor(() => expect(client.script.plan.turn).toHaveBeenCalledTimes(2));
+    fireEvent.change(screen.getByLabelText('选题灵感'), { target: { value: '新的策划方向' } });
+    await act(async () => resolveTurn(status === 'ready'
+      ? { status, session: 'interview', round: 2, plan: { ...buildPlan(), title: '旧灵感的答案', revision: 5 } }
+      : { status, session: 'interview', round: 2, questions }));
+    expect(screen.getByLabelText('剧本名称')).toHaveValue(buildPlan().title);
+    expect(screen.queryByRole('button', { name: '提交本轮答案' })).not.toBeInTheDocument();
+    expect(screen.getByText('选题灵感已修改，当前策划已保留，请重新发起 Agent 策划')).toBeInTheDocument();
+    expect(client.script.plan.approve).not.toHaveBeenCalled();
+  });
+
+  it('discards concept proposals based on a draft that was edited while generating', async () => {
+    const client = createClient();
+    let resolveConcepts!: (result: Awaited<ReturnType<typeof client.script.plan.concepts>>) => void;
+    vi.mocked(client.script.plan.concepts).mockReturnValue(new Promise((resolve) => { resolveConcepts = resolve; }));
+    render(<ScriptWorkspace projectId="project-1" client={client} />);
+    const title = await screen.findByLabelText('剧本名称');
+    fireEvent.click(screen.getByRole('button', { name: '生成 3 个选题' }));
+    fireEvent.change(title, { target: { value: '生成选题期间修改的策划' } });
+    await act(async () => resolveConcepts({ proposals: [{
+      title: '旧稿的选题', theme: '职场反击', market: 'domestic', channel: 'female',
+      genres: ['都市'], logline: '店员查出证据。', audience: '年轻女性', coreConflict: '店员对抗店长',
+      highlights: ['证据反转'], endingDirection: '公开真相', mainArc: '寻找证据完成反击',
+      coverPrompt: '便利店夜景', totalEpisodes: 60,
+    }] }));
+    expect(title).toHaveValue('生成选题期间修改的策划');
+    expect(screen.queryByText('旧稿的选题')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '采用此方案' })).not.toBeInTheDocument();
+    expect(screen.getByText('用于选题的策划草稿已修改，已保留当前候选，请重新生成选题')).toBeInTheDocument();
   });
 
   it('preserves the local CAS revision after editing during an Agent request and blocks repeated overwrites of its saved plan', async () => {
