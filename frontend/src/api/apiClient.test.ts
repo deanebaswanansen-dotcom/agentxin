@@ -668,6 +668,33 @@ describe('apiClient unified error handling', () => {
 });
 
 describe('Netlify background Agent jobs', () => {
+  it('stops later chapter batches after a structured pause and preserves saved artifacts', async () => {
+    let starts = 0;
+    installFetch((url, init) => {
+      if (url.endsWith('/agent-job-background')) {
+        starts += 1;
+        return new Response(null, { status: 202 });
+      }
+      if (url.endsWith('/api/projects')) return jsonResponse([]);
+      if (init?.method === 'DELETE') return new Response(null, { status: 204 });
+      return jsonResponse({
+        state: 'completed', events: [],
+        result: {
+          task: 'long_novel', mode: 'draft', projectId: 'p1', summary: starts === 2 ? '待人工确认' : '完成', steps: [],
+          artifacts: [{ kind: 'chapter', id: `c${starts}`, title: `第${starts}章` }],
+          ...(starts === 2 ? { outcome: { status: 'paused', code: 'QUALITY_GATE', message: '待人工确认' } } : {}),
+        },
+      });
+    });
+    const result = await runAgentBackgroundJob('/api', {
+      task: 'long_novel', mode: 'draft', prompt: '测试', options: { chapters: 3 },
+    });
+    expect(starts).toBe(2);
+    expect(result.outcome?.status).toBe('paused');
+    expect(result.summary).toBe('待人工确认');
+    expect(result.artifacts.map((artifact) => artifact.id)).toEqual(['c1', 'c2']);
+  });
+
   it('submits credentials once, polls by client id, and returns progress plus result', async () => {
     const config: ModelConfig = {
       baseUrl: 'https://api.example.com',
@@ -782,6 +809,37 @@ describe('Netlify background Agent jobs', () => {
 });
 
 describe('persistent backend Agent jobs', () => {
+  it('returns structured waiting results without automatically resuming or polling again', async () => {
+    const result: AgentRunResult = {
+      task: 'long_novel', mode: 'draft', projectId: 'p1', summary: '草稿已保存', steps: [], artifacts: [],
+      outcome: { status: 'paused', code: 'QUALITY_GATE', message: '请检查草稿' },
+    };
+    const mock = installFetch(() => jsonResponse({ id: 'job-paused', status: 'waiting_user', events: [], result }));
+    await expect(watchPersistentAgentJob('/api', 'job-paused')).resolves.toEqual(result);
+    expect(mock).toHaveBeenCalledTimes(1);
+    expect(mock.mock.calls[0][1]?.method).toBe('GET');
+  });
+
+  it('resumes the same job with current credentials and ignores a retained paused result while queued', async () => {
+    await client().modelConfig.save({ baseUrl: 'https://api.example.com', apiKey: 'sk-browser-only', modelName: 'novel-model' });
+    const result: AgentRunResult = {
+      task: 'full_novel', mode: 'draft', projectId: 'p1', summary: '已完成', steps: [], artifacts: [], outcome: { status: 'completed' },
+    };
+    let polls = 0;
+    const mock = installFetch((url, init) => {
+      if (url.endsWith('/resume') && init?.method === 'POST') return jsonResponse({ id: 'job/1', status: 'queued', events: [] });
+      polls += 1;
+      return jsonResponse(polls === 1
+        ? { id: 'job/1', status: 'queued', events: [], result: { ...result, outcome: { status: 'paused', code: 'QUALITY_GATE', message: '旧暂停' } } }
+        : { id: 'job/1', status: 'completed', events: [], result });
+    });
+    await client().agent.resumeJob('job/1');
+    await expect(client().agent.watchJob('job/1')).resolves.toEqual(result);
+    expect(mock.mock.calls[0][0]).toBe('/api/agent/jobs/job%2F1/resume');
+    expect((mock.mock.calls[0][1]?.headers as Record<string, string>)['X-Agentxin-Model-Config']).toBeDefined();
+    expect(polls).toBe(2);
+  });
+
   it('creates a server job and replays persisted progress while polling', async () => {
     const progress = vi.fn();
     let polls = 0;
@@ -834,6 +892,35 @@ describe('persistent backend Agent jobs', () => {
       task: 'long_novel', mode: 'draft', prompt: '写一章', projectId: 'p1',
     })).resolves.toEqual(result);
     expect(resumed).toBe(true);
+  });
+
+  it('resumes an interrupted run once even when it retains an earlier paused result', async () => {
+    const completed: AgentRunResult = {
+      task: 'full_novel', mode: 'draft', projectId: 'p1', summary: '恢复后完成', steps: [], artifacts: [],
+      outcome: { status: 'completed' },
+    };
+    const oldPartial: AgentRunResult = {
+      ...completed, summary: '先前暂停的部分结果',
+      outcome: { status: 'paused', code: 'QUALITY_GATE', message: '先前暂停' },
+    };
+    let resumes = 0;
+    let polls = 0;
+    installFetch((url, init) => {
+      if (url.endsWith('/resume') && init?.method === 'POST') {
+        resumes += 1;
+        return jsonResponse({ id: 'job-interrupted', status: 'queued', events: [], result: oldPartial });
+      }
+      polls += 1;
+      return jsonResponse(resumes === 0
+        ? {
+          id: 'job-interrupted', status: 'waiting_user', events: [], result: oldPartial,
+          error: { code: 'RUN_INTERRUPTED', message: '服务重启，继续上次任务' },
+        }
+        : { id: 'job-interrupted', status: 'completed', events: [], result: completed });
+    });
+    await expect(watchPersistentAgentJob('/api', 'job-interrupted')).resolves.toEqual(completed);
+    expect(resumes).toBe(1);
+    expect(polls).toBe(2);
   });
 
   it('keeps polling after one silent status request times out', async () => {

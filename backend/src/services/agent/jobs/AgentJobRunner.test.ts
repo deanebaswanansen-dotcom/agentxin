@@ -36,6 +36,74 @@ function result(summary: string, projectId = 'p1'): AgentRunResult {
 }
 
 describe('AgentJobRunner', () => {
+  it.each(['full_novel', 'long_novel'] as const)(
+    'persists a paused %s result and resumes the same job after restart',
+    async (task) => {
+      const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-novel-pause-'));
+      const file = join(directory, 'runs.json');
+      const store = await AgentRunStore.create(file);
+      const request: AgentRunRequest = { task, mode: 'draft', prompt: '继续当前小说', options: { chapters: 2, totalChapters: 5 } };
+      const paused: AgentRunResult = {
+        task, mode: 'draft', projectId: 'novel-1', chapterId: 'chapter-5',
+        // The state must come from outcome, regardless of the display wording.
+        summary: '生成结果', steps: ['第4章已保存', '第5章正文已保留'],
+        artifacts: [{ kind: 'chapter', id: 'chapter-5', title: '第5章' }],
+        outcome: { status: 'paused', code: 'NOVEL_QUALITY_NEEDS_REVIEW', message: '第5章等待确认' },
+      };
+      const execute = vi.fn(async (_request, _signal, onProgress) => {
+        onProgress?.({ phase: 'chapter', message: '已保存待确认正文' });
+        return paused;
+      });
+      const runner = new AgentJobRunner(store, { run: execute });
+      const created = await runner.start(CLIENT_ID, request, undefined);
+      await runner.waitUntilIdle(created.id);
+      expect(execute).toHaveBeenCalledOnce();
+      expect(store.get(created.id)).toMatchObject({
+        status: 'waiting_user', attempts: 1, result: paused,
+        request: { projectId: 'novel-1' },
+        error: { code: 'NOVEL_QUALITY_NEEDS_REVIEW', message: '第5章等待确认' },
+        events: [{ message: '已保存待确认正文' }],
+      });
+
+      const restartedStore = await AgentRunStore.create(file);
+      expect(restartedStore.get(created.id)).toMatchObject({ status: 'waiting_user', result: paused });
+      const completed: AgentRunResult = { ...paused, summary: '剩余章节已完成', outcome: { status: 'completed' } };
+      const resumeExecution = vi.fn(async () => completed);
+      const restartedRunner = new AgentJobRunner(restartedStore, { run: resumeExecution });
+      await restartedRunner.resume(CLIENT_ID, created.id, undefined);
+      await restartedRunner.waitUntilIdle(created.id);
+      expect(resumeExecution).toHaveBeenCalledWith(
+        { ...request, projectId: 'novel-1' }, expect.any(AbortSignal), expect.any(Function),
+        { resumeRejectedCandidates: true },
+      );
+      expect(restartedStore.listForClient(CLIENT_ID)).toHaveLength(1);
+      expect(restartedStore.get(created.id)).toMatchObject({ status: 'completed', attempts: 2, result: completed });
+      expect(restartedStore.get(created.id)?.error).toBeUndefined();
+      expect((await AgentRunStore.create(file)).get(created.id)).toMatchObject({ status: 'completed', result: completed });
+    },
+  );
+
+  it.each([
+    ['full_novel', 'failed'], ['full_novel', 'cancelled'],
+    ['long_novel', 'failed'], ['long_novel', 'cancelled'],
+  ] as const)('resumes a %s job advertised as continuable after %s', async (task, status) => {
+    const directory = await mkdtemp(join(tmpdir(), 'agentxin-runner-novel-recover-'));
+    const store = await AgentRunStore.create(join(directory, 'runs.json'));
+    const request: AgentRunRequest = { task, mode: 'draft', prompt: '继续小说', projectId: 'novel-1' };
+    const existing = await store.create(CLIENT_ID, request);
+    if (status === 'failed') await store.fail(existing.id, { code: 'RUN_FAILED', message: '保存的正文可重试' });
+    else await store.cancel(existing.id);
+    const execute = vi.fn(async (_request: AgentRunRequest): Promise<AgentRunResult> => ({
+      task, mode: 'draft', projectId: 'novel-1', summary: '已恢复完成', steps: [], artifacts: [],
+    }));
+    const runner = new AgentJobRunner(store, { run: execute });
+    await runner.resume(CLIENT_ID, existing.id, undefined);
+    await runner.waitUntilIdle(existing.id);
+    expect(execute).toHaveBeenCalledOnce();
+    expect(execute.mock.calls[0]?.[0]).toEqual(request);
+    expect(store.get(existing.id)).toMatchObject({ status: 'completed', result: { summary: '已恢复完成' } });
+  });
+
   it.each(['execution', 'progress'] as const)(
     'keeps a standalone Node process alive when %s and recovery persistence fail',
     async (failure) => {

@@ -15,6 +15,7 @@ vi.mock('../api/apiClient.js', () => ({
       clearPlanSession: vi.fn(),
       listJobs: vi.fn(),
       watchJob: vi.fn(),
+      resumeJob: vi.fn(),
       cancelJob: vi.fn(),
     },
     chapters: { list: vi.fn() },
@@ -40,6 +41,31 @@ function mockWriteResponse(content: string): void {
 }
 
 describe('ChatWorkspace', () => {
+  it('shows a paused job after refresh and continues that job from the enabled button', async () => {
+    const paused = {
+      task: 'full_novel' as const, mode: 'draft' as const, projectId: 'p-1', summary: '草稿已保存，请检查', steps: [], artifacts: [],
+      outcome: { status: 'paused' as const, code: 'QUALITY_GATE', message: '检查后可以继续' },
+    };
+    vi.mocked(apiClient.agent.listJobs).mockResolvedValue([{
+      id: 'job-paused', status: 'waiting_user', events: [], result: paused,
+      request: { task: 'full_novel', mode: 'draft', prompt: '生成', projectId: 'p-1' },
+    }]);
+    vi.mocked(apiClient.agent.watchJob).mockResolvedValueOnce(paused).mockResolvedValue({ ...paused, summary: '继续后生成完成', outcome: { status: 'completed' } });
+    vi.mocked(apiClient.agent.resumeJob).mockResolvedValue({ id: 'job-paused', status: 'queued', events: [] });
+    render(<ChatWorkspace projectId="p-1" />);
+    const button = await screen.findByRole('button', { name: '继续任务' });
+    await waitFor(() => expect(button).toBeEnabled());
+    expect(screen.getByText('任务已暂停')).toBeInTheDocument();
+    expect(screen.queryByText('任务完成')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('对话输入')).toBeEnabled();
+    expect(apiClient.agent.resumeJob).not.toHaveBeenCalled();
+    fireEvent.click(button);
+    await screen.findByText('继续后生成完成');
+    expect(apiClient.agent.resumeJob).toHaveBeenCalledWith('job-paused', expect.any(AbortSignal));
+    expect(apiClient.agent.runStream).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: '继续任务' })).not.toBeInTheDocument();
+  });
+
   it('flushes the editor before generating and refuses a candidate after the selection changes', async () => {
     let releaseSave!: () => void;
     const beforeWriting = vi.fn(() => new Promise<void>((resolve) => { releaseSave = resolve; }));

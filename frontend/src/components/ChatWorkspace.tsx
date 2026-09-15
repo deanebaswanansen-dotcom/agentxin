@@ -1277,6 +1277,20 @@ export function ChatWorkspace({
         )}
       </div>
 
+      {agent.pausedJob ? (
+        <div className="nwa-chat-pending" role="status">
+          <span>{agent.running ? '正在继续任务…' : `任务已暂停：${agent.pausedJob.message}`}</span>
+          <button
+            type="button"
+            className="nwa-button nwa-button--primary"
+            disabled={busy}
+            onClick={() => { void agent.resume(); }}
+          >
+            继续任务
+          </button>
+        </div>
+      ) : null}
+
       {/* —— 待执行任务条 —— */}
       {pendingTask ? (
         <div className="nwa-chat-pending">

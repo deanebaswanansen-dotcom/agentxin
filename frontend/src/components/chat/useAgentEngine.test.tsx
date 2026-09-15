@@ -1,4 +1,4 @@
-import { renderHook, waitFor } from '@testing-library/react';
+import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../api/apiClient.js', () => ({
@@ -6,6 +6,7 @@ vi.mock('../../api/apiClient.js', () => ({
     agent: {
       listJobs: vi.fn(),
       watchJob: vi.fn(),
+      resumeJob: vi.fn(),
       cancelJob: vi.fn(),
       runStream: vi.fn(),
       run: vi.fn(),
@@ -16,7 +17,7 @@ vi.mock('../../api/apiClient.js', () => ({
 }));
 
 import apiClient from '../../api/apiClient.js';
-import { forgetActiveAgentJob, rememberActiveAgentJob } from './activeAgentJob.js';
+import { forgetActiveAgentJob, loadActiveAgentJob, rememberActiveAgentJob } from './activeAgentJob.js';
 import { useAgentEngine } from './useAgentEngine.js';
 
 describe('useAgentEngine persistent job recovery', () => {
@@ -27,6 +28,68 @@ describe('useAgentEngine persistent job recovery', () => {
 
   afterEach(() => {
     forgetActiveAgentJob();
+  });
+
+  const pausedResult = {
+    task: 'full_novel' as const, mode: 'draft' as const, projectId: 'p-1',
+    summary: '已保存部分章节', steps: [], artifacts: [],
+    outcome: { status: 'paused' as const, code: 'QUALITY_GATE', message: '请检查草稿后继续' },
+  };
+
+  it('releases the editor on pause and resumes the same job only on explicit action', async () => {
+    const appendMessage = vi.fn();
+    const onStreamingChange = vi.fn();
+    const onCompleted = vi.fn();
+    const options = { projectId: 'p-1', appendMessage, updateMessage: vi.fn(), removeMessage: vi.fn(), onStreamingChange, onCompleted };
+    vi.mocked(apiClient.agent.runStream).mockImplementation(async (_body, stream) => {
+      stream?.onJobCreated?.('job-paused');
+      return pausedResult;
+    });
+    const { result } = renderHook(() => useAgentEngine(options));
+    await act(() => result.current.run({ task: 'full_novel', prompt: '开始生成' }));
+    expect(result.current.running).toBe(false);
+    expect(result.current.pausedJob?.id).toBe('job-paused');
+    expect(loadActiveAgentJob()?.id).toBe('job-paused');
+    expect(onStreamingChange).toHaveBeenLastCalledWith({ streaming: false, content: '', thinking: '' });
+    expect(appendMessage).toHaveBeenCalledWith(expect.objectContaining({ kind: 'agent-result', outcome: pausedResult.outcome }));
+    expect(apiClient.agent.resumeJob).not.toHaveBeenCalled();
+
+    vi.mocked(apiClient.agent.resumeJob).mockResolvedValue({ id: 'job-paused', status: 'queued', events: [{ phase: 'info', message: '旧进度' }] });
+    const completed = { ...pausedResult, summary: '完成', outcome: { status: 'completed' as const } };
+    vi.mocked(apiClient.agent.watchJob).mockResolvedValue(completed);
+    await act(() => result.current.resume());
+    expect(apiClient.agent.resumeJob).toHaveBeenCalledWith('job-paused', expect.any(AbortSignal));
+    expect(apiClient.agent.watchJob).toHaveBeenCalledWith('job-paused', expect.objectContaining({ deliveredEvents: 1 }));
+    expect(apiClient.agent.runStream).toHaveBeenCalledTimes(1);
+    expect(onCompleted).toHaveBeenLastCalledWith(completed, 'p-1');
+    expect(result.current.running).toBe(false);
+    expect(result.current.pausedJob).toBeNull();
+    expect(loadActiveAgentJob()).toBeNull();
+  });
+
+  it('restores a structured pause after refresh without resuming generation and keeps it retryable after resume failure', async () => {
+    vi.mocked(apiClient.agent.listJobs).mockResolvedValue([{
+      id: 'job-refresh', status: 'waiting_user', events: [], result: pausedResult,
+      request: { task: 'full_novel', mode: 'draft', projectId: 'p-1', prompt: '生成' },
+    }]);
+    vi.mocked(apiClient.agent.watchJob).mockResolvedValue(pausedResult);
+    const onError = vi.fn();
+    const onStreamingChange = vi.fn();
+    const options = { projectId: 'p-1', appendMessage: vi.fn(), updateMessage: vi.fn(), removeMessage: vi.fn(), onError, onStreamingChange };
+    const { result } = renderHook(() => useAgentEngine(options));
+    await waitFor(() => expect(result.current.pausedJob?.id).toBe('job-refresh'));
+    expect(result.current.running).toBe(false);
+    expect(apiClient.agent.resumeJob).not.toHaveBeenCalled();
+    expect(apiClient.agent.runStream).not.toHaveBeenCalled();
+    expect(loadActiveAgentJob()?.id).toBe('job-refresh');
+    vi.mocked(apiClient.agent.resumeJob).mockRejectedValue(new Error('网络暂不可用'));
+    await act(() => result.current.resume());
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: '网络暂不可用' }));
+    expect(result.current.running).toBe(false);
+    expect(result.current.pausedJob?.id).toBe('job-refresh');
+    expect(onStreamingChange).toHaveBeenLastCalledWith({ streaming: false, content: '', thinking: '' });
+    await act(() => result.current.run({ task: 'full_novel', prompt: '重试' }));
+    expect(apiClient.agent.runStream).not.toHaveBeenCalled();
   });
 
   it('reconnects a new-project job after refresh and removes the old progress card on completion', async () => {
