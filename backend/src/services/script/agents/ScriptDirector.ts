@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { ModelAttemptBudget } from '../../../proxy/ModelProxy.js';
 import { getCurrentClientId } from '../../client/clientScope.js';
+import type { WriteBrief } from '../../../types/WriteBrief.js';
+import { createWriteBrief, renderWriteBrief } from '../../writing/WriteBrief.js';
+import { buildScriptWriteBrief, scriptWriteBriefRef } from '../ScriptWriteBrief.js';
 import { scriptPlanningFailureMessage } from './ScriptPlanModelContent.js';
 
 import type {
@@ -2805,6 +2808,8 @@ export class ScriptDirector {
         reports.push({ episodeNumber, report: direct.report });
         continue;
       }
+      let writeBrief = buildScriptWriteBrief(state, episodeNumber, { outline });
+      if (!writeBrief) throw new ScriptModelOutputError('正文生成缺少可定位的写前任务书来源。');
       let scenePlanArtifact: ScriptScenePlanArtifact | undefined;
       let scenePlanCheckpointRevision: number | undefined;
       if (outline.plannedScenes.length === 0) {
@@ -2816,6 +2821,7 @@ export class ScriptDirector {
         const inputFingerprint = computeScriptCheckpointInputFingerprint({
           node: 'scene_plan',
           inputRevisionRefs,
+          upstreamArtifactRefs: [scriptWriteBriefRef(writeBrief)],
           promptVersion,
           configRevision,
         });
@@ -2853,6 +2859,7 @@ export class ScriptDirector {
           `场景上限：${plan.maxScenesPerEpisode}`,
           scriptCreativeWritingInstruction(plan),
           `大纲：${JSON.stringify(outline)}`,
+          renderWriteBrief(writeBrief),
         ].join('\n');
         if (!plannedScenes) {
           plannedScenes = await this.generateNodeStructured({
@@ -2871,6 +2878,8 @@ export class ScriptDirector {
             episodeNumber,
             baseEpisodeRevision: currentEpisodeRevision,
             inputRevisionRefs,
+            upstreamArtifactRefs: [scriptWriteBriefRef(writeBrief)],
+            writeBrief,
             promptVersion,
             configRevision,
             createdAt: this.now(),
@@ -2913,6 +2922,10 @@ export class ScriptDirector {
       }
 
       state = (await this.dependencies.store.getProjectState(request.projectId)) ?? state;
+      writeBrief = buildScriptWriteBrief(state, episodeNumber, { outline });
+      if (!writeBrief) throw new ScriptModelOutputError('正文生成缺少可定位的写前任务书来源。');
+      const writeBriefRef = scriptWriteBriefRef(writeBrief);
+      episodeUpstreamRefs.push(writeBriefRef);
       const deterministicEpisodeGate = (
         candidate: ScriptEpisode,
         reviewIssues?: readonly ScriptGateIssue[],
@@ -2938,6 +2951,7 @@ export class ScriptDirector {
       const confirmedSceneInputFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'scene_plan',
         inputRevisionRefs: confirmedSceneInputRevisionRefs,
+        upstreamArtifactRefs: [writeBriefRef],
         promptVersion: 'scene-plan-v2',
         configRevision,
       });
@@ -2988,6 +3002,8 @@ export class ScriptDirector {
           episodeNumber,
           baseEpisodeRevision: confirmedSceneBaseEpisodeRevision,
           inputRevisionRefs: confirmedSceneInputRevisionRefs,
+          upstreamArtifactRefs: [writeBriefRef],
+          writeBrief,
           promptVersion: 'scene-plan-v2',
           configRevision,
           createdAt: preservedCreatedAt ?? this.now(),
@@ -3017,14 +3033,14 @@ export class ScriptDirector {
       );
       episodeUpstreamRefs.push(scenePlanRef);
       const draftInputRevisionRefs = buildScriptInputRevisionRefs(state, episodeNumber);
-      const draftPromptVersion = 'episode-draft-v12';
+      const draftPromptVersion = 'episode-draft-v13';
       const currentEpisodeRevision = state.episodes.find(
         (episode) => episode.episodeNumber === episodeNumber,
       )?.revision ?? 0;
       const draftInputFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'draft',
         inputRevisionRefs: draftInputRevisionRefs,
-        upstreamArtifactRefs: [scenePlanRef],
+        upstreamArtifactRefs: [writeBriefRef, scenePlanRef],
         promptVersion: draftPromptVersion,
         configRevision,
       });
@@ -3099,7 +3115,7 @@ export class ScriptDirector {
           `所有 blocks.text 去除空白后的总字符数以 ${plan.targetCharsPerEpisode} 为目标，必须控制在 ${scriptEpisodeLengthRange(plan.targetCharsPerEpisode).minimum}—${scriptEpisodeLengthRange(plan.targetCharsPerEpisode).maximum} 字；优先保留关键冲突、行动过程与结尾卡点。任何情况下都必须写完句子，不得用省略号代替被截掉的正文。`,
           scriptCreativeWritingInstruction(plan),
           `对白只能使用这些已登记人物：${JSON.stringify(state.characters.map((character) => ({ id: character.id, name: character.name })))}`,
-          this.assembleEpisodeContext(state, plan, outline, episodeNumber),
+          this.assembleEpisodeContext(state, plan, outline, episodeNumber, writeBrief),
         ].join('\n');
         if (!draft) {
           const draftContract = defineStructuredContract<ScriptEpisode>({
@@ -3119,6 +3135,7 @@ export class ScriptDirector {
                   plan,
                   currentEpisode,
                 );
+                candidate.id = writeBrief!.target.id;
               } catch (error) {
                 if (!(error instanceof ScriptModelOutputError)) throw error;
                 return {
@@ -3163,11 +3180,12 @@ export class ScriptDirector {
               message: issue.message,
             }));
           const baseArtifact = buildScriptEpisodeCandidateArtifact({
+            writeBrief,
             projectId: request.projectId,
             episodeNumber,
             baseEpisodeRevision: currentEpisodeRevision,
             inputRevisionRefs: draftInputRevisionRefs,
-            upstreamArtifactRefs: [scenePlanRef],
+            upstreamArtifactRefs: [writeBriefRef, scenePlanRef],
             promptVersion: draftPromptVersion,
             configRevision,
             validationErrors: baseValidationErrors,
@@ -3230,7 +3248,7 @@ export class ScriptDirector {
               ? `上一轮续写反馈：${JSON.stringify(rejectedDraftFeedback)}`
               : '',
             `本集大纲：${JSON.stringify(outline)}`,
-            `创作上下文：\n${this.assembleEpisodeContext(state, plan, outline, episodeNumber)}`,
+            `创作上下文：\n${this.assembleEpisodeContext(state, plan, outline, episodeNumber, writeBrief)}`,
             `不可改写的现有正文：${JSON.stringify(continuationBase)}`,
           ].filter(Boolean).join('\n');
 
@@ -3433,11 +3451,12 @@ export class ScriptDirector {
             plan.targetCharsPerEpisode,
           ).episode;
           const continuedArtifact = buildScriptEpisodeCandidateArtifact({
+            writeBrief,
             projectId: request.projectId,
             episodeNumber,
             baseEpisodeRevision: currentEpisodeRevision,
             inputRevisionRefs: draftInputRevisionRefs,
-            upstreamArtifactRefs: [scenePlanRef],
+            upstreamArtifactRefs: [writeBriefRef, scenePlanRef],
             promptVersion: draftPromptVersion,
             configRevision,
             createdAt: this.now(),
@@ -3474,11 +3493,12 @@ export class ScriptDirector {
         }
       }
       draftArtifact ??= buildScriptEpisodeCandidateArtifact({
+        writeBrief,
         projectId: request.projectId,
         episodeNumber,
         baseEpisodeRevision: currentEpisodeRevision,
         inputRevisionRefs: draftInputRevisionRefs,
-        upstreamArtifactRefs: [scenePlanRef],
+        upstreamArtifactRefs: [writeBriefRef, scenePlanRef],
         promptVersion: draftPromptVersion,
         configRevision,
         createdAt: this.now(),
@@ -3525,7 +3545,7 @@ export class ScriptDirector {
         artifactRef: ScriptUpstreamArtifactRef;
       }> => {
         const inputRevisionRefs = buildScriptInputRevisionRefs(reviewState, episodeNumber);
-        const upstreamArtifactRefs = [candidateRef];
+        const upstreamArtifactRefs = [writeBriefRef, candidateRef];
         const promptVersion = 'script-sanity-review-v4';
         const inputFingerprint = computeScriptCheckpointInputFingerprint({
           node: 'review',
@@ -3542,6 +3562,7 @@ export class ScriptDirector {
           '不要评价文风、措辞、节奏、爽点强弱、对白密度、字数、服装审美、反转力度或是否足够精彩；这些不是明显逻辑错误。每条问题必须尽量给出 sceneId 和精确 path。',
           '只有能由正文与连续性材料直接证明的矛盾才标 hard；hard 必须给 sceneId，能定位到正文块时必须给 blockId；拿不准或无法定位就不报。',
           scriptQualityReviewInstruction(plan),
+          renderWriteBrief(writeBrief!),
           attempt > 1 ? '这是修订后复检。不得假设上一轮问题已解决，必须以当前正文重新判断。' : '',
           `策划：${JSON.stringify(plan)}`,
           `大纲：${JSON.stringify(outline)}`,
@@ -3655,7 +3676,7 @@ export class ScriptDirector {
         const hasTooShortIssue = report.blockingIssues.some((issue) => issue.code === 'TOO_SHORT');
         const hasTooLongIssue = report.blockingIssues.some((issue) => issue.code === 'TOO_LONG');
         const revisionInputRevisionRefs = buildScriptInputRevisionRefs(reviewState, episodeNumber);
-        const revisionUpstreamArtifactRefs = [currentCandidateRef, currentReviewRef];
+        const revisionUpstreamArtifactRefs = [writeBriefRef, currentCandidateRef, currentReviewRef];
       const revisionPromptVersion = 'script-revision-patch-v5';
         const revisionInputFingerprint = computeScriptCheckpointInputFingerprint({
           node: 'revision',
@@ -3698,6 +3719,7 @@ export class ScriptDirector {
             blockingIssues: [...report.blockingIssues, patchIssue],
           };
           const rejectedArtifact = buildScriptEpisodeCandidateArtifact({
+            writeBrief,
             projectId: request.projectId,
             episodeNumber,
             baseEpisodeRevision: currentEpisodeRevision,
@@ -3930,6 +3952,7 @@ export class ScriptDirector {
             ),
             `人物 ID 白名单：${JSON.stringify(state.characters.map((character) => character.id))}`,
             `本集大纲：${JSON.stringify(outline)}`,
+            renderWriteBrief(writeBrief),
             `阻断错误：${JSON.stringify(report.blockingIssues)}`,
             rejectedRevisionFeedback.length > 0
               ? `上次候选被系统拒绝：${JSON.stringify(rejectedRevisionFeedback)}。必须根据反馈换一种满足精确策略与长度保护的补丁，禁止重复该越界做法。`
@@ -3964,6 +3987,7 @@ export class ScriptDirector {
             // before the candidate artifact can be persisted.
             draft = validateAndApplyRevisionPatch(patch, () => this.createId(), this.now());
             patchedArtifact = buildScriptEpisodeCandidateArtifact({
+              writeBrief,
               projectId: request.projectId,
               episodeNumber,
               baseEpisodeRevision: currentEpisodeRevision,
@@ -4052,11 +4076,12 @@ export class ScriptDirector {
           message: issue.message,
         }));
         const needsReviewArtifact = buildScriptEpisodeCandidateArtifact({
+          writeBrief,
           projectId: request.projectId,
           episodeNumber,
           baseEpisodeRevision: currentEpisodeRevision,
           inputRevisionRefs: currentCandidateInputRevisionRefs,
-          upstreamArtifactRefs: [currentCandidateRef, currentReviewRef],
+          upstreamArtifactRefs: [writeBriefRef, currentCandidateRef, currentReviewRef],
           promptVersion: 'quality-gate-needs-review-v1',
           configRevision,
           validationErrors,
@@ -4127,11 +4152,12 @@ export class ScriptDirector {
           message: issue.message,
         }));
         const needsReviewArtifact = buildScriptEpisodeCandidateArtifact({
+          writeBrief,
           projectId: request.projectId,
           episodeNumber,
           baseEpisodeRevision: currentEpisodeRevision,
           inputRevisionRefs: currentCandidateInputRevisionRefs,
-          upstreamArtifactRefs: [currentCandidateRef, currentReviewRef],
+          upstreamArtifactRefs: [writeBriefRef, currentCandidateRef, currentReviewRef],
           promptVersion: 'quality-gate-needs-review-v1',
           configRevision,
           validationErrors,
@@ -4164,11 +4190,12 @@ export class ScriptDirector {
         { node: 'completed', episodeNumber },
       );
       const finalCandidateArtifact = buildScriptEpisodeCandidateArtifact({
+        writeBrief,
         projectId: request.projectId,
         episodeNumber,
         baseEpisodeRevision: currentEpisodeRevision,
         inputRevisionRefs: currentCandidateInputRevisionRefs,
-        upstreamArtifactRefs: [currentCandidateRef, currentReviewRef],
+        upstreamArtifactRefs: [writeBriefRef, currentCandidateRef, currentReviewRef],
         promptVersion: 'quality-gate-final-v1',
         configRevision,
         createdAt: this.now(),
@@ -4187,7 +4214,8 @@ export class ScriptDirector {
       const continuity = buildScriptContinuityCandidate(reviewState, draft, review.wardrobe);
       const commitInput = buildScriptAtomicCommitInput(reviewState, draft, continuity, {
         upstreamArtifactRefs: episodeUpstreamRefs,
-        promptVersion: 'short-drama-director-v2',
+        promptVersion: 'short-drama-director-v3',
+        writeBrief,
         modelConfigFingerprint: configRevision,
       });
       commitInput.reviewUpdate = reviewUpdate;
@@ -4271,9 +4299,14 @@ export class ScriptDirector {
     const baseEpisodeRevision = currentEpisode?.revision ?? 0;
     const inputRevisionRefs = buildScriptInputRevisionRefs(state, episodeNumber);
     const outlineRef = buildScriptUpstreamArtifactRef('episode_outline', outline.revision, outline);
-    const baseContext = directWritingContext(state, plan, outline);
     const rewriteInstruction = request.rewriteInstruction?.trim();
     const rewriteMode = request.rewriteMode ?? (rewriteInstruction ? 'revise' : 'replace');
+    const writeBrief = buildScriptWriteBrief(state, episodeNumber, {
+      outline, ...(explicitRewrite ? { rewriteInstruction, rewriteMode } : {}),
+    });
+    if (!writeBrief) throw new ScriptModelOutputError('正文生成缺少可定位的写前任务书来源。');
+    const writeBriefRef = scriptWriteBriefRef(writeBrief);
+    const baseContext = directWritingContext(state, plan, outline, writeBrief);
     const context = explicitRewrite
       ? {
           ...baseContext,
@@ -4295,11 +4328,11 @@ export class ScriptDirector {
       );
     const canonicalDirectCandidate = (value: ScriptEpisode): ScriptEpisode =>
       reconcileDirectSceneCast(canonicalStoredDirectCandidate(value));
-    const promptVersion = 'direct-draft-v10';
+    const promptVersion = 'direct-draft-v11';
     const draftFingerprint = computeScriptCheckpointInputFingerprint({
       node: 'direct_draft',
       inputRevisionRefs,
-      upstreamArtifactRefs: [outlineRef],
+      upstreamArtifactRefs: [writeBriefRef, outlineRef],
       promptVersion,
       configRevision,
     });
@@ -4325,7 +4358,7 @@ export class ScriptDirector {
       try {
         const episode = capGeneratedEpisodeLength(canonicalDirectCandidate({
           ...parsed.episode,
-          id: currentEpisode?.id ?? this.createId(),
+          id: writeBrief.target.id,
           projectId: request.projectId,
           revision: baseEpisodeRevision,
           createdAt: currentEpisode?.createdAt ?? now,
@@ -4391,7 +4424,7 @@ export class ScriptDirector {
         episodeNumber,
         artifact: input.artifact,
         inputRevisionRefs,
-        upstreamArtifactRefs: [outlineRef],
+        upstreamArtifactRefs: [writeBriefRef, outlineRef],
         promptVersion,
         configRevision,
         inputFingerprint: draftFingerprint,
@@ -4418,11 +4451,13 @@ export class ScriptDirector {
         candidate.stage !== expectedStage ||
         typeof candidate.rawText !== 'string' ||
         !candidate.episode ||
+        candidate.writeBrief?.fingerprint !== writeBrief.fingerprint ||
         typeof candidate.candidateHash !== 'string' ||
         !Array.isArray(candidate.parseWarnings)
       ) return undefined;
       let storedEpisode: ScriptEpisode;
       try {
+        if (createWriteBrief(candidate.writeBrief!).fingerprint !== writeBrief.fingerprint) return undefined;
         storedEpisode = canonicalStoredDirectCandidate(candidate.episode);
       } catch {
         return undefined;
@@ -4577,7 +4612,7 @@ export class ScriptDirector {
         );
         const fallback = canonicalDirectCandidate({
           ...localDraft,
-          id: currentEpisode?.id ?? localDraft.id,
+          id: writeBrief.target.id,
           revision: baseEpisodeRevision,
           createdAt: currentEpisode?.createdAt ?? localDraft.createdAt,
         });
@@ -4611,6 +4646,7 @@ export class ScriptDirector {
       const artifact: ScriptDirectDraftArtifact = {
         schemaVersion: 1,
         stage: 'direct_draft',
+        writeBrief,
         rawText,
         episode: parsedDraft,
         candidateHash: computeScriptEpisodeCandidateHash(parsedDraft),
@@ -4627,7 +4663,7 @@ export class ScriptDirector {
         episodeNumber,
         artifact,
         inputRevisionRefs,
-        upstreamArtifactRefs: [outlineRef],
+        upstreamArtifactRefs: [writeBriefRef, outlineRef],
         promptVersion,
         configRevision,
         inputFingerprint: draftFingerprint,
@@ -4648,7 +4684,7 @@ export class ScriptDirector {
       { rawText, candidateHash: computeScriptEpisodeCandidateHash(draft) },
     );
     let currentCandidateRef = directDraftRef;
-    const episodeUpstreamRefs: ScriptUpstreamArtifactRef[] = [outlineRef, directDraftRef];
+    const episodeUpstreamRefs: ScriptUpstreamArtifactRef[] = [writeBriefRef, outlineRef, directDraftRef];
     const continuationThreshold = Math.max(150, Math.round(plan.targetCharsPerEpisode * 0.58));
     const maxDirectDraftAndContinuationCalls = maxDirectDraftCalls +
       SCRIPT_DIRECT_TEXT_MAX_CONTINUATIONS;
@@ -4660,7 +4696,7 @@ export class ScriptDirector {
       const continuationFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'continuation',
         inputRevisionRefs,
-        upstreamArtifactRefs: [currentCandidateRef],
+        upstreamArtifactRefs: [writeBriefRef, currentCandidateRef],
         promptVersion: continuationPromptVersion,
         configRevision,
       });
@@ -4726,6 +4762,7 @@ export class ScriptDirector {
         continued = {
           schemaVersion: 1,
           stage: 'direct_continuation',
+          writeBrief,
           rawText,
           episode: draft,
           candidateHash: computeScriptEpisodeCandidateHash(draft),
@@ -4742,7 +4779,7 @@ export class ScriptDirector {
           episodeNumber,
           artifact: continued,
           inputRevisionRefs,
-          upstreamArtifactRefs: [currentCandidateRef],
+          upstreamArtifactRefs: [writeBriefRef, currentCandidateRef],
           promptVersion: continuationPromptVersion,
           configRevision,
           inputFingerprint: continuationFingerprint,
@@ -4766,6 +4803,7 @@ export class ScriptDirector {
       const rejectedArtifact = {
         schemaVersion: 1 as const,
         stage: 'direct_draft' as const,
+        writeBrief,
         rawText,
         episode: draft,
         candidateHash: computeScriptEpisodeCandidateHash(draft),
@@ -4787,7 +4825,7 @@ export class ScriptDirector {
     const reviewFingerprint = computeScriptCheckpointInputFingerprint({
       node: 'handoff_review',
       inputRevisionRefs,
-      upstreamArtifactRefs: [currentCandidateRef],
+      upstreamArtifactRefs: [writeBriefRef, currentCandidateRef],
       promptVersion: reviewPromptVersion,
       configRevision,
     });
@@ -4860,7 +4898,7 @@ export class ScriptDirector {
         chunkStart: 1,
         artifact,
         inputRevisionRefs,
-        upstreamArtifactRefs: [currentCandidateRef],
+        upstreamArtifactRefs: [writeBriefRef, currentCandidateRef],
         promptVersion: reviewPromptVersion,
         configRevision,
         inputFingerprint: reviewFingerprint,
@@ -4985,7 +5023,7 @@ export class ScriptDirector {
       const rewriteFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'direct_rewrite',
         inputRevisionRefs,
-        upstreamArtifactRefs: [currentCandidateRef, reviewRef],
+        upstreamArtifactRefs: [writeBriefRef, currentCandidateRef, reviewRef],
         promptVersion: rewritePromptVersion,
         configRevision,
       });
@@ -5041,6 +5079,7 @@ export class ScriptDirector {
           rewriteArtifact = {
             schemaVersion: 1,
             stage: 'direct_rewrite',
+            writeBrief,
             rawText,
             episode: draft,
             candidateHash: computeScriptEpisodeCandidateHash(draft),
@@ -5057,7 +5096,7 @@ export class ScriptDirector {
             episodeNumber,
             artifact: rewriteArtifact,
             inputRevisionRefs,
-            upstreamArtifactRefs: [currentCandidateRef, reviewRef],
+            upstreamArtifactRefs: [writeBriefRef, currentCandidateRef, reviewRef],
             promptVersion: rewritePromptVersion,
             configRevision,
             inputFingerprint: rewriteFingerprint,
@@ -5081,7 +5120,7 @@ export class ScriptDirector {
       const postRewriteReviewFingerprint = computeScriptCheckpointInputFingerprint({
         node: 'handoff_review',
         inputRevisionRefs,
-        upstreamArtifactRefs: [currentCandidateRef],
+        upstreamArtifactRefs: [writeBriefRef, currentCandidateRef],
         promptVersion: postRewriteReviewPromptVersion,
         configRevision,
       });
@@ -5157,7 +5196,7 @@ export class ScriptDirector {
           chunkStart: 2,
           artifact: postRewriteReviewArtifact,
           inputRevisionRefs,
-          upstreamArtifactRefs: [currentCandidateRef],
+          upstreamArtifactRefs: [writeBriefRef, currentCandidateRef],
           promptVersion: postRewriteReviewPromptVersion,
           configRevision,
           inputFingerprint: postRewriteReviewFingerprint,
@@ -5246,6 +5285,7 @@ export class ScriptDirector {
         { node: 'completed', episodeNumber },
       );
       const needsReviewArtifact = buildScriptEpisodeCandidateArtifact({
+        writeBrief,
         projectId: request.projectId,
         episodeNumber,
         baseEpisodeRevision,
@@ -5281,6 +5321,7 @@ export class ScriptDirector {
       { node: 'completed', episodeNumber },
     );
     const finalCandidateArtifact = buildScriptEpisodeCandidateArtifact({
+      writeBrief,
       projectId: request.projectId,
       episodeNumber,
       baseEpisodeRevision,
@@ -5304,7 +5345,8 @@ export class ScriptDirector {
     );
     const commitInput = buildScriptAtomicCommitInput(reviewState, draft, continuity, {
       upstreamArtifactRefs: [...episodeUpstreamRefs, finalCandidateRef],
-      promptVersion: 'short-drama-direct-writing-v1',
+      promptVersion: 'short-drama-direct-writing-v2',
+      writeBrief,
       modelConfigFingerprint: configRevision,
     });
     commitInput.reviewUpdate = reviewUpdate;
@@ -5534,6 +5576,7 @@ export class ScriptDirector {
     plan: ScriptPlan,
     outline: ScriptEpisodeOutline,
     episodeNumber: number,
+    writeBrief?: WriteBrief,
   ): string {
     const previous = state.episodes.find((episode) => episode.episodeNumber === episodeNumber - 1);
     const cast = state.characters.filter((character) => outline.characterIds.includes(character.id));
@@ -5598,9 +5641,9 @@ export class ScriptDirector {
       }), 3_500],
       ['格式规则', '结构化 JSON；1—5 场；每场含地点、时间、内外景、人物与 caption/action/dialogue 块。', 1_000],
     ] as const;
-    return sections
+    return [writeBrief ? renderWriteBrief(writeBrief) : '', ...sections
       .map(([label, content, limit]) => `${label}：${content.slice(0, limit)}`)
-      .join('\n');
+    ].filter(Boolean).join('\n');
   }
 
   private async generateNodeStructured<T>(

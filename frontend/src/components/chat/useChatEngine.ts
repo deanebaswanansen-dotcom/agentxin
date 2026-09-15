@@ -25,6 +25,8 @@ import {
   type WritingOperation,
 } from './types.js';
 import { makeId } from './types-shared.js';
+import type { WriteBrief } from '../../types/writeBrief.js';
+import type { ChapterPreviewMessage } from './types.js';
 
 export interface UseChatEngineOptions {
   projectId: Id | null;
@@ -37,7 +39,8 @@ export interface UseChatEngineOptions {
   /** 流式状态变化（供中央预览）。 */
   onStreamingChange?: (state: { streaming: boolean; content: string; thinking: string }) => void;
   /** 写作模式生成可采用的章节预览时触发。 */
-  onAdoptChapter?: (messageId: string, generated: string, chapterId?: string) => void;
+  onAdoptChapter?: (messageId: string, generated: string, chapterId?: string, writeBrief?: WriteBrief, context?: ChapterPreviewMessage['generationContext']) => void;
+  beforeWriting?: () => Promise<void>;
 }
 
 export interface ChatEngineState {
@@ -123,6 +126,7 @@ export function useChatEngine(options: UseChatEngineOptions): ChatEngineState & 
     onError,
     onStreamingChange,
     onAdoptChapter,
+    beforeWriting,
   } = options;
 
   const isWritingMode = chapterId != null;
@@ -139,6 +143,13 @@ export function useChatEngine(options: UseChatEngineOptions): ChatEngineState & 
   const [streaming, setStreaming] = useState(false);
 
   const currentSessionKeyRef = useRef(sessionKey);
+  const targetKey = `${projectId}:${chapterId}`;
+  const targetKeyRef = useRef(targetKey);
+  targetKeyRef.current = targetKey;
+  const instanceId = useRef(makeId());
+  const editorKey = JSON.stringify([projectId, chapterId, editorContent, selection?.start, selection?.end]);
+  const editorContextRef = useRef({ key: editorKey, version: 0 });
+  if (editorContextRef.current.key !== editorKey) editorContextRef.current = { key: editorKey, version: editorContextRef.current.version + 1 };
   const messagesRef = useRef<ChatMessage[]>(messages);
   const carryNextSessionRef = useRef(false);
 
@@ -169,6 +180,8 @@ export function useChatEngine(options: UseChatEngineOptions): ChatEngineState & 
     setLiveThinking('');
     // 切换上下文时中止任何进行中的流
     abortRef.current?.abort();
+    abortRef.current = null;
+    setStreaming(false);
   }, [sessionKey]);
 
   // 持久化当前消息到 sessionsRef
@@ -182,8 +195,18 @@ export function useChatEngine(options: UseChatEngineOptions): ChatEngineState & 
   useEffect(() => {
     return () => {
       abortRef.current?.abort();
+      abortRef.current = null;
     };
-  }, []);
+  }, [targetKey]);
+
+  useEffect(() => {
+    setStreaming(false);
+    setLiveText('');
+    setLiveThinking('');
+    onStreamingChange?.({ streaming: false, content: '', thinking: '' });
+    // A chapter switch changes the writing target, not the project's message history.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targetKey]);
 
   const updateStreaming = useCallback(
     (streamingFlag: boolean, content: string, thinking: string) => {
@@ -258,6 +281,10 @@ export function useChatEngine(options: UseChatEngineOptions): ChatEngineState & 
 
       let accumulated = '';
       let accumulatedThinking = '';
+      let writeBrief: WriteBrief | undefined;
+      const requestEditorVersion = editorContextRef.current.version;
+      const generationContext = { baseContent: editorContent, selection: selection ? { ...selection } : undefined, editorVersion: requestEditorVersion, sessionId: instanceId.current };
+      const isCurrentRequest = () => currentSessionKeyRef.current === sessionKey && targetKeyRef.current === targetKey && abortRef.current === controller;
 
       try {
         let full: string;
@@ -275,17 +302,21 @@ export function useChatEngine(options: UseChatEngineOptions): ChatEngineState & 
           full = await apiClient.freeChat.stream(projectId, body, {
             signal: controller.signal,
             onDelta: (delta) => {
+              if (!isCurrentRequest() || controller.signal.aborted) return;
               accumulated += delta;
               setLiveText(accumulated);
               updateStreaming(true, accumulated, accumulatedThinking);
             },
             onThinking: (delta) => {
+              if (!isCurrentRequest() || controller.signal.aborted) return;
               accumulatedThinking += delta;
               setLiveThinking(accumulatedThinking);
               updateStreaming(true, accumulated, accumulatedThinking);
             },
           });
         } else {
+          await beforeWriting?.();
+          if (controller.signal.aborted || !isCurrentRequest() || editorContextRef.current.version !== requestEditorVersion) return;
           // 写作模式续写/改写/润色
           const body: WritingRequestBody = {
             operation,
@@ -299,12 +330,19 @@ export function useChatEngine(options: UseChatEngineOptions): ChatEngineState & 
           }
           full = await apiClient.write(projectId, chapterId!, body, {
             signal: controller.signal,
+            onWriteBrief: (brief) => {
+              if (!isCurrentRequest() || controller.signal.aborted) return;
+              if (brief.projectId !== projectId || brief.target.id !== chapterId) throw new Error('写前依据与当前章节不匹配，请重新生成。');
+              writeBrief = brief;
+            },
             onDelta: (delta) => {
+              if (!isCurrentRequest() || controller.signal.aborted) return;
               accumulated += delta;
               setLiveText(accumulated);
               updateStreaming(true, accumulated, accumulatedThinking);
             },
             onThinking: (delta) => {
+              if (!isCurrentRequest() || controller.signal.aborted) return;
               accumulatedThinking += delta;
               setLiveThinking(accumulatedThinking);
               updateStreaming(true, accumulated, accumulatedThinking);
@@ -312,6 +350,7 @@ export function useChatEngine(options: UseChatEngineOptions): ChatEngineState & 
           });
         }
 
+        if (!isCurrentRequest() || controller.signal.aborted) return;
         // 写作模式（非提问）且生成了实质内容 → 作为章节预览消息（可"采用"）
         if (isWritingMode && operation !== 'ask' && full.trim().length > 0) {
           const previewMsg: ChatMessage = {
@@ -321,6 +360,8 @@ export function useChatEngine(options: UseChatEngineOptions): ChatEngineState & 
             chapterId: String(chapterId),
             title: '写作结果',
             content: full,
+            writeBrief,
+            generationContext,
           };
           commitMessages((prev) => [...prev, previewMsg]);
         } else {
@@ -335,6 +376,7 @@ export function useChatEngine(options: UseChatEngineOptions): ChatEngineState & 
           commitMessages((prev) => [...prev, assistantMsg]);
         }
       } catch (error) {
+        if (!isCurrentRequest()) return;
         if (isAbort(error)) {
           // 保留已累积的内容
           if (accumulated.length > 0) {
@@ -351,11 +393,13 @@ export function useChatEngine(options: UseChatEngineOptions): ChatEngineState & 
           onError?.(error);
         }
       } finally {
-        setLiveText('');
-        setLiveThinking('');
-        setStreaming(false);
-        updateStreaming(false, '', '');
-        abortRef.current = null;
+        if (isCurrentRequest()) {
+          setLiveText('');
+          setLiveThinking('');
+          setStreaming(false);
+          updateStreaming(false, '', '');
+          abortRef.current = null;
+        }
       }
     },
     [
@@ -371,6 +415,9 @@ export function useChatEngine(options: UseChatEngineOptions): ChatEngineState & 
       updateStreaming,
       onError,
       commitMessages,
+      beforeWriting,
+      sessionKey,
+      targetKey,
     ],
   );
 
@@ -378,15 +425,18 @@ export function useChatEngine(options: UseChatEngineOptions): ChatEngineState & 
     (messageId: string) => {
       const target = messages.find((m) => m.id === messageId);
       if (!target || target.kind !== 'chapter-preview') return;
-      onAdoptChapter?.(messageId, target.content, target.chapterId);
-      // 标记为已采用
-      commitMessages((prev) =>
-        prev.map((m) =>
-          m.id === messageId && m.kind === 'chapter-preview' ? { ...m, adopted: true } : m,
-        ),
-      );
+      const context = target.generationContext;
+      if (!context || !target.writeBrief) {
+        onError?.(new Error('该生成结果缺少写前依据，请重新生成后采用。正文仍可复制保留。'));
+        return;
+      }
+      if (context && (context.sessionId !== instanceId.current || context.editorVersion !== editorContextRef.current.version || target.chapterId !== chapterId)) {
+        onError?.(new Error('生成后章节内容或选区已改变，请重新生成后采用。'));
+        return;
+      }
+      onAdoptChapter?.(messageId, target.content, target.chapterId, target.writeBrief, context);
     },
-    [messages, onAdoptChapter, commitMessages],
+    [messages, onAdoptChapter, commitMessages, chapterId, onError],
   );
 
   return {

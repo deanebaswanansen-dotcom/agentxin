@@ -22,6 +22,7 @@ import type {
   ReferenceNovelSummary,
   ReferenceTransferDimension,
 } from '../../types/index.js';
+import type { WriteBrief } from '../../types/writeBrief.js';
 
 export type { NovelPlanChapterOutline };
 
@@ -59,6 +60,8 @@ export interface ChapterPreviewMessage {
   chapterId: string;
   title: string;
   content: string;
+  writeBrief?: WriteBrief;
+  generationContext?: { baseContent: string; selection?: { start: number; end: number }; editorVersion: number; sessionId: string };
   /** 标记是否已被用户采用。 */
   adopted?: boolean;
 }

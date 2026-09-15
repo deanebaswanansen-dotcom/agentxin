@@ -66,6 +66,8 @@ export interface ChapterEditorHandle {
   setContent(next: string): void;
   /** Persist unsaved edits before the parent navigates away. */
   saveIfDirty(): Promise<void>;
+  /** Acknowledge a server-accepted generated save without sending a manual PUT. */
+  acceptSavedContent(saved: Chapter, expectedContent: string): boolean;
 }
 
 /** Minimal client surface this editor depends on (eases testing). */
@@ -689,8 +691,27 @@ function ChapterEditorInner(
       async saveIfDirty() {
         await persistLatest();
       },
+      acceptSavedContent(saved, expectedContent) {
+        if (chapterIdRef.current !== saved.id) return false;
+        lastSavedContentRef.current = saved.content;
+        lastSavedRevisionRef.current = saved.revision ?? 0;
+        if (contentRef.current !== expectedContent) {
+          setDirty(contentRef.current !== saved.content);
+          return false;
+        }
+        const current = contentRef.current;
+        if (current !== saved.content) {
+          saveChapterSnapshot({ id: saved.id, title: saved.title, content: current }, '采用前');
+          setSnapshots(listChapterSnapshots(saved.id));
+        }
+        updateHistory({ past: trimHistory([...historyRef.current.past, current]), future: [] });
+        contentRef.current = saved.content;
+        setContentState(saved.content);
+        setDirty(false);
+        return true;
+      },
     }),
-    [applyContent, persistLatest],
+    [applyContent, persistLatest, updateHistory],
   );
 
   // Optional debounced autosave for unsaved changes.

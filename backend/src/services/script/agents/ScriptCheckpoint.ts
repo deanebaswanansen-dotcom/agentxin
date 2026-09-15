@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto';
+import type { WriteBrief } from '../../../types/WriteBrief.js';
+import { createWriteBrief } from '../../writing/WriteBrief.js';
 
 import type {
   ScriptEpisode,
@@ -59,6 +61,7 @@ export interface ScriptCheckpointArtifactMeta {
   candidateHash: string;
   validationErrors: ScriptCheckpointValidationError[];
   createdAt: string;
+  writeBrief?: WriteBrief;
 }
 
 export interface ScriptScenePlanArtifact extends ScriptCheckpointArtifactMeta {
@@ -81,6 +84,7 @@ export interface ScriptCheckpointArtifactBuildContext {
   configRevision: string;
   validationErrors?: readonly ScriptCheckpointValidationError[];
   createdAt: string;
+  writeBrief?: WriteBrief;
 }
 
 export interface ScriptCheckpointArtifactExpectation {
@@ -406,6 +410,7 @@ function artifactMeta<TStage extends ScriptArtifactStage>(
     inputFingerprint,
     validationErrors: structuredClone([...(context.validationErrors ?? [])]),
     createdAt: context.createdAt,
+    ...(context.writeBrief ? { writeBrief: structuredClone(context.writeBrief) } : {}),
   };
 }
 
@@ -484,6 +489,14 @@ function decodeArtifactMeta(
   ) {
     throw new TypeError('短剧 checkpoint artifact inputFingerprint 校验失败');
   }
+  let writeBrief: WriteBrief | undefined;
+  if (record.writeBrief !== undefined) {
+    writeBrief = createWriteBrief(record.writeBrief as WriteBrief);
+    if (writeBrief.fingerprint !== (record.writeBrief as WriteBrief).fingerprint ||
+        !record.upstreamArtifactRefs.some((ref) => ref.node === 'write_brief' && ref.artifactHash === writeBrief!.fingerprint)) {
+      throw new TypeError('单集候选的写作任务书与来源指纹不匹配');
+    }
+  }
   return {
     schemaVersion: 1,
     stage,
@@ -498,6 +511,7 @@ function decodeArtifactMeta(
     candidateHash: record.candidateHash,
     validationErrors: structuredClone(record.validationErrors),
     createdAt: record.createdAt,
+    ...(writeBrief ? { writeBrief } : {}),
   };
 }
 

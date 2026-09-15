@@ -12,6 +12,7 @@ import type {
 } from '../types/index.js';
 import completeCharacterFixtureJson from '../../../spec/fixtures/script-character.v1.json';
 import { ScriptWorkspace } from './ScriptWorkspace.js';
+import { makeWriteBrief } from '../test/writeBriefFixture.js';
 
 const completeCharacterFixture: ScriptCharacter = {
   ...completeCharacterFixtureJson,
@@ -165,6 +166,24 @@ function buildWorkspaceSnapshot(
 }
 
 describe('ScriptWorkspace', () => {
+  it('loads current episode provenance and marks it stale after a local edit', async () => {
+    const client = createClient();
+    const first = buildNumberedEpisode(1, '第一集正文');
+    const second = buildNumberedEpisode(2, '第二集正文');
+    vi.mocked(client.script.episodes.list).mockResolvedValue([summarizeEpisode(first), summarizeEpisode(second)]);
+    vi.mocked(client.script.episodes.get).mockImplementation(async (_projectId, number) => number === 1 ? first : second);
+    client.script.episodes.writeBrief = vi.fn().mockImplementation(async (_projectId, number) => ({ status: 'current', origin: 'generation', brief: makeWriteBrief({ mode: 'short_drama', objective: [{ text: `第${number}集独立目标`, sourceKeys: [] }] }) }));
+    render(<ScriptWorkspace projectId="project-1" client={client} />);
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('tab', { name: '分批正文' }));
+    fireEvent.click(screen.getByRole('button', { name: '打开第 2 集' }));
+    const editor = await screen.findByLabelText('第 2 集场景 1 块 1');
+    await screen.findByText('第2集独立目标');
+    expect(client.script.episodes.writeBrief).toHaveBeenLastCalledWith('project-1', 2, expect.any(AbortSignal));
+    fireEvent.change(editor, { target: { value: '作者正在修改' } });
+    expect(screen.getByText('已过期')).toBeInTheDocument();
+    expect(screen.queryByText('当前')).not.toBeInTheDocument();
+  });
   afterEach(() => {
     vi.restoreAllMocks();
   });

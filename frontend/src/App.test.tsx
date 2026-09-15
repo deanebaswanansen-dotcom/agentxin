@@ -1,11 +1,49 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 import fc from 'fast-check';
 import { App } from './App.js';
+import { makeWriteBrief } from './test/writeBriefFixture.js';
+
+function installWritingServer(accept?: (body: { content: string }) => Response | Promise<Response>) {
+  let chapter = { id: 'ch-1', projectId: 'p-1', title: '测试第一章', content: '已有正文', revision: 3, position: 0 };
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(String(input), 'http://localhost');
+    if (url.pathname.endsWith('/projects')) return Response.json([{ id: 'p-1', name: '小说测试项目', kind: 'novel' }]);
+    if (url.pathname.endsWith('/chapters') && init?.method !== 'POST') return Response.json([chapter]);
+    if (url.pathname.endsWith('/write')) return new Response(`event: write_brief\ndata: ${JSON.stringify(makeWriteBrief())}\n\nevent: delta\ndata: "生成片段"\n\nevent: done\ndata: \n\n`, { headers: { 'Content-Type': 'text/event-stream' } });
+    if (url.pathname.endsWith('/generated-content')) {
+      const body = JSON.parse(init!.body as string) as { content: string };
+      if (accept) return accept(body);
+      chapter = { ...chapter, content: body.content, revision: chapter.revision + 1 };
+      return Response.json(chapter);
+    }
+    if (url.pathname.endsWith('/content') && init?.method === 'PUT') {
+      const body = JSON.parse(init.body as string) as { content: string };
+      chapter = { ...chapter, content: body.content, revision: chapter.revision + 1 };
+      return Response.json(chapter);
+    }
+    return Response.json([]);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  return fetchMock;
+}
+
+async function openWritingCandidate() {
+  render(<App />);
+  fireEvent.click(await screen.findByTitle('小说测试项目'));
+  fireEvent.click(await screen.findByTitle('测试第一章'));
+  await screen.findByRole('textbox', { name: '章节正文' });
+  fireEvent.change(screen.getByLabelText('对话输入'), { target: { value: '继续写' } });
+  fireEvent.click(screen.getByRole('button', { name: '发送' }));
+  await screen.findByText('生成片段');
+  fireEvent.click(screen.getByRole('button', { name: '采用到正文' }));
+  await screen.findByRole('dialog', { name: '整章替换确认' });
+}
 
 describe('App shell', () => {
   beforeEach(() => {
+    window.localStorage.clear();
     vi.stubGlobal(
       'fetch',
       vi.fn(async () =>
@@ -27,6 +65,43 @@ describe('App shell', () => {
     expect(
       await screen.findByRole('heading', { name: /小说\s*Agent/ }),
     ).toBeInTheDocument();
+  });
+
+  it('accepts generated content through its guarded endpoint and continues manual edits at the returned revision', async () => {
+    const fetchMock = installWritingServer();
+    await openWritingCandidate();
+    fireEvent.click(screen.getByRole('button', { name: '确认替换' }));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '整章替换确认' })).not.toBeInTheDocument());
+    const candidateCall = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/generated-content'));
+    expect(candidateCall).toBeDefined();
+    expect(JSON.parse(candidateCall![1]!.body as string)).toEqual({ content: '已有正文生成片段', writeBrief: makeWriteBrief() });
+    expect(screen.getByRole('textbox', { name: '章节正文' })).toHaveValue('已有正文生成片段');
+    expect(fetchMock.mock.calls.filter(([url, init]) => String(url).endsWith('/content') && init?.method === 'PUT')).toHaveLength(0);
+    fireEvent.change(screen.getByRole('textbox', { name: '章节正文' }), { target: { value: '手工修订' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/content'))).toBe(true));
+    const manualCall = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/content'))!;
+    expect(JSON.parse(manualCall[1]!.body as string)).toEqual({ content: '手工修订', expectedRevision: 4 });
+  });
+
+  it('keeps the existing editor text when generated acceptance fails', async () => {
+    const fetchMock = installWritingServer(() => Response.json({ error: { code: 'CONFLICT', message: '来源已过期' } }, { status: 409 }));
+    await openWritingCandidate();
+    fireEvent.click(screen.getByRole('button', { name: '确认替换' }));
+    await screen.findByText('来源已过期');
+    expect(screen.getByRole('textbox', { name: '章节正文' })).toHaveValue('已有正文');
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/content'))).toHaveLength(0);
+  });
+
+  it('does not overwrite an edit made while generated acceptance is in flight', async () => {
+    let release!: (response: Response) => void;
+    const fetchMock = installWritingServer(() => new Promise<Response>((resolve) => { release = resolve; }));
+    await openWritingCandidate();
+    fireEvent.click(screen.getByRole('button', { name: '确认替换' }));
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/generated-content'))).toBe(true));
+    fireEvent.change(screen.getByRole('textbox', { name: '章节正文' }), { target: { value: '等待时的手工编辑' } });
+    await act(async () => release(Response.json({ id: 'ch-1', projectId: 'p-1', content: '已有正文生成片段', title: '测试第一章', revision: 4, position: 0 })));
+    expect(screen.getByRole('textbox', { name: '章节正文' })).toHaveValue('等待时的手工编辑');
   });
 
   it('renders the project tree and centered chat workspace immediately', async () => {

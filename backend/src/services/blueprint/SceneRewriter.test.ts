@@ -1,3 +1,4 @@
+import { saveCurrentSceneDraft } from './sceneTestFixtures.js';
 /**
  * Example/edge-case unit tests for {@link SceneRewriter} (task 9.5).
  *
@@ -123,7 +124,7 @@ describe('SceneRewriter.streamRewrite', () => {
     'throws VALIDATION_ERROR for empty/whitespace instruction %p before any provider call (Req 12.5)',
     async (instruction) => {
       await store.saveModelConfig(VALID_CONFIG);
-      await store.saveSceneDraft({
+      await saveCurrentSceneDraft(store, {
         chapterId,
         sceneId: 'scene-0',
         content: '原始正文',
@@ -146,7 +147,7 @@ describe('SceneRewriter.streamRewrite', () => {
   );
 
   it('throws MODEL_NOT_CONFIGURED before any provider call when no config is saved (Req 12.7)', async () => {
-    await store.saveSceneDraft({
+    await saveCurrentSceneDraft(store, {
       chapterId,
       sceneId: 'scene-0',
       content: '原始正文',
@@ -203,13 +204,13 @@ describe('SceneRewriter.streamRewrite', () => {
 
   it('streams deltas and finalizeDraft updates ONLY the target scene (Req 12.3)', async () => {
     await store.saveModelConfig(VALID_CONFIG);
-    await store.saveSceneDraft({
+    await saveCurrentSceneDraft(store, {
       chapterId,
       sceneId: 'scene-0',
       content: '场景0原始正文',
       updatedAt: new Date().toISOString(),
     });
-    await store.saveSceneDraft({
+    await saveCurrentSceneDraft(store, {
       chapterId,
       sceneId: 'scene-1',
       content: '场景1原始正文',
@@ -223,7 +224,7 @@ describe('SceneRewriter.streamRewrite', () => {
       proxy,
     );
 
-    const { scene, stream } = await rewriter.streamRewrite(
+    const { scene, stream, guard } = await rewriter.streamRewrite(
       chapterId,
       'scene-0',
       { instruction: '让冲突更激烈' },
@@ -238,7 +239,7 @@ describe('SceneRewriter.streamRewrite', () => {
     expect(fullText).toBe(DELTAS.join(''));
 
     // Persist only after the stream completes (Req 12.3).
-    await rewriter.finalizeDraft(chapterId, 'scene-0', fullText);
+    await rewriter.finalizeDraft(chapterId, 'scene-0', fullText, guard);
 
     const updated = await store.getSceneDraft(chapterId, 'scene-0');
     expect(updated?.content).toBe(fullText);

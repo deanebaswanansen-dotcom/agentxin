@@ -24,6 +24,7 @@ import type {
   WordCountReport,
   WorldSetting,
 } from '../types/index.js';
+import type { NovelWriteGuard } from './NovelWriteGuard.js';
 
 export interface DataStore {
   // 项目（Projects）
@@ -37,7 +38,7 @@ export interface DataStore {
   createChapter(projectId: Id, title: string): Promise<Chapter>;
   listChapters(projectId: Id): Promise<Chapter[]>; // 按 position 升序
   getChapter(id: Id): Promise<Chapter | undefined>;
-  updateChapterContent(id: Id, content: string, expectedRevision?: number): Promise<Chapter>;
+  updateChapterContent(id: Id, content: string, expectedRevision?: number, guard?: NovelWriteGuard): Promise<Chapter>;
   renameChapter(id: Id, title: string): Promise<Chapter>;
   reorderChapters(projectId: Id, orderedIds: Id[]): Promise<void>;
   deleteChapter(id: Id): Promise<void>;
@@ -71,22 +72,22 @@ export interface DataStore {
 
   // 章节蓝图（Chapter Blueprints, 每章至多一份）
   // 按 chapter_id 替换：同一章节已存在蓝图则整体替换，确保只保留一份（需求 5.1、5.2、5.3）
-  saveChapterBlueprint(blueprint: ChapterBlueprint): Promise<ChapterBlueprint>;
+  saveChapterBlueprint(blueprint: ChapterBlueprint, guard?: NovelWriteGuard): Promise<ChapterBlueprint>;
   getChapterBlueprintByChapter(chapterId: Id): Promise<ChapterBlueprint | undefined>;
 
   // 场景正文（Scene Drafts, 按 (chapterId, sceneId) upsert）
   // 写入仅替换目标场景正文，其余场景不受影响（需求 6.5、11.5、12.3）
-  saveSceneDraft(draft: SceneDraft): Promise<SceneDraft>;
+  saveSceneDraft(draft: SceneDraft, guard?: NovelWriteGuard): Promise<SceneDraft>;
   getSceneDraft(chapterId: Id, sceneId: string): Promise<SceneDraft | undefined>;
   listSceneDrafts(chapterId: Id): Promise<SceneDraft[]>; // 按 scene_id 升序
 
   // 字数检查报告（WordCountReport, 每章至多一份）
   // 按 chapterId 替换最新一份（需求 9.4、13.1）
-  saveWordCountReport(report: WordCountReport): Promise<WordCountReport>;
+  saveWordCountReport(report: WordCountReport, guard?: NovelWriteGuard): Promise<WordCountReport>;
   getWordCountReportByChapter(chapterId: Id): Promise<WordCountReport | undefined>;
 
   // 节奏检查报告（PacingReport, 每章至多一份）
   // 按 chapterId 替换最新一份（需求 10.5、13.1）
-  savePacingReport(report: PacingReport): Promise<PacingReport>;
+  savePacingReport(report: PacingReport, guard?: NovelWriteGuard): Promise<PacingReport>;
   getPacingReportByChapter(chapterId: Id): Promise<PacingReport | undefined>;
 }

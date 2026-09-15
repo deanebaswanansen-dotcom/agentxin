@@ -4607,3 +4607,12 @@
   font-size: 0.82em;
   -webkit-text-fill-color: currentColor;
 }
+.nwa-writing-brief { margin: 0.75rem 0; padding: 0.75rem; border: 1px solid var(--border-color, #b8b1a533); border-radius: 8px; }
+.nwa-writing-brief summary { cursor: pointer; font-weight: 600; }
+.nwa-writing-brief__status { margin-left: 0.75rem; font-size: 0.85em; font-weight: normal; }
+.nwa-writing-brief dl > div { margin: 0.65rem 0; }
+.nwa-writing-brief dt { font-weight: 600; }
+.nwa-writing-brief dd { margin: 0.25rem 0; }
+.nwa-writing-brief ul { margin: 0.3rem 0; padding-left: 1.25rem; }
+.nwa-writing-brief h4 { margin-bottom: 0.3rem; }
+.nwa-writing-brief__source { display: block; margin: 0.15rem 0 0.35rem; }

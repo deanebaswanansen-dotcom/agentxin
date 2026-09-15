@@ -97,7 +97,27 @@ export function projectScriptContinuity(
   const commits = currentScriptContinuityCommits(state).filter(
     (commit) => beforeEpisodeNumber === undefined || commit.episodeNumber < beforeEpisodeNumber,
   );
-  if (!hasDetailedContinuity) return structuredClone(state.continuity);
+  if (!hasDetailedContinuity) {
+    if (beforeEpisodeNumber === undefined) return structuredClone(state.continuity);
+    // The legacy aggregate has no source episode for facts or threads. A
+    // time-bounded prompt can only inherit attributable completed episodes.
+    const pastEpisodes = state.episodes
+      .filter((episode) => episode.status === 'completed' && episode.episodeNumber < beforeEpisodeNumber)
+      .sort((left, right) => left.episodeNumber - right.episodeNumber);
+    const openThreads = new Set<string>();
+    for (const episode of pastEpisodes) {
+      episode.openedThreads.forEach((thread) => openThreads.add(thread));
+      episode.closedThreads.forEach((thread) => openThreads.delete(thread));
+    }
+    return {
+      currentState: uniqueStrings(pastEpisodes.flatMap((episode) => episode.newFacts)).slice(-100),
+      openThreads: [...openThreads],
+      wardrobeLedger: structuredClone((state.continuity?.wardrobeLedger ?? []).filter(
+        (entry) => entry.episodeNumber < beforeEpisodeNumber &&
+          pastEpisodes.some((episode) => episode.episodeNumber === entry.episodeNumber),
+      )),
+    };
+  }
 
   const threadById = new Map<string, string>();
   const wardrobeLedger: ScriptContinuityState['wardrobeLedger'] = [];
@@ -267,6 +287,7 @@ export interface BuildScriptAtomicCommitOptions {
   upstreamArtifactRefs?: readonly ScriptUpstreamArtifactRef[];
   promptVersion: string;
   modelConfigFingerprint: string;
+  writeBrief?: ScriptCommitEpisodeWithContinuityInput['writeBrief'];
 }
 
 export function buildScriptInputRevisionRefs(
@@ -354,6 +375,7 @@ export function buildScriptAtomicCommitInput(
     promptVersion: options.promptVersion,
     modelConfigFingerprint: options.modelConfigFingerprint,
     candidateHash,
+    ...(options.writeBrief ? { writeBrief: options.writeBrief } : {}),
   };
   return {
     ...base,

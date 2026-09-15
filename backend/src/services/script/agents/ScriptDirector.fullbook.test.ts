@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -452,7 +452,17 @@ describe('ScriptDirector offline ten-episode full-book diagnostic', () => {
     expect(rerun.skippedEpisodeNumbers).toEqual([96, 97, 98, 99, 100]);
     expect(rerun.callSummary.totalCalls).toBe(0);
     expect(model.calls).toHaveLength(callsBeforeRerun);
-  });
+    if (process.env.SCRIPT_FULLBOOK_METRICS === '1') {
+      const checkpointDirectory = join(directory, 'checkpoints', PROJECT_ID);
+      const checkpointSizes = await Promise.all((await readdir(checkpointDirectory))
+        .map(async (name) => (await stat(join(checkpointDirectory, name))).size));
+      console.info('100-episode provenance fixture', {
+        projectBytes: (await stat(join(directory, 'projects', `${PROJECT_ID}.json`))).size,
+        checkpointBytes: checkpointSizes.reduce((sum, bytes) => sum + bytes, 0),
+        modelCalls: model.calls.length,
+      });
+    }
+  }, 60_000);
 
   it('resumes after a durable draft candidate without calling the draft model again', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'agentxin-fullbook-resume-'));

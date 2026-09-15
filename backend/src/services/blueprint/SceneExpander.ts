@@ -1,3 +1,6 @@
+import { captureSceneWriteGuard, persistSceneCandidate, assertSceneWriteGuardCurrent, assertReusableSceneDraft } from './SceneWriteGuard.js';
+import { captureNovelWriteSnapshot, type NovelWriteGuard } from '../../store/NovelWriteGuard.js';
+import { renderWriteBrief } from '../writing/WriteBrief.js';
 /**
  * SceneExpander — 场景局部扩写编排（design: "Services 领域层 > SceneService（分场景
  * 写作 / 扩写 / 重写，流式）"，需求 11）。
@@ -77,7 +80,7 @@ export class SceneExpander {
     sceneId: string,
     body: ExpandSceneBody,
     signal: AbortSignal,
-  ): Promise<{ scene: Scene; stream: AsyncIterable<StreamDelta> }> {
+  ): Promise<{ scene: Scene; stream: AsyncIterable<StreamDelta>; guard: NovelWriteGuard }> {
     // 1) 校验扩写字数：必须为 1–100000 的正整数（需求 11.2）。
     const { addWords } = body;
     if (
@@ -100,6 +103,8 @@ export class SceneExpander {
     }
 
     // 3) 读取章节蓝图并定位目标场景（需求 11.6）。
+    const guard = await captureSceneWriteGuard(this.store, chapterId, sceneId);
+    guard.signal = signal;
     const blueprint = await this.store.getChapterBlueprintByChapter(chapterId);
     if (!blueprint) {
       throw ServiceError.notFound(`章节蓝图不存在：${chapterId}`);
@@ -117,6 +122,8 @@ export class SceneExpander {
       );
     }
 
+    assertReusableSceneDraft(await captureNovelWriteSnapshot(this.store, chapterId), draft);
+
     // 5) 组装扩写消息（注入当前正文 + 蓝图约束 + 目标字数，需求 11.4）。
     const messages = buildExpandPrompt({
       blueprint,
@@ -126,8 +133,10 @@ export class SceneExpander {
     });
 
     // 6) 发起流式补全并透传增量（需求 11.3）。
+    await assertSceneWriteGuardCurrent(this.store, guard);
+    messages.push({ role: 'system', content: renderWriteBrief(guard.brief) });
     const stream = this.modelProxy.streamCompletion(config, messages, signal);
-    return { scene, stream };
+    return { scene, stream, guard };
   }
 
   /**
@@ -145,12 +154,8 @@ export class SceneExpander {
     chapterId: Id,
     sceneId: string,
     content: string,
+    guard?: NovelWriteGuard,
   ): Promise<void> {
-    await this.store.saveSceneDraft({
-      chapterId,
-      sceneId,
-      content: stripReasoningArtifacts(content),
-      updatedAt: new Date().toISOString(),
-    });
+    await persistSceneCandidate(this.store, chapterId, sceneId, stripReasoningArtifacts(content), guard);
   }
 }

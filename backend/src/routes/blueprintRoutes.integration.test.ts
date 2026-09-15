@@ -1,3 +1,4 @@
+import { saveCurrentSceneDraft } from '../services/blueprint/sceneTestFixtures.js';
 /**
  * 路由集成测试（task 11.4）：章节蓝图与分场景写作路由组
  * （{@link registerBlueprintRoutes}），经真实接线的 {@link buildServer} 验证。
@@ -309,8 +310,8 @@ describe('blueprintRoutes 集成（buildServer + app.inject）', () => {
     await store.saveChapterBlueprint(makeValidBlueprint(chapterId));
     // 仅写入前两个场景，缺 scene-3 的正文。
     const now = new Date().toISOString();
-    await store.saveSceneDraft({ chapterId, sceneId: 'scene-1', content: 'A', updatedAt: now });
-    await store.saveSceneDraft({ chapterId, sceneId: 'scene-2', content: 'B', updatedAt: now });
+    await saveCurrentSceneDraft(store, { chapterId, sceneId: 'scene-1', content: 'A', updatedAt: now });
+    await saveCurrentSceneDraft(store, { chapterId, sceneId: 'scene-2', content: 'B', updatedAt: now });
 
     const res = await app.inject({
       method: 'POST',
@@ -329,9 +330,9 @@ describe('blueprintRoutes 集成（buildServer + app.inject）', () => {
     await store.saveChapterBlueprint(makeValidBlueprint(chapterId));
     const now = new Date().toISOString();
     // 故意乱序写入，验证合并按 scene_id 升序拼接。
-    await store.saveSceneDraft({ chapterId, sceneId: 'scene-3', content: 'C', updatedAt: now });
-    await store.saveSceneDraft({ chapterId, sceneId: 'scene-1', content: 'A', updatedAt: now });
-    await store.saveSceneDraft({ chapterId, sceneId: 'scene-2', content: 'B', updatedAt: now });
+    await saveCurrentSceneDraft(store, { chapterId, sceneId: 'scene-3', content: 'C', updatedAt: now });
+    await saveCurrentSceneDraft(store, { chapterId, sceneId: 'scene-1', content: 'A', updatedAt: now });
+    await saveCurrentSceneDraft(store, { chapterId, sceneId: 'scene-2', content: 'B', updatedAt: now });
 
     const res = await app.inject({
       method: 'POST',
@@ -356,9 +357,9 @@ describe('blueprintRoutes 集成（buildServer + app.inject）', () => {
       ],
     });
     const now = new Date().toISOString();
-    await store.saveSceneDraft({ chapterId, sceneId: 'scene-1', content: 'A', updatedAt: now });
-    await store.saveSceneDraft({ chapterId, sceneId: 'scene-2', content: 'B', updatedAt: now });
-    await store.saveSceneDraft({ chapterId, sceneId: 'scene-3', content: 'C', updatedAt: now });
+    await saveCurrentSceneDraft(store, { chapterId, sceneId: 'scene-1', content: 'A', updatedAt: now });
+    await saveCurrentSceneDraft(store, { chapterId, sceneId: 'scene-2', content: 'B', updatedAt: now });
+    await saveCurrentSceneDraft(store, { chapterId, sceneId: 'scene-3', content: 'C', updatedAt: now });
 
     const res = await app.inject({
       method: 'POST',
@@ -377,7 +378,7 @@ describe('blueprintRoutes 集成（buildServer + app.inject）', () => {
     const chapterId = await seedChapter();
     await store.saveChapterBlueprint(makeValidBlueprint(chapterId));
     const now = new Date().toISOString();
-    await store.saveSceneDraft({ chapterId, sceneId: 'scene-1', content: '短', updatedAt: now });
+    await saveCurrentSceneDraft(store, { chapterId, sceneId: 'scene-1', content: '短', updatedAt: now });
 
     const checkRes = await app.inject({
       method: 'POST',
@@ -528,7 +529,7 @@ describe('blueprintRoutes 集成（buildServer + app.inject）', () => {
     await store.saveModelConfig(MODEL_CONFIG);
     const chapterId = await seedChapter();
     await store.saveChapterBlueprint(makeValidBlueprint(chapterId));
-    await store.saveSceneDraft({
+    await saveCurrentSceneDraft(store, {
       chapterId,
       sceneId: 'scene-1',
       content: '   \n',
@@ -551,7 +552,7 @@ describe('blueprintRoutes 集成（buildServer + app.inject）', () => {
     await store.saveModelConfig(MODEL_CONFIG);
     const chapterId = await seedChapter();
     await store.saveChapterBlueprint(makeValidBlueprint(chapterId));
-    await store.saveSceneDraft({
+    await saveCurrentSceneDraft(store, {
       chapterId,
       sceneId: 'scene-1',
       content: '\t  ',

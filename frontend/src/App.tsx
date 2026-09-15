@@ -33,6 +33,7 @@ import { usePaneLayout } from './hooks/usePaneLayout.js';
 import { useNovelImportDrop } from './hooks/useNovelImportDrop.js';
 import applyAdoption from './lib/applyAdoption.js';
 import type { AgentArtifact, Chapter, Id, ProjectKind } from './types/index.js';
+import type { WriteBrief } from './types/writeBrief.js';
 import type { WorkspaceTab } from './components/ProjectWorkspaceView.js';
 import type { EditorSelectionRequest } from './components/ChapterEditor.js';
 import { LazyLoadBoundary } from './components/LazyLoadBoundary.js';
@@ -52,6 +53,8 @@ interface PendingAdoption {
   targetChapter: Chapter;
   nextContent: string;
   mode: 'replace' | 'append';
+  writeBrief?: WriteBrief;
+  editorVersion: number;
 }
 const THEME_STORAGE_KEY = 'nwa:theme-mode';
 function isThemeMode(value: unknown): value is ThemeMode {
@@ -174,6 +177,9 @@ function Workbench(): JSX.Element {
   const [selectionRequest, setSelectionRequest] = useState<EditorSelectionRequest | null>(null);
   const [pendingAdoption, setPendingAdoption] = useState<PendingAdoption | null>(null);
   const [adoptionSaving, setAdoptionSaving] = useState(false);
+  const adoptionEditorKey = JSON.stringify([selectedProjectId, selectedChapterId, editorContent, selection?.start, selection?.end]);
+  const adoptionEditorRef = useRef({ key: adoptionEditorKey, version: 0, projectId: selectedProjectId, chapterId: selectedChapterId });
+  if (adoptionEditorRef.current.key !== adoptionEditorKey) adoptionEditorRef.current = { key: adoptionEditorKey, version: adoptionEditorRef.current.version + 1, projectId: selectedProjectId, chapterId: selectedChapterId };
 
   const handleSelectProject = useCallback((projectId: Id, kind: ProjectKind) => {
     void flushEditor().then(() => {
@@ -252,7 +258,12 @@ function Workbench(): JSX.Element {
 
   // —— 采用写作内容到中间编辑器 ——
   const handleAdoptContent = useCallback(
-    async (content: string, targetChapterId?: Id) => {
+    async (content: string, targetChapterId?: Id, writeBrief?: WriteBrief) => {
+      const editorVersion = adoptionEditorRef.current.version;
+      if (writeBrief && (writeBrief.projectId !== selectedProjectId || writeBrief.target.id !== selectedChapterId || (targetChapterId !== undefined && targetChapterId !== selectedChapterId))) {
+        reportError(new Error('生成结果所属章节已改变，请回到原章节重新生成。'));
+        return;
+      }
       if (selectedProjectId === null || selectedChapter === null) {
         setEditorContent(content);
         return;
@@ -262,6 +273,7 @@ function Workbench(): JSX.Element {
       } catch {
         return;
       }
+      if (adoptionEditorRef.current.version !== editorVersion) return;
 
       const crossChapter = targetChapterId !== undefined && targetChapterId !== selectedChapterId;
       let targetChapter: Chapter;
@@ -289,11 +301,14 @@ function Workbench(): JSX.Element {
           })
         : content;
       if (nextContent === targetChapter.content) return;
+      if (adoptionEditorRef.current.version !== editorVersion) return;
       setPendingAdoption({
         projectId: selectedProjectId,
         targetChapter,
         nextContent,
         mode: crossChapter ? 'append' : 'replace',
+        writeBrief,
+        editorVersion,
       });
     },
     [editorContent, flushEditor, reportError, selectedChapter, selectedChapterId, selectedProjectId, setEditorContent],
@@ -306,10 +321,29 @@ function Workbench(): JSX.Element {
       setPendingAdoption(null);
       return;
     }
+    if (pendingAdoption.writeBrief && adoptionEditorRef.current.version !== pendingAdoption.editorVersion) {
+      reportError(new Error('确认期间章节内容或选区已改变，请重新生成后采用。'));
+      setPendingAdoption(null);
+      return;
+    }
     setAdoptionSaving(true);
     try {
       const { targetChapter, nextContent, projectId } = pendingAdoption;
-      if (selectedChapterId === targetChapter.id && editorRef.current !== null) {
+      if (pendingAdoption.writeBrief) {
+        const saved = await apiClient.chapters.acceptGeneratedContent(targetChapter.id, { content: nextContent, writeBrief: pendingAdoption.writeBrief });
+        if (adoptionEditorRef.current.projectId !== projectId || adoptionEditorRef.current.chapterId !== targetChapter.id) return;
+        if (adoptionEditorRef.current.version !== pendingAdoption.editorVersion) {
+          setPendingAdoption(null);
+          return;
+        }
+        const applied = editorRef.current?.acceptSavedContent(saved, targetChapter.content) ?? false;
+        handleSaved(saved.id, saved.content, saved.revision);
+        if (applied) setEditorContent(saved.content);
+        if (!applied) {
+          setPendingAdoption(null);
+          return;
+        }
+      } else if (selectedChapterId === targetChapter.id && editorRef.current !== null) {
         editorRef.current.setContent(nextContent);
         await editorRef.current.saveIfDirty();
       } else {
@@ -343,14 +377,23 @@ function Workbench(): JSX.Element {
     reportError,
     selectedChapterId,
     selectedProjectId,
+    setEditorContent,
   ]);
 
   // —— 蓝图模块"采用整章" ——
   const handleAdoptChapterContent = useCallback(
-    (content: string) => {
-      handleAdoptContent(content);
+    (content: string, savedChapter?: Chapter, expectedContent?: string) => {
+      if (!savedChapter || savedChapter.id !== selectedChapterId || savedChapter.projectId !== selectedProjectId || savedChapter.content !== content) {
+        reportError(new Error('合并结果与当前章节不匹配，请重新读取章节。'));
+        return false;
+      }
+      const applied = editorRef.current?.acceptSavedContent(savedChapter, expectedContent ?? editorContent) ?? false;
+      if (!applied) return false;
+      handleSaved(savedChapter.id, savedChapter.content, savedChapter.revision);
+      setEditorContent(savedChapter.content);
+      return true;
     },
-    [handleAdoptContent],
+    [editorContent, handleSaved, reportError, selectedChapterId, selectedProjectId, setEditorContent],
   );
 
   // —— artifact 跳转 ——
@@ -755,6 +798,7 @@ function Workbench(): JSX.Element {
             onError={reportError}
             onStreamingChange={setStreamingState}
             onAdoptContent={handleAdoptContent}
+            beforeWriting={flushEditor}
             onAgentCompleted={applyAgentResult} /* NEW-04: 架构上右侧 AI 栏持久存在（非 tab 切换），Agent 结果（summary/artifacts/进度）留在聊天消息中供 review；loadChapter 仅在用户点击“打开章节”或列表时显式调用，不自动强制切换 */
             onJumpToArtifact={handleJumpToArtifact}
             onOpenChapter={(chapterId) => {
@@ -797,6 +841,9 @@ function Workbench(): JSX.Element {
           {/* —— 章节工具抽屉 —— */}
           <ChapterToolsDrawer
             chapter={drawer === 'chapterTools' ? selectedChapter : null}
+            locallyChanged={selectedChapter !== null && editorContent !== selectedChapter.content}
+            editorVersion={adoptionEditorRef.current.version}
+            editorContent={editorContent}
             onAdoptChapterContent={handleAdoptChapterContent}
             onClose={handleCloseDrawer}
             onError={reportError}

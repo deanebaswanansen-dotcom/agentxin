@@ -1,3 +1,6 @@
+import { captureSceneWriteGuard, persistSceneCandidate, assertSceneWriteGuardCurrent, assertReusableSceneDraft } from './SceneWriteGuard.js';
+import { captureNovelWriteSnapshot, type NovelWriteGuard } from '../../store/NovelWriteGuard.js';
+import { renderWriteBrief } from '../writing/WriteBrief.js';
 /**
  * SceneRewriter — 局部场景重写编排（design: "Services 领域层 > SceneService
  * （分场景写作 / 扩写 / 重写，流式）"，需求 12）。
@@ -76,7 +79,7 @@ export class SceneRewriter {
     sceneId: string,
     body: RewriteSceneBody,
     signal: AbortSignal,
-  ): Promise<{ scene: Scene; stream: AsyncIterable<StreamDelta> }> {
+  ): Promise<{ scene: Scene; stream: AsyncIterable<StreamDelta>; guard: NovelWriteGuard }> {
     // 1) 校验修改要求非空（需求 12.5）。
     const instruction = body.instruction;
     if (instruction.trim().length === 0) {
@@ -92,6 +95,8 @@ export class SceneRewriter {
     }
 
     // 3) 读取章节蓝图并定位目标场景（需求 12.4）。
+    const guard = await captureSceneWriteGuard(this.store, chapterId, sceneId);
+    guard.signal = signal;
     const blueprint = await this.store.getChapterBlueprintByChapter(chapterId);
     if (!blueprint) {
       throw ServiceError.notFound(`章节蓝图不存在：${chapterId}`);
@@ -107,6 +112,8 @@ export class SceneRewriter {
       throw ServiceError.validation(`该场景尚未写作，无法重写：${sceneId}`);
     }
 
+    assertReusableSceneDraft(await captureNovelWriteSnapshot(this.store, chapterId), draft);
+
     // 5) 组装重写消息（注入当前正文 + 蓝图约束 + 修改要求，需求 12.1, 12.2）。
     const messages = buildRewritePrompt({
       blueprint,
@@ -116,8 +123,10 @@ export class SceneRewriter {
     });
 
     // 6) 发起流式补全并透传增量（需求 12.1）。
+    await assertSceneWriteGuardCurrent(this.store, guard);
+    messages.push({ role: 'system', content: renderWriteBrief(guard.brief) });
     const stream = this.modelProxy.streamCompletion(config, messages, signal);
-    return { scene, stream };
+    return { scene, stream, guard };
   }
 
   /**
@@ -135,12 +144,8 @@ export class SceneRewriter {
     chapterId: Id,
     sceneId: string,
     content: string,
+    guard?: NovelWriteGuard,
   ): Promise<void> {
-    await this.store.saveSceneDraft({
-      chapterId,
-      sceneId,
-      content: stripReasoningArtifacts(content),
-      updatedAt: new Date().toISOString(),
-    });
+    await persistSceneCandidate(this.store, chapterId, sceneId, stripReasoningArtifacts(content), guard);
   }
 }

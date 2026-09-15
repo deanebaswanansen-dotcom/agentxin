@@ -82,6 +82,7 @@ import type {
   WritingRequestBody,
 } from '../types/index.js';
 import { ReasoningArtifactFilter } from '../lib/reasoningSanitizer.js';
+import type { WriteBrief, WriteBriefView } from '../types/writeBrief.js';
 
 // ---------------------------------------------------------------------------
 // Base URL configuration
@@ -693,6 +694,8 @@ function decodeDelta(data: string): string {
 // ---------------------------------------------------------------------------
 
 export interface WriteOptions {
+  /** Frozen server inputs for this generated candidate; never a text delta. */
+  onWriteBrief?: (brief: WriteBrief) => void;
   /** Invoked for each text delta as it arrives from the stream. */
   onDelta?: (delta: string) => void;
   /** Invoked for each reasoning/thinking delta (chain-of-thought). */
@@ -801,11 +804,23 @@ async function streamSse(
   let buffer = '';
   let full = '';
   let sawDone = false;
+  let sawWriteBrief = false;
 
   const consumeEvents = (events: SseEvent[]): 'done' | 'continue' => {
     for (const ev of events) {
       if (ev.event === 'error') {
         throw sseErrorToApiClientError(ev.data);
+      }
+      if (ev.event === 'write_brief') {
+        try {
+          const brief = JSON.parse(ev.data) as WriteBrief;
+          if (sawWriteBrief || full.length > 0 || brief.schemaVersion !== 1 || !brief.fingerprint || !brief.sourceFingerprint || !brief.target?.id || !brief.projectId || !['novel', 'short_drama'].includes(brief.mode) || !Array.isArray(brief.sources) || !Array.isArray(brief.objective) || !Array.isArray(brief.required) || !Array.isArray(brief.forbidden) || !Array.isArray(brief.authorConstraints)) throw new Error();
+          sawWriteBrief = true;
+          options?.onWriteBrief?.(brief);
+        } catch {
+          throw new ApiClientError({ error: { code: 'PROVIDER_ERROR', message: '写前依据无效，请重新生成。' } });
+        }
+        continue;
       }
       if (ev.event === 'done') {
         sawDone = true;
@@ -1556,6 +1571,7 @@ export interface ApiClient {
       save(projectId: Id, episodeNumber: number, value: ScriptEpisodeOutline, expectedRevision: number, signal?: AbortSignal): Promise<ScriptEpisodeOutline>;
     };
     episodes: {
+      writeBrief(projectId: Id, episodeNumber: number, signal?: AbortSignal): Promise<WriteBriefView>;
       list(projectId: Id, signal?: AbortSignal): Promise<ScriptEpisodeSummary[]>;
       get(projectId: Id, episodeNumber: number, signal?: AbortSignal): Promise<ScriptEpisode>;
       save(projectId: Id, episodeNumber: number, value: ScriptEpisode, expectedRevision: number, signal?: AbortSignal): Promise<ScriptEpisode>;
@@ -1581,6 +1597,7 @@ export interface ApiClient {
     exportFile(projectId: Id, format: ScriptExportFormat, range?: ScriptExportRange, signal?: AbortSignal): Promise<ScriptExportFile>;
   };
   chapters: {
+    acceptGeneratedContent(id: Id, body: { content: string; writeBrief: WriteBrief }, signal?: AbortSignal): Promise<Chapter>;
     list(projectId: Id, signal?: AbortSignal): Promise<Chapter[]>;
     create(projectId: Id, title: string, signal?: AbortSignal): Promise<{ id: Id }>;
     updateContent(
@@ -1690,6 +1707,7 @@ export interface ApiClient {
     ): Promise<string>;
   };
   blueprint: {
+    writeBrief(chapterId: Id, signal?: AbortSignal): Promise<WriteBriefView>;
     /** Read the latest persisted blueprint for a chapter (NOT_FOUND if none). */
     get(chapterId: Id, signal?: AbortSignal): Promise<ChapterBlueprint>;
     /** Generate and persist a blueprint, returning the validated result. */
@@ -1699,7 +1717,7 @@ export interface ApiClient {
       signal?: AbortSignal,
     ): Promise<ChapterBlueprint>;
     /** Merge persisted scene drafts into the chapter content. */
-    merge(chapterId: Id, signal?: AbortSignal): Promise<{ content: string }>;
+    merge(chapterId: Id, signal?: AbortSignal): Promise<{ content: string; chapter?: Chapter }>;
     wordCount: {
       /** Run a word-count check and persist the report. */
       run(chapterId: Id, signal?: AbortSignal): Promise<WordCountReport>;
@@ -1817,6 +1835,7 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
           request(b, 'PUT', `/projects/${seg(projectId)}/episode-outlines/${episodeNumber}`, { expectedRevision, value }, { signal }),
       },
       episodes: {
+        writeBrief: (projectId, episodeNumber, signal) => request(b, 'GET', `/script/projects/${seg(projectId)}/episodes/${episodeNumber}/write-brief`, undefined, { signal }),
         list: (projectId, signal) =>
           request(b, 'GET', `/projects/${seg(projectId)}/script-episodes`, undefined, { signal }),
         get: (projectId, episodeNumber, signal) =>
@@ -1874,6 +1893,7 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
         ),
     },
     chapters: {
+      acceptGeneratedContent: (id, body, signal) => request(b, 'POST', `/chapters/${seg(id)}/generated-content`, body, { signal }),
       list: (projectId, signal) =>
         request(b, 'GET', `/projects/${seg(projectId)}/chapters`, undefined, { signal }),
       create: (projectId, title, signal) =>
@@ -1979,6 +1999,7 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
         streamSse(`${b}/projects/${seg(projectId)}/chat`, body, options),
     },
     blueprint: {
+      writeBrief: (chapterId, signal) => request(b, 'GET', `/chapters/${seg(chapterId)}/write-brief`, undefined, { signal }),
       get: (chapterId, signal) =>
         request(b, 'GET', `/chapters/${seg(chapterId)}/blueprint`, undefined, { signal }),
       // Backend route is POST /projects/:id/chapters/:chapterId/blueprint, but the

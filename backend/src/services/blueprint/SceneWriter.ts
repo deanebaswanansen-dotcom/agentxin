@@ -1,3 +1,6 @@
+import { captureSceneWriteGuard, persistSceneCandidate, assertSceneWriteGuardCurrent } from './SceneWriteGuard.js';
+import type { NovelWriteGuard } from '../../store/NovelWriteGuard.js';
+import { renderWriteBrief } from '../writing/WriteBrief.js';
 /**
  * SceneWriter — 分场景写作编排（design: "Services 领域层 > SceneService（分场景写作 / 扩写 / 重写，流式）"）。
  *
@@ -76,6 +79,7 @@ export class SceneWriter {
     blueprint: ChapterBlueprint;
     scene: Scene;
     stream: AsyncIterable<StreamDelta>;
+    guard: NovelWriteGuard;
   }> {
     // 1) 模型配置存在性检查 —— 必须先于任何提供商调用（需求 6.7）。
     const config = await this.modelConfigService.getInternalConfig();
@@ -86,6 +90,8 @@ export class SceneWriter {
     }
 
     // 2) 读取章节蓝图并定位目标场景（需求 6.6）。
+    const guard = await captureSceneWriteGuard(this.store, chapterId, sceneId);
+    guard.signal = signal;
     const blueprint = await this.store.getChapterBlueprintByChapter(chapterId);
     if (!blueprint) {
       throw ServiceError.notFound(`章节蓝图不存在：${chapterId}`);
@@ -114,6 +120,8 @@ export class SceneWriter {
     });
 
     // 6) 发起流式补全并透传增量（需求 6.4）。
+    await assertSceneWriteGuardCurrent(this.store, guard);
+    messages.push({ role: 'system', content: renderWriteBrief(guard.brief) });
     const stream = this.modelProxy.streamCompletion(config, messages, signal, {
       disableThinking: true,
       maxTokens: Math.min(
@@ -124,7 +132,7 @@ export class SceneWriter {
         ),
       ),
     });
-    return { blueprint, scene, stream };
+    return { blueprint, scene, stream, guard };
   }
 
   /**
@@ -142,13 +150,9 @@ export class SceneWriter {
     chapterId: Id,
     sceneId: string,
     content: string,
+    guard?: NovelWriteGuard,
   ): Promise<void> {
-    await this.store.saveSceneDraft({
-      chapterId,
-      sceneId,
-      content: stripReasoningArtifacts(content),
-      updatedAt: new Date().toISOString(),
-    });
+    await persistSceneCandidate(this.store, chapterId, sceneId, stripReasoningArtifacts(content), guard);
   }
 
   /**

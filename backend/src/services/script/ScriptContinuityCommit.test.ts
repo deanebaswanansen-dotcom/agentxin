@@ -5,7 +5,10 @@ import {
   buildScriptAtomicCommitInput,
   buildScriptContinuityCandidate,
   currentScriptContinuityCommits,
+  projectScriptContinuity,
 } from './ScriptContinuityCommit.js';
+import { buildScriptWriteBrief } from './ScriptWriteBrief.js';
+import { renderWriteBrief } from '../writing/WriteBrief.js';
 
 function fixture(): { state: ScriptProjectState; episode: ScriptEpisode } {
   const state: ScriptProjectState = {
@@ -105,6 +108,26 @@ function fixture(): { state: ScriptProjectState; episode: ScriptEpisode } {
 }
 
 describe('ScriptContinuityCommit', () => {
+  it('excludes unscoped legacy facts and future episodes from time-bounded writing context', () => {
+    const { state, episode } = fixture();
+    state.episodes = [
+      { ...episode, status: 'completed', episodeNumber: 1, newFacts: ['过去已证实的事实'], openedThreads: ['过去伏笔'] },
+      { ...episode, id: 'episode-3', status: 'completed', episodeNumber: 3, newFacts: ['未来事实'], openedThreads: ['未来伏笔'] },
+    ];
+    state.continuity = {
+      currentState: ['无来源的未来事实'], openThreads: ['无来源伏笔'],
+      wardrobeLedger: [
+        { episodeNumber: 1, characterId: 'lead', outfit: '旧衣服' },
+        { episodeNumber: 3, characterId: 'lead', outfit: '未来衣服' },
+      ],
+    };
+    expect(projectScriptContinuity(state, 2)).toEqual({
+      currentState: ['过去已证实的事实'], openThreads: ['过去伏笔'],
+      wardrobeLedger: [{ episodeNumber: 1, characterId: 'lead', outfit: '旧衣服' }],
+    });
+    expect(projectScriptContinuity(state)).toEqual(state.continuity);
+  });
+
   it('fingerprints every character revision independently and binds evidence to candidate blocks', () => {
     const { state, episode } = fixture();
     const continuity = buildScriptContinuityCandidate(state, episode);
@@ -195,9 +218,27 @@ describe('ScriptContinuityCommit', () => {
       },
     ];
 
+    state.plan!.totalEpisodes = 2;
+    state.seriesOutline = {
+      projectId: state.projectId, synopsis: '调查', openingState: '开始', midpointTurn: '线索', climax: '揭晓',
+      endingState: '结束', mainArc: [], subplotArcs: [], revision: 1,
+      episodeCards: [{ episodeNumber: 2, title: '第二集', logline: '核验线索', mainEvent: '核验线索', endingHook: '证人出现' }],
+    };
+    state.continuityCommits[0]!.factsAdded = [{ factId: 'past-fact', text: '过去已确认 PAST_FACT', evidenceBlockIds: ['block-1'] }];
+    state.continuityCommits[1]!.factsAdded = [{ factId: 'future-fact', text: '本集尚未发生 FUTURE_FACT', evidenceBlockIds: ['block-1'] }];
+    const brief = buildScriptWriteBrief(state, 2)!;
+    expect(renderWriteBrief(brief)).toContain('PAST_FACT');
+    expect(JSON.stringify(brief)).not.toContain('FUTURE_FACT');
+    expect(brief.sources.filter((source) => ['episode', 'continuity'].includes(source.kind))
+      .every((source) => source.unitNumber! < 2)).toBe(true);
+    const sourceKeys = new Set(brief.sources.map((source) => source.key));
+    expect([...brief.objective, ...brief.required, ...brief.forbidden, ...brief.authorConstraints]
+      .every((item) => item.sourceKeys.every((key) => sourceKeys.has(key)))).toBe(true);
+
     expect(currentScriptContinuityCommits(state).map((commit) => commit.episodeNumber))
       .toEqual([1, 2]);
     state.continuityCommits[0]!.status = 'stale';
     expect(currentScriptContinuityCommits(state)).toEqual([]);
+    expect(JSON.stringify(buildScriptWriteBrief(state, 2))).not.toContain('PAST_FACT');
   });
 });

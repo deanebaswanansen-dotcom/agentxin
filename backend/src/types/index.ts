@@ -14,6 +14,7 @@
  */
 
 // 唯一标识符统一使用 string（UUID v4）
+import type { WriteBrief } from './WriteBrief.js';
 export type Id = string;
 
 export type ProjectKind = 'novel' | 'short_drama';
@@ -34,6 +35,7 @@ export interface Chapter {
   position: number; // 排序位置, 升序
   /** 正文乐观锁版本；旧数据缺失时按 0 处理。 */
   revision?: number;
+  generatedCandidate?: { brief: WriteBrief; candidateHash: string; sceneDependencies?: Array<{ sceneId: string; contentHash: string }> };
 }
 
 export interface Character {
@@ -958,6 +960,8 @@ export interface Scene {
 
 /** 章节蓝图：章节施工方案，以 JSON 持久化（需求 2.3）。 */
 export interface ChapterBlueprint {
+  writeBrief?: WriteBrief;
+  authorRequirements?: { requirement?: string; targetWords?: number };
   chapter_id: string; // 关联章节标识符
   title: string; // 章节标题
   target_words: number; // 章节目标字数, 正整数（需求 4.5）
@@ -979,6 +983,9 @@ export type BlueprintCore = Omit<ChapterBlueprint, 'id' | 'projectId'>;
 
 /** 场景正文：单个场景的生成文本，关联章节与场景标识符（术语表 SceneDraft）。 */
 export interface SceneDraft {
+  writeBrief?: WriteBrief;
+  candidateHash?: string;
+  sceneDependencies?: Array<{ sceneId: string; contentHash: string }>;
   chapterId: Id; // 关联章节（数据存储内部主键, UUID）
   sceneId: string; // 关联蓝图内的 scene_id
   content: string; // 场景正文
@@ -999,6 +1006,8 @@ export interface SceneWordCount {
 
 /** 字数检查报告：场景级 + 整章级（需求 9）。 */
 export interface WordCountReport {
+  candidateHash?: string;
+  sourceFingerprint?: string;
   chapterId: Id;
   scenes: SceneWordCount[];
   chapterTargetWords: number; // 章节蓝图 target_words
@@ -1031,6 +1040,8 @@ export interface ScenePacingIssue {
 
 /** 节奏检查报告（需求 10）。 */
 export interface PacingReport {
+  candidateHash?: string;
+  sourceFingerprint?: string;
   chapterId: Id;
   plotPoints: PlotPointResult[]; // 每个 required_plot_points 的完成状态（需求 10.2）
   violatedForbiddenPoints: string[]; // 被违反的禁止事项（需求 10.3）

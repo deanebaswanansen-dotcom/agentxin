@@ -1,3 +1,4 @@
+import { saveCurrentSceneDraft } from './sceneTestFixtures.js';
 /**
  * Property-based test for {@link ChapterMerger.merge} when scenes are missing.
  *
@@ -161,7 +162,7 @@ describe('ChapterMerger.merge — missing scenes block merge', () => {
           const nowIso = new Date().toISOString();
           for (let i = 0; i < scenario.sceneIds.length; i += 1) {
             if (scenario.hasDraft[i]) {
-              await store.saveSceneDraft({
+              await saveCurrentSceneDraft(store, {
                 chapterId: chapter.id,
                 sceneId: scenario.sceneIds[i],
                 content: scenario.draftContents[i],

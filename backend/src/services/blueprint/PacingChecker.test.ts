@@ -1,3 +1,5 @@
+import { captureNovelWriteBrief } from '../../store/NovelWriteGuard.js';
+import { hashWriteBriefValue } from '../writing/WriteBrief.js';
 /**
  * Example/edge-case unit tests for {@link PacingChecker} (task 9.5).
  *
@@ -271,6 +273,8 @@ describe('PacingChecker.getReport', () => {
 
   it('returns the persisted report when one exists', async () => {
     const persisted: PacingReport = {
+      candidateHash: hashWriteBriefValue((await store.getChapter(chapterId))?.content ?? ""),
+      sourceFingerprint: (await captureNovelWriteBrief(store, chapterId)).sourceFingerprint,
       chapterId,
       plotPoints: [{ point: '主角登场', status: 'missing' }],
       violatedForbiddenPoints: [],

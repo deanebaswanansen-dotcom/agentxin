@@ -58,6 +58,14 @@ interface FakeData {
 function makeFakeStore(data: FakeData): DataStore {
   let config = data.modelConfig;
   const fake: Partial<DataStore> = {
+    async getProject(id) {
+      return { id, name: '测试小说', kind: 'novel', createdAt: '2026-09-15T00:00:00Z', updatedAt: '2026-09-15T00:00:00Z' };
+    },
+    async listChapters(projectId) {
+      return (data.chapters ?? []).filter((c) => c.projectId === projectId);
+    },
+    async getChapterBlueprintByChapter() { return undefined; },
+    async listSceneDrafts() { return []; },
     async getChapter(id) {
       return (data.chapters ?? []).find((c) => c.id === id);
     },

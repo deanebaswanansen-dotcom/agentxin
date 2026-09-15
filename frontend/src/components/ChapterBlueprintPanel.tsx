@@ -17,6 +17,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import apiClient, { isApiClientError } from '../api/apiClient.js';
 import type {
   ChapterBlueprint,
+  Chapter,
   GenerateBlueprintBody,
   Id,
   PacingReport,
@@ -27,6 +28,7 @@ import { EmptyIllustration } from './EmptyIllustration.js';
 import SceneList from './SceneList.js';
 import ReportView from './ReportView.js';
 import MergedChapterView from './MergedChapterView.js';
+import { WritingBriefPanel } from './WritingBriefPanel.js';
 import './components.css';
 
 /** 本面板所依赖的最小客户端接口（便于测试时注入桩）。 */
@@ -35,8 +37,12 @@ export type BlueprintPanelClient = Pick<typeof apiClient, 'blueprint'>;
 export interface ChapterBlueprintPanelProps {
   /** 当前章节标识符。 */
   chapterId: Id;
+  chapterRevision?: number;
+  locallyChanged?: boolean;
+  editorVersion?: number;
+  editorContent?: string;
   /** 把整章合并正文写回章节编辑器的回调（需求 14.5）。 */
-  onAdoptChapterContent?: (content: string) => void;
+  onAdoptChapterContent?: (content: string, savedChapter?: Chapter, expectedContent?: string) => boolean | Promise<boolean>;
   /** 将后端/运行时错误上抛至全局错误提示（需求 14.6）。 */
   onError?: (error: unknown) => void;
   /** 可注入的客户端（默认使用共享 {@link apiClient}）。 */
@@ -115,6 +121,10 @@ function BlueprintSummary({ blueprint }: { blueprint: ChapterBlueprint }): JSX.E
  */
 export function ChapterBlueprintPanel({
   chapterId,
+  chapterRevision = 0,
+  locallyChanged = false,
+  editorVersion,
+  editorContent,
   onAdoptChapterContent,
   onError,
   client = apiClient,
@@ -128,6 +138,12 @@ export function ChapterBlueprintPanel({
   const [pacingReport, setPacingReport] = useState<PacingReport | undefined>(undefined);
 
   const requestIdRef = useRef(0);
+  const targetRef = useRef(chapterId);
+  targetRef.current = chapterId;
+  const generationRef = useRef<AbortController>();
+  const [briefVersion, setBriefVersion] = useState(0);
+  const [blueprintVersion, setBlueprintVersion] = useState(0);
+  const loadWriteBrief = useCallback((signal: AbortSignal) => client.blueprint.writeBrief(chapterId, signal), [client, chapterId]);
 
   const handleError = useCallback(
     (error: unknown) => {
@@ -168,6 +184,8 @@ export function ChapterBlueprintPanel({
   // Reset local blueprint state when the drawer switches to another chapter.
   useEffect(() => {
     requestIdRef.current += 1;
+    generationRef.current?.abort();
+    setGenerating(false);
     setBlueprint(null);
     setNotFound(true);
     setLoading(false);
@@ -177,20 +195,28 @@ export function ChapterBlueprintPanel({
 
   useEffect(() => {
     void load();
+    return () => { requestIdRef.current += 1; generationRef.current?.abort(); };
   }, [load]);
 
   const handleGenerate = useCallback(
     async (body: GenerateBlueprintBody) => {
       if (generating) return;
       setGenerating(true);
+      const controller = new AbortController();
+      generationRef.current = controller;
+      requestIdRef.current += 1;
       try {
-        const result = await client.blueprint.generate(chapterId, body);
+        const result = await client.blueprint.generate(chapterId, body, controller.signal);
+        if (controller.signal.aborted || targetRef.current !== chapterId) return;
         setBlueprint(result);
         setNotFound(false);
+        setLoading(false);
+        setBriefVersion((value) => value + 1);
+        setBlueprintVersion((value) => value + 1);
       } catch (error) {
-        handleError(error);
+        if (!controller.signal.aborted && targetRef.current === chapterId) handleError(error);
       } finally {
-        setGenerating(false);
+        if (!controller.signal.aborted && targetRef.current === chapterId) setGenerating(false);
       }
     },
     [generating, client, chapterId, handleError],
@@ -199,6 +225,7 @@ export function ChapterBlueprintPanel({
   return (
     <section className="nwa-panel" aria-label="章节蓝图">
       <h2 className="nwa-panel__title">章节蓝图</h2>
+      <WritingBriefPanel targetKey={chapterId} refreshKey={`${chapterRevision}:${briefVersion}`} load={typeof client.blueprint.writeBrief === 'function' ? loadWriteBrief : undefined} locallyChanged={locallyChanged} />
 
       {loading ? <p className="nwa-muted">加载中…</p> : null}
 
@@ -237,10 +264,12 @@ export function ChapterBlueprintPanel({
           </details>
 
           <SceneList
+            key={`scenes:${chapterId}:${blueprintVersion}`}
             blueprint={blueprint}
             chapterId={chapterId}
             onError={onError}
             client={client}
+            onSceneComplete={() => setBriefVersion((value) => value + 1)}
           />
 
           {/* NEW: 支持章节蓝图 + 分场景工作流增强：展示后可直接点场景“写作/扩写/重写”流式生成；
@@ -272,7 +301,12 @@ export function ChapterBlueprintPanel({
           />
 
           <MergedChapterView
+            key={`merge:${chapterId}:${blueprintVersion}`}
             chapterId={chapterId}
+            editorVersion={editorVersion}
+            editorContent={editorContent}
+            locallyChanged={locallyChanged}
+            onMerged={() => setBriefVersion((value) => value + 1)}
             onAdoptChapterContent={onAdoptChapterContent}
             onError={onError}
             client={client}

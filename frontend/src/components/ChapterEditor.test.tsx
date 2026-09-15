@@ -51,6 +51,18 @@ function makeClient(
 }
 
 describe('ChapterEditor', () => {
+  it('accepts a server generated save as the new baseline without another PUT', async () => {
+    const ref = createRef<ChapterEditorHandle>();
+    const client = makeClient();
+    render(<ChapterEditor ref={ref} chapter={makeChapter()} client={client} />);
+    act(() => { expect(ref.current!.acceptSavedContent(makeChapter({ content: '生成整章', revision: 7 }), '初始正文内容')).toBe(true); });
+    expect(screen.getByRole('textbox', { name: '章节正文' })).toHaveValue('生成整章');
+    await act(async () => ref.current!.saveIfDirty());
+    expect(client.chapters.updateContent).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByRole('textbox', { name: '章节正文' }), { target: { value: '手工修订' } });
+    await act(async () => ref.current!.saveIfDirty());
+    expect(client.chapters.updateContent).toHaveBeenCalledWith('ch-1', '手工修订', 7);
+  });
   beforeEach(() => {
     window.localStorage.clear();
   });

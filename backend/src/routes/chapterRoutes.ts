@@ -65,6 +65,16 @@ export function registerChapterRoutes(
   app: FastifyInstance,
   chapterService: ChapterService,
 ): void {
+  app.get<{ Params: ChapterParams }>('/api/chapters/:id/write-brief', async (request, reply) => {
+    try { return reply.send(await chapterService.getWriteBrief(request.params.id)); }
+    catch (error) { const response = toErrorResponse(error); return reply.code(response.status).send(response.body); }
+  });
+  app.post<{ Params: ChapterParams; Body: { content?: unknown; writeBrief?: unknown } }>('/api/chapters/:id/generated-content', async (request, reply) => {
+    try {
+      if (typeof request.body?.content !== 'string') throw ServiceError.validation('章节正文必须为字符串。');
+      return reply.send(await chapterService.acceptGeneratedContent(request.params.id, request.body.content, request.body.writeBrief));
+    } catch (error) { const response = toErrorResponse(error); return reply.code(response.status).send(response.body); }
+  });
   // 2.1 创建章节
   app.post<{ Params: ProjectParams; Body: CreateChapterBody }>(
     '/api/projects/:id/chapters',

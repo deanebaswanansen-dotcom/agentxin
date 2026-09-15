@@ -242,6 +242,22 @@ describe('scriptRoutes', () => {
     expect(response.json().error.code).toBe('VALIDATION_ERROR');
   });
 
+  it('returns a deterministic brief preview and an explicit unavailable response without model generation', async () => {
+    const url = `/api/script/projects/${projectId}/episodes/1/write-brief`;
+    expect((await app.inject({ method: 'GET', url })).json()).toMatchObject({ status: 'unavailable', origin: 'preview' });
+    const service = new ScriptService(store);
+    await service.savePlan(projectId, planInput(), 0);
+    await service.saveSeriesOutline(projectId, outlineInput(), 0);
+    const response = await app.inject({ method: 'GET', url });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      status: 'current', origin: 'preview', brief: { mode: 'short_drama', projectId, target: { unitNumber: 1, revision: 0 } },
+    });
+    expect((await app.inject({ method: 'GET', url })).json()).toEqual(response.json());
+    expect((await app.inject({ method: 'GET', url: `/api/script/projects/${projectId}/episodes/0/write-brief` })).statusCode).toBe(400);
+    expect((await store.getProjectState(projectId))?.episodes).toEqual([]);
+  });
+
   async function seedManualContinuityEpisode(richHandoff = false) {
     const service = new ScriptService(store);
     await service.savePlan(projectId, { ...planInput(), targetCharsPerEpisode: 300 }, 0);

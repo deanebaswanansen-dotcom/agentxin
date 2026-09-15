@@ -110,6 +110,10 @@ async function send<T>(reply: import('fastify').FastifyReply, operation: () => P
 }
 
 export function registerScriptRoutes(app: FastifyInstance, service: ScriptService): void {
+  app.get<{ Params: { projectId: string; episodeNumber: string } }>(
+    '/api/script/projects/:projectId/episodes/:episodeNumber/write-brief', (request, reply) =>
+      send(reply, () => service.getWriteBrief(request.params.projectId, episodeNumber(request.params.episodeNumber))),
+  );
   app.get<{ Params: ProjectParams }>('/api/projects/:id/script-state', (request, reply) =>
     send(reply, async () => (await service.getState(request.params.id)) ?? {
       schemaVersion: 1,

@@ -58,6 +58,8 @@ import type {
 import type { DataStore } from './DataStore.js';
 import { ChapterRevisionConflictError } from './ChapterRevisionConflictError.js';
 import { StoreError } from './StoreError.js';
+import { assertNovelWriteGuard, type NovelWriteGuard, type NovelWriteSnapshot } from './NovelWriteGuard.js';
+import { hashWriteBriefValue } from '../services/writing/WriteBrief.js';
 
 /**
  * On-disk / in-memory shape of the entire store. Arrays are always present
@@ -102,6 +104,20 @@ function emptyState(): FileDataStoreState {
 }
 
 export class FileDataStore implements DataStore {
+  private assertGeneratedWrite(chapterId: string, guard: NovelWriteGuard): void {
+    const chapter = this.state.chapters.find((item) => item.id === chapterId);
+    const projectId = chapter?.projectId;
+    const snapshot: NovelWriteSnapshot = {
+      chapter, project: this.state.projects.find((item) => item.id === projectId),
+      chapters: this.state.chapters.filter((item) => item.projectId === projectId),
+      characters: this.state.characters.filter((item) => item.projectId === projectId),
+      worldSettings: this.state.worldSettings.filter((item) => item.projectId === projectId),
+      outlines: this.state.outlines.filter((item) => item.projectId === projectId),
+      blueprint: this.state.chapterBlueprints.find((item) => item.chapter_id === chapterId),
+      sceneDrafts: this.state.sceneDrafts.filter((item) => item.chapterId === chapterId),
+    };
+    assertNovelWriteGuard(snapshot, guard);
+  }
   /** Absolute path to the JSON data file. */
   private readonly filePath: string;
 
@@ -438,7 +454,7 @@ export class FileDataStore implements DataStore {
     };
     this.state.chapters.push(chapter);
     await this.persist();
-    return { ...chapter };
+    return structuredClone(chapter);
   }
 
   /**
@@ -451,13 +467,13 @@ export class FileDataStore implements DataStore {
     return this.state.chapters
       .filter((c) => c.projectId === projectId)
       .sort((a, b) => a.position - b.position)
-      .map((c) => ({ ...c }));
+      .map((c) => structuredClone(c));
   }
 
   /** Return a copy of the chapter, or `undefined` if it does not exist. */
   async getChapter(id: Id): Promise<Chapter | undefined> {
     const chapter = this.state.chapters.find((c) => c.id === id);
-    return chapter ? { ...chapter } : undefined;
+    return chapter ? structuredClone(chapter) : undefined;
   }
 
   /**
@@ -475,7 +491,9 @@ export class FileDataStore implements DataStore {
     id: Id,
     content: string,
     expectedRevision?: number,
+    guard?: NovelWriteGuard,
   ): Promise<Chapter> {
+    if (guard) this.assertGeneratedWrite(id, guard);
     const chapter = this.state.chapters.find((c) => c.id === id);
     if (!chapter) {
       throw new Error(
@@ -488,8 +506,11 @@ export class FileDataStore implements DataStore {
     }
     chapter.content = content;
     chapter.revision = actualRevision + 1;
+    if (guard) chapter.generatedCandidate = { brief: structuredClone(guard.brief), candidateHash: hashWriteBriefValue(content), ...(guard.sceneDrafts ? { sceneDependencies: structuredClone(guard.sceneDrafts) } : {}) };
+    else delete chapter.generatedCandidate;
+    const result = structuredClone(chapter);
     await this.persist();
-    return { ...chapter };
+    return result;
   }
 
   /**
@@ -506,7 +527,7 @@ export class FileDataStore implements DataStore {
     }
     chapter.title = title;
     await this.persist();
-    return { ...chapter };
+    return structuredClone(chapter);
   }
 
   /**
@@ -844,7 +865,9 @@ export class FileDataStore implements DataStore {
    */
   async saveChapterBlueprint(
     blueprint: ChapterBlueprint,
+    guard?: NovelWriteGuard,
   ): Promise<ChapterBlueprint> {
+    if (guard) this.assertGeneratedWrite(blueprint.chapter_id, guard);
     this.state.chapterBlueprints = this.state.chapterBlueprints.filter(
       (b) => b.chapter_id !== blueprint.chapter_id,
     );
@@ -878,7 +901,8 @@ export class FileDataStore implements DataStore {
    * affects other scenes' drafts. A deep copy is stored and returned so
    * callers cannot mutate the in-memory state.
    */
-  async saveSceneDraft(draft: SceneDraft): Promise<SceneDraft> {
+  async saveSceneDraft(draft: SceneDraft, guard?: NovelWriteGuard): Promise<SceneDraft> {
+    if (guard) this.assertGeneratedWrite(draft.chapterId, guard);
     const stored = structuredClone(draft);
     const index = this.state.sceneDrafts.findIndex(
       (d) => d.chapterId === draft.chapterId && d.sceneId === draft.sceneId,
@@ -935,7 +959,9 @@ export class FileDataStore implements DataStore {
    */
   async saveWordCountReport(
     report: WordCountReport,
+    guard?: NovelWriteGuard,
   ): Promise<WordCountReport> {
+    if (guard) this.assertGeneratedWrite(report.chapterId, guard);
     this.state.wordCountReports = this.state.wordCountReports.filter(
       (r) => r.chapterId !== report.chapterId,
     );
@@ -965,7 +991,8 @@ export class FileDataStore implements DataStore {
    * copy is stored and returned so callers cannot mutate the in-memory state
    * via the nested arrays.
    */
-  async savePacingReport(report: PacingReport): Promise<PacingReport> {
+  async savePacingReport(report: PacingReport, guard?: NovelWriteGuard): Promise<PacingReport> {
+    if (guard) this.assertGeneratedWrite(report.chapterId, guard);
     this.state.pacingReports = this.state.pacingReports.filter(
       (r) => r.chapterId !== report.chapterId,
     );

@@ -11,9 +11,9 @@
  *
  * 后端错误统一经 `onError` 上抛（由 13.2 接到 ErrorToast，需求 14.6）。
  */
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import apiClient from '../api/apiClient.js';
-import type { Id } from '../types/index.js';
+import type { Chapter, Id } from '../types/index.js';
 import './components.css';
 
 /** 本组件所依赖的最小客户端接口（便于测试时注入桩）。 */
@@ -23,7 +23,11 @@ export interface MergedChapterViewProps {
   /** 目标章节标识符。 */
   chapterId: Id;
   /** 采用合并正文时回调，由父组件写回章节编辑器（需求 14.5）。 */
-  onAdoptChapterContent?: (content: string) => void;
+  onAdoptChapterContent?: (content: string, savedChapter?: Chapter, expectedContent?: string) => boolean | Promise<boolean>;
+  editorVersion?: number;
+  editorContent?: string;
+  locallyChanged?: boolean;
+  onMerged?: () => void;
   /** 将后端/运行时错误上抛至全局错误提示（需求 14.6）。 */
   onError?: (error: unknown) => void;
   /** 可注入的客户端（默认使用共享 {@link apiClient}）。 */
@@ -39,6 +43,10 @@ function isAbort(error: unknown): boolean {
  */
 export function MergedChapterView({
   chapterId,
+  editorVersion = 0,
+  editorContent = '',
+  locallyChanged = false,
+  onMerged,
   onAdoptChapterContent,
   onError,
   client = apiClient,
@@ -46,6 +54,19 @@ export function MergedChapterView({
   const [merging, setMerging] = useState(false);
   const [mergedContent, setMergedContent] = useState<string | null>(null);
   const [adopted, setAdopted] = useState(false);
+  const [adopting, setAdopting] = useState(false);
+  const [savedCandidate, setSavedCandidate] = useState<{ chapter: Chapter; editorVersion: number; baseContent: string }>();
+  const requestRef = useRef(0);
+  const targetRef = useRef(chapterId);
+  targetRef.current = chapterId;
+  useEffect(() => {
+    setMergedContent(null);
+    setAdopted(false);
+    setAdopting(false);
+    setSavedCandidate(undefined);
+    setMerging(false);
+    return () => { requestRef.current += 1; };
+  }, [chapterId]);
 
   const handleError = useCallback(
     (error: unknown) => {
@@ -56,24 +77,47 @@ export function MergedChapterView({
   );
 
   const handleMerge = useCallback(async () => {
-    if (merging) return;
+    if (merging || adopting || locallyChanged) return;
     setMerging(true);
     setAdopted(false);
+    setSavedCandidate(undefined);
+    const requestId = ++requestRef.current;
+    const isCurrent = () => requestRef.current === requestId && targetRef.current === chapterId;
     try {
       const result = await client.blueprint.merge(chapterId);
+      if (!isCurrent()) return;
       setMergedContent(result.content);
+      setSavedCandidate(result.chapter ? { chapter: result.chapter, editorVersion, baseContent: editorContent } : undefined);
+      onMerged?.();
     } catch (error) {
-      handleError(error);
+      if (isCurrent()) handleError(error);
     } finally {
-      setMerging(false);
+      if (isCurrent()) setMerging(false);
     }
-  }, [merging, client, chapterId, handleError]);
+  }, [merging, adopting, client, chapterId, handleError, editorVersion, editorContent, locallyChanged, onMerged]);
 
-  const handleAdopt = useCallback(() => {
-    if (mergedContent === null) return;
-    onAdoptChapterContent?.(mergedContent);
-    setAdopted(true);
-  }, [mergedContent, onAdoptChapterContent]);
+  const handleAdopt = useCallback(async () => {
+    if (mergedContent === null || adopting) return;
+    if (!savedCandidate) {
+      handleError(new Error('该服务未返回已保存章节，请刷新章节读取合并结果。'));
+      return;
+    }
+    if (savedCandidate.editorVersion !== editorVersion || locallyChanged) {
+      handleError(new Error('合并后本地正文已改变，请保存手工内容后重新读取章节。'));
+      return;
+    }
+    const requestId = requestRef.current;
+    const isCurrent = () => requestRef.current === requestId && targetRef.current === chapterId;
+    setAdopting(true);
+    try {
+      const accepted = await onAdoptChapterContent?.(mergedContent, savedCandidate.chapter, savedCandidate.baseContent);
+      if (isCurrent() && accepted === true) setAdopted(true);
+    } catch (error) {
+      if (isCurrent()) handleError(error);
+    } finally {
+      if (isCurrent()) setAdopting(false);
+    }
+  }, [mergedContent, adopting, onAdoptChapterContent, savedCandidate, editorVersion, locallyChanged, handleError, chapterId]);
 
   return (
     <div className="nwa-panel" aria-label="整章合并">
@@ -82,12 +126,13 @@ export function MergedChapterView({
         <button
           type="button"
           className="nwa-button"
-          disabled={merging}
+          disabled={merging || adopting || locallyChanged}
           onClick={() => void handleMerge()}
         >
           {merging ? '合并中…' : '合并整章'}
         </button>
       </div>
+      {locallyChanged ? <p className="nwa-muted">请先保存正文修改，再合并场景。</p> : null}
 
       {/* 合并正文预览 */}
       <div className="nwa-stream" aria-label="合并正文预览">
@@ -107,8 +152,8 @@ export function MergedChapterView({
         <button
           type="button"
           className="nwa-button"
-          disabled={mergedContent === null}
-          onClick={handleAdopt}
+          disabled={mergedContent === null || merging || adopting}
+          onClick={() => void handleAdopt()}
         >
           采用到章节
         </button>
