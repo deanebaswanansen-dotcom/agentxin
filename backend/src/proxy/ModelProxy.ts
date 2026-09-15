@@ -20,10 +20,19 @@
 import crypto from 'node:crypto';
 import { BlockList, isIP } from 'node:net';
 import type { ChatMessage, ModelConfig } from '../types/index.js';
-import { ProxyError } from './ProxyError.js';
+import { ProxyError, providerErrorDetail, sanitizeProviderDetail } from './ProxyError.js';
 import { SseDeltaParser, type StreamDelta } from './sseParser.js';
 
+export interface ModelAttemptBudget {
+  maxAttempts: number;
+  attemptsUsed: number;
+}
+
 export interface StreamCompletionOptions {
+  /** Shared across structured retries/repairs; counts actual HTTP attempts only. */
+  attemptBudget?: ModelAttemptBudget;
+  /** Validate the active credentials against the provider, without cache replay. */
+  bypassCache?: boolean;
   jsonMode?: boolean;
   /** Optional small output budget for connection probes and classifiers. */
   maxTokens?: number;
@@ -266,29 +275,38 @@ function retryDelayMs(attempt: number): number {
   return FETCH_RETRY_BASE_MS * 2 ** attempt;
 }
 
-function sanitizeProviderDetail(value: string): string {
-  return value
-    .replace(/sk-[a-zA-Z0-9_-]{8,}/g, '[API_KEY]')
-    .replace(/Bearer\s+[^\s"']+/gi, 'Bearer [API_KEY]')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 300);
-}
+const MAX_PROVIDER_DETAIL_LENGTH = 16_384;
 
-async function providerFailureMessage(response: Response): Promise<string> {
+async function providerFailureMessage(response: Response, apiKey: string, signal: AbortSignal): Promise<string> {
   let detail = '';
   try {
-    const raw = await response.text();
+    // Read only a bounded diagnostic prefix using the same request deadline.
+    // Error pages can be large or stall just like successful response streams.
+    let raw = '';
+    if (response.body) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      try {
+        while (raw.length < MAX_PROVIDER_DETAIL_LENGTH) {
+          const { done, value } = await readStreamChunk(reader, signal);
+          if (done) break;
+          if (value) raw += decoder.decode(value, { stream: true });
+        }
+        raw += decoder.decode();
+      } finally {
+        void reader.cancel().catch(() => undefined);
+        reader.releaseLock();
+      }
+    }
     try {
-      const parsed = JSON.parse(raw) as { error?: { message?: unknown } };
-      detail = typeof parsed.error?.message === 'string' ? parsed.error.message : raw;
+      detail = providerErrorDetail(JSON.parse(raw)) || raw;
     } catch {
       detail = raw;
     }
   } catch {
     // Status-specific guidance below remains available when the body cannot be read.
   }
-  const safeDetail = sanitizeProviderDetail(detail);
+  const safeDetail = sanitizeProviderDetail(detail, apiKey);
   const guidance: Record<number, string> = {
     400: '请求参数或模型名称不被提供商接受',
     401: 'API Key 无效',
@@ -302,7 +320,7 @@ async function providerFailureMessage(response: Response): Promise<string> {
     503: '模型提供商暂时不可用',
     504: '模型提供商响应超时',
   };
-  const base = guidance[response.status] ?? `模型提供商返回 HTTP ${response.status}`;
+  const base = `${guidance[response.status] ?? '模型提供商请求失败'}（HTTP ${response.status}）`;
   return safeDetail ? `${base}：${safeDetail}` : base;
 }
 
@@ -325,6 +343,8 @@ async function sleepMs(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 export class OpenAiCompatibleModelProxy implements ModelProxy {
+  private readonly budgetFailures = new WeakMap<ModelAttemptBudget, ProxyError>();
+
   streamCompletion(
     config: ModelConfig,
     messages: ChatMessage[],
@@ -392,9 +412,16 @@ export class OpenAiCompatibleModelProxy implements ModelProxy {
 
     const deadline = createRequestDeadline(signal);
     const requestSignal = deadline.signal;
+    const attemptBudget = options?.attemptBudget;
+    const hasAttempt = (): boolean => !attemptBudget || attemptBudget.attemptsUsed < attemptBudget.maxAttempts;
     try {
       let response: Response | undefined;
       for (let attempt = 0; attempt < FETCH_MAX_ATTEMPTS; attempt += 1) {
+        if (!hasAttempt()) {
+          throw (attemptBudget && this.budgetFailures.get(attemptBudget)) ??
+            new ProxyError('本轮模型请求的传输尝试额度已用完，请重试。');
+        }
+        if (attemptBudget) attemptBudget.attemptsUsed += 1;
         try {
           response = await fetch(url, {
           method: 'POST',
@@ -412,7 +439,7 @@ export class OpenAiCompatibleModelProxy implements ModelProxy {
             if (deadline.timedOut()) throw timeoutProxyError(deadline, error);
             throw new ProxyError('请求模型提供商已被取消', { cause: error });
           }
-          if (attempt < FETCH_MAX_ATTEMPTS - 1) {
+          if (attempt < FETCH_MAX_ATTEMPTS - 1 && hasAttempt()) {
             const delay = retryDelayMs(attempt);
             console.warn(`[ModelProxy] Connection failed (attempt ${attempt + 1}/${FETCH_MAX_ATTEMPTS}), retrying in ${delay}ms`);
             await sleepMs(delay, requestSignal);
@@ -426,7 +453,8 @@ export class OpenAiCompatibleModelProxy implements ModelProxy {
           break;
         }
 
-        if (isRetryableStatus(response.status) && attempt < FETCH_MAX_ATTEMPTS - 1) {
+        if (isRetryableStatus(response.status) && attempt < FETCH_MAX_ATTEMPTS - 1 && hasAttempt()) {
+          void response.body?.cancel().catch(() => undefined);
           const delay = retryDelayMs(attempt);
           console.warn(
             `[ModelProxy] Provider status ${response.status} (attempt ${attempt + 1}/${FETCH_MAX_ATTEMPTS}), retrying in ${delay}ms`,
@@ -435,7 +463,7 @@ export class OpenAiCompatibleModelProxy implements ModelProxy {
           continue;
         }
 
-        throw new ProxyError(await providerFailureMessage(response), { status: response.status });
+        throw new ProxyError(await providerFailureMessage(response, config.apiKey, requestSignal), { status: response.status });
       }
 
       if (response === undefined) {
@@ -443,12 +471,21 @@ export class OpenAiCompatibleModelProxy implements ModelProxy {
       }
 
       if (response.body === null) {
-        throw new ProxyError('模型提供商未返回响应内容');
+        throw new ProxyError(`模型提供商未返回有效正文（HTTP ${response.status}）。`, { status: response.status });
       }
 
       const decoder = new TextDecoder('utf-8');
-      const parser = new SseDeltaParser(config.modelName);
+      const parser = new SseDeltaParser(config.modelName, (detail) => sanitizeProviderDetail(detail, config.apiKey));
       const reader = response.body.getReader();
+      let receivedContent = false;
+      let receivedThinking = false;
+      let responsePrefix = '';
+      let streamEnded = false;
+      const observe = (delta: StreamDelta): StreamDelta => {
+        if (delta.kind === 'content' && delta.text.trim().length > 0) receivedContent = true;
+        if (delta.kind === 'thinking' && delta.text.trim().length > 0) receivedThinking = true;
+        return delta;
+      };
 
       try {
         for (;;) {
@@ -465,6 +502,7 @@ export class OpenAiCompatibleModelProxy implements ModelProxy {
           }
 
           if (done) {
+            streamEnded = true;
             break;
           }
           if (value === undefined) {
@@ -473,22 +511,48 @@ export class OpenAiCompatibleModelProxy implements ModelProxy {
           deadline.touch();
 
           const text = decoder.decode(value, { stream: true });
+          if (responsePrefix.length < MAX_PROVIDER_DETAIL_LENGTH) {
+            responsePrefix += text.slice(0, MAX_PROVIDER_DETAIL_LENGTH - responsePrefix.length);
+          }
           for (const delta of parser.push(text)) {
-            yield delta;
+            yield observe(delta);
           }
         }
 
         const tail = decoder.decode();
         if (tail.length > 0) {
           for (const delta of parser.push(tail)) {
-            yield delta;
+            yield observe(delta);
           }
         }
         for (const delta of parser.flush()) {
-          yield delta;
+          yield observe(delta);
         }
+        if (!receivedContent) {
+          let reason = receivedThinking
+            ? '模型只返回推理内容，未返回有效正文，请检查模型和输出预算。'
+            : '模型未返回有效正文，响应为空或只有空白。';
+          if (!parser.receivedData && responsePrefix.trim()) {
+            let detail = '';
+            try {
+              detail = providerErrorDetail(JSON.parse(responsePrefix));
+            } catch {
+              // HTML and other unexpected bodies get actionable endpoint guidance.
+            }
+            reason = detail
+              ? `模型提供商返回错误：${sanitizeProviderDetail(detail, config.apiKey)}`
+              : '模型提供商返回的不是有效 SSE 响应，请核对 Base URL 和 /chat/completions 地址，确认服务商是否要求 /v1。';
+          }
+          throw new ProxyError(`模型提供商（HTTP ${response.status}）：${reason}`, { status: response.status });
+        }
+        if (attemptBudget) this.budgetFailures.delete(attemptBudget);
+      } catch (error) {
+        if (error instanceof ProxyError && error.status === undefined && !requestSignal.aborted) {
+          throw new ProxyError(`模型提供商（HTTP ${response.status}）：${error.message}`, { status: response.status });
+        }
+        throw error;
       } finally {
-        if (requestSignal.aborted) {
+        if (!streamEnded) {
           // Some broken provider streams never settle `cancel()`. The request
           // has already reached a terminal timeout/cancel state, so cleanup
           // must not be allowed to keep the job in `running` forever.
@@ -499,6 +563,13 @@ export class OpenAiCompatibleModelProxy implements ModelProxy {
     } catch (error: unknown) {
       if (deadline.timedOut() && !(error instanceof ProxyError && error.status === 504)) {
         throw timeoutProxyError(deadline, error);
+      }
+      if (error instanceof ProxyError) {
+        // Provider and transport errors may reflect arbitrary, non-sk credentials.
+        // Expose only a sanitized message/status, never a raw response or cause.
+        const sanitized = new ProxyError(sanitizeProviderDetail(error.message, config.apiKey), { status: error.status });
+        if (attemptBudget) this.budgetFailures.set(attemptBudget, sanitized);
+        throw sanitized;
       }
       throw error;
     } finally {

@@ -49,3 +49,26 @@ export class ProxyError extends Error {
 export function isProxyError(value: unknown): value is ProxyError {
   return value instanceof ProxyError;
 }
+
+/** Sanitize before truncating so a reflected credential cannot survive at a boundary. */
+export function sanitizeProviderDetail(value: string, apiKey = ''): string {
+  return (apiKey ? value.split(apiKey).join('[API_KEY]') : value)
+    .replace(/sk-[a-zA-Z0-9_-]{8,}/g, '[API_KEY]')
+    .replace(/Bearer\s+[^\s"']+/gi, 'Bearer [API_KEY]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 300);
+}
+
+/** Read a provider's error reason without serializing unrelated response fields. */
+export function providerErrorDetail(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (!value || typeof value !== 'object') return '';
+  const candidate = value as { error?: unknown; message?: unknown; code?: unknown };
+  const error = candidate.error ?? candidate;
+  if (typeof error === 'string') return error;
+  if (!error || typeof error !== 'object') return '';
+  const detail = error as { message?: unknown; code?: unknown };
+  if (typeof detail.message === 'string') return detail.message;
+  return typeof detail.code === 'string' || typeof detail.code === 'number' ? String(detail.code) : '';
+}

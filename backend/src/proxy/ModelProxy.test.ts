@@ -75,6 +75,7 @@ async function collect(iterable: AsyncIterable<StreamDelta>): Promise<string[]> 
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   if (ORIGINAL_MODEL_REQUEST_TIMEOUT_MS === undefined) {
     delete process.env.MODEL_REQUEST_TIMEOUT_MS;
@@ -322,6 +323,20 @@ describe('OpenAiCompatibleModelProxy request shape', () => {
 });
 
 describe('OpenAiCompatibleModelProxy successful streaming', () => {
+  it.each(['text/plain', 'application/json', 'text/html', 'text/event-stream'])(
+    'accepts valid SSE with Content-Type %s without another provider call',
+    async (contentType) => {
+      const fetchMock = vi.fn(async () => new Response(buildSseWire(['有效', '正文']), {
+        headers: { 'Content-Type': contentType },
+      }));
+      vi.stubGlobal('fetch', fetchMock);
+      await expect(collect(new OpenAiCompatibleModelProxy().streamCompletion(
+        CONFIG, MESSAGES, new AbortController().signal,
+      ))).resolves.toEqual(['有效', '正文']);
+      expect(fetchMock).toHaveBeenCalledOnce();
+    },
+  );
+
   it('yields provider deltas in order and concatenates to the full text (5.1, 5.2)', async () => {
     const deltas = ['从', '前', '有', '座', '山'];
     const fetchMock = vi.fn(async () => streamingResponse(buildSseWire(deltas)));
@@ -338,6 +353,85 @@ describe('OpenAiCompatibleModelProxy successful streaming', () => {
 });
 
 describe('OpenAiCompatibleModelProxy error handling', () => {
+  it('shares a fetch budget across calls and preserves the last HTTP failure after exhaustion', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(buildSseWire(['first completion'])))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: 'quota exhausted' } }), { status: 429 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const proxy = new OpenAiCompatibleModelProxy();
+    const attemptBudget = { maxAttempts: 2, attemptsUsed: 0 };
+    const complete = () => collect(proxy.streamCompletion(CONFIG, MESSAGES, new AbortController().signal, { attemptBudget }));
+    await expect(complete()).resolves.toEqual(['first completion']);
+    await expect(complete()).rejects.toMatchObject({ status: 429, message: expect.stringContaining('quota exhausted') });
+    await expect(complete()).rejects.toMatchObject({ status: 429, message: expect.stringContaining('quota exhausted') });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(attemptBudget.attemptsUsed).toBe(2);
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect(JSON.parse(init.body as string).attemptBudget).toBeUndefined();
+  });
+
+  it('counts every transport retry against the shared budget', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ error: { message: 'upstream busy' } }), { status: 503 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const attemptBudget = { maxAttempts: 2, attemptsUsed: 0 };
+    const rejection = expect(collect(new OpenAiCompatibleModelProxy().streamCompletion(
+      CONFIG, MESSAGES, new AbortController().signal, { attemptBudget },
+    ))).rejects.toMatchObject({ status: 503, message: expect.stringContaining('upstream busy') });
+    await vi.advanceTimersByTimeAsync(2_000);
+    await rejection;
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(attemptBudget.attemptsUsed).toBe(2);
+  });
+
+  it.each([
+    ['HTML error page', '<html><body>gateway login</body></html>', /Base URL.*\/v1/],
+    ['JSON error', JSON.stringify({ error: { message: '余额不足' } }), /余额不足/],
+    ['empty body', '', /未返回有效正文/],
+    ['DONE only', 'data: [DONE]\n\n', /未返回有效正文/],
+    ['role only', 'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n', /未返回有效正文/],
+    ['null payload', 'data: null\n\n', /未返回有效正文/],
+    ['reasoning only', 'data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}\n\n', /只返回推理内容/],
+    ['whitespace only', buildSseWire([' ', '\n\t', '\u3000']), /未返回有效正文/],
+  ])('rejects HTTP 200 %s instead of succeeding', async (_name, wire, reason) => {
+    const fetchMock = vi.fn(async () => new Response(wire as string));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(collect(new OpenAiCompatibleModelProxy().streamCompletion(
+      CONFIG, MESSAGES, new AbortController().signal,
+    ))).rejects.toMatchObject({ code: 'PROVIDER_ERROR', status: 200, message: expect.stringMatching(reason as RegExp) });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    'data: {"error":{"message":"quota exhausted"}}\n\n',
+    'data: {"error":"quota exhausted"}\n\n',
+    'event: error\ndata: {"message":"quota exhausted"}\n\n',
+    'event: error\ndata: quota exhausted\n\n',
+    'data: {"type":"error","message":"quota exhausted"}',
+  ])('rejects an in-band SSE error after partial content: %s', async (errorWire) => {
+    const encoder = new TextEncoder();
+    const cancel = vi.fn(() => new Promise<void>(() => undefined));
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(buildSseWire(['partial'])));
+        controller.enqueue(encoder.encode(errorWire));
+        if (!errorWire.endsWith('\n\n')) controller.close();
+      },
+      cancel,
+    });
+    const fetchMock = vi.fn(async () => new Response(body));
+    vi.stubGlobal('fetch', fetchMock);
+    const iterator = new OpenAiCompatibleModelProxy().streamCompletion(
+      CONFIG, MESSAGES, new AbortController().signal,
+    )[Symbol.asyncIterator]();
+    await expect(iterator.next()).resolves.toMatchObject({ value: { kind: 'content', text: 'partial' }, done: false });
+    await expect(iterator.next()).rejects.toMatchObject({
+      code: 'PROVIDER_ERROR', status: 200, message: expect.stringContaining('quota exhausted'),
+    });
+    if (errorWire.endsWith('\n\n')) expect(cancel).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
   it('throws ProxyError carrying the upstream status on a non-2xx response (5.5)', async () => {
     const fetchMock = vi.fn(async () => errorResponse(429));
     vi.stubGlobal('fetch', fetchMock);
@@ -481,6 +575,34 @@ describe('OpenAiCompatibleModelProxy error handling', () => {
 });
 
 describe('OpenAiCompatibleModelProxy API key safety (5.6)', () => {
+  it.each(['http', 'json', 'sse'] as const)(
+    'redacts a reflected non-sk API key from %s error messages and serialized errors',
+    async (kind) => {
+      const key = 'plain-credential-123456';
+      const error = { error: { message: `rejected credential ${key}; Bearer ${key}` } };
+      const fetchMock = vi.fn(async () => new Response(
+        kind === 'sse' ? `data: ${JSON.stringify(error)}\n\n` : JSON.stringify(error),
+        { status: kind === 'http' ? 401 : 200 },
+      ));
+      vi.stubGlobal('fetch', fetchMock);
+      let thrown: unknown;
+      try {
+        await collect(new OpenAiCompatibleModelProxy().streamCompletion(
+          { ...CONFIG, apiKey: key }, MESSAGES, new AbortController().signal,
+        ));
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toMatchObject({
+        code: 'PROVIDER_ERROR', status: kind === 'http' ? 401 : 200,
+        message: expect.stringContaining('rejected credential [API_KEY]'),
+      });
+      expect(String(thrown)).not.toContain(key);
+      expect((thrown as Error).stack).not.toContain(key);
+      expect(JSON.stringify(thrown)).not.toContain(key);
+    },
+  );
+
   it('never leaks the API key in yielded deltas', async () => {
     const fetchMock = vi.fn(async () =>
       streamingResponse(buildSseWire(['safe', 'output', 'text'])),

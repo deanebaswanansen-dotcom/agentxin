@@ -1,14 +1,16 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { runWithClientId } from '../services/client/clientScope.js';
 import { CachingModelProxy } from './CachingModelProxy.js';
 import type { ModelProxy, StreamCompletionOptions } from './ModelProxy.js';
+import { OpenAiCompatibleModelProxy } from './ModelProxy.js';
 import type { StreamDelta } from './sseParser.js';
 import { getCacheStatsSummary, resetCacheStats } from './cacheStats.js';
 import type { ChatMessage, ModelConfig } from '../types/index.js';
+import { ProxyError } from './ProxyError.js';
 
 class CountingProxy implements ModelProxy {
   calls = 0;
@@ -49,6 +51,7 @@ describe('CachingModelProxy', () => {
   });
 
   afterEach(async () => {
+    vi.unstubAllGlobals();
     await rm(dir, { recursive: true, force: true });
     resetCacheStats();
   });
@@ -69,6 +72,65 @@ describe('CachingModelProxy', () => {
     expect(stats.localCache.misses).toBe(1);
     expect(stats.localCache.hits).toBe(1);
     expect(stats.localCache.hitRatePct).toBe(50);
+  });
+
+  it('bypasses an existing success cache to validate changed credentials', async () => {
+    const proxy = new CachingModelProxy(new CountingProxy('cached success'), { dir });
+    await collect(proxy.streamCompletion(realConfig, messages, new AbortController().signal));
+    let calls = 0;
+    const rejectingProxy = new CachingModelProxy({
+      async *streamCompletion(config) {
+        calls += 1;
+        expect(config.apiKey).toBe('new-invalid-key');
+        throw new ProxyError('API Key 无效', { status: 401 });
+      },
+    }, { dir });
+    await expect(collect(rejectingProxy.streamCompletion(
+      { ...realConfig, apiKey: 'new-invalid-key' }, messages, new AbortController().signal,
+      { bypassCache: true },
+    ))).rejects.toMatchObject({ status: 401 });
+    expect(calls).toBe(1);
+    expect(getCacheStatsSummary().localCache).toMatchObject({ hits: 0, misses: 1 });
+  });
+
+  it('does not write probe responses to cache and keeps normal generation caching', async () => {
+    const inner = new CountingProxy('fresh content');
+    const proxy = new CachingModelProxy(inner, { dir });
+    const signal = new AbortController().signal;
+    await collect(proxy.streamCompletion(realConfig, messages, signal, { bypassCache: true }));
+    await collect(proxy.streamCompletion(realConfig, messages, signal));
+    await collect(proxy.streamCompletion(realConfig, messages, signal));
+    expect(inner.calls).toBe(2);
+    expect(getCacheStatsSummary().localCache).toMatchObject({ hits: 1, misses: 1 });
+  });
+
+  it('does not spend the shared transport budget on a cache hit', async () => {
+    const fetchMock = vi.fn(async () => new Response('data: {"choices":[{"delta":{"content":"正文"}}]}\n\n'));
+    vi.stubGlobal('fetch', fetchMock);
+    const proxy = new CachingModelProxy(new OpenAiCompatibleModelProxy(), { dir });
+    const attemptBudget = { maxAttempts: 1, attemptsUsed: 0 };
+    const signal = new AbortController().signal;
+    await collect(proxy.streamCompletion(realConfig, messages, signal, { attemptBudget }));
+    await expect(collect(proxy.streamCompletion(realConfig, messages, signal, { attemptBudget }))).resolves.toBe('正文');
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(attemptBudget.attemptsUsed).toBe(1);
+  });
+
+  it('ignores a legacy whitespace-only cache entry and requests fresh content', async () => {
+    const signal = new AbortController().signal;
+    const seed = new CachingModelProxy(new CountingProxy('old content'), { dir });
+    await collect(seed.streamCompletion(realConfig, messages, signal));
+    const files = (await readdir(dir)).filter((name) => name.endsWith('.json'));
+    expect(files).toHaveLength(1);
+    const path = join(dir, files[0]);
+    const entry = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+    await writeFile(path, JSON.stringify({ ...entry, content: ' \n\t\u3000' }), 'utf8');
+
+    const inner = new CountingProxy('fresh content');
+    const proxy = new CachingModelProxy(inner, { dir });
+    await expect(collect(proxy.streamCompletion(realConfig, messages, signal))).resolves.toBe('fresh content');
+    expect(inner.calls).toBe(1);
+    expect(getCacheStatsSummary().localCache.hits).toBe(0);
   });
 
   it('does not share cached completions across clients', async () => {

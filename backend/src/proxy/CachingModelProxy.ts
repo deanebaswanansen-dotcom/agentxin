@@ -91,7 +91,7 @@ export class CachingModelProxy implements ModelProxy {
     try {
       const raw = await readFile(this.pathFor(key), 'utf8');
       const parsed = JSON.parse(raw) as Partial<CacheEntry>;
-      if (typeof parsed.content === 'string' && parsed.content.length > 0) {
+      if (typeof parsed.content === 'string' && parsed.content.trim().length > 0) {
         return { model: parsed.model ?? '', at: parsed.at ?? '', content: parsed.content };
       }
       return undefined;
@@ -119,7 +119,7 @@ export class CachingModelProxy implements ModelProxy {
     options?: StreamCompletionOptions,
   ): AsyncGenerator<StreamDelta> {
     // Mock 或禁用：直接透传，不参与缓存统计。
-    if (!this.enabled || isMockConfig(config)) {
+    if (!this.enabled || isMockConfig(config) || options?.bypassCache === true) {
       yield* this.inner.streamCompletion(config, messages, signal, options);
       return;
     }

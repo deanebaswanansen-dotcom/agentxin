@@ -59,6 +59,44 @@ function makeClient(overrides: Partial<SettingsClient['modelConfig']> = {}): Set
 }
 
 describe('SettingsPanel', () => {
+  it.each([
+    { ok: true, receivedOutput: false },
+    { ok: true },
+    { ok: false, receivedOutput: true },
+  ])('rejects a probe without confirmed valid output: %j', async (probe) => {
+    const onSaved = vi.fn();
+    const onError = vi.fn();
+    const client = makeClient({ test: vi.fn().mockResolvedValue(probe) });
+    render(<SettingsPanel client={client} onSaved={onSaved} onError={onError} />);
+    await screen.findByDisplayValue('https://api.deepseek.com');
+    fireEvent.change(screen.getByLabelText('API Key'), { target: { value: 'new-key' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存并测试 API' }));
+    await waitFor(() => expect(onError).toHaveBeenCalledWith(expect.objectContaining({
+      message: expect.stringContaining('未收到有效正文'),
+    })));
+    expect(screen.queryByText('连接成功，本机已启用')).not.toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent('连接测试失败');
+    expect(onSaved).not.toHaveBeenCalled();
+  });
+
+  it('previews the exact endpoint and makes /v1 a provider-specific choice', async () => {
+    const client = makeClient();
+    render(<SettingsPanel client={client} />);
+    await screen.findByDisplayValue('https://api.deepseek.com');
+    fireEvent.change(screen.getByLabelText('Base URL'), { target: { value: 'https://gateway.example.com' } });
+    expect(screen.getByLabelText('最终请求地址')).toHaveTextContent('https://gateway.example.com/chat/completions');
+    expect(screen.getByText(/当前地址未包含 \/v1/)).toHaveTextContent('请手动补入');
+    fireEvent.change(screen.getByLabelText('API Key'), { target: { value: 'new-key' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存并测试 API' }));
+    await waitFor(() => expect(client.modelConfig.save).toHaveBeenCalledWith(expect.objectContaining({
+      baseUrl: 'https://gateway.example.com',
+    })));
+    await waitFor(() => expect(screen.getByText('连接成功，本机已启用')).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText('Base URL'), { target: { value: 'https://gateway.example.com/v1///' } });
+    expect(screen.getByLabelText('最终请求地址')).toHaveTextContent('https://gateway.example.com/v1/chat/completions');
+    expect(screen.queryByText(/当前地址未包含 \/v1/)).not.toBeInTheDocument();
+  });
+
   it('loads and displays the masked model config on mount (Requirement 8.5)', async () => {
     const client = makeClient();
     render(<SettingsPanel client={client} />);
