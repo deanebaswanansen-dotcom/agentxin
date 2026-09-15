@@ -1,0 +1,26 @@
+.nwa-story-memory { min-width: 0; font-size: 14px; line-height: 1.55; }
+.nwa-story-memory h3 { font-size: 15px; margin: 20px 0 10px; }
+.nwa-memory-status, .nwa-memory-actions, .nwa-memory-tabs, .nwa-memory-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.nwa-memory-tabs { border-bottom: 1px solid var(--border-subtle, #d6d4ce); padding: 10px 0; }
+.nwa-memory-tabs .is-active { font-weight: 700; background: var(--bg-surface-hover, #eeeae1); }
+.nwa-memory-list { list-style: none; padding: 0; margin: 8px 0; }
+.nwa-memory-card { border: 1px solid var(--border-subtle, #d6d4ce); border-radius: 8px; padding: 12px; margin: 8px 0; overflow-wrap: anywhere; }
+.nwa-memory-card p { margin: 6px 0; white-space: pre-wrap; }
+.nwa-memory-source { margin: 8px 0; overflow-wrap: anywhere; }
+.nwa-memory-source summary { cursor: pointer; font-size: 12px; }
+.nwa-memory-source blockquote { margin: 8px 0; padding: 8px 12px; border-left: 3px solid var(--border-subtle, #aaa); white-space: pre-wrap; }
+.nwa-memory-tags span { border-radius: 4px; padding: 2px 5px; background: var(--bg-surface-hover, #eeeae1); font-size: 12px; }
+.nwa-memory-form { padding: 12px 0; }
+.nwa-memory-form fieldset { margin: 0; padding: 0; border: 0; min-width: 0; }
+.nwa-memory-form label { display: block; margin: 8px 0; }
+.nwa-memory-form textarea, .nwa-memory-form input:not([type=checkbox]), .nwa-memory-form select { display: block; width: 100%; min-width: 0; box-sizing: border-box; margin: 4px 0; padding: 7px 8px; color: inherit; background: var(--bg-editor, transparent); border: 1px solid var(--border-subtle, #aaa); border-radius: 5px; font: inherit; }
+.nwa-memory-actions input[type=number] { max-width: 110px; }
+.nwa-memory-form .nwa-memory-actions > label { flex: 1 1 140px; }
+.nwa-memory-notice, .nwa-memory-confirm, .nwa-memory-conflict { border-left: 3px solid var(--accent-primary, #94743c); padding: 8px 12px; }
+.nwa-memory-evidence { font: inherit; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 340px; overflow: auto; padding: 12px; border: 1px solid var(--border-subtle, #aaa); border-radius: 5px; }
+.nwa-source-accept { margin: 12px 0; font-size: 13px; }
+.nwa-source-accept label { display: block; margin: 8px 0; }
+.nwa-memory-drawer { width: min(620px, 100vw); max-width: 100vw; }
+.nwa-memory-body { overflow-y: auto; min-width: 0; }
+[data-memory-evidence=current] { outline: 2px solid var(--accent-primary, #94743c); outline-offset: 4px; background: var(--bg-surface-hover, #eeeae1); }
+@media (max-width: 480px) { .nwa-memory-card { padding: 10px; } .nwa-memory-actions > button { white-space: normal; } }

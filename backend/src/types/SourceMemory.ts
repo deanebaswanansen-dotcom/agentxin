@@ -1,4 +1,4 @@
-/** Shared accepted-source/projection contract. This phase activates screenplay sources only. */
+/** Shared accepted-source/projection contract for novels and screenplays. */
 export type SourceMemoryMode = 'short_drama' | 'novel';
 
 export interface MemorySourceRef {

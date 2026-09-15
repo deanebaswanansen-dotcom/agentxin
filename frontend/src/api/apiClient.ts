@@ -83,6 +83,7 @@ import type {
 } from '../types/index.js';
 import { ReasoningArtifactFilter } from '../lib/reasoningSanitizer.js';
 import type { WriteBrief, WriteBriefView } from '../types/writeBrief.js';
+import type { ChapterSourcePreview, MemorySyncStatusView, StoryControlCollection, StoryControlInput, StoryMemoryQuery, StoryMemoryWorkspaceView } from '../types/storyMemory.js';
 
 // ---------------------------------------------------------------------------
 // Base URL configuration
@@ -1520,6 +1521,13 @@ function decodeSceneId(data: string): string | undefined {
 // ---------------------------------------------------------------------------
 
 export interface ApiClient {
+  storyMemory: {
+    workspace(projectId: Id, query?: StoryMemoryQuery, signal?: AbortSignal): Promise<StoryMemoryWorkspaceView>;
+    status(projectId: Id, signal?: AbortSignal): Promise<MemorySyncStatusView>;
+    retry(projectId: Id, signal?: AbortSignal): Promise<MemorySyncStatusView>;
+    saveControl(projectId: Id, control: StoryControlInput, expectedRevision: number, signal?: AbortSignal): Promise<StoryControlCollection>;
+    removeControl(projectId: Id, id: Id, expectedRevision: number, signal?: AbortSignal): Promise<StoryControlCollection>;
+  };
   agent: {
     run(body: AgentRunRequest, signal?: AbortSignal): Promise<AgentRunResult>;
     runStream(body: AgentRunRequest, options?: AgentRunStreamOptions): Promise<AgentRunResult>;
@@ -1597,6 +1605,8 @@ export interface ApiClient {
     exportFile(projectId: Id, format: ScriptExportFormat, range?: ScriptExportRange, signal?: AbortSignal): Promise<ScriptExportFile>;
   };
   chapters: {
+    sourcePreview(id: Id, signal?: AbortSignal): Promise<ChapterSourcePreview>;
+    acceptSource(id: Id, body: { expectedRevision: number; expectedContentHash: string }, signal?: AbortSignal): Promise<Chapter>;
     acceptGeneratedContent(id: Id, body: { content: string; writeBrief: WriteBrief }, signal?: AbortSignal): Promise<Chapter>;
     list(projectId: Id, signal?: AbortSignal): Promise<Chapter[]>;
     create(projectId: Id, title: string, signal?: AbortSignal): Promise<{ id: Id }>;
@@ -1759,6 +1769,21 @@ export interface ApiClient {
 export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
   const b = baseUrl.replace(/\/$/, '');
   return {
+    storyMemory: {
+      workspace: (projectId, query = {}, signal) => {
+        const params = new URLSearchParams();
+        if (query.beforeUnit !== undefined) params.set('beforeUnit', String(query.beforeUnit));
+        if (query.q) params.set('q', query.q);
+        if (query.topK !== undefined) params.set('topK', String(query.topK));
+        if (query.maxContextChars !== undefined) params.set('maxContextChars', String(query.maxContextChars));
+        return request(b, 'GET', `/projects/${seg(projectId)}/story-memory${params.size ? `?${params}` : ''}`, undefined, { signal });
+      },
+      status: (projectId, signal) => request(b, 'GET', `/projects/${seg(projectId)}/memory-sync`, undefined, { signal }),
+      retry: (projectId, signal) => request(b, 'POST', `/projects/${seg(projectId)}/memory-sync/retry`, {}, { signal }),
+      saveControl: (projectId, control, expectedRevision, signal) => request(b, control.id ? 'PUT' : 'POST',
+        `/projects/${seg(projectId)}/story-controls${control.id ? `/${seg(control.id)}` : ''}`, { expectedRevision, control }, { signal }),
+      removeControl: (projectId, id, expectedRevision, signal) => request(b, 'DELETE', `/projects/${seg(projectId)}/story-controls/${seg(id)}`, { expectedRevision }, { signal }),
+    },
     agent: {
       run: (body, signal) =>
         request(b, 'POST', '/agent/run', body, { signal, includeModelConfig: true }),
@@ -1893,6 +1918,8 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
         ),
     },
     chapters: {
+      sourcePreview: (id, signal) => request(b, 'GET', `/chapters/${seg(id)}/accept-source`, undefined, { signal }),
+      acceptSource: (id, body, signal) => request(b, 'POST', `/chapters/${seg(id)}/accept-source`, body, { signal }),
       acceptGeneratedContent: (id, body, signal) => request(b, 'POST', `/chapters/${seg(id)}/generated-content`, body, { signal }),
       list: (projectId, signal) =>
         request(b, 'GET', `/projects/${seg(projectId)}/chapters`, undefined, { signal }),

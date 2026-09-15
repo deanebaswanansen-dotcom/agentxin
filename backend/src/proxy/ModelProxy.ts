@@ -365,7 +365,9 @@ export class OpenAiCompatibleModelProxy implements ModelProxy {
       // Extract last user prompt for canned response
       const lastUser = [...messages].reverse().find((m) => m.role === 'user');
       const promptText = typeof lastUser?.content === 'string' ? lastUser.content : JSON.stringify(lastUser?.content || '');
-      yield* mockGenerate(promptText, signal, options);
+      const systemPrompt = messages.filter((message) => message.role === 'system')
+        .map((message) => typeof message.content === 'string' ? message.content : '').join('\n');
+      yield* mockGenerate(promptText, signal, options, systemPrompt);
       return;
     }
 
@@ -616,8 +618,10 @@ async function* mockGenerate(
   prompt: string,
   signal?: AbortSignal,
   options?: StreamCompletionOptions,
+  systemPrompt = '',
 ): AsyncGenerator<StreamDelta> {
-  if (prompt.includes('inspector_only') || prompt.includes('「检测子 Agent」')) {
+  const intent = `${systemPrompt}\n${prompt}`;
+  if (intent.includes('inspector_only') || intent.includes('「检测子 Agent」')) {
     yield {
       kind: 'content',
       text: JSON.stringify({
@@ -632,7 +636,7 @@ async function* mockGenerate(
     };
     return;
   }
-  if (options?.jsonMode === true && /"summary"|反思子 Agent/.test(prompt)) {
+  if (options?.jsonMode === true && /"summary"|反思子 Agent/.test(intent)) {
     yield {
       kind: 'content',
       text: JSON.stringify({

@@ -3,11 +3,15 @@ import { createWriteBrief, hashWriteBriefValue, writeBriefSourceKey } from '../w
 import type { ScriptEpisodeOutline, ScriptProjectState, ScriptUpstreamArtifactRef } from './domain.js';
 import { currentScriptContinuityCommits } from './ScriptContinuityCommit.js';
 import { computeScriptEpisodeCandidateHash, ScriptCommitConflictError } from './ScriptStore.js';
+import { applyStoryControlsToBrief, emptyStoryControls } from '../story/StoryControls.js';
+import { projectSourceMemory } from '../memory/sourceMemoryContract.js';
+import { composeStoryMemoryContext } from '../memory/StoryMemoryContext.js';
 
 export interface ScriptWriteBriefOptions {
   outline?: ScriptEpisodeOutline;
   rewriteInstruction?: string;
   rewriteMode?: 'revise' | 'replace';
+  memoryQuery?: string;
 }
 
 function source(
@@ -79,6 +83,10 @@ export function buildScriptWriteBrief(
     }));
   }
   const pastCommits = currentScriptContinuityCommits(state).filter((commit) => commit.episodeNumber < episodeNumber);
+  const projection = state.memorySync?.projection;
+  const usesSourceMemory = Boolean(projection || state.storyControls?.revision);
+  sources.push(source('collection', `${state.projectId}:accepted-memory-before-${episodeNumber}`, '已接受正文记忆来源',
+    projection?.acceptances.filter((input) => input.source.unitNumber < episodeNumber) ?? []));
   const hasDetailedContinuity = (state.continuityCommits?.length ?? 0) > 0;
   const pastEpisodes = state.episodes
     .filter((episode) => episode.status === 'completed' && episode.episodeNumber < episodeNumber &&
@@ -97,7 +105,7 @@ export function buildScriptWriteBrief(
       ...(episode.episodeNumber === episodeNumber - 1 ? { excerpt: episode.summary } : {}),
     });
     sources.push(entry);
-    if (episode.episodeNumber === episodeNumber - 1) {
+    if (episode.episodeNumber === episodeNumber - 1 && !pastCommits.some((commit) => commit.episodeNumber === episode.episodeNumber && commit.memoryInput)) {
       required.push(...items([episode.summary], [entry.key]));
     }
     if (!hasDetailedContinuity) {
@@ -112,6 +120,15 @@ export function buildScriptWriteBrief(
       ...(commit.episodeNumber === episodeNumber - 1 ? { excerpt: commit.nextEpisodeMustInherit.join('；') } : {}),
     });
     sources.push(entry);
+    // Sourced commits are composed below with citation status and the shared
+    // budget. Do not reintroduce unverified extraction as mandatory fact here.
+    if (commit.memoryInput) {
+      // New sourced state also supersedes an older pre-migration handoff. Its
+      // closed/unverified updates must not leave the legacy reminder alive.
+      for (const thread of commit.threads) liveThreads.delete(thread.threadId);
+      for (const prop of commit.props) currentProps.delete(prop.propId);
+      continue;
+    }
     required.push(...items(commit.factsAdded.map((fact) => fact.text), [entry.key]));
     if (commit.episodeNumber === episodeNumber - 1) required.push(...items(commit.nextEpisodeMustInherit, [entry.key]));
     for (const thread of commit.threads) {
@@ -143,12 +160,24 @@ export function buildScriptWriteBrief(
     forbidden.push(...items(state.worldBible.forbiddenAnachronisms, [writeBriefSourceKey('world', state.worldBible.projectId)]));
     authorConstraints.push(...items(state.worldBible.rules, [writeBriefSourceKey('world', state.worldBible.projectId)]));
   }
-  return createWriteBrief({
+  return createWriteBrief(applyStoryControlsToBrief({
     mode: 'short_drama', projectId: state.projectId,
     target: { id: current?.id ?? `episode-${episodeNumber}`, unitNumber: episodeNumber, revision: current?.revision ?? 0, title: outline?.title ?? card!.title },
     objective: items([outline?.goal ?? card?.mainEvent, outline?.conflict, ...(outline?.beats ?? []), outline?.endingHook ?? card?.endingHook], [outlineKey]),
     required, forbidden, authorConstraints, sources,
-  });
+    ...(usesSourceMemory ? { memoryContext: composeStoryMemoryContext({
+      projection,
+      view: projection ? projectSourceMemory(projection, episodeNumber) : {
+        projectId: state.projectId, mode: 'short_drama', beforeUnit: episodeNumber, projectionRevision: 0,
+        origin: 'accepted_sources', entries: [], unverifiedReferences: [],
+      },
+      controls: state.storyControls ?? emptyStoryControls(),
+      // Replace the existing 2,000-character predecessor + 3,500-character
+      // continuity sections; do not stack an extra novel-sized memory budget.
+      maxChars: 5500,
+      query: (options.memoryQuery ?? [outline?.title ?? card?.title, outline?.goal ?? card?.mainEvent, ...(outline?.beats ?? [])].filter(Boolean).join(' ')).slice(0, 200),
+    }) } : {}),
+  }, state.storyControls, { hashOnly: usesSourceMemory }));
 }
 
 export function scriptWriteBriefRef(brief: WriteBrief): ScriptUpstreamArtifactRef {

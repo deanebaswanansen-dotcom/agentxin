@@ -65,6 +65,18 @@ export function registerChapterRoutes(
   app: FastifyInstance,
   chapterService: ChapterService,
 ): void {
+  app.get<{ Params: ChapterParams }>('/api/chapters/:id/accept-source', async (request, reply) => {
+    try { return reply.send(await chapterService.getAcceptancePreview(request.params.id)); }
+    catch (error) { const response = toErrorResponse(error); return reply.code(response.status).send(response.body); }
+  });
+  app.post<{ Params: ChapterParams; Body: { expectedRevision?: unknown; expectedContentHash?: unknown } }>('/api/chapters/:id/accept-source', async (request, reply) => {
+    try {
+      const { expectedRevision, expectedContentHash } = request.body ?? {};
+      if (typeof expectedRevision !== 'number' || !Number.isSafeInteger(expectedRevision) || expectedRevision < 0 ||
+          typeof expectedContentHash !== 'string' || !/^[a-f0-9]{64}$/u.test(expectedContentHash)) throw ServiceError.validation('请先查看当前保存正文并确认其版本。');
+      return reply.send(await chapterService.acceptSource(request.params.id, expectedRevision, expectedContentHash));
+    } catch (error) { const response = toErrorResponse(error); return reply.code(response.status).send(response.body); }
+  });
   app.get<{ Params: ChapterParams }>('/api/chapters/:id/write-brief', async (request, reply) => {
     try { return reply.send(await chapterService.getWriteBrief(request.params.id)); }
     catch (error) { const response = toErrorResponse(error); return reply.code(response.status).send(response.body); }

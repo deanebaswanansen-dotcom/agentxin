@@ -12,7 +12,7 @@ import type {
   ScriptProjectState,
   ScriptWorldBible,
 } from '../domain.js';
-import { projectScriptContinuity } from '../ScriptContinuityCommit.js';
+import { currentScriptContinuityCommits, projectScriptContinuity } from '../ScriptContinuityCommit.js';
 import type { ScriptTextParseWarning } from '../parsers/chineseShortDramaText.js';
 import { looksLikeUnattributedDialogueAction } from '../quality/ScriptDialogueFormat.js';
 import {
@@ -314,8 +314,14 @@ function compactWorld(world: ScriptWorldBible): Record<string, unknown> {
   };
 }
 
+function completedHistory(state: ScriptProjectState, episodeNumber: number): ScriptEpisode[] {
+  const current = new Set(currentScriptContinuityCommits(state).map((commit) => commit.episodeNumber));
+  return state.episodes.filter((episode) => episode.episodeNumber < episodeNumber && episode.status === 'completed' &&
+    (!(state.continuityCommits?.length) || current.has(episode.episodeNumber)));
+}
+
 function previousEpisodeContext(state: ScriptProjectState, episodeNumber: number): Record<string, unknown> {
-  const previous = state.episodes.find((episode) => episode.episodeNumber === episodeNumber - 1);
+  const previous = completedHistory(state, episodeNumber).find((episode) => episode.episodeNumber === episodeNumber - 1);
   if (!previous) return {};
   const tail = previous.scenes
     .flatMap((scene) => scene.blocks.map((block) => block.text.trim()))
@@ -334,8 +340,7 @@ function priorEpisodeHistory(
   state: ScriptProjectState,
   episodeNumber: number,
 ): Record<string, unknown> {
-  const previousEpisodes = state.episodes
-    .filter((episode) => episode.episodeNumber < episodeNumber)
+  const previousEpisodes = completedHistory(state, episodeNumber)
     .sort((left, right) => left.episodeNumber - right.episodeNumber);
   return {
     allEpisodeSummaries: previousEpisodes.map((episode) => ({
@@ -371,6 +376,7 @@ export function directWritingContext(
   );
   return {
     ...(writeBrief ? { writingBrief: renderWriteBrief(writeBrief) } : {}),
+    ...(writeBrief?.memoryContext ? { historySource: 'accepted_writing_brief' } : {}),
     project: {
       title: plan.title,
       theme: plan.theme,
@@ -398,9 +404,13 @@ export function directWritingContext(
     },
     characters: involvedCharacters.map(compactCharacter),
     world: compactWorld(state.worldBible!),
-    previousEpisode: previousEpisodeContext(state, outline.episodeNumber),
-    priorEpisodeHistory: priorEpisodeHistory(state, outline.episodeNumber),
-    continuity: projectScriptContinuity(state, outline.episodeNumber),
+    // The frozen brief already contains budgeted current facts and historical
+    // observations. Mutable draft/history aggregates must not bypass retraction.
+    ...(!writeBrief?.memoryContext ? {
+      previousEpisode: previousEpisodeContext(state, outline.episodeNumber),
+      priorEpisodeHistory: priorEpisodeHistory(state, outline.episodeNumber),
+      continuity: projectScriptContinuity(state, outline.episodeNumber),
+    } : {}),
     nextEpisodeDirection: nextCard
       ? { title: nextCard.title, logline: nextCard.logline, mainEvent: nextCard.mainEvent }
       : undefined,
@@ -430,7 +440,9 @@ export function buildDirectDraftPrompt(context: Record<string, unknown>): string
         : '',
     boundaryInstruction,
     directLengthInstruction(context),
-    '创作资料中的 priorEpisodeHistory 是前面已经演完的剧情：allEpisodeSummaries 覆盖全部前集，recentSceneEvents 补充最近12集细节。只能承接其结果，绝不能换人物、地点或措辞后把其中一场重新演一遍。',
+    context.historySource === 'accepted_writing_brief'
+      ? '前情以 writingBrief 中有来源的故事记忆与历史正文片段为准。只承接有效结果，不重演旧事件；未核实条目不能当成确定事实。'
+      : '创作资料中的 priorEpisodeHistory 是前面已经演完的剧情：allEpisodeSummaries 覆盖全部前集，recentSceneEvents 补充最近12集细节。只能承接其结果，绝不能换人物、地点或措辞后把其中一场重新演一遍。',
     '同一道具动作链只能完整演一次。例如已经写过“打开抽屉—拿起照片—看完放回”，后面不能换个人再次从打开同一抽屉、查看同一照片重新演起，必须直接写新的发现、冲突或后果。',
     '对白比例允许按剧情自然波动，对白要用冲突推进。',
     scriptCreativeWritingInstruction({ creativeRules: creativeRulesFromContext(context) }),
@@ -459,7 +471,9 @@ export function buildDirectContinuationPrompt(
   const suggestedAddition = Math.max(200, Math.min(900, targetChars - currentChars));
   return [
     '下面是一集已经写完但明显偏短的中文短剧。请从现有结尾自然继续，补充冲突、行动与对白。',
-    'priorEpisodeHistory 中的前集场景也不得重演；新增内容只能承接其后果并推进新事件。',
+    context.historySource === 'accepted_writing_brief'
+      ? 'writingBrief 中有来源的前集场景不得重演；新增内容只承接其后果并推进新事件。'
+      : 'priorEpisodeHistory 中的前集场景也不得重演；新增内容只能承接其后果并推进新事件。',
     '不要重写已有内容，不要复述已经发生的事件，不要再次制造“首次发现”同一证物；同一抽屉、照片、手机或文件的打开—拿取—查看动作链已经演过，就直接续写新的信息或后果。',
     '可以继续最后一场或增加下一场；只输出新增的标准剧本文本，不要输出解释、JSON或Markdown围栏。',
     '每句说出口的话必须写“说话人：完整台词”；△只写无对白动作。禁止给台词加△，人物边做边说必须拆成动作行和对白行。',
@@ -479,7 +493,9 @@ export function buildDirectReviewPrompt(
   return [
     '你是短剧明显错误检查员，同时为下一集提取极简交接状态。',
     '只检查：跑出当前大纲、题材或场景类型错误、人物身份关系冲突、主要事件或具体道具动作链重复发生、明显因果倒置、重要道具状态矛盾。',
-    '必须将本集与 priorEpisodeHistory.allEpisodeSummaries 的全部前集对照，并用 recentSceneEvents 核验近12集细节；前面某一集已经完整发生的场景若在本集换措辞重演，使用 DUPLICATE_MAJOR_EVENT。',
+    context.historySource === 'accepted_writing_brief'
+      ? '将本集与 writingBrief 中有效来源和历史正文片段对照。已发生的场景被换措辞重演时使用 DUPLICATE_MAJOR_EVENT；证据不足不能推断已经发生或强行判错。'
+      : '必须将本集与 priorEpisodeHistory.allEpisodeSummaries 的全部前集对照，并用 recentSceneEvents 核验近12集细节；前面某一集已经完整发生的场景若在本集换措辞重演，使用 DUPLICATE_MAJOR_EVENT。',
     '必须对照正文前段、中段和后段：换了人物、措辞或位置，仍再次完整演“打开同一抽屉—拿取/查看同一照片（或手机、文件）—收回”的，使用 DUPLICATE_MAJOR_EVENT；后段若直接核验、转交或产生新后果则不算重复。',
     'DUPLICATE_MAJOR_EVENT 必须有同一对象上至少两个相同的有序核心动作，并且再次得到相同结果；仅地点、人物、道具或“检查”行为重合，以及承接前情后产生新信息、新冲突或新结果，都不是重复，必须 pass。',
     '若人物说出口的话被写成△动作且缺少“说话人：”，使用 DIALOGUE_FORMAT_ERROR；普通动作行不得因此误报。',

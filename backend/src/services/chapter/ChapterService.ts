@@ -58,7 +58,23 @@ export class ChapterService {
       throw ServiceError.validation('生成正文缺少有效写前任务书，请重新生成。');
     }
     if (!content.trim()) throw ServiceError.validation('生成正文不能为空。');
-    return this.store.updateChapterContent(id, content, brief.target.revision, { brief });
+    if (!this.store.acceptChapter) throw ServiceError.validation('正文存储未实现原子来源接受。');
+    return this.store.acceptChapter({ chapterId: id, content, expectedRevision: brief.target.revision, contentHash: hashWriteBriefValue(content), guard: { brief } });
+  }
+
+  async getAcceptancePreview(id: Id): Promise<{ chapterId: string; title: string; content: string; revision: number; contentHash: string }> {
+    const chapter = await this.store.getChapter(id);
+    if (!chapter) throw ServiceError.notFound('章节不存在。');
+    return { chapterId: id, title: chapter.title, content: chapter.content, revision: chapter.revision ?? 0, contentHash: hashWriteBriefValue(chapter.content) };
+  }
+
+  async acceptSource(id: Id, expectedRevision: number, expectedContentHash: string): Promise<Chapter> {
+    if (!this.store.acceptChapter) throw ServiceError.validation('正文存储未实现原子来源接受。');
+    try { return await this.store.acceptChapter({ chapterId: id, expectedRevision, contentHash: expectedContentHash }); }
+    catch (error) {
+      if (error instanceof ChapterRevisionConflictError) throw ServiceError.conflict('正文已变化，请重新查看并确认当前保存正文。');
+      throw error;
+    }
   }
   /**
    * @param store 持久化抽象。通过依赖注入传入，使领域逻辑与具体存储实现解耦。

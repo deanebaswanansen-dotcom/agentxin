@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ApiClientError, type ApiClient } from '../api/apiClient.js';
+import apiClient, { ApiClientError, type ApiClient } from '../api/apiClient.js';
 import type {
   ScriptAgentJobSnapshot,
   ScriptCharacter,
@@ -13,6 +13,7 @@ import type {
 import completeCharacterFixtureJson from '../../../spec/fixtures/script-character.v1.json';
 import { ScriptWorkspace } from './ScriptWorkspace.js';
 import { makeWriteBrief } from '../test/writeBriefFixture.js';
+import { makeStoryMemory, memorySource } from '../test/storyMemoryFixture.js';
 
 const completeCharacterFixture: ScriptCharacter = {
   ...completeCharacterFixtureJson,
@@ -166,6 +167,32 @@ function buildWorkspaceSnapshot(
 }
 
 describe('ScriptWorkspace', () => {
+  it.each([false, true])('opens a memory source episode and only highlights evidence from the same saved revision (stale=%s)', async (stale) => {
+    const client = createClient();
+    const episode = buildEpisode('钥匙在门外。', stale ? 2 : 1);
+    vi.mocked(client.script.episodes.list).mockResolvedValue([summarizeEpisode(episode)]);
+    vi.mocked(client.script.episodes.get).mockResolvedValue(episode);
+    const source = { ...memorySource, mode: 'short_drama' as const, projectId: 'project-1', resourceId: 'episode-1', revision: 1 };
+    vi.spyOn(apiClient.storyMemory, 'workspace').mockResolvedValue(makeStoryMemory({
+      projectId: 'project-1', mode: 'short_drama', acceptedSources: [{ source, title: '第一集' }], unverifiedReferences: [],
+      entries: [{ ...makeStoryMemory().entries[0], source, evidence: [{ blockId: 'block-1', start: 0, end: 2, quote: '钥匙' }] }],
+    }));
+    render(<ScriptWorkspace projectId="project-1" client={client} />);
+    await screen.findByDisplayValue('绝食逼我道歉？我当面吃香喝辣');
+    fireEvent.click(screen.getByRole('button', { name: '故事记忆' }));
+    await screen.findByText('钥匙在门外。');
+    fireEvent.click(screen.getAllByText('第 1 集 · 第一集 · 保存版本 1')[0]);
+    fireEvent.click(screen.getByRole('button', { name: '定位正文证据' }));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '故事记忆' })).not.toBeInTheDocument());
+    if (stale) {
+      expect(screen.getByText('来源正文已变化，请结合记忆面板中的冻结引文核对。')).toBeInTheDocument();
+      expect(document.querySelector('[data-memory-evidence=current]')).not.toBeInTheDocument();
+    } else {
+      const target = document.querySelector('[data-memory-evidence=current]');
+      expect(target).toHaveTextContent('钥匙在门外。');
+      expect(target).toHaveFocus();
+    }
+  });
   it('loads current episode provenance and marks it stale after a local edit', async () => {
     const client = createClient();
     const first = buildNumberedEpisode(1, '第一集正文');

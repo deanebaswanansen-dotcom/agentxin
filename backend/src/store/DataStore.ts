@@ -25,6 +25,9 @@ import type {
   WorldSetting,
 } from '../types/index.js';
 import type { NovelWriteGuard } from './NovelWriteGuard.js';
+import type { NovelChapterAcceptanceInput } from './NovelWriteGuard.js';
+import type { FrozenMemoryProjection, MemorySyncClaim, MemorySyncIntent, MemorySyncTarget } from '../types/SourceMemory.js';
+import type { StoryControlStorePort } from '../types/StoryControl.js';
 
 export interface DataStore {
   // 项目（Projects）
@@ -42,6 +45,14 @@ export interface DataStore {
   renameChapter(id: Id, title: string): Promise<Chapter>;
   reorderChapters(projectId: Id, orderedIds: Id[]): Promise<void>;
   deleteChapter(id: Id): Promise<void>;
+  acceptChapter?(input: NovelChapterAcceptanceInput): Promise<Chapter>;
+  listMemorySyncTargets?(): Promise<MemorySyncTarget[]>;
+  getMemorySync?(projectId: string): Promise<MemorySyncIntent | undefined>;
+  claimMemorySync?(projectId: string, options: { owner: string; now: string; leaseMs: number; retryFailed?: boolean }): Promise<MemorySyncClaim | undefined>;
+  applyMemorySync?(projectId: string, claim: MemorySyncClaim, write: (projection: FrozenMemoryProjection) => Promise<void>): Promise<MemorySyncIntent | undefined>;
+  getStoryControls?: StoryControlStorePort['getStoryControls'];
+  upsertStoryControl?: StoryControlStorePort['upsertStoryControl'];
+  deleteStoryControl?: StoryControlStorePort['deleteStoryControl'];
 
   // 结构化设定（Characters / WorldSettings / Outlines）
   createCharacter(projectId: Id, name: string, description: string): Promise<Character>;

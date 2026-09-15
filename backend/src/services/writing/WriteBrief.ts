@@ -32,7 +32,17 @@ export function createWriteBrief(input: WriteBriefInput): WriteBrief {
     mode: input.mode, projectId: input.projectId, target: input.target,
     objective: input.objective, required: input.required, forbidden: input.forbidden,
     authorConstraints: input.authorConstraints, sources: input.sources,
+    ...(input.memoryContext ? { memoryContext: input.memoryContext } : {}),
   });
+  if (snapshot.memoryContext) {
+    const { text, statistics } = snapshot.memoryContext;
+    if (typeof text !== 'string' || !statistics || typeof statistics.truncated !== 'boolean' ||
+        !['maxChars', 'usedChars', 'estimatedTokens', 'requiredChars', 'sourceChars', 'authorChars', 'threadChars', 'retrievalChars', 'omittedItems']
+          .every((key) => Number.isSafeInteger(statistics[key as keyof typeof statistics]) && Number(statistics[key as keyof typeof statistics]) >= 0) ||
+        statistics.maxChars > 16000 || statistics.usedChars !== text.length || text.length > statistics.maxChars) {
+      throw new Error('写前记忆预算或内容无效。');
+    }
+  }
   snapshot.sources.sort((a, b) => a.key.localeCompare(b.key));
   const sourceKeys = new Set<string>();
   for (const source of snapshot.sources) {
@@ -84,6 +94,7 @@ export function renderWriteBrief(brief: WriteBrief): string {
   const historyKinds = new Set(['chapter', 'episode', 'continuity']);
   const referenceKinds = new Set(['character', 'world', 'outline', 'plan']);
   const references = brief.sources.filter((source) => source.excerpt?.trim() &&
+    (!brief.memoryContext || !historyKinds.has(source.kind)) &&
     (historyKinds.has(source.kind) || referenceKinds.has(source.kind)))
     .sort((a, b) => Number(historyKinds.has(b.kind)) - Number(historyKinds.has(a.kind)) ||
       (b.unitNumber ?? 0) - (a.unitNumber ?? 0) || a.key.localeCompare(b.key));
@@ -107,6 +118,7 @@ export function renderWriteBrief(brief: WriteBrief): string {
     ...sections.flatMap(([label, items]) => items.length ? [label, ...items.map((item) =>
       `- ${item.text}（依据：${item.sourceKeys.map((key) => sources.get(key)).join('、')}）`,
     )] : []),
+    ...(brief.memoryContext?.text ? ['故事记忆与历史证据', brief.memoryContext.text] : []),
     ...(excerpts.length ? ['来源摘录（节选）', ...excerpts] : []),
   ].join('\n');
 }

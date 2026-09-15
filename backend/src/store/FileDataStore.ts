@@ -6,9 +6,9 @@
  * -------------
  * All data lives in a single JSON file whose shape is {@link FileDataStoreState}:
  * `{ projects, chapters, characters, worldSettings, outlines, modelConfig }`.
- * The full state is held in memory after load; every mutation updates the
- * in-memory state and is then flushed to disk before the mutating method
- * resolves (Requirement 7.1 — writes complete before returning).
+ * The committed state is held in memory after load. Each queued mutation edits
+ * a private copy, persists it atomically, then publishes it to readers before
+ * returning (Requirement 7.1 — writes complete before returning).
  *
  * Durability / atomicity (Requirement 7.4)
  * ----------------------------------------
@@ -35,7 +35,7 @@
  * methods (task 2.2), the chapter methods (task 2.3) and the setting /
  * model-config methods (task 2.4) are all implemented. The in-memory state
  * container and the {@link persist} helper are written generically so each
- * mutation only adds its own logic plus a `persist()` call.
+ * mutation supplies its own logic to the copy-on-write transaction helper.
  */
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
@@ -60,6 +60,13 @@ import { ChapterRevisionConflictError } from './ChapterRevisionConflictError.js'
 import { StoreError } from './StoreError.js';
 import { assertNovelWriteGuard, type NovelWriteGuard, type NovelWriteSnapshot } from './NovelWriteGuard.js';
 import { hashWriteBriefValue } from '../services/writing/WriteBrief.js';
+import type { NovelChapterAcceptanceInput } from './NovelWriteGuard.js';
+import type { FrozenMemoryProjection, MemorySyncClaim, MemorySyncIntent, MemorySyncTarget } from '../types/SourceMemory.js';
+import { isValidClientId } from '../services/client/clientScope.js';
+import { createNovelAcceptance, refreshNovelMemoryIntent, retractNovelSourcesFrom } from '../services/chapter/NovelSourceMemory.js';
+import { ServiceError } from '../services/ServiceError.js';
+import type { StoryControlCollection, StoryControlInput } from '../types/StoryControl.js';
+import { assertStoryControls, deleteStoryControlRecord, emptyStoryControls, upsertStoryControlRecord } from '../services/story/StoryControls.js';
 
 /**
  * On-disk / in-memory shape of the entire store. Arrays are always present
@@ -104,17 +111,17 @@ function emptyState(): FileDataStoreState {
 }
 
 export class FileDataStore implements DataStore {
-  private assertGeneratedWrite(chapterId: string, guard: NovelWriteGuard): void {
-    const chapter = this.state.chapters.find((item) => item.id === chapterId);
+  private assertGeneratedWrite(chapterId: string, guard: NovelWriteGuard, state = this.state): void {
+    const chapter = state.chapters.find((item) => item.id === chapterId);
     const projectId = chapter?.projectId;
     const snapshot: NovelWriteSnapshot = {
-      chapter, project: this.state.projects.find((item) => item.id === projectId),
-      chapters: this.state.chapters.filter((item) => item.projectId === projectId),
-      characters: this.state.characters.filter((item) => item.projectId === projectId),
-      worldSettings: this.state.worldSettings.filter((item) => item.projectId === projectId),
-      outlines: this.state.outlines.filter((item) => item.projectId === projectId),
-      blueprint: this.state.chapterBlueprints.find((item) => item.chapter_id === chapterId),
-      sceneDrafts: this.state.sceneDrafts.filter((item) => item.chapterId === chapterId),
+      chapter, project: state.projects.find((item) => item.id === projectId),
+      chapters: state.chapters.filter((item) => item.projectId === projectId),
+      characters: state.characters.filter((item) => item.projectId === projectId),
+      worldSettings: state.worldSettings.filter((item) => item.projectId === projectId),
+      outlines: state.outlines.filter((item) => item.projectId === projectId),
+      blueprint: state.chapterBlueprints.find((item) => item.chapter_id === chapterId),
+      sceneDrafts: state.sceneDrafts.filter((item) => item.chapterId === chapterId),
     };
     assertNovelWriteGuard(snapshot, guard);
   }
@@ -125,8 +132,8 @@ export class FileDataStore implements DataStore {
   private state: FileDataStoreState;
 
   /**
-   * Serializes persistence so concurrent mutations cannot interleave their
-   * temp-file writes / renames. Each {@link persist} chains onto the previous.
+   * Serializes validation, mutation, persistence and publication as one boundary.
+   * Projection ACKs share this queue; readers see the last committed snapshot.
    */
   private writeQueue: Promise<void> = Promise.resolve();
 
@@ -141,7 +148,8 @@ export class FileDataStore implements DataStore {
    * constructor only records the path and starts from an empty state so that
    * `create` can decide whether to load from disk or initialize fresh.
    */
-  constructor(filePath: string = DEFAULT_DATA_FILE) {
+  constructor(filePath: string = DEFAULT_DATA_FILE, readonly storageClientId = 'local') {
+    if (storageClientId !== 'local' && !isValidClientId(storageClientId)) throw new StoreError('小说客户端标识无效');
     this.filePath = resolve(filePath);
     this.state = emptyState();
   }
@@ -155,14 +163,20 @@ export class FileDataStore implements DataStore {
    */
   static async create(
     filePath: string = DEFAULT_DATA_FILE,
+    clientId = 'local',
   ): Promise<FileDataStore> {
-    const store = new FileDataStore(filePath);
+    const store = new FileDataStore(filePath, clientId);
     await store.load();
     const needsAgentMaterialMigration = store.migrateLegacyAgentMaterials();
+    let needsMemoryRepair = false;
+    for (const project of store.state.projects) if (project.kind === 'novel') {
+      if (project.storyControls) assertStoryControls(project.storyControls, { clientId, projectId: project.id, mode: 'novel' });
+      needsMemoryRepair = refreshNovelMemoryIntent(project, store.state.chapters, clientId) || needsMemoryRepair;
+    }
     if (
       store.needsProjectKindMigration ||
       store.needsChapterRevisionMigration ||
-      needsAgentMaterialMigration
+      needsAgentMaterialMigration || needsMemoryRepair
     ) {
       await store.persist();
     }
@@ -272,19 +286,18 @@ export class FileDataStore implements DataStore {
   }
 
   /**
-   * Atomically persist the current in-memory state to disk.
+   * Atomically persist a candidate state before it is published to readers.
    *
    * Strategy: serialize state -> write to a unique temp file -> `rename` over
-   * the target. Writes are queued so they never overlap. Tasks 2.3/2.4 call
-   * this after mutating {@link state}.
+   * the target. Callers hold the transaction queue; startup migrations finish
+   * before the store is exposed.
    *
    * @throws {StoreError} when writing or renaming fails.
    */
-  protected persist(): Promise<void> {
+  protected persist(candidate = this.state): Promise<void> {
     const run = async (): Promise<void> => {
-      // Snapshot at execution time so the queued write reflects the latest
-      // committed state (no lost updates across concurrent mutations).
-      const json = JSON.stringify(this.state, null, 2);
+      // The caller owns this candidate and has validated it inside the queue.
+      const json = JSON.stringify(candidate, null, 2);
       const tempPath = `${this.filePath}.${randomUUID()}.tmp`;
       try {
         await writeFile(tempPath, json, 'utf8');
@@ -310,10 +323,24 @@ export class FileDataStore implements DataStore {
       }
     };
 
-    // Chain onto the queue regardless of whether the previous write settled or
-    // rejected, so a single failed write does not wedge all later persists.
-    this.writeQueue = this.writeQueue.then(run, run);
-    return this.writeQueue;
+    return run();
+  }
+
+  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.writeQueue.then(operation, operation);
+    this.writeQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private mutate<T>(operation: (state: FileDataStoreState) => Promise<T>): Promise<T> {
+    return this.enqueue(async () => {
+      const working = structuredClone(this.state);
+      const value = await operation(working);
+      for (const project of working.projects) if (project.kind === 'novel') refreshNovelMemoryIntent(project, working.chapters, this.storageClientId);
+      await this.persist(working);
+      this.state = working;
+      return structuredClone(value);
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -327,17 +354,18 @@ export class FileDataStore implements DataStore {
    * the name as given.
    */
   async createProject(name: string, kind: ProjectKind = 'novel'): Promise<Project> {
-    const now = new Date().toISOString();
-    const project: Project = {
-      id: randomUUID(),
-      name,
-      kind,
-      createdAt: now,
-      updatedAt: now,
-    };
-    this.state.projects.push(project);
-    await this.persist();
-    return { ...project };
+    return this.mutate(async (state) => {
+      const now = new Date().toISOString();
+      const project: Project = {
+        id: randomUUID(),
+        name,
+        kind,
+        createdAt: now,
+        updatedAt: now,
+      };
+      state.projects.push(project);
+      return project;
+    });
   }
 
   /** Return the identity, display name and workspace kind for every project. */
@@ -348,7 +376,7 @@ export class FileDataStore implements DataStore {
   /** Return a copy of the project, or `undefined` if it does not exist. */
   async getProject(id: Id): Promise<Project | undefined> {
     const project = this.state.projects.find((p) => p.id === id);
-    return project ? { ...project } : undefined;
+    return project ? structuredClone(project) : undefined;
   }
 
   /**
@@ -362,16 +390,17 @@ export class FileDataStore implements DataStore {
    * `StoreError`/`STORE_ERROR` is reserved for).
    */
   async renameProject(id: Id, name: string): Promise<Project> {
-    const project = this.state.projects.find((p) => p.id === id);
-    if (!project) {
-      throw new Error(
-        `renameProject 调用了不存在的项目 id：${id}（应由服务层先校验存在性）`,
-      );
-    }
-    project.name = name;
-    project.updatedAt = new Date().toISOString();
-    await this.persist();
-    return { ...project };
+    return this.mutate(async (state) => {
+      const project = state.projects.find((p) => p.id === id);
+      if (!project) {
+        throw new Error(
+          `renameProject 调用了不存在的项目 id：${id}（应由服务层先校验存在性）`,
+        );
+      }
+      project.name = name;
+      project.updatedAt = new Date().toISOString();
+      return project;
+    });
   }
 
   /**
@@ -383,47 +412,47 @@ export class FileDataStore implements DataStore {
    * for returning `NOT_FOUND` when appropriate).
    */
   async deleteProject(id: Id): Promise<void> {
-    // Compute the set of chapter ids belonging to this project BEFORE removing
-    // the chapters, so the blueprint-module collections (which carry only a
-    // `chapterId` foreign key, no `projectId`) can be cascade-cleared via that
-    // set (Requirement 13.4).
-    const chapterIds = new Set(
-      this.state.chapters
-        .filter((c) => c.projectId === id)
-        .map((c) => c.id),
-    );
+    return this.mutate(async (state) => {
+      // Compute the set of chapter ids belonging to this project BEFORE removing
+      // the chapters, so the blueprint-module collections (which carry only a
+      // `chapterId` foreign key, no `projectId`) can be cascade-cleared via that
+      // set (Requirement 13.4).
+      const chapterIds = new Set(
+        state.chapters
+          .filter((c) => c.projectId === id)
+          .map((c) => c.id),
+      );
 
-    this.state.projects = this.state.projects.filter((p) => p.id !== id);
-    this.state.chapters = this.state.chapters.filter(
-      (c) => c.projectId !== id,
-    );
-    this.state.characters = this.state.characters.filter(
-      (c) => c.projectId !== id,
-    );
-    this.state.worldSettings = this.state.worldSettings.filter(
-      (w) => w.projectId !== id,
-    );
-    this.state.outlines = this.state.outlines.filter(
-      (o) => o.projectId !== id,
-    );
+      state.projects = state.projects.filter((p) => p.id !== id);
+      state.chapters = state.chapters.filter(
+        (c) => c.projectId !== id,
+      );
+      state.characters = state.characters.filter(
+        (c) => c.projectId !== id,
+      );
+      state.worldSettings = state.worldSettings.filter(
+        (w) => w.projectId !== id,
+      );
+      state.outlines = state.outlines.filter(
+        (o) => o.projectId !== id,
+      );
 
-    // Cascade-delete blueprint-module data tied to any of the project's
-    // chapters. These types reference the chapter only, so filter by the
-    // pre-computed chapterIds set (Requirement 13.4).
-    this.state.chapterBlueprints = this.state.chapterBlueprints.filter(
-      (b) => !chapterIds.has(b.chapter_id),
-    );
-    this.state.sceneDrafts = this.state.sceneDrafts.filter(
-      (d) => !chapterIds.has(d.chapterId),
-    );
-    this.state.wordCountReports = this.state.wordCountReports.filter(
-      (r) => !chapterIds.has(r.chapterId),
-    );
-    this.state.pacingReports = this.state.pacingReports.filter(
-      (r) => !chapterIds.has(r.chapterId),
-    );
-
-    await this.persist();
+      // Cascade-delete blueprint-module data tied to any of the project's
+      // chapters. These types reference the chapter only, so filter by the
+      // pre-computed chapterIds set (Requirement 13.4).
+      state.chapterBlueprints = state.chapterBlueprints.filter(
+        (b) => !chapterIds.has(b.chapter_id),
+      );
+      state.sceneDrafts = state.sceneDrafts.filter(
+        (d) => !chapterIds.has(d.chapterId),
+      );
+      state.wordCountReports = state.wordCountReports.filter(
+        (r) => !chapterIds.has(r.chapterId),
+      );
+      state.pacingReports = state.pacingReports.filter(
+        (r) => !chapterIds.has(r.chapterId),
+      );
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -441,20 +470,21 @@ export class FileDataStore implements DataStore {
    * the store stores the title as given.
    */
   async createChapter(projectId: Id, title: string): Promise<Chapter> {
-    const nextPosition = this.state.chapters
-      .filter((c) => c.projectId === projectId)
-      .reduce((max, c) => Math.max(max, c.position + 1), 0);
-    const chapter: Chapter = {
-      id: randomUUID(),
-      projectId,
-      title,
-      content: '',
-      position: nextPosition,
-      revision: 0,
-    };
-    this.state.chapters.push(chapter);
-    await this.persist();
-    return structuredClone(chapter);
+    return this.mutate(async (state) => {
+      const nextPosition = state.chapters
+        .filter((c) => c.projectId === projectId)
+        .reduce((max, c) => Math.max(max, c.position + 1), 0);
+      const chapter: Chapter = {
+        id: randomUUID(),
+        projectId,
+        title,
+        content: '',
+        position: nextPosition,
+        revision: 0,
+      };
+      state.chapters.push(chapter);
+      return chapter;
+    });
   }
 
   /**
@@ -493,24 +523,24 @@ export class FileDataStore implements DataStore {
     expectedRevision?: number,
     guard?: NovelWriteGuard,
   ): Promise<Chapter> {
-    if (guard) this.assertGeneratedWrite(id, guard);
-    const chapter = this.state.chapters.find((c) => c.id === id);
-    if (!chapter) {
-      throw new Error(
-        `updateChapterContent 调用了不存在的章节 id：${id}（应由服务层先校验存在性）`,
-      );
-    }
-    const actualRevision = chapter.revision ?? 0;
-    if (expectedRevision !== undefined && expectedRevision !== actualRevision) {
-      throw new ChapterRevisionConflictError(expectedRevision, actualRevision);
-    }
-    chapter.content = content;
-    chapter.revision = actualRevision + 1;
-    if (guard) chapter.generatedCandidate = { brief: structuredClone(guard.brief), candidateHash: hashWriteBriefValue(content), ...(guard.sceneDrafts ? { sceneDependencies: structuredClone(guard.sceneDrafts) } : {}) };
-    else delete chapter.generatedCandidate;
-    const result = structuredClone(chapter);
-    await this.persist();
-    return result;
+    return this.mutate(async (state) => {
+      if (guard) this.assertGeneratedWrite(id, guard, state);
+      const chapter = state.chapters.find((c) => c.id === id);
+      if (!chapter) {
+        throw new Error(
+          `updateChapterContent 调用了不存在的章节 id：${id}（应由服务层先校验存在性）`,
+        );
+      }
+      const actualRevision = chapter.revision ?? 0;
+      if (expectedRevision !== undefined && expectedRevision !== actualRevision) {
+        throw new ChapterRevisionConflictError(expectedRevision, actualRevision);
+      }
+      chapter.content = content;
+      chapter.revision = actualRevision + 1;
+      if (guard) chapter.generatedCandidate = { brief: structuredClone(guard.brief), candidateHash: hashWriteBriefValue(content), ...(guard.sceneDrafts ? { sceneDependencies: structuredClone(guard.sceneDrafts) } : {}) };
+      else delete chapter.generatedCandidate;
+      return chapter;
+    });
   }
 
   /**
@@ -519,15 +549,16 @@ export class FileDataStore implements DataStore {
    * is expected to have validated existence first).
    */
   async renameChapter(id: Id, title: string): Promise<Chapter> {
-    const chapter = this.state.chapters.find((c) => c.id === id);
-    if (!chapter) {
-      throw new Error(
-        `renameChapter 调用了不存在的章节 id：${id}（应由服务层先校验存在性）`,
-      );
-    }
-    chapter.title = title;
-    await this.persist();
-    return structuredClone(chapter);
+    return this.mutate(async (state) => {
+      const chapter = state.chapters.find((c) => c.id === id);
+      if (!chapter) {
+        throw new Error(
+          `renameChapter 调用了不存在的章节 id：${id}（应由服务层先校验存在性）`,
+        );
+      }
+      chapter.title = title;
+      return chapter;
+    });
   }
 
   /**
@@ -543,36 +574,36 @@ export class FileDataStore implements DataStore {
    * Idempotent with respect to ids it does not recognize.
    */
   async reorderChapters(projectId: Id, orderedIds: Id[]): Promise<void> {
-    const projectChapters = this.state.chapters.filter(
-      (c) => c.projectId === projectId,
-    );
+    return this.mutate(async (state) => {
+      const projectChapters = state.chapters.filter(
+        (c) => c.projectId === projectId,
+      );
 
-    // Index lookup for ids explicitly listed in the requested order.
-    const orderIndex = new Map<Id, number>();
-    orderedIds.forEach((id, index) => {
-      if (!orderIndex.has(id)) {
-        orderIndex.set(id, index);
+      // Index lookup for ids explicitly listed in the requested order.
+      const orderIndex = new Map<Id, number>();
+      orderedIds.forEach((id, index) => {
+        if (!orderIndex.has(id)) {
+          orderIndex.set(id, index);
+        }
+      });
+
+      // Chapters not mentioned in orderedIds keep their existing relative order,
+      // placed after all explicitly ordered ones.
+      const trailing = projectChapters
+        .filter((c) => !orderIndex.has(c.id))
+        .sort((a, b) => a.position - b.position);
+      const trailingIndex = new Map<Id, number>();
+      trailing.forEach((c, index) => trailingIndex.set(c.id, index));
+
+      const base = orderIndex.size;
+      for (const chapter of projectChapters) {
+        const explicit = orderIndex.get(chapter.id);
+        chapter.position =
+          explicit !== undefined
+            ? explicit
+            : base + (trailingIndex.get(chapter.id) ?? 0);
       }
     });
-
-    // Chapters not mentioned in orderedIds keep their existing relative order,
-    // placed after all explicitly ordered ones.
-    const trailing = projectChapters
-      .filter((c) => !orderIndex.has(c.id))
-      .sort((a, b) => a.position - b.position);
-    const trailingIndex = new Map<Id, number>();
-    trailing.forEach((c, index) => trailingIndex.set(c.id, index));
-
-    const base = orderIndex.size;
-    for (const chapter of projectChapters) {
-      const explicit = orderIndex.get(chapter.id);
-      chapter.position =
-        explicit !== undefined
-          ? explicit
-          : base + (trailingIndex.get(chapter.id) ?? 0);
-    }
-
-    await this.persist();
   }
 
   /**
@@ -585,20 +616,21 @@ export class FileDataStore implements DataStore {
    * other chapters retain their positions.
    */
   async deleteChapter(id: Id): Promise<void> {
-    this.state.chapters = this.state.chapters.filter((c) => c.id !== id);
-    this.state.chapterBlueprints = this.state.chapterBlueprints.filter(
-      (b) => b.chapter_id !== id,
-    );
-    this.state.sceneDrafts = this.state.sceneDrafts.filter(
-      (d) => d.chapterId !== id,
-    );
-    this.state.wordCountReports = this.state.wordCountReports.filter(
-      (r) => r.chapterId !== id,
-    );
-    this.state.pacingReports = this.state.pacingReports.filter(
-      (r) => r.chapterId !== id,
-    );
-    await this.persist();
+    return this.mutate(async (state) => {
+      state.chapters = state.chapters.filter((c) => c.id !== id);
+      state.chapterBlueprints = state.chapterBlueprints.filter(
+        (b) => b.chapter_id !== id,
+      );
+      state.sceneDrafts = state.sceneDrafts.filter(
+        (d) => d.chapterId !== id,
+      );
+      state.wordCountReports = state.wordCountReports.filter(
+        (r) => r.chapterId !== id,
+      );
+      state.pacingReports = state.pacingReports.filter(
+        (r) => r.chapterId !== id,
+      );
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -616,15 +648,16 @@ export class FileDataStore implements DataStore {
     name: string,
     description: string,
   ): Promise<Character> {
-    const character: Character = {
-      id: randomUUID(),
-      projectId,
-      name,
-      description,
-    };
-    this.state.characters.push(character);
-    await this.persist();
-    return { ...character };
+    return this.mutate(async (state) => {
+      const character: Character = {
+        id: randomUUID(),
+        projectId,
+        name,
+        description,
+      };
+      state.characters.push(character);
+      return { ...character };
+    });
   }
 
   /**
@@ -637,15 +670,16 @@ export class FileDataStore implements DataStore {
     title: string,
     content: string,
   ): Promise<WorldSetting> {
-    const worldSetting: WorldSetting = {
-      id: randomUUID(),
-      projectId,
-      title,
-      content,
-    };
-    this.state.worldSettings.push(worldSetting);
-    await this.persist();
-    return { ...worldSetting };
+    return this.mutate(async (state) => {
+      const worldSetting: WorldSetting = {
+        id: randomUUID(),
+        projectId,
+        title,
+        content,
+      };
+      state.worldSettings.push(worldSetting);
+      return { ...worldSetting };
+    });
   }
 
   /**
@@ -662,19 +696,20 @@ export class FileDataStore implements DataStore {
     title: string,
     content: string,
   ): Promise<Outline> {
-    const nextPosition = this.state.outlines
-      .filter((o) => o.projectId === projectId)
-      .reduce((max, o) => Math.max(max, o.position + 1), 0);
-    const outline: Outline = {
-      id: randomUUID(),
-      projectId,
-      title,
-      content,
-      position: nextPosition,
-    };
-    this.state.outlines.push(outline);
-    await this.persist();
-    return { ...outline };
+    return this.mutate(async (state) => {
+      const nextPosition = state.outlines
+        .filter((o) => o.projectId === projectId)
+        .reduce((max, o) => Math.max(max, o.position + 1), 0);
+      const outline: Outline = {
+        id: randomUUID(),
+        projectId,
+        title,
+        content,
+        position: nextPosition,
+      };
+      state.outlines.push(outline);
+      return { ...outline };
+    });
   }
 
   /**
@@ -724,20 +759,21 @@ export class FileDataStore implements DataStore {
     id: Id,
     fields: Partial<Pick<Character, 'name' | 'description'>>,
   ): Promise<Character> {
-    const character = this.state.characters.find((c) => c.id === id);
-    if (!character) {
-      throw new Error(
-        `updateCharacter 调用了不存在的人物 id：${id}（应由服务层先校验存在性）`,
-      );
-    }
-    if (fields.name !== undefined) {
-      character.name = fields.name;
-    }
-    if (fields.description !== undefined) {
-      character.description = fields.description;
-    }
-    await this.persist();
-    return { ...character };
+    return this.mutate(async (state) => {
+      const character = state.characters.find((c) => c.id === id);
+      if (!character) {
+        throw new Error(
+          `updateCharacter 调用了不存在的人物 id：${id}（应由服务层先校验存在性）`,
+        );
+      }
+      if (fields.name !== undefined) {
+        character.name = fields.name;
+      }
+      if (fields.description !== undefined) {
+        character.description = fields.description;
+      }
+      return { ...character };
+    });
   }
 
   /**
@@ -749,20 +785,21 @@ export class FileDataStore implements DataStore {
     id: Id,
     fields: Partial<Pick<WorldSetting, 'title' | 'content'>>,
   ): Promise<WorldSetting> {
-    const worldSetting = this.state.worldSettings.find((w) => w.id === id);
-    if (!worldSetting) {
-      throw new Error(
-        `updateWorldSetting 调用了不存在的世界观 id：${id}（应由服务层先校验存在性）`,
-      );
-    }
-    if (fields.title !== undefined) {
-      worldSetting.title = fields.title;
-    }
-    if (fields.content !== undefined) {
-      worldSetting.content = fields.content;
-    }
-    await this.persist();
-    return { ...worldSetting };
+    return this.mutate(async (state) => {
+      const worldSetting = state.worldSettings.find((w) => w.id === id);
+      if (!worldSetting) {
+        throw new Error(
+          `updateWorldSetting 调用了不存在的世界观 id：${id}（应由服务层先校验存在性）`,
+        );
+      }
+      if (fields.title !== undefined) {
+        worldSetting.title = fields.title;
+      }
+      if (fields.content !== undefined) {
+        worldSetting.content = fields.content;
+      }
+      return { ...worldSetting };
+    });
   }
 
   /**
@@ -775,20 +812,21 @@ export class FileDataStore implements DataStore {
     id: Id,
     fields: Partial<Pick<Outline, 'title' | 'content'>>,
   ): Promise<Outline> {
-    const outline = this.state.outlines.find((o) => o.id === id);
-    if (!outline) {
-      throw new Error(
-        `updateOutline 调用了不存在的大纲 id：${id}（应由服务层先校验存在性）`,
-      );
-    }
-    if (fields.title !== undefined) {
-      outline.title = fields.title;
-    }
-    if (fields.content !== undefined) {
-      outline.content = fields.content;
-    }
-    await this.persist();
-    return { ...outline };
+    return this.mutate(async (state) => {
+      const outline = state.outlines.find((o) => o.id === id);
+      if (!outline) {
+        throw new Error(
+          `updateOutline 调用了不存在的大纲 id：${id}（应由服务层先校验存在性）`,
+        );
+      }
+      if (fields.title !== undefined) {
+        outline.title = fields.title;
+      }
+      if (fields.content !== undefined) {
+        outline.content = fields.content;
+      }
+      return { ...outline };
+    });
   }
 
   /**
@@ -797,8 +835,9 @@ export class FileDataStore implements DataStore {
    * returning `NOT_FOUND` when appropriate).
    */
   async deleteCharacter(id: Id): Promise<void> {
-    this.state.characters = this.state.characters.filter((c) => c.id !== id);
-    await this.persist();
+    return this.mutate(async (state) => {
+      state.characters = state.characters.filter((c) => c.id !== id);
+    });
   }
 
   /**
@@ -806,10 +845,11 @@ export class FileDataStore implements DataStore {
    * non-existent id removes nothing.
    */
   async deleteWorldSetting(id: Id): Promise<void> {
-    this.state.worldSettings = this.state.worldSettings.filter(
-      (w) => w.id !== id,
-    );
-    await this.persist();
+    return this.mutate(async (state) => {
+      state.worldSettings = state.worldSettings.filter(
+        (w) => w.id !== id,
+      );
+    });
   }
 
   /**
@@ -818,8 +858,9 @@ export class FileDataStore implements DataStore {
    * retain their positions.
    */
   async deleteOutline(id: Id): Promise<void> {
-    this.state.outlines = this.state.outlines.filter((o) => o.id !== id);
-    await this.persist();
+    return this.mutate(async (state) => {
+      state.outlines = state.outlines.filter((o) => o.id !== id);
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -834,8 +875,9 @@ export class FileDataStore implements DataStore {
    * service layer (task 6.1); the store persists the values as given.
    */
   async saveModelConfig(config: ModelConfig): Promise<void> {
-    this.state.modelConfig = { ...config };
-    await this.persist();
+    return this.mutate(async (state) => {
+      state.modelConfig = { ...config };
+    });
   }
 
   /**
@@ -867,17 +909,18 @@ export class FileDataStore implements DataStore {
     blueprint: ChapterBlueprint,
     guard?: NovelWriteGuard,
   ): Promise<ChapterBlueprint> {
-    if (guard) this.assertGeneratedWrite(blueprint.chapter_id, guard);
-    this.state.chapterBlueprints = this.state.chapterBlueprints.filter(
-      (b) => b.chapter_id !== blueprint.chapter_id,
-    );
-    const stored = structuredClone(blueprint);
-    this.state.chapterBlueprints.push(stored);
-    this.state.sceneDrafts = this.state.sceneDrafts.filter(
-      (d) => d.chapterId !== blueprint.chapter_id,
-    );
-    await this.persist();
-    return structuredClone(stored);
+    return this.mutate(async (state) => {
+      if (guard) this.assertGeneratedWrite(blueprint.chapter_id, guard, state);
+      state.chapterBlueprints = state.chapterBlueprints.filter(
+        (b) => b.chapter_id !== blueprint.chapter_id,
+      );
+      const stored = structuredClone(blueprint);
+      state.chapterBlueprints.push(stored);
+      state.sceneDrafts = state.sceneDrafts.filter(
+        (d) => d.chapterId !== blueprint.chapter_id,
+      );
+      return structuredClone(stored);
+    });
   }
 
   /**
@@ -902,18 +945,19 @@ export class FileDataStore implements DataStore {
    * callers cannot mutate the in-memory state.
    */
   async saveSceneDraft(draft: SceneDraft, guard?: NovelWriteGuard): Promise<SceneDraft> {
-    if (guard) this.assertGeneratedWrite(draft.chapterId, guard);
-    const stored = structuredClone(draft);
-    const index = this.state.sceneDrafts.findIndex(
-      (d) => d.chapterId === draft.chapterId && d.sceneId === draft.sceneId,
-    );
-    if (index >= 0) {
-      this.state.sceneDrafts[index] = stored;
-    } else {
-      this.state.sceneDrafts.push(stored);
-    }
-    await this.persist();
-    return structuredClone(stored);
+    return this.mutate(async (state) => {
+      if (guard) this.assertGeneratedWrite(draft.chapterId, guard, state);
+      const stored = structuredClone(draft);
+      const index = state.sceneDrafts.findIndex(
+        (d) => d.chapterId === draft.chapterId && d.sceneId === draft.sceneId,
+      );
+      if (index >= 0) {
+        state.sceneDrafts[index] = stored;
+      } else {
+        state.sceneDrafts.push(stored);
+      }
+      return structuredClone(stored);
+    });
   }
 
   /**
@@ -961,14 +1005,15 @@ export class FileDataStore implements DataStore {
     report: WordCountReport,
     guard?: NovelWriteGuard,
   ): Promise<WordCountReport> {
-    if (guard) this.assertGeneratedWrite(report.chapterId, guard);
-    this.state.wordCountReports = this.state.wordCountReports.filter(
-      (r) => r.chapterId !== report.chapterId,
-    );
-    const stored = structuredClone(report);
-    this.state.wordCountReports.push(stored);
-    await this.persist();
-    return structuredClone(stored);
+    return this.mutate(async (state) => {
+      if (guard) this.assertGeneratedWrite(report.chapterId, guard, state);
+      state.wordCountReports = state.wordCountReports.filter(
+        (r) => r.chapterId !== report.chapterId,
+      );
+      const stored = structuredClone(report);
+      state.wordCountReports.push(stored);
+      return structuredClone(stored);
+    });
   }
 
   /**
@@ -992,14 +1037,15 @@ export class FileDataStore implements DataStore {
    * via the nested arrays.
    */
   async savePacingReport(report: PacingReport, guard?: NovelWriteGuard): Promise<PacingReport> {
-    if (guard) this.assertGeneratedWrite(report.chapterId, guard);
-    this.state.pacingReports = this.state.pacingReports.filter(
-      (r) => r.chapterId !== report.chapterId,
-    );
-    const stored = structuredClone(report);
-    this.state.pacingReports.push(stored);
-    await this.persist();
-    return structuredClone(stored);
+    return this.mutate(async (state) => {
+      if (guard) this.assertGeneratedWrite(report.chapterId, guard, state);
+      state.pacingReports = state.pacingReports.filter(
+        (r) => r.chapterId !== report.chapterId,
+      );
+      const stored = structuredClone(report);
+      state.pacingReports.push(stored);
+      return structuredClone(stored);
+    });
   }
 
   /**
@@ -1013,6 +1059,107 @@ export class FileDataStore implements DataStore {
       (r) => r.chapterId === chapterId,
     );
     return report ? structuredClone(report) : undefined;
+  }
+
+  async acceptChapter(input: NovelChapterAcceptanceInput): Promise<Chapter> {
+    return this.mutate(async (state) => {
+      const chapter = state.chapters.find((item) => item.id === input.chapterId);
+      const project = state.projects.find((item) => item.id === chapter?.projectId);
+      if (!chapter || !project) throw ServiceError.notFound('待接受章节或项目不存在。');
+      if (project.kind !== 'novel') throw ServiceError.validation('该接受入口仅适用于小说正文。');
+      if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0) throw ServiceError.validation('缺少有效正文版本。');
+      if (input.guard) this.assertGeneratedWrite(chapter.id, input.guard, state);
+      if ((chapter.revision ?? 0) !== input.expectedRevision) throw new ChapterRevisionConflictError(input.expectedRevision, chapter.revision ?? 0);
+      const content = input.content ?? chapter.content;
+      if (!content.trim()) throw ServiceError.validation('空白正文不能接受为来源。');
+      if (input.contentHash !== hashWriteBriefValue(content)) throw ServiceError.conflict('接受正文哈希已变化，请重新查看正文。');
+      if (input.content !== undefined) {
+        if (!input.guard) throw ServiceError.validation('生成正文采用缺少写作来源守卫。');
+        chapter.content = content;
+        chapter.revision = (chapter.revision ?? 0) + 1;
+        chapter.generatedCandidate = { brief: structuredClone(input.guard.brief), candidateHash: input.contentHash,
+          ...(input.guard.sceneDrafts ? { sceneDependencies: structuredClone(input.guard.sceneDrafts) } : {}) };
+      } else if (chapter.acceptance?.status === 'current' && chapter.acceptance.revision === chapter.revision &&
+          chapter.acceptance.contentHash === input.contentHash) return chapter;
+      const records = project.novelAcceptances ??= [];
+      for (const previous of records) if (previous.memoryInput.source.resourceId === chapter.id) previous.status = 'stale';
+      const acceptance = createNovelAcceptance(this.storageClientId, chapter, state.chapters, input.entries);
+      records.push(acceptance);
+      chapter.acceptance = { id: acceptance.id, status: 'current', revision: chapter.revision ?? 0, contentHash: input.contentHash,
+        acceptedAt: acceptance.memoryInput.acceptedAt, unitNumber: acceptance.memoryInput.source.unitNumber };
+      return chapter;
+    });
+  }
+
+  async listMemorySyncTargets(): Promise<MemorySyncTarget[]> {
+    return this.state.projects.filter((project) => project.kind === 'novel').map((project) => ({ clientId: this.storageClientId, projectId: project.id }));
+  }
+
+  async getMemorySync(projectId: string): Promise<MemorySyncIntent | undefined> {
+    const intent = this.state.projects.find((project) => project.id === projectId)?.memorySync;
+    return intent ? structuredClone(intent) : undefined;
+  }
+
+  claimMemorySync(projectId: string, options: { owner: string; now: string; leaseMs: number; retryFailed?: boolean }): Promise<MemorySyncClaim | undefined> {
+    const now = Date.parse(options.now);
+    if (!options.owner.trim() || !Number.isFinite(now) || !Number.isFinite(options.leaseMs) || options.leaseMs <= 0 ||
+        !Number.isFinite(new Date(now + options.leaseMs).getTime())) return Promise.reject(ServiceError.validation('记忆同步租约无效。'));
+    return this.enqueue(async () => {
+      const working = structuredClone(this.state);
+      const intent = working.projects.find((project) => project.id === projectId)?.memorySync;
+      if (!intent || !(intent.status === 'pending' || (intent.status === 'failed' && options.retryFailed) ||
+          (intent.status === 'running' && (!intent.lease || !Number.isFinite(Date.parse(intent.lease.expiresAt)) || Date.parse(intent.lease.expiresAt) <= now)))) return undefined;
+      intent.status = 'running'; intent.attempts += 1; intent.updatedAt = new Date(now).toISOString();
+      intent.lease = { token: randomUUID(), owner: options.owner, expiresAt: new Date(now + options.leaseMs).toISOString() };
+      delete intent.error;
+      await this.persist(working); this.state = working;
+      return { clientId: this.storageClientId, projectId, revision: intent.projection.revision,
+        idempotencyKey: intent.projection.idempotencyKey, lease: structuredClone(intent.lease) };
+    });
+  }
+
+  applyMemorySync(projectId: string, claim: MemorySyncClaim, write: (projection: FrozenMemoryProjection) => Promise<void>): Promise<MemorySyncIntent | undefined> {
+    return this.enqueue(async () => {
+      const working = structuredClone(this.state);
+      const intent = working.projects.find((project) => project.id === projectId)?.memorySync;
+      if (!intent || intent.status !== 'running' || !intent.lease || claim.clientId !== this.storageClientId || claim.projectId !== projectId ||
+          claim.revision !== intent.projection.revision || claim.idempotencyKey !== intent.projection.idempotencyKey ||
+          claim.lease.token !== intent.lease.token || claim.lease.owner !== intent.lease.owner || claim.lease.expiresAt !== intent.lease.expiresAt ||
+          !Number.isFinite(Date.parse(intent.lease.expiresAt)) || Date.parse(intent.lease.expiresAt) <= Date.now()) return undefined;
+      try { await write(structuredClone(intent.projection)); intent.status = 'succeeded'; delete intent.error; }
+      catch { intent.status = 'failed'; intent.error = { code: 'SOURCE_MEMORY_SYNC_FAILED', message: '记忆同步失败，已接受正文保留，可重试同步。' }; }
+      delete intent.lease; intent.updatedAt = new Date().toISOString();
+      await this.persist(working); this.state = working;
+      return structuredClone(intent);
+    });
+  }
+
+  async getStoryControls(projectId: string): Promise<StoryControlCollection> {
+    const project = this.state.projects.find((item) => item.id === projectId);
+    if (!project) throw ServiceError.notFound('项目不存在。');
+    return structuredClone(project.storyControls ?? emptyStoryControls());
+  }
+
+  upsertStoryControl(projectId: string, input: StoryControlInput, expectedRevision: number): Promise<StoryControlCollection> {
+    return this.mutate(async (state) => {
+      const project = state.projects.find((item) => item.id === projectId);
+      if (!project || project.kind !== 'novel') throw ServiceError.notFound('小说项目不存在。');
+      const result = upsertStoryControlRecord(project.storyControls ?? emptyStoryControls(), input, expectedRevision, {
+        clientId: this.storageClientId, projectId, mode: 'novel', activeAcceptances: (project.novelAcceptances ?? []).filter((item) => item.status === 'current').map((item) => item.memoryInput),
+      });
+      project.storyControls = result.collection;
+      if (result.retractFromUnit !== undefined) retractNovelSourcesFrom(project, result.retractFromUnit);
+      return result.collection;
+    });
+  }
+
+  deleteStoryControl(projectId: string, id: string, expectedRevision: number): Promise<StoryControlCollection> {
+    return this.mutate(async (state) => {
+      const project = state.projects.find((item) => item.id === projectId);
+      if (!project || project.kind !== 'novel') throw ServiceError.notFound('小说项目不存在。');
+      project.storyControls = deleteStoryControlRecord(project.storyControls ?? emptyStoryControls(), id, expectedRevision);
+      return project.storyControls;
+    });
   }
 }
 

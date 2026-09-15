@@ -1,4 +1,4 @@
-import { buildNovelWriteBrief, captureNovelWriteSnapshot, assertNovelWriteBriefCurrent } from '../../store/NovelWriteGuard.js';
+import { buildNovelWriteBrief, captureNovelWriteSnapshot, assertNovelWriteBriefCurrent, isUnverifiedSystemOutline } from '../../store/NovelWriteGuard.js';
 import { renderWriteBrief } from '../writing/WriteBrief.js';
 /**
  * BlueprintService — 章节蓝图生成编排（design: "Services 领域层 > BlueprintService（生成 / 读取 / 替换蓝图）"）。
@@ -162,7 +162,7 @@ export class BlueprintService {
       this.store.listWorldSettings(projectId),
     ]);
 
-    const outlineContext: OutlineContext[] = outlines.map((o) => ({
+    const outlineContext: OutlineContext[] = outlines.filter((outline) => !isUnverifiedSystemOutline(outline)).map((o) => ({
       title: o.title,
       content: o.content,
     }));

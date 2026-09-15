@@ -25,6 +25,11 @@ export interface WriteBrief {
   forbidden: WriteBriefItem[];
   authorConstraints: WriteBriefItem[];
   sources: WriteBriefSource[];
+  memoryContext?: {
+    text: string;
+    statistics: { maxChars: number; usedChars: number; estimatedTokens: number; requiredChars: number;
+      sourceChars: number; authorChars: number; threadChars: number; retrievalChars: number; omittedItems: number; truncated: boolean };
+  };
   sourceFingerprint: string;
   fingerprint: string;
 }

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { isApiClientError } from '../api/apiClient.js';
 import type { WriteBriefItem, WriteBriefView } from '../types/writeBrief.js';
 import './components.css';
+import './story-memory.css';
 
 interface WritingBriefPanelProps {
   targetKey: string;
@@ -48,6 +49,11 @@ export function WritingBriefPanel({ targetKey, refreshKey = '', load, locallyCha
       {!locallyChanged && view?.origin === 'preview' && brief ? <p className="nwa-muted">根据当前已保存资料预览，生成时会固定本次依据。</p> : null}
       {!locallyChanged && current?.failed ? <p role="status">写前依据读取失败，请重试。</p> : null}
       {brief ? <>
+        {brief.memoryContext ? <details><summary>本次记忆段 · {brief.memoryContext.statistics.usedChars} / {brief.memoryContext.statistics.maxChars} 字符</summary>
+          <p className="nwa-muted">估算 {brief.memoryContext.statistics.estimatedTokens} token，仅为本段预算估算，不是模型服务实际用量。</p>
+          {brief.memoryContext.statistics.truncated ? <p className="nwa-muted">预算内省略 {brief.memoryContext.statistics.omittedItems} 项参考内容。</p> : null}
+          <pre className="nwa-memory-evidence">{brief.memoryContext.text}</pre>
+        </details> : null}
         <dl>
           {groups.map(([label, items]) => <div key={label}><dt>{label}</dt><dd>{items?.length ? <ul>{items.map((item, index) => {
             const labels = item.sourceKeys.map((sourceKey) => brief.sources.find((source) => source.key === sourceKey)?.label).filter(Boolean);

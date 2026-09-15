@@ -37,6 +37,7 @@ export interface Chapter {
   /** 正文乐观锁版本；旧数据缺失时按 0 处理。 */
   revision?: number;
   generatedCandidate?: { brief: WriteBrief; candidateHash: string; sceneDependencies?: Array<{ sceneId: string; contentHash: string }> };
+  acceptance?: { id: string; status: 'current' | 'stale'; revision: number; contentHash: string; acceptedAt: string; unitNumber: number };
 }
 
 export interface Character {
