@@ -28,6 +28,16 @@ import type {
   WorkflowEvent,
 } from './MemoryStore.js';
 import type { MemoryStorePort } from './MemoryStore.js';
+import type { FrozenMemoryProjection, SourceMemoryView } from '../../types/SourceMemory.js';
+import { getCurrentClientId } from '../client/clientScope.js';
+import { ServiceError } from '../ServiceError.js';
+import { projectSourceMemory, sourceMemoryEntriesAt, validateFrozenMemoryProjection } from './sourceMemoryContract.js';
+import { assertProjectionFollows, replaceSourceMemoryPartition, sourceMemoryConflict } from './sourceMemoryPartition.js';
+
+function assertProjectionScope(projection: FrozenMemoryProjection): void {
+  validateFrozenMemoryProjection(projection);
+  if (projection.clientId !== getCurrentClientId()) throw ServiceError.validation('记忆来源与当前客户端不匹配。');
+}
 
 export interface BuildContextOptions {
   /** 最多回灌的近端章节摘要条数（默认 6）。 */
@@ -353,6 +363,31 @@ const MERGE_THRESHOLD = 0.82;
 
 export class MemoryService {
   constructor(private readonly store: MemoryStorePort) {}
+
+  /** Complete replacement for one mode. Validation and revision checks run inside the store's write queue. */
+  async applySourceProjection(projection: FrozenMemoryProjection): Promise<void> {
+    assertProjectionScope(projection);
+    const frozen = structuredClone(projection);
+    await this.store.update(frozen.projectId, (memory) => {
+      if (memory.deleted) throw sourceMemoryConflict('SOURCE_MEMORY_DELETED');
+      memory.sourceMemory = { ...memory.sourceMemory,
+        [frozen.mode]: replaceSourceMemoryPartition(memory.sourceMemory?.[frozen.mode], frozen) };
+    });
+  }
+
+  /** A lagging cache never takes precedence over the current frozen accepted set. */
+  querySourceMemory(projection: FrozenMemoryProjection, beforeUnit: number): SourceMemoryView {
+    assertProjectionScope(projection);
+    const memory = this.store.read(projection.projectId);
+    if (memory.deleted) throw sourceMemoryConflict('SOURCE_MEMORY_DELETED');
+    const partition = memory.sourceMemory?.[projection.mode];
+    assertProjectionFollows(partition, projection);
+    if (partition?.revision === projection.revision && partition.contentHash === projection.contentHash) {
+      return { mode: projection.mode, projectId: projection.projectId, beforeUnit, projectionRevision: projection.revision,
+        origin: 'projection', ...sourceMemoryEntriesAt(partition.entries, beforeUnit) };
+    }
+    return projectSourceMemory(projection, beforeUnit);
+  }
 
   /** 读取某项目记忆快照（深拷贝）。 */
   get(projectId: string): ProjectMemory {

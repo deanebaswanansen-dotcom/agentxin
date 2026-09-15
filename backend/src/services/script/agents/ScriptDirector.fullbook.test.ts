@@ -3,6 +3,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
+import { MemoryService } from '../../memory/MemoryService.js';
+import { MemoryStore } from '../../memory/MemoryStore.js';
 
 import { FileScriptCheckpointStore } from '../FileScriptCheckpointStore.js';
 import { FileScriptStore } from '../FileScriptStore.js';
@@ -456,10 +458,17 @@ describe('ScriptDirector offline ten-episode full-book diagnostic', () => {
       const checkpointDirectory = join(directory, 'checkpoints', PROJECT_ID);
       const checkpointSizes = await Promise.all((await readdir(checkpointDirectory))
         .map(async (name) => (await stat(join(checkpointDirectory, name))).size));
+      const memoryFile = join(directory, 'source-memory.json');
+      const memory = new MemoryService(await MemoryStore.create(memoryFile));
+      const syncStarted = performance.now();
+      await memory.applySourceProjection(state!.memorySync!.projection);
+      const sourceProjectionMs = performance.now() - syncStarted;
       console.info('100-episode provenance fixture', {
         projectBytes: (await stat(join(directory, 'projects', `${PROJECT_ID}.json`))).size,
         checkpointBytes: checkpointSizes.reduce((sum, bytes) => sum + bytes, 0),
         modelCalls: model.calls.length,
+        sourceProjectionMs: Math.round(sourceProjectionMs * 100) / 100,
+        sourceMemoryBytes: (await stat(memoryFile)).size,
       });
     }
   }, 60_000);

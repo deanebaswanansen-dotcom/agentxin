@@ -51,6 +51,8 @@ import { OpenAiCompatibleModelProxy } from './proxy/ModelProxy.js';
 import { CachingModelProxy } from './proxy/CachingModelProxy.js';
 import { MemoryStore } from './services/memory/MemoryStore.js';
 import { MemoryService } from './services/memory/MemoryService.js';
+import { MemorySyncRunner } from './services/memory/MemorySyncRunner.js';
+import { registerMemorySyncRoutes } from './routes/memorySyncRoutes.js';
 import { ProjectService } from './services/project/ProjectService.js';
 import { ChapterService } from './services/chapter/ChapterService.js';
 import { SettingService } from './services/setting/SettingService.js';
@@ -198,9 +200,21 @@ export function buildServer(
     ? scriptCheckpointStore ?? new InMemoryScriptCheckpointStore()
     : undefined;
   let agentJobRunner: AgentJobRunner | undefined;
+  const memorySyncRunner = scriptStore?.listMemorySyncTargets && scriptStore.getMemorySync && scriptStore.claimMemorySync && scriptStore.applyMemorySync
+    ? new MemorySyncRunner(store, scriptStore, memory, {
+        // Only a concrete single-library store can override request scope.
+        // The client-scoped proxy must continue using the validated HTTP client.
+        ...(scriptStore instanceof FileScriptStore ? { fixedClientId: scriptStore.storageClientId } : {}),
+      })
+    : undefined;
+  if (memorySyncRunner) {
+    app.addHook('onReady', () => memorySyncRunner.start());
+    app.addHook('onClose', () => memorySyncRunner.close());
+  }
   const projectService = new ProjectService(store, {
     afterRemove: async (projectId) => {
       const clientId = getCurrentClientId();
+      await memorySyncRunner?.blockAndDrainProject(clientId, projectId);
       if (agentJobRunner) await agentJobRunner.cancelForProject(clientId, projectId);
       if (scriptStore) await scriptStore.deleteProject(projectId);
       if (scriptCheckpoints) await scriptCheckpoints.deleteProject(projectId);
@@ -306,6 +320,7 @@ export function buildServer(
 
   // Transport layer — register every route group against its service.
   registerProjectRoutes(app, projectService);
+  if (memorySyncRunner) registerMemorySyncRoutes(app, memorySyncRunner);
   if (scriptService) registerScriptRoutes(app, scriptService);
   if (scriptPlanTurnService) registerScriptPlanRoutes(app, scriptPlanTurnService, scriptConceptService);
   registerChapterRoutes(app, chapterService);

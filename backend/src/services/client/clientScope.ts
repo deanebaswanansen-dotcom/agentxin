@@ -27,6 +27,14 @@ export function runWithClientId<T>(clientId: string, operation: () => T): T {
   return clientScope.run({ clientId }, operation);
 }
 
+/** Internal recovery accepts the local library; HTTP headers still require a browser id. */
+export function runWithStoredClientId<T>(clientId: string, operation: () => T): T {
+  if (clientId !== LOCAL_CLIENT_ID && !isValidClientId(clientId)) {
+    throw new Error('Invalid stored Agentxin client id');
+  }
+  return clientScope.run({ clientId }, operation);
+}
+
 export function registerClientScope(app: FastifyInstance): void {
   const required = process.env.REQUIRE_CLIENT_ID === '1' || process.env.NETLIFY === 'true';
 
