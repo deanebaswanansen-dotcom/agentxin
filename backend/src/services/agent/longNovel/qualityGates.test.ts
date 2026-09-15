@@ -121,6 +121,36 @@ describe('long novel quality gates', () => {
   });
 
   it.each([
+    '他援引赫尔文城治安律法第七章第三款，要求释放商贩。',
+    '书记员指着法典第12章，解释申诉期限。',
+    '她按照法律第三章的要求，在登记册上签字。',
+    '守卫读出《城邦律法》第七章第三款，众人安静下来。',
+    '她翻到法典（修订版）的第七章，发现印章被改动。',
+    '她援引律法第七章及第八章，要求复核。',
+    '法典第七章、第八章均有规定。',
+    '她援引法律第七章、第八章及第九章，要求复核。',
+  ])('allows a local legal-document chapter reference: %s', (content) => {
+    const result = runChapterQualityGates({ content, minWords: 1, maxWords: 8000, targetWords: 2000, chapterTitle: '第20章' });
+    expect(result.hardFail).toBe(false);
+    expect(result.findings.some((finding) => finding.message.includes('章节编号'))).toBe(false);
+  });
+
+  it.each([
+    '他念出律法第七章，第17章从仓库拿到的钥匙仍在手里。',
+    '他念出法典第七章第三款，第17章从仓库拿到的钥匙仍在手里。',
+    '他念出协议第三章，第17章从仓库拿到的钥匙仍在手里。',
+    '他合上法典，第17章从仓库拿到的钥匙仍在手里。',
+    '他念出律法第七章又想起第17章从仓库拿到的钥匙。',
+    '他念出法典第七章、第17章从仓库拿到的钥匙仍在手里。',
+    '他念出法典第七章及第八章，又想起第17章从仓库拿到的钥匙。',
+  ])('does not extend a document exemption to a narrative reference in the same sentence: %s', (content) => {
+    const result = runChapterQualityGates({ content, minWords: 1, maxWords: 8000, targetWords: 2000, chapterTitle: '第20章' });
+    expect(result.hardFail).toBe(true);
+    expect(result.findings).toContainEqual(expect.objectContaining({ gate: 'format', severity: 'hard',
+      message: expect.stringContaining('「第17章」') }));
+  });
+
+  it.each([
     '角色此前被捕关押，本章却无解释地自由行动并出席宴会',
     '唯一神器归墟钥匙同一时间被两人持有',
     '主角提前知道尚未公开的核心秘密',

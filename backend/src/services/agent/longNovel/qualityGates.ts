@@ -58,7 +58,12 @@ const NARRATIVE_CHAPTER_REFERENCE = new RegExp(
   'gu',
 );
 const DOCUMENT_CHAPTER_QUALIFIER =
-  /(?:协议|合同|小说|书籍|报告|文件|条例|法案|手册|卷宗|档案|目录|经文|剧本|教材)[^。！？\n]{0,8}$/u;
+  /(?:协议|合同|小说|书籍|报告|文件|条例|法案|法律|法典|律法|手册|卷宗|档案|目录|经文|剧本|教材)[^。！？；，,;：:—\n]{0,8}$/u;
+const DOCUMENT_CHAPTER_JOINER = /^(?:、|及|以及|和|与)$/u;
+const DOCUMENT_CHAPTER_LIST_CONTINUATION = new RegExp(
+  `^(?:$|[。！？；，,;：:》」”）)]|均(?:有)?规定|的(?:规定|条款)|中(?:规定|明确)|(?:、|及|以及|和|与)${CHAPTER_NUMBER})`,
+  'u',
+);
 
 function narrativeChapterReference(text: string): string | undefined {
   const trimmed = text.trimStart();
@@ -67,9 +72,21 @@ function narrativeChapterReference(text: string): string | undefined {
   const body = LEADING_CHAPTER_HEADING.test(firstLine)
     ? (newline >= 0 ? trimmed.slice(newline + 1) : '')
     : trimmed;
+  let previousChapterEnd = 0;
+  let previousWasDocument = false;
   for (const match of body.matchAll(NARRATIVE_CHAPTER_REFERENCE)) {
-    const prefix = body.slice(Math.max(0, (match.index ?? 0) - 28), match.index ?? 0);
-    if (DOCUMENT_CHAPTER_QUALIFIER.test(prefix.replace(/\s+/gu, ''))) continue;
+    const index = match.index ?? 0;
+    // A document cue belongs only to this reference, not to a later chapter
+    // number elsewhere in the same sentence (even without punctuation).
+    const prefix = body.slice(Math.max(previousChapterEnd, index - 28), index);
+    // Only an immediate citation-list joiner may inherit the document cue.
+    // Require citation syntax after it; "、第17章从仓库拿到" is still narration.
+    const coordinatedDocument: boolean = previousWasDocument &&
+      DOCUMENT_CHAPTER_JOINER.test(body.slice(previousChapterEnd, index).replace(/\s+/gu, '')) &&
+      DOCUMENT_CHAPTER_LIST_CONTINUATION.test(body.slice(index + match[0].length).trimStart());
+    previousChapterEnd = index + match[0].length;
+    previousWasDocument = DOCUMENT_CHAPTER_QUALIFIER.test(prefix.replace(/\s+/gu, '')) || coordinatedDocument;
+    if (previousWasDocument) continue;
     return match[0];
   }
   return undefined;
