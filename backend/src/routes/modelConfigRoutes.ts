@@ -24,6 +24,7 @@
  */
 import type { FastifyInstance } from 'fastify';
 import type { ModelProxy } from '../proxy/ModelProxy.js';
+import { ProxyError } from '../proxy/ProxyError.js';
 import { ServiceError } from '../services/ServiceError.js';
 import type { ModelConfigService } from '../services/modelConfig/ModelConfigService.js';
 import type { ModelConfig } from '../types/index.js';
@@ -118,10 +119,11 @@ export function registerModelConfigRoutes(
           { role: 'user', content: '回复 OK' },
         ],
         AbortSignal.timeout(30_000),
-        { maxTokens: 64 },
+        { maxTokens: 64, disableThinking: true, bypassCache: true },
       )) {
-        if (delta.text.length > 0) receivedOutput = true;
+        if (delta.kind === 'content' && delta.text.trim().length > 0) receivedOutput = true;
       }
+      if (!receivedOutput) throw new ProxyError('模型连接测试未收到有效正文，请检查模型和 API 地址。');
       return reply.code(200).send({ ok: true, modelName: config.modelName, receivedOutput });
     } catch (error) {
       const { status, body } = toErrorResponse(error);

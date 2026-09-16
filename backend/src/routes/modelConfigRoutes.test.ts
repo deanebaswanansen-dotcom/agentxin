@@ -24,7 +24,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { ModelConfigService } from '../services/modelConfig/ModelConfigService.js';
 import { FileDataStore } from '../store/FileDataStore.js';
-import type { ModelProxy } from '../proxy/ModelProxy.js';
+import type { ModelProxy, StreamCompletionOptions } from '../proxy/ModelProxy.js';
+import type { StreamDelta } from '../proxy/sseParser.js';
 import { ProxyError } from '../proxy/ProxyError.js';
 import type { ModelConfig, ModelConfigView } from '../types/index.js';
 import { registerModelConfigRoutes } from './modelConfigRoutes.js';
@@ -39,17 +40,22 @@ let dir: string;
 let store: FileDataStore;
 let app: FastifyInstance;
 let connectionError: Error | undefined;
+let connectionDeltas: StreamDelta[];
+let probeOptions: StreamCompletionOptions | undefined;
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), 'model-config-routes-'));
   store = await FileDataStore.create(join(dir, 'store.json'));
   connectionError = undefined;
+  connectionDeltas = [{ kind: 'content', text: 'OK' }];
+  probeOptions = undefined;
 
   app = Fastify({ logger: false });
   const proxy: ModelProxy = {
-    async *streamCompletion() {
+    async *streamCompletion(_config, _messages, _signal, options) {
+      probeOptions = options;
+      yield* connectionDeltas;
       if (connectionError) throw connectionError;
-      yield { kind: 'content', text: 'OK' };
     },
   };
   registerModelConfigRoutes(app, new ModelConfigService(store), proxy);
@@ -182,6 +188,20 @@ describe('GET /api/model-config', () => {
 });
 
 describe('POST /api/model-config/test', () => {
+  it.each<[string, StreamDelta[]]>([
+    ['no deltas', []],
+    ['only thinking', [{ kind: 'thinking', text: 'thinking' }]],
+    ['only whitespace', [{ kind: 'content', text: ' \n\t\u3000' }]],
+    ['thinking plus whitespace', [{ kind: 'thinking', text: 'thinking' }, { kind: 'content', text: ' ' }]],
+  ])('rejects a probe with %s', async (_label, deltas) => {
+    await app.inject({ method: 'PUT', url: '/api/model-config', payload: VALID_CONFIG });
+    connectionDeltas = deltas;
+    const res = await app.inject({ method: 'POST', url: '/api/model-config/test' });
+    expect(res.statusCode).toBe(502);
+    expect(res.json()).toMatchObject({ error: { code: 'PROVIDER_ERROR', message: expect.stringContaining('未收到有效正文') } });
+    expect(res.json().ok).toBeUndefined();
+  });
+
   it('runs a real proxy probe with the active config', async () => {
     await app.inject({ method: 'PUT', url: '/api/model-config', payload: VALID_CONFIG });
     const res = await app.inject({ method: 'POST', url: '/api/model-config/test' });
@@ -189,6 +209,7 @@ describe('POST /api/model-config/test', () => {
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ ok: true, modelName: VALID_CONFIG.modelName, receivedOutput: true });
     expect(res.body).not.toContain(VALID_CONFIG.apiKey);
+    expect(probeOptions).toMatchObject({ maxTokens: 64, disableThinking: true, bypassCache: true });
   });
 
   it('returns MODEL_NOT_CONFIGURED before any config is supplied', async () => {
@@ -197,7 +218,7 @@ describe('POST /api/model-config/test', () => {
     expect(res.json().error.code).toBe('MODEL_NOT_CONFIGURED');
   });
 
-  it('returns a sanitized provider error instead of an unexplained 502', async () => {
+  it('returns a provider error even after the probe produced content', async () => {
     await app.inject({ method: 'PUT', url: '/api/model-config', payload: VALID_CONFIG });
     connectionError = new ProxyError('API Key 无效');
     const res = await app.inject({ method: 'POST', url: '/api/model-config/test' });

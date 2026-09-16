@@ -237,7 +237,10 @@ export function SettingsPanel({
       setTopP(view.topP ?? DEFAULT_TOP_P);
       setApiKeyMasked(view.apiKeyMasked);
       setApiKey('');
-      await client.modelConfig.test();
+      const connection = await client.modelConfig.test();
+      if (connection.ok !== true || connection.receivedOutput !== true) {
+        throw new Error('模型连接测试未收到有效正文，请检查模型和 API 地址。');
+      }
       setSaved(true);
       setConnectionStatus('ok');
       onSaved?.(view);
@@ -409,8 +412,18 @@ export function SettingsPanel({
               }}
             />
             <span className="nwa-field__hint nwa-muted">
-              OpenAI 兼容入口示例：DeepSeek 使用 https://api.deepseek.com。
+              填写服务商提供的 API 基础地址。是否包含 /v1 以服务商说明为准；系统会在末尾加上 /chat/completions。
             </span>
+            {!isMockPreset && baseUrl.trim() ? (
+              <span className="nwa-field__hint nwa-muted" aria-label="最终请求地址">
+                最终请求地址：<code>{baseUrl.trim().replace(/\/+$/, '')}/chat/completions</code>
+              </span>
+            ) : null}
+            {!isMockPreset && baseUrl.trim() && !/\/v1(?:\/|$)/.test(baseUrl.trim()) ? (
+              <span className="nwa-field__hint nwa-muted">
+                当前地址未包含 /v1。若服务商给出的入口以 /v1 结尾，请手动补入；DeepSeek 官方入口可以不带 /v1。
+              </span>
+            ) : null}
           </label>
 
           <label className="nwa-field">

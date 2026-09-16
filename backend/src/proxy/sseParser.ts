@@ -1,4 +1,5 @@
 import { recordCacheUsage } from './cacheStats.js';
+import { ProxyError, providerErrorDetail, sanitizeProviderDetail } from './ProxyError.js';
 
 /**
  * A typed incremental delta extracted from an OpenAI-compatible SSE stream.
@@ -47,6 +48,9 @@ export type StreamDelta =
  * is not JSON at all.
  */
 interface OpenAiStreamChunk {
+  error?: unknown;
+  type?: unknown;
+  object?: unknown;
   choices?: Array<{
     delta?: {
       content?: unknown;
@@ -83,11 +87,16 @@ const DONE_SENTINEL = '[DONE]';
  *   payload is the `[DONE]` sentinel, is not valid JSON, or carries no usable
  *   delta.
  */
-export function extractDeltaFromData(dataPayload: string, modelName = 'unknown'): StreamDelta | null {
+export function extractDeltaFromData(
+  dataPayload: string,
+  modelName = 'unknown',
+  errorEvent = false,
+  sanitizeDetail = sanitizeProviderDetail,
+): StreamDelta | null {
   const trimmed = dataPayload.trim();
 
   // End-of-stream sentinel carries no content.
-  if (trimmed === DONE_SENTINEL || trimmed.length === 0) {
+  if (!errorEvent && (trimmed === DONE_SENTINEL || trimmed.length === 0)) {
     return null;
   }
 
@@ -95,10 +104,23 @@ export function extractDeltaFromData(dataPayload: string, modelName = 'unknown')
   try {
     parsed = JSON.parse(trimmed) as OpenAiStreamChunk;
   } catch {
+    if (errorEvent) {
+      throw new ProxyError(`模型响应流返回错误：${sanitizeDetail(trimmed) || '提供商未说明原因'}`);
+    }
     // Non-JSON data line (e.g. a provider keep-alive comment that slipped
     // through). Nothing to forward.
     return null;
   }
+
+  if (
+    errorEvent || (parsed && typeof parsed === 'object' && (
+      (parsed.error !== undefined && parsed.error !== null && parsed.error !== false) ||
+      parsed.type === 'error' || parsed.object === 'error'
+    ))
+  ) {
+    throw new ProxyError(`模型响应流返回错误：${sanitizeDetail(providerErrorDetail(parsed)) || '提供商未说明原因'}`);
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
 
   if (parsed.usage) {
     const u = parsed.usage;
@@ -213,26 +235,45 @@ export function parseSseChunk(
 }
 
 /**
- * Small stateful wrapper around {@link parseSseChunk} that hides the
- * carry-over buffer. Feed it raw decoded text chunks via {@link push}; call
+ * Stateful SSE event parser that carries partial lines and multi-line data
+ * fields across chunks. Feed it raw decoded text chunks via {@link push}; call
  * {@link flush} once after the stream ends to drain any final line that lacked
  * a trailing newline.
  *
- * State is limited to the partial-line buffer; the wrapper holds no API key or
- * other sensitive data.
+ * Error details pass through the caller's sanitizer before being exposed.
  */
 export class SseDeltaParser {
   private buffer = '';
+  private dataLines: string[] = [];
+  private eventType = '';
+  private sawData = false;
 
-  constructor(private readonly modelName = 'unknown') {}
+  constructor(
+    private readonly modelName = 'unknown',
+    private readonly sanitizeDetail = sanitizeProviderDetail,
+  ) {}
+
+  get receivedData(): boolean {
+    return this.sawData;
+  }
 
   /**
    * Feed one decoded text chunk. Returns the content deltas contained in the
    * complete lines now available, in stream order.
    */
   push(chunk: string): StreamDelta[] {
-    const { deltas, rest } = parseSseChunk(this.buffer, chunk, this.modelName);
-    this.buffer = rest;
+    const combined = this.buffer + chunk;
+    const endings = /\r\n|\r|\n/g;
+    let start = 0;
+    const deltas: StreamDelta[] = [];
+    for (let ending = endings.exec(combined); ending; ending = endings.exec(combined)) {
+      // Hold a trailing CR until we know whether the next chunk starts with LF.
+      if (ending[0] === '\r' && ending.index === combined.length - 1) break;
+      const delta = this.readLine(combined.slice(start, ending.index));
+      if (delta) deltas.push(delta);
+      start = ending.index + ending[0].length;
+    }
+    this.buffer = combined.slice(start);
     return deltas;
   }
 
@@ -241,12 +282,28 @@ export class SseDeltaParser {
    * trailing newline). Returns the remaining deltas, if any, and clears state.
    */
   flush(): StreamDelta[] {
-    const remaining = this.buffer;
-    this.buffer = '';
-    if (remaining.length === 0) {
-      return [];
+    const deltas = this.push('\n');
+    const delta = this.dispatch();
+    if (delta) deltas.push(delta);
+    return deltas;
+  }
+
+  private readLine(line: string): StreamDelta | null {
+    const normalized = line.endsWith('\r') ? line.slice(0, -1) : line;
+    if (normalized.length === 0) return this.dispatch();
+    if (normalized.startsWith('event:')) this.eventType = normalized.slice(6).trim();
+    if (normalized.startsWith('data:')) {
+      this.sawData = true;
+      this.dataLines.push(normalized.slice(5).replace(/^ /, ''));
     }
-    const delta = extractDeltaFromLine(remaining, this.modelName);
-    return delta !== null ? [delta] : [];
+    return null;
+  }
+
+  private dispatch(): StreamDelta | null {
+    const data = this.dataLines.join('\n');
+    const errorEvent = this.eventType === 'error';
+    this.dataLines = [];
+    this.eventType = '';
+    return extractDeltaFromData(data, this.modelName, errorEvent, this.sanitizeDetail);
   }
 }

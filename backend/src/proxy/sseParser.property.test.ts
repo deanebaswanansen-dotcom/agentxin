@@ -137,12 +137,14 @@ describe('OpenAiCompatibleModelProxy streaming', () => {
 
         const proxy = new OpenAiCompatibleModelProxy();
         const controller = new AbortController();
-        const collected = await collect(
-          proxy.streamCompletion(CONFIG, MESSAGES, controller.signal),
-        );
-
         // Parser drops empty-string deltas; they carry no information.
         const expected = deltas.filter((d) => d.length > 0).join('');
+        const completion = collect(proxy.streamCompletion(CONFIG, MESSAGES, controller.signal));
+        if (!expected.trim()) {
+          await expect(completion).rejects.toMatchObject({ code: 'PROVIDER_ERROR', status: 200 });
+          return;
+        }
+        const collected = await completion;
 
         // Ordered concatenation must match exactly: no loss/dup/reorder.
         expect(collected.join('')).toBe(expected);
