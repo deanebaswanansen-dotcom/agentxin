@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { ScriptConceptService } from './ScriptConceptService.js';
+import { ProxyError } from '../../../proxy/ProxyError.js';
 
 const project = {
   id: 'project-1',
@@ -44,10 +45,12 @@ describe('ScriptConceptService', () => {
     }));
   });
 
-  it('salvages one partial proposal and fills missing fields locally', async () => {
+  it('keeps model-authored story fields and fills only optional fields locally', async () => {
     const complete = vi.fn().mockResolvedValue(JSON.stringify({
       proposals: [{
         title: '只返回一个也能用',
+        story: '会计为找回失踪账本潜入旧公司，却发现母亲也是嫌疑人。',
+        conflict: '她必须在账本销毁前公开证据并承担亲情破裂的代价',
         market: '国内',
         channel: '女频',
         genres: '都市、悬疑',
@@ -62,7 +65,7 @@ describe('ScriptConceptService', () => {
     expect(result.proposals).toHaveLength(1);
     expect(result.proposals[0]).toMatchObject({
       title: '只返回一个也能用',
-      theme: '失踪的账本',
+      theme: '只返回一个也能用',
       market: 'domestic',
       channel: 'female',
       genres: ['都市', '悬疑'],
@@ -71,6 +74,13 @@ describe('ScriptConceptService', () => {
     });
     expect(result.proposals[0]?.logline).toBeTruthy();
     expect(result.proposals[0]?.mainArc).toBeTruthy();
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+
+  it('repairs JSON syntax without fabricating missing story content', async () => {
+    const complete = vi.fn().mockResolvedValue(`\`\`\`json\n{"concepts":[${JSON.stringify(candidate(1))},],}\n\`\`\``);
+    const service = new ScriptConceptService({ complete }, async () => project);
+    await expect(service.generate('project-1')).resolves.toMatchObject({ proposals: [{ title: '原创选题1' }] });
     expect(complete).toHaveBeenCalledTimes(1);
   });
 
@@ -86,37 +96,64 @@ describe('ScriptConceptService', () => {
     expect(complete).toHaveBeenCalledTimes(1);
   });
 
-  it.each(['', '模型暂时没有生成 JSON', '{"proposals":[]}'])('uses deterministic local proposals for empty or unusable output: %j', async (raw) => {
+  it.each(['', '模型暂时没有生成 JSON', '{}', '{"message":"ok"}', '{"proposals":[]}', '{"proposals":[{"title":"只有标题"}]}'])('rejects unusable output after one fixup: %j', async (raw) => {
     const complete = vi.fn().mockResolvedValue(raw);
     const service = new ScriptConceptService({ complete }, async () => project);
 
-    const result = await service.generate('project-1', '修车佬复出');
-
-    expect(result.proposals).toHaveLength(3);
-    expect(result.proposals[0]).toMatchObject({
-      title: '修车佬复出：绝境反击',
-      theme: '修车佬复出',
-      totalEpisodes: 60,
+    await expect(service.generate('project-1', '修车佬复出')).rejects.toMatchObject({
+      code: 'SCRIPT_MODEL_OUTPUT_INVALID',
     });
-    expect(new Set(result.proposals.map((item) => item.title))).toHaveProperty('size', 3);
-    expect(complete).toHaveBeenCalledTimes(1);
+    expect(complete).toHaveBeenCalledTimes(2);
   });
 
-  it('falls back locally after one failed model call but still honors user cancellation', async () => {
-    const failedComplete = vi.fn().mockRejectedValue(new Error('provider timeout'));
+  it('exposes a safe failure after a failed call and honors cancellation', async () => {
+    const failedComplete = vi.fn().mockRejectedValue(new Error('provider timeout Authorization: Bearer private-secret'));
     const service = new ScriptConceptService({ complete: failedComplete }, async () => project);
 
-    const fallback = await service.generate('project-1', '遗嘱疑云');
-    expect(fallback.proposals).toHaveLength(3);
-    expect(fallback.proposals[0]?.title).toBe('遗嘱疑云：绝境反击');
+    await expect(service.generate('project-1', '遗嘱疑云')).rejects.toThrow('AI 选题未生成有效故事方案');
     expect(failedComplete).toHaveBeenCalledTimes(1);
 
     const controller = new AbortController();
     controller.abort();
     const abortedComplete = vi.fn().mockRejectedValue(new Error('cancelled'));
     const abortedService = new ScriptConceptService({ complete: abortedComplete }, async () => project);
-    await expect(abortedService.generate('project-1', '', controller.signal)).rejects.toThrow('cancelled');
-    expect(abortedComplete).toHaveBeenCalledTimes(1);
+    await expect(abortedService.generate('project-1', '', controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
+    expect(abortedComplete).not.toHaveBeenCalled();
+  });
+
+  it('preserves sanitized provider reasons while hiding unknown errors', async () => {
+    const known = new ScriptConceptService({
+      complete: vi.fn().mockRejectedValue(new ProxyError('模型不存在 model_not_found Bearer reflected-secret', { status: 404 })),
+    }, async () => project);
+    const knownError = await known.generate('project-1').catch((error: Error) => error);
+    expect(knownError).toBeInstanceOf(Error);
+    expect((knownError as Error).message).toContain('model_not_found');
+    expect((knownError as Error).message).not.toContain('reflected-secret');
+    const unknown = new ScriptConceptService({ complete: vi.fn().mockRejectedValue(new Error('private internal diagnostic')) }, async () => project);
+    const unknownError = await unknown.generate('project-1').catch((error: Error) => error);
+    expect((unknownError as Error).message).not.toContain('private internal diagnostic');
+  });
+
+  it('recovers once through fixup and uses only an explicitly configured fallback', async () => {
+    const complete = vi.fn()
+      .mockResolvedValueOnce('{}')
+      .mockResolvedValueOnce('not json')
+      .mockResolvedValueOnce(JSON.stringify({ concepts: [candidate(1)] }));
+    const service = new ScriptConceptService({
+      complete, getStructuredFallbackModelName: async () => 'repair-model',
+    }, async () => project);
+    await expect(service.generate('project-1')).resolves.toMatchObject({ proposals: [{ title: '原创选题1' }] });
+    expect(complete).toHaveBeenCalledTimes(3);
+    expect(complete.mock.calls[2]?.[0]).toMatchObject({ modelNameOverride: 'repair-model' });
+  });
+
+  it('rejects a response which echoes serialized draft context into story fields', async () => {
+    const complete = vi.fn().mockResolvedValue(JSON.stringify({ proposals: [{
+      ...candidate(1), logline: '当前草稿：{"title":"旧标题"}',
+    }] }));
+    const service = new ScriptConceptService({ complete }, async () => project);
+    await expect(service.generate('project-1')).rejects.toThrow('未生成有效故事方案');
+    expect(complete).toHaveBeenCalledTimes(2);
   });
 
   it('keeps project and input validation as hard data-integrity floors', async () => {

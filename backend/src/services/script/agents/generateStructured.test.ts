@@ -1,4 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+import { ProxyError } from '../../../proxy/ProxyError.js';
 
 import {
   defineStructuredContract,
@@ -62,6 +64,43 @@ class QueueModel implements StructuredModel {
 }
 
 describe('generateStructured', () => {
+  it('shares physical request capacity across primary, fixup and fallback', async () => {
+    const budgets: StructuredModelRequest['attemptBudget'][] = [];
+    const primary: StructuredModel = {
+      async complete(request) {
+        budgets.push(request.attemptBudget);
+        request.attemptBudget.attemptsUsed += request.stage === 'primary' ? 3 : 1;
+        return '{}';
+      },
+    };
+    const fallback = { complete: vi.fn(async () => '{"name":"林晓","hairstyle":"齐肩黑发"}') };
+    const result = await generateStructured({ contract: characterContract, prompt: '生成人物卡', primary, fallback });
+    expect(result.status).toBe('needs_review');
+    expect(result.callsUsed).toBe(2);
+    expect(budgets[0]).toBe(budgets[1]);
+    expect(budgets[0]).toEqual({ maxAttempts: 4, attemptsUsed: 4 });
+    expect(result.attempts.map((attempt) => attempt.transportAttempts)).toEqual([3, 1]);
+    expect(fallback.complete).not.toHaveBeenCalled();
+  });
+
+  it('keeps the final provider error when transport retries exhaust the shared budget', async () => {
+    const primary: StructuredModel = {
+      async complete(request) {
+        request.attemptBudget.attemptsUsed = 4;
+        throw new ProxyError('模型不存在（HTTP 503）：model_not_found', { status: 503 });
+      },
+    };
+    const fallback = { complete: vi.fn(async () => '{}') };
+    const result = await generateStructured({ contract: characterContract, prompt: '生成人物卡', primary, fallback });
+    expect(result.status).toBe('needs_review');
+    expect(result.callsUsed).toBe(1);
+    expect(result.attempts[0]).toMatchObject({
+      transportAttempts: 4,
+      issues: [{ code: 'model.provider_error', message: '模型不存在（HTTP 503）：model_not_found' }],
+    });
+    expect(fallback.complete).not.toHaveBeenCalled();
+  });
+
   it('completes from the primary response after a full contract decode', async () => {
     const primary = new QueueModel(['{"name":"林晓","hairstyle":"齐肩黑发"}']);
 

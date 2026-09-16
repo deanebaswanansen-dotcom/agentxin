@@ -8,10 +8,12 @@ import type {
 } from '../services/script/agents/ScriptPlanTurnService.js';
 import type { ScriptConceptService } from '../services/script/agents/ScriptConceptService.js';
 import { toErrorResponse } from './errorMapping.js';
+import { decodeScriptPlanDraftContext } from '../services/script/ScriptCanonicalInput.js';
 
 interface ScriptPlanTurnBody {
   projectId?: unknown;
   seedPrompt?: unknown;
+  draft?: unknown;
   answers?: unknown;
   reset?: unknown;
 }
@@ -64,6 +66,7 @@ function parseBody(body: ScriptPlanTurnBody) {
   return {
     projectId: body.projectId.trim(),
     seedPrompt: typeof body.seedPrompt === 'string' ? body.seedPrompt : undefined,
+    ...(body.draft !== undefined ? { draft: decodeScriptPlanDraftContext(body.draft) } : {}),
     answers: parseAnswers(body.answers ?? []),
     reset: body.reset === true,
   };

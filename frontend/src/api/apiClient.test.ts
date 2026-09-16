@@ -282,6 +282,27 @@ describe('apiClient request building', () => {
     });
   });
 
+  it('sends planning inspiration and the editable draft as separate JSON fields', async () => {
+    const body = {
+      projectId: 'project-1', seedPrompt: '西方玄幻', reset: true, answers: [],
+      draft: { title: '原草稿', logline: '骑士查明王室阴谋。', totalEpisodes: 20, forbiddenElements: ['穿越'] },
+    };
+    const mock = installFetch((url) => {
+      expect(url).toBe('/api/plan/script/turn');
+      return jsonResponse({ status: 'asking', session: 'plan-session', round: 1, questions: [] });
+    });
+
+    await expect(client().script.plan.turn(body)).resolves.toMatchObject({ status: 'asking' });
+    expect(mock.mock.calls[0]?.[1]?.method).toBe('POST');
+    expect(JSON.parse(String(mock.mock.calls[0]?.[1]?.body))).toEqual(body);
+  });
+
+  it('propagates planning validation failures without returning a fabricated ready plan', async () => {
+    installFetch(() => jsonResponse({ error: { code: 'VALIDATION_ERROR', message: '模型未返回可用策划' } }, { status: 422 }));
+    await expect(client().script.plan.turn({ projectId: 'project-1', seedPrompt: '西方玄幻', answers: [] }))
+      .rejects.toMatchObject({ message: '模型未返回可用策划', status: 422 });
+  });
+
   it('starts and resumes a five-episode script job with checkpoint-safe options', async () => {
     const running = {
       id: 'job-1',

@@ -111,6 +111,7 @@ export class AgentService {
         task: 'script_plan',
         projectId,
         seedPrompt: request.prompt,
+        projectContext: { name: project.name, kind: 'short_drama' },
         planningSession: {
           values: {},
           delegatedFields: [...SCRIPT_PLANNING_FIELDS],

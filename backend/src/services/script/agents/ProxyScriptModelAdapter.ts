@@ -68,6 +68,7 @@ export class ProxyScriptModelAdapter implements ScriptModelAdapter {
       { role: 'user', content: request.prompt },
     ];
     const options: StreamCompletionOptions = {
+      ...(request.attemptBudget ? { attemptBudget: request.attemptBudget } : {}),
       jsonMode: request.responseFormat !== 'text',
       disableThinking: true,
       maxTokens: NODE_OUTPUT_BUDGET[request.node],

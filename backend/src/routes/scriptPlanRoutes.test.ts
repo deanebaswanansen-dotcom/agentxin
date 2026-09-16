@@ -77,7 +77,7 @@ describe('script plan routes', () => {
     await app.close();
   });
 
-  it('retries a structured plan failure and then surfaces PROVIDER_ERROR', async () => {
+  it('does not multiply the Director recovery budget and lets an explicit retry succeed', async () => {
     const run = vi.fn()
       .mockRejectedValueOnce(new ScriptStructuredNeedsReviewError(
         'plan',
@@ -114,8 +114,14 @@ describe('script plan routes', () => {
         ],
       },
     });
-    expect(first.statusCode).toBe(200);
-    expect(first.json()).toMatchObject({ status: 'ready', plan: { title: '她不再道歉' } });
+    expect(first.statusCode).toBe(502);
+    expect(first.json().error.code).toBe('PROVIDER_ERROR');
+    expect(run).toHaveBeenCalledTimes(1);
+    const retry = await app.inject({
+      method: 'POST', url: '/api/plan/script/turn', payload: { projectId: 'project-1', answers: [] },
+    });
+    expect(retry.statusCode).toBe(200);
+    expect(retry.json()).toMatchObject({ status: 'ready', plan: { title: '她不再道歉' } });
     expect(run).toHaveBeenCalledTimes(2);
 
     run.mockReset();
@@ -135,9 +141,54 @@ describe('script plan routes', () => {
     expect(failed.statusCode).toBe(502);
     expect(failed.json().error.code).toBe('PROVIDER_ERROR');
     expect(failed.json().error.message).not.toBe('服务器内部错误。');
-    expect(run).toHaveBeenCalledTimes(3);
+    expect(run).toHaveBeenCalledTimes(1);
     await app.close();
   });
+
+  it('keeps draft context separate across interview rounds and strips ownership fields', async () => {
+    const run = vi.fn()
+      .mockResolvedValueOnce({ kind: 'planning_questions', questions: [{ field: 'endingDirection', prompt: '结局？' }], askedFields: ['endingDirection'], questionCount: 1 })
+      .mockResolvedValue({ kind: 'plan_draft', plan: plan() });
+    const service = new ScriptPlanTurnService({ run } as never, new InMemoryScriptCheckpointStore(), async (id) => ({
+      id, name: '123', kind: 'short_drama', createdAt: '2026-08-15T00:00:00.000Z', updatedAt: '2026-08-15T00:00:00.000Z',
+    }));
+    const app = Fastify();
+    registerScriptPlanRoutes(app, service);
+    const draft = { title: '作者草稿', logline: '', coreRequirements: '保留原创角色', totalEpisodes: 12 };
+    const first = await app.inject({
+      method: 'POST', url: '/api/plan/script/turn',
+      payload: { projectId: 'project-1', seedPrompt: '西方玄幻', draft: { ...draft, id: 'injected', status: 'approved', apiKey: 'secret' }, reset: true },
+    });
+    expect(first.statusCode).toBe(200);
+    const second = await app.inject({
+      method: 'POST', url: '/api/plan/script/turn',
+      payload: { projectId: 'project-1', answers: [{ field: 'endingDirection', delegate: true }] },
+    });
+    expect(second.statusCode).toBe(200);
+    expect(run.mock.calls[1]?.[0]).toMatchObject({
+      seedPrompt: '西方玄幻', draft, projectContext: { name: '123', kind: 'short_drama' },
+    });
+    expect(run.mock.calls[1]?.[0].draft).toEqual(draft);
+    const reset = await app.inject({ method: 'POST', url: '/api/plan/script/turn', payload: { projectId: 'project-1', reset: true } });
+    expect(reset.statusCode).toBe(200);
+    expect(run.mock.calls[2]?.[0].draft).toBeUndefined();
+    await app.close();
+  });
+
+  it.each([[], 'raw json', { title: {} }, { totalEpisodes: 201 }, { genres: [123] }, { episodeDurationSeconds: { min: 100, max: 60 } }])(
+    'rejects malformed draft context before invoking the Director: %j', async (draft) => {
+      const run = vi.fn();
+      const service = new ScriptPlanTurnService({ run } as never, new InMemoryScriptCheckpointStore(), async (id) => ({
+        id, name: '短剧', kind: 'short_drama', createdAt: '2026-08-15T00:00:00.000Z', updatedAt: '2026-08-15T00:00:00.000Z',
+      }));
+      const app = Fastify();
+      registerScriptPlanRoutes(app, service);
+      const response = await app.inject({ method: 'POST', url: '/api/plan/script/turn', payload: { projectId: 'project-1', draft } });
+      expect(response.statusCode).toBe(400);
+      expect(run).not.toHaveBeenCalled();
+      await app.close();
+    },
+  );
 
   it('rejects malformed answers and non-script projects', async () => {
     const director = { run: vi.fn() } as never;

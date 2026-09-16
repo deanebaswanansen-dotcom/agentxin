@@ -31,10 +31,12 @@ function plan(overrides: Partial<ScriptPlan> = {}): ScriptPlan {
 }
 
 describe('FoundationArtifactCoercion', () => {
-  it('fills a nearly empty plan while preserving confirmed values and ownership metadata', () => {
+  it('fills optional fields while preserving confirmed values and ownership metadata', () => {
     const current = plan();
     const completed = coerceScriptPlanCandidate({
       title: '  新标题  ',
+      logline: '记者潜入新闻社追查失踪同事，发现关键线索指向自己的导师。',
+      coreConflict: '记者必须在导师销毁线索前公开证据',
       maxPrimaryCharacters: '999',
       market: '国内',
     }, {
@@ -58,11 +60,34 @@ describe('FoundationArtifactCoercion', () => {
     expect(() => decodeScriptPlanInput(completed)).not.toThrow();
 
     const converted = coerceScriptPlanCandidate({
+      name: '失踪档案', story: '记者在导师与真相之间作出选择。', conflict: '记者对抗试图掩盖失踪案的导师',
       genres: '都市、悬疑', totalEpisodes: '88集',
     }, {
       projectId: 'project-1', now: '2026-08-26T00:00:00.000Z', id: 'plan-2', explicit: {},
     });
     expect(converted).toMatchObject({ genres: ['都市', '悬疑'], totalEpisodes: 88 });
+  });
+
+  it.each([{}, { message: 'ok' }, { title: '西方玄幻' }, { title: '标题', logline: '只有故事' }])(
+    'does not complete missing model story content from a seed or an existing draft: %j', (value) => {
+      expect(() => coerceScriptPlanCandidate(value, {
+        projectId: 'project-1', now: '2026-08-26T00:00:00.000Z', id: 'plan-2',
+        current: plan(), draft: plan(), explicit: { coreConflict: '用户已确认的冲突' },
+        seedPrompt: '西方玄幻\n项目名称：123\n当前草稿：{"title":"旧标题"}',
+      })).toThrow('模型结果缺少有效故事字段');
+    },
+  );
+
+  it('uses explicit draft fields as context defaults, never the raw seed', () => {
+    const seedPrompt = '西方玄幻\n项目名称：123\n当前草稿：{"title":"旧标题"}';
+    const completed = coerceScriptPlanCandidate({
+      title: '最后一封信', logline: '邮差为救出女儿寻找被截获的密信。', coreConflict: '邮差与截信的领主争夺密信',
+    }, {
+      projectId: 'project-1', now: '2026-08-26T00:00:00.000Z', id: 'plan-2', explicit: {}, seedPrompt,
+      draft: { audience: '奇幻观众', totalEpisodes: 12, coreRequirements: '保留作者设定' },
+    });
+    expect(completed).toMatchObject({ title: '最后一封信', totalEpisodes: 12, audience: '奇幻观众', coreRequirements: '保留作者设定' });
+    expect(JSON.stringify(completed)).not.toContain('当前草稿');
   });
 
   it('repairs duplicated, sparse and out-of-order outline cards into one complete range', () => {

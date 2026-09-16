@@ -69,6 +69,9 @@ export type ScriptPlanInput = Omit<
   'id' | 'projectId' | 'revision' | 'createdAt' | 'updatedAt'
 > & { id?: ScriptId };
 
+/** Editable input context for AI planning; never conveys ownership or approval. */
+export type ScriptPlanDraftContext = Partial<Omit<ScriptPlanInput, 'id' | 'status'>>;
+
 export interface ScriptCharacterRelationship {
   characterId: ScriptId;
   label: string;

@@ -160,6 +160,37 @@ async function optional<T>(request: Promise<T>): Promise<T | undefined> {
   }
 }
 
+function planningDraft(plan: ScriptPlan): NonNullable<Parameters<ApiClient['script']['plan']['turn']>[0]['draft']> {
+  return {
+    title: plan.title,
+    theme: plan.theme,
+    market: plan.market,
+    channel: plan.channel,
+    genres: plan.genres,
+    audience: plan.audience,
+    coreConflict: plan.coreConflict,
+    logline: plan.logline,
+    highlights: plan.highlights,
+    totalEpisodes: plan.totalEpisodes,
+    episodeDurationSeconds: plan.episodeDurationSeconds,
+    targetCharsPerEpisode: plan.targetCharsPerEpisode,
+    maxPrimaryCharacters: plan.maxPrimaryCharacters,
+    maxScenesPerEpisode: plan.maxScenesPerEpisode,
+    dialogueDensityPercent: plan.dialogueDensityPercent,
+    language: plan.language,
+    format: plan.format,
+    coreRequirements: plan.coreRequirements,
+    forbiddenElements: plan.forbiddenElements,
+    endingDirection: plan.endingDirection,
+    coverPrompt: plan.coverPrompt,
+    creativeRules: plan.creativeRules,
+  };
+}
+
+function planningErrorNotice(action: string, error: unknown): string {
+  return `${action}未完成，当前策划已保留。${error instanceof Error ? error.message : '请重试或检查模型配置。'}`;
+}
+
 function PlanEditor({
   value,
   busy,
@@ -1426,6 +1457,7 @@ export function ScriptWorkspace({
   const resourceEditVersions = useRef<ScriptResourceVersions>(cleanResourceVersions());
   const resourceEditBases = useRef<Partial<Pick<ScriptWorkspaceData, EditableScriptResource>>>({});
   const workspaceVersion = useRef(0);
+  const conceptInputVersion = useRef(0);
   const stageRef = useRef<ScriptStage>('plan');
   const selectedBatchStartRef = useRef(1);
   const selectedEpisodeRef = useRef<ScriptEpisode>();
@@ -1647,6 +1679,11 @@ export function ScriptWorkspace({
     resourceEditVersions.current[resource] += 1;
   }, [data]);
 
+  const changeConceptPrompt = useCallback((prompt: string) => {
+    conceptInputVersion.current += 1;
+    setConceptPrompt(prompt);
+  }, []);
+
   const applyPlanTurn = useCallback((
     result: Awaited<ReturnType<ApiClient['script']['plan']['turn']>>,
     requestEditVersion: number,
@@ -1685,18 +1722,35 @@ export function ScriptWorkspace({
 
   const generateConcepts = useCallback(async () => {
     if (!data) return;
+    const requestWorkspaceVersion = workspaceVersion.current;
+    const inputVersion = conceptInputVersion.current;
+    const editVersion = resourceEditVersions.current.plan;
+    const usesDraft = !conceptPrompt.trim();
+    const isCurrentWorkspace = () => workspaceVersion.current === requestWorkspaceVersion;
     setConceptBusy(true);
     setNotice('');
     try {
       const fallbackPrompt = [data.plan.title, data.plan.logline, data.plan.coreRequirements]
         .map((item) => item.trim()).filter(Boolean).join('\n');
       const result = await client.script.plan.concepts(projectId, conceptPrompt.trim() || fallbackPrompt);
+      if (!isCurrentWorkspace()) return;
+      if (conceptInputVersion.current !== inputVersion) {
+        setNotice('选题灵感已修改，已保留当前候选，请重新生成选题');
+        return;
+      }
+      if (usesDraft && resourceEditVersions.current.plan !== editVersion) {
+        setNotice('用于选题的策划草稿已修改，已保留当前候选，请重新生成选题');
+        return;
+      }
+      if (!result.proposals.length) throw new Error('模型没有返回可用选题，请重试。');
       setConcepts(result.proposals);
       setNotice(`AI 已生成 ${result.proposals.length} 个选题方向，采用前不会覆盖当前策划`);
     } catch (error) {
+      if (!isCurrentWorkspace()) return;
+      setNotice(planningErrorNotice('AI 选题生成', error));
       onError?.(error);
     } finally {
-      setConceptBusy(false);
+      if (isCurrentWorkspace()) setConceptBusy(false);
     }
   }, [client, conceptPrompt, data, onError, projectId]);
 
@@ -1735,60 +1789,62 @@ export function ScriptWorkspace({
 
   const startPlanInterview = useCallback(async () => {
     if (!data) return;
+    const requestWorkspaceVersion = workspaceVersion.current;
+    const isCurrentWorkspace = () => workspaceVersion.current === requestWorkspaceVersion;
     const editVersion = resourceEditVersions.current.plan;
+    const inputVersion = conceptInputVersion.current;
     setBusy(true);
     setNotice('');
     try {
-      const seedPrompt = [
-        data.plan.title,
-        data.plan.logline,
-        data.plan.coreRequirements,
-        data.plan.creativeRules ? `创作规则：${JSON.stringify(data.plan.creativeRules)}` : '',
-      ]
-        .map((item) => item.trim()).filter(Boolean).join('\n');
-      applyPlanTurn(await client.script.plan.turn({
+      const result = await client.script.plan.turn({
         projectId,
-        seedPrompt,
-        answers: [],
-        reset: true,
-      }), editVersion);
-    } catch (error) {
-      onError?.(error);
-    } finally {
-      setBusy(false);
-    }
-  }, [applyPlanTurn, client, data, onError, projectId]);
-
-  const autoCompletePlan = useCallback(async () => {
-    if (!data) return;
-    setBusy(true);
-    setNotice('AI 正在自动补全策划，请稍候…');
-    try {
-      const seedPrompt = [
-        conceptPrompt.trim(),
-        `项目名称：${projectNameRef.current ?? ''}`,
-        `当前草稿：${JSON.stringify({
-          title: data.plan.title,
-          theme: data.plan.theme,
-          market: data.plan.market,
-          channel: data.plan.channel,
-          genres: data.plan.genres,
-          audience: data.plan.audience,
-          coreConflict: data.plan.coreConflict,
-          logline: data.plan.logline,
-          totalEpisodes: data.plan.totalEpisodes,
-           targetCharsPerEpisode: data.plan.targetCharsPerEpisode,
-           coreRequirements: data.plan.coreRequirements,
-           creativeRules: data.plan.creativeRules,
-           endingDirection: data.plan.endingDirection,
-        })}`,
-      ].filter(Boolean).join('\n');
-      let result = await client.script.plan.turn({
-        projectId,
-        seedPrompt,
+        seedPrompt: conceptPrompt.trim(),
+        draft: planningDraft(data.plan),
         answers: [],
         reset: true,
       });
+      if (!isCurrentWorkspace()) return;
+      if (conceptInputVersion.current !== inputVersion) {
+        setPlanQuestions([]);
+        setPlanAnswers({});
+        setNotice('选题灵感已修改，当前策划已保留，请重新发起 Agent 策划');
+        return;
+      }
+      applyPlanTurn(result, editVersion);
+    } catch (error) {
+      if (!isCurrentWorkspace()) return;
+      setNotice(planningErrorNotice('Agent 策划', error));
+      onError?.(error);
+    } finally {
+      if (isCurrentWorkspace()) setBusy(false);
+    }
+  }, [applyPlanTurn, client, conceptPrompt, data, onError, projectId]);
+
+  const autoCompletePlan = useCallback(async () => {
+    if (!data) return;
+    const requestWorkspaceVersion = workspaceVersion.current;
+    const editVersion = resourceEditVersions.current.plan;
+    const inputVersion = conceptInputVersion.current;
+    const isCurrentWorkspace = () => workspaceVersion.current === requestWorkspaceVersion;
+    const inputsAreCurrent = () => {
+      if (!isCurrentWorkspace()) return false;
+      if (resourceEditVersions.current.plan === editVersion && conceptInputVersion.current === inputVersion) return true;
+      setPlanQuestions([]);
+      setPlanAnswers({});
+      setNotice('策划或灵感已修改，已保留当前内容并停止自动策划；请检查后重新生成');
+      return false;
+    };
+    setBusy(true);
+    setNotice('AI 正在自动补全策划，请稍候…');
+    try {
+      let result = await client.script.plan.turn({
+        projectId,
+        seedPrompt: conceptPrompt.trim(),
+        draft: planningDraft(data.plan),
+        answers: [],
+        reset: true,
+      });
+      if (!inputsAreCurrent()) return;
       for (let round = 0; result.status === 'asking' && round < 16; round += 1) {
         const questions = result.questions ?? [];
         if (questions.length === 0) throw new Error('AI 策划没有返回可委托的问题。');
@@ -1796,6 +1852,7 @@ export function ScriptWorkspace({
           projectId,
           answers: questions.map((question) => ({ field: question.field, delegate: true })),
         });
+        if (!inputsAreCurrent()) return;
       }
       if (result.status !== 'ready' || !result.plan) {
         throw new Error('AI 策划尚未完成，请重试。');
@@ -1803,6 +1860,7 @@ export function ScriptWorkspace({
       const approved = result.plan.status === 'draft'
         ? await client.script.plan.approve(projectId, result.plan.revision)
         : result.plan;
+      if (!inputsAreCurrent()) return;
       dirtyResources.current.plan = false;
       setData((current) => current ? {
         ...current,
@@ -1815,10 +1873,11 @@ export function ScriptWorkspace({
       setPlanAnswers({});
       setNotice('AI 已自动完成并确认策划；你仍可点“编辑模式”修改，修改后记得保存');
     } catch (error) {
-      setNotice('AI 自动策划未完成，请按错误提示处理后重试');
+      if (!isCurrentWorkspace()) return;
+      setNotice(planningErrorNotice('AI 自动策划', error));
       onError?.(error);
     } finally {
-      setBusy(false);
+      if (isCurrentWorkspace()) setBusy(false);
     }
   }, [client, conceptPrompt, data, onError, projectId]);
 
@@ -1834,17 +1893,30 @@ export function ScriptWorkspace({
       return;
     }
     const editVersion = resourceEditVersions.current.plan;
+    const requestWorkspaceVersion = workspaceVersion.current;
+    const inputVersion = conceptInputVersion.current;
+    const isCurrentWorkspace = () => workspaceVersion.current === requestWorkspaceVersion;
     setBusy(true);
     setNotice('');
     try {
-      applyPlanTurn(await client.script.plan.turn({
+      const result = await client.script.plan.turn({
         projectId,
         answers: planQuestions.map((question) => planAnswers[question.field]!),
-      }), editVersion);
+      });
+      if (!isCurrentWorkspace()) return;
+      if (conceptInputVersion.current !== inputVersion) {
+        setPlanQuestions([]);
+        setPlanAnswers({});
+        setNotice('选题灵感已修改，当前策划已保留，请重新发起 Agent 策划');
+        return;
+      }
+      applyPlanTurn(result, editVersion);
     } catch (error) {
+      if (!isCurrentWorkspace()) return;
+      setNotice(planningErrorNotice('Agent 策划', error));
       onError?.(error);
     } finally {
-      setBusy(false);
+      if (isCurrentWorkspace()) setBusy(false);
     }
   }, [applyPlanTurn, client, onError, planAnswers, planQuestions, projectId]);
 
@@ -1855,10 +1927,13 @@ export function ScriptWorkspace({
       return;
     }
     const editVersion = resourceEditVersions.current.plan;
+    const requestWorkspaceVersion = workspaceVersion.current;
+    const isCurrentWorkspace = () => workspaceVersion.current === requestWorkspaceVersion;
     setBusy(true);
     setNotice('');
     try {
       const plan = await client.script.plan.approve(projectId, data.plan.revision);
+      if (!isCurrentWorkspace()) return;
       const unchangedWhileApproving = resourceEditVersions.current.plan === editVersion;
       setData((current) => current ? {
         ...current,
@@ -1875,9 +1950,10 @@ export function ScriptWorkspace({
         ? '策划已确认，可生成大纲、角色与世界设定'
         : '策划已确认，仍有未保存修改');
     } catch (error) {
+      if (!isCurrentWorkspace()) return;
       onError?.(error);
     } finally {
-      setBusy(false);
+      if (isCurrentWorkspace()) setBusy(false);
     }
   }, [client, data, onError, projectId]);
 
@@ -2945,7 +3021,7 @@ export function ScriptWorkspace({
         {taskRecordMode ? <TaskRecordPanel mode={taskRecordMode} jobs={taskRecordMode === 'trash' ? trashJobs : data?.jobs ?? []} busy={busy} loading={taskRecordMode === 'trash' && trashLoading} onClose={() => setTaskRecordMode(undefined)} onTrash={(jobId) => void trashJob(jobId)} onRestore={(jobId) => void restoreJob(jobId)} onDeletePermanently={(jobId) => void deleteJobPermanently(jobId)} /> : null}
         {visibleBackgroundJob ? <MaterialJobPanel job={visibleBackgroundJob} label={backgroundJobLabel} busy={busy} onResume={(jobId) => void resumeJob(jobId)} onCancel={(jobId) => void cancelJob(jobId)} /> : null}
         {!data ? <div className="script-loading" role="status">正在加载短剧资料…</div> : null}
-        {data && stage === 'plan' ? <PlanEditor value={data.plan} busy={busy} conceptBusy={conceptBusy} conceptPrompt={conceptPrompt} concepts={concepts} questions={planQuestions} answers={planAnswers} onChange={(plan) => { markResourceDirty('plan'); setData((current) => current ? { ...current, plan } : current); }} onConceptPromptChange={setConceptPrompt} onGenerateConcepts={() => void generateConcepts()} onAdoptConcept={adoptConcept} onSave={() => void savePlan()} onAgentPlan={() => void startPlanInterview()} onAutoComplete={() => void autoCompletePlan()} onAnswer={(field, value) => setPlanAnswers((current) => ({ ...current, [field]: { field, value } }))} onDelegate={(field) => setPlanAnswers((current) => ({ ...current, [field]: { field, delegate: true } }))} onSubmitAnswers={() => void submitPlanAnswers()} onApprove={() => void approvePlan()} /> : null}
+        {data && stage === 'plan' ? <PlanEditor value={data.plan} busy={busy} conceptBusy={conceptBusy} conceptPrompt={conceptPrompt} concepts={concepts} questions={planQuestions} answers={planAnswers} onChange={(plan) => { markResourceDirty('plan'); setData((current) => current ? { ...current, plan } : current); }} onConceptPromptChange={changeConceptPrompt} onGenerateConcepts={() => void generateConcepts()} onAdoptConcept={adoptConcept} onSave={() => void savePlan()} onAgentPlan={() => void startPlanInterview()} onAutoComplete={() => void autoCompletePlan()} onAnswer={(field, value) => setPlanAnswers((current) => ({ ...current, [field]: { field, value } }))} onDelegate={(field) => setPlanAnswers((current) => ({ ...current, [field]: { field, delegate: true } }))} onSubmitAnswers={() => void submitPlanAnswers()} onApprove={() => void approvePlan()} /> : null}
         {data && stage === 'outline' ? <OutlineEditor value={data.outline ?? emptyOutline(projectId)} busy={busy} onChange={(outline) => { markResourceDirty('outline'); setData((current) => current ? { ...current, outline } : current); }} onSave={() => void saveOutline()} onGenerate={(regenerate) => void (regenerate ? startMaterialJob('script_series_outline', ['plan', 'outline'], true) : startOutlineCompletion())} /> : null}
         {data && stage === 'characters' ? <CharacterEditor projectId={projectId} value={data.characters} busy={busy} onChange={(characters) => { markResourceDirty('characters'); setData((current) => current ? { ...current, characters } : current); }} onSave={() => void saveCharacters()} onGenerate={(regenerate) => void startMaterialJob('script_bible', ['plan', 'outline', 'characters', 'world'], regenerate)} /> : null}
         {data && stage === 'episodes' ? <EpisodeBatchPanel data={data} busy={busy} batchStart={selectedBatchStart} batchEpisodes={batchEpisodes} batchLoading={batchLoading} episode={selectedEpisode} episodeLoading={episodeLoading} onStart={(start, count, regenerate) => void startEpisodeBatch(start, count, regenerate)} onResume={(jobId) => void resumeJob(jobId)} onCancel={(jobId) => void cancelJob(jobId)} onTrash={(jobId) => void trashJob(jobId)} onOpenEpisode={(episodeNumber) => void openEpisode(episodeNumber)} onRegenerateEpisode={(episodeNumber, instruction, rewriteMode) => startEpisodeBatch(episodeNumber, 1, true, instruction, rewriteMode)} onEpisodeChange={editSelectedEpisode} onSaveEpisode={() => void saveEpisode()} onReviewEpisode={(episodeNumber) => void reviewEpisode(episodeNumber)} onReviewBatch={(episodeNumbers) => void reviewCurrentBatch(episodeNumbers)} onReviewStatus={(issueId, status) => void updateReviewStatus(issueId, status)} onExport={(format, range) => void exportScript(format, range)} /> : null}
