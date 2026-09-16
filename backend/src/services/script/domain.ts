@@ -1,5 +1,6 @@
 /** Canonical short-drama domain contract. Structured JSON is the source of truth. */
 import type { WriteBrief } from '../../types/WriteBrief.js';
+import type { AcceptedMemoryInput, MemorySyncIntent } from '../../types/SourceMemory.js';
 
 export type ScriptId = string;
 export type ScriptPlanStatus = 'draft' | 'approved' | 'locked';
@@ -335,6 +336,8 @@ export interface ScriptEpisodeContinuityCommit
   revision: number;
   status: 'current' | 'stale';
   inputFingerprint: string;
+  /** Immutable projection input accepted in the same transaction as this commit. */
+  memoryInput?: AcceptedMemoryInput;
   previousContinuityCommitId?: ScriptId;
   previousContinuityRevision?: number;
   createdAt: string;
@@ -425,6 +428,8 @@ export interface ScriptProjectState {
   episodes: ScriptEpisode[];
   /** Detailed continuity source of truth; missing in legacy v1 files. */
   continuityCommits?: ScriptEpisodeContinuityCommit[];
+  /** Current complete replacement intent; absent on untouched legacy projects. */
+  memorySync?: MemorySyncIntent;
   /** Legacy aggregate retained while readers migrate to continuityCommits. */
   continuity: ScriptContinuityState;
   /** Aggregate compare-and-save revision for the review issue collection. */

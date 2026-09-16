@@ -2,13 +2,16 @@ import { randomUUID } from 'node:crypto';
 import {
   mkdir,
   readFile,
+  readdir,
   rename,
   unlink,
   writeFile,
 } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
-import { getCurrentClientId } from '../client/clientScope.js';
+import { getCurrentClientId, isValidClientId } from '../client/clientScope.js';
+import type { FrozenMemoryProjection, MemorySyncClaim, MemorySyncIntent, MemorySyncTarget } from '../../types/SourceMemory.js';
+import { validateFrozenMemoryProjection } from '../memory/sourceMemoryContract.js';
 import { StoreError } from '../../store/StoreError.js';
 import type {
   ScriptCharacter,
@@ -36,6 +39,7 @@ import {
 } from './ScriptStore.js';
 import { currentScriptContinuityCommits } from './ScriptContinuityCommit.js';
 import { assertScriptWriteBriefCurrent, scriptWriteBriefRef } from './ScriptWriteBrief.js';
+import { freezeScriptMemoryInput, refreshScriptMemoryIntent, staleInvalidScriptMemorySources } from './ScriptSourceMemory.js';
 import {
   allowsTemporaryDialogueSpeakers,
   isBlockingScriptReviewIssue,
@@ -174,6 +178,7 @@ function normalizeState(value: unknown, projectId: string): ScriptProjectState {
       : [],
     episodes,
     continuityCommits,
+    ...(input.memorySync ? { memorySync: clone(input.memorySync) } : {}),
     continuity: {
       currentState: Array.isArray(continuity?.currentState)
         ? clone(continuity.currentState)
@@ -477,13 +482,17 @@ export class FileScriptStore implements ScriptStore {
   private readonly states = new Map<string, ScriptProjectState | undefined>();
   private readonly mutationQueues = new Map<string, Promise<void>>();
 
-  private constructor(rootDirectory: string) {
+  private constructor(rootDirectory: string, private readonly clientId: string) {
     this.rootDirectory = resolve(rootDirectory);
   }
 
-  static async create(rootDirectory: string): Promise<FileScriptStore> {
+  /** This concrete store owns one library, independently of an HTTP request's header. */
+  get storageClientId(): string { return this.clientId; }
+
+  static async create(rootDirectory: string, clientId = 'local'): Promise<FileScriptStore> {
+    if (clientId !== 'local' && !isValidClientId(clientId)) throw new StoreError('短剧客户端标识无效');
     await mkdir(resolve(rootDirectory), { recursive: true });
-    return new FileScriptStore(rootDirectory);
+    return new FileScriptStore(rootDirectory, clientId);
   }
 
   private filePath(projectId: string): string {
@@ -499,6 +508,19 @@ export class FileScriptStore implements ScriptStore {
     try {
       const parsed = JSON.parse(await readFile(filePath, 'utf8')) as unknown;
       const state = normalizeState(parsed, projectId);
+      if (state.memorySync) {
+        validateFrozenMemoryProjection(state.memorySync.projection);
+        if (state.memorySync.projection.clientId !== this.clientId ||
+            state.memorySync.projection.projectId !== projectId || state.memorySync.projection.mode !== 'short_drama') {
+          throw new StoreError('短剧记忆同步来源与客户端项目不一致');
+        }
+      }
+      const invalidSourcesStaled = staleInvalidScriptMemorySources(state, this.clientId);
+      const originalIntent = state.memorySync;
+      refreshScriptMemoryIntent(state, this.clientId);
+      // Every load runs inside the project queue. Repair a normalized/staled
+      // chain durably before exposing its replacement intent to any worker.
+      if (invalidSourcesStaled || state.memorySync !== originalIntent) await this.persist(state);
       this.states.set(projectId, state);
       this.loaded.add(projectId);
       return state;
@@ -530,40 +552,35 @@ export class FileScriptStore implements ScriptStore {
     projectId: string,
     operation: (state: ScriptProjectState) => Promise<T> | T,
   ): Promise<T> {
-    let resolveResult!: (value: T | PromiseLike<T>) => void;
-    let rejectResult!: (reason?: unknown) => void;
-    const result = new Promise<T>((resolvePromise, rejectPromise) => {
-      resolveResult = resolvePromise;
-      rejectResult = rejectPromise;
+    return this.inProjectQueue(projectId, async () => {
+      const current = (await this.load(projectId)) ?? emptyState(projectId);
+      const working = clone(current);
+      const value = await operation(working);
+      refreshScriptMemoryIntent(working, this.clientId);
+      working.updatedAt = new Date().toISOString();
+      await this.persist(working);
+      this.states.set(projectId, working);
+      this.loaded.add(projectId);
+      return clone(value);
     });
+  }
+
+  private inProjectQueue<T>(projectId: string, operation: () => Promise<T>): Promise<T> {
     const previous = this.mutationQueues.get(projectId) ?? Promise.resolve();
-    const run = async (): Promise<void> => {
-      try {
-        const current = (await this.load(projectId)) ?? emptyState(projectId);
-        const working = clone(current);
-        const value = await operation(working);
-        working.updatedAt = new Date().toISOString();
-        await this.persist(working);
-        this.states.set(projectId, working);
-        this.loaded.add(projectId);
-        resolveResult(clone(value));
-      } catch (error) {
-        rejectResult(error);
-      }
-    };
-    const queued = previous.then(run, run);
-    this.mutationQueues.set(projectId, queued);
-    void queued.finally(() => {
-      if (this.mutationQueues.get(projectId) === queued) this.mutationQueues.delete(projectId);
+    const result = previous.then(operation, operation);
+    const settled = result.then(() => undefined, () => undefined);
+    this.mutationQueues.set(projectId, settled);
+    void settled.then(() => {
+      if (this.mutationQueues.get(projectId) === settled) this.mutationQueues.delete(projectId);
     });
     return result;
   }
 
   async getProjectState(projectId: string): Promise<ScriptProjectState | undefined> {
-    const queued = this.mutationQueues.get(projectId);
-    if (queued) await queued;
-    const state = await this.load(projectId);
-    return state ? clone(state) : undefined;
+    return this.inProjectQueue(projectId, async () => {
+      const state = await this.load(projectId);
+      return state ? clone(state) : undefined;
+    });
   }
 
   savePlan(plan: ScriptPlan, expectedRevision?: number): Promise<ScriptPlan> {
@@ -805,6 +822,8 @@ export class FileScriptStore implements ScriptStore {
         createdAt: updatedAt,
         updatedAt,
       };
+      // The accepted body, immutable source, and replacement intent share one rename.
+      continuity.memoryInput = freezeScriptMemoryInput(this.clientId, episode, continuity);
 
       if (episodeIndex >= 0) state.episodes[episodeIndex] = episode;
       else state.episodes.push(episode);
@@ -881,6 +900,90 @@ export class FileScriptStore implements ScriptStore {
       if (this.mutationQueues.get(projectId) === queued) this.mutationQueues.delete(projectId);
     }
   }
+
+  async listMemorySyncTargets(): Promise<MemorySyncTarget[]> {
+    const files = await readdir(this.rootDirectory, { withFileTypes: true });
+    const targets: MemorySyncTarget[] = [];
+    for (const file of files) {
+      if (!file.isFile() || !file.name.endsWith('.json')) continue;
+      const projectId = file.name.slice(0, -5);
+      if (!SAFE_ID.test(projectId)) continue;
+      // Discovery never loads a project: one corrupt file must not block
+      // recovery of unrelated projects or force every scan to parse snapshots.
+      targets.push({ clientId: this.clientId, projectId });
+    }
+    return targets.sort((left, right) => left.projectId.localeCompare(right.projectId));
+  }
+
+  async getMemorySync(projectId: string): Promise<MemorySyncIntent | undefined> {
+    return this.inProjectQueue(projectId, async () => {
+      const state = await this.load(projectId);
+      return state?.memorySync ? clone(state.memorySync) : undefined;
+    });
+  }
+
+  claimMemorySync(projectId: string, options: {
+    owner: string; now: string; leaseMs: number; retryFailed?: boolean;
+  }): Promise<MemorySyncClaim | undefined> {
+    const now = Date.parse(options.now);
+    if (!options.owner.trim() || !Number.isFinite(now) || !Number.isFinite(options.leaseMs) || options.leaseMs <= 0 ||
+        !Number.isFinite(new Date(now + options.leaseMs).getTime())) {
+      return Promise.reject(new StoreError('短剧记忆同步租约参数无效'));
+    }
+    return this.inProjectQueue(projectId, async () => {
+      const current = await this.load(projectId);
+      const intent = current?.memorySync;
+      if (!current || !intent) return undefined;
+      const claimable = intent.status === 'pending' ||
+        (intent.status === 'running' && (!intent.lease || !Number.isFinite(Date.parse(intent.lease.expiresAt)) || Date.parse(intent.lease.expiresAt) <= now)) ||
+        (intent.status === 'failed' && options.retryFailed === true);
+      if (!claimable) return undefined;
+      const working = clone(current);
+      const next = working.memorySync!;
+      next.status = 'running';
+      next.attempts += 1;
+      next.updatedAt = new Date(now).toISOString();
+      next.lease = { token: randomUUID(), owner: options.owner, expiresAt: new Date(now + options.leaseMs).toISOString() };
+      delete next.error;
+      await this.persist(working);
+      this.states.set(projectId, working);
+      return { clientId: this.clientId, projectId, revision: next.projection.revision,
+        idempotencyKey: next.projection.idempotencyKey, lease: clone(next.lease) };
+    });
+  }
+
+  applyMemorySync(
+    projectId: string,
+    claim: MemorySyncClaim,
+    write: (projection: FrozenMemoryProjection) => Promise<void>,
+  ): Promise<MemorySyncIntent | undefined> {
+    return this.inProjectQueue(projectId, async () => {
+      const current = await this.load(projectId);
+      const intent = current?.memorySync;
+      if (!current || !intent || intent.status !== 'running' ||
+          claim.clientId !== this.clientId || claim.projectId !== projectId ||
+          claim.revision !== intent.projection.revision || claim.idempotencyKey !== intent.projection.idempotencyKey ||
+          !intent.lease || claim.lease.token !== intent.lease.token || claim.lease.owner !== intent.lease.owner ||
+          claim.lease.expiresAt !== intent.lease.expiresAt || !Number.isFinite(Date.parse(intent.lease.expiresAt)) ||
+          Date.parse(intent.lease.expiresAt) <= Date.now()) return undefined;
+      const working = clone(current);
+      const next = working.memorySync!;
+      try {
+        await write(clone(next.projection));
+        next.status = 'succeeded';
+        delete next.error;
+      } catch {
+        next.status = 'failed';
+        next.error = { code: 'SOURCE_MEMORY_SYNC_FAILED', message: '记忆同步失败，已接受正文保持不变，可重试同步。' };
+      }
+      delete next.lease;
+      next.updatedAt = new Date().toISOString();
+      // Publish only after ACK persistence. A failed ACK leaves a replayable running lease.
+      await this.persist(working);
+      this.states.set(projectId, working);
+      return clone(next);
+    });
+  }
 }
 
 /** Lazily supplies one FileScriptStore per validated browser client id. */
@@ -888,11 +991,10 @@ export function createClientScopedScriptStore(rootDirectory: string): ScriptStor
   const root = resolve(rootDirectory);
   const stores = new Map<string, Promise<FileScriptStore>>();
 
-  function currentStore(): Promise<FileScriptStore> {
-    const clientId = getCurrentClientId();
+  function storeFor(clientId: string): Promise<FileScriptStore> {
     let store = stores.get(clientId);
     if (!store) {
-      store = FileScriptStore.create(join(root, clientId));
+      store = FileScriptStore.create(join(root, clientId), clientId);
       stores.set(clientId, store);
     }
     return store;
@@ -901,8 +1003,19 @@ export function createClientScopedScriptStore(rootDirectory: string): ScriptStor
   return new Proxy({} as ScriptStore, {
     get(_target, property) {
       if (property === 'then' || typeof property !== 'string') return undefined;
+      if (property === 'listMemorySyncTargets') return async (): Promise<MemorySyncTarget[]> => {
+        let clients;
+        try { clients = await readdir(root, { withFileTypes: true }); }
+        catch (error) { if (isErrno(error) && error.code === 'ENOENT') return []; throw error; }
+        const targets: MemorySyncTarget[] = [];
+        for (const client of clients) {
+          if (!client.isDirectory() || (client.name !== 'local' && !isValidClientId(client.name))) continue;
+          targets.push(...await (await storeFor(client.name)).listMemorySyncTargets());
+        }
+        return targets.sort((left, right) => left.clientId.localeCompare(right.clientId) || left.projectId.localeCompare(right.projectId));
+      };
       return async (...args: unknown[]) => {
-        const store = await currentStore();
+        const store = await storeFor(getCurrentClientId());
         const method = Reflect.get(store, property) as unknown;
         if (typeof method !== 'function') {
           throw new TypeError(`Unknown ScriptStore method: ${property}`);

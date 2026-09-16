@@ -1,7 +1,7 @@
 import Fastify from 'fastify';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { getCurrentClientId, registerClientScope } from './clientScope.js';
+import { getCurrentClientId, registerClientScope, runWithStoredClientId } from './clientScope.js';
 
 const ORIGINAL_REQUIRE_CLIENT_ID = process.env.REQUIRE_CLIENT_ID;
 
@@ -11,6 +11,15 @@ afterEach(() => {
 });
 
 describe('clientScope', () => {
+  it('restores local internally without allowing local or traversal ids in headers', async () => {
+    expect(await runWithStoredClientId('local', async () => { await Promise.resolve(); return getCurrentClientId(); })).toBe('local');
+    expect(() => runWithStoredClientId('../escape', () => undefined)).toThrow();
+    const app = Fastify();
+    registerClientScope(app);
+    app.get('/api/client', async () => ({ clientId: getCurrentClientId() }));
+    expect((await app.inject({ method: 'GET', url: '/api/client', headers: { 'x-agentxin-client-id': 'local' } })).statusCode).toBe(400);
+    await app.close();
+  });
   it('binds a valid browser library id to the request', async () => {
     const app = Fastify();
     registerClientScope(app);

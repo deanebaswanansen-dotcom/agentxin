@@ -10,9 +10,13 @@
  * - 全部内容按 projectId 分桶，删除项目时可整桶清理。
  * - 写路径经全局 promise 链串行化，避免并发 read-modify-write 丢更新。
  */
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { StoreError } from '../../store/StoreError.js';
+import type { SourceMemoryMode } from '../../types/SourceMemory.js';
+import { sourceMemoryConflict, validateSourceMemoryPartition } from './sourceMemoryPartition.js';
+import type { SourceMemoryPartition } from './sourceMemoryPartition.js';
 
 /** 单条章节摘要：写完一章后由「反思子 Agent」沉淀，供后续章节回灌前情。 */
 export interface ChapterSummary {
@@ -111,11 +115,18 @@ export interface ProjectMemory {
   /** 伏笔台账（埋设 / 呼应 / 回收）。 */
   foreshadows: ForeshadowEntry[];
   updatedAt: string;
+  /** Accepted-source projections are separate from the legacy novel memory API. */
+  sourceMemory?: Partial<Record<SourceMemoryMode, SourceMemoryPartition>>;
+  /** Existing unsourced items remain references in the legacy API, not accepted facts. */
+  legacyUntracked?: true;
+  /** Read-only tombstone marker; a deleted project cannot be recreated by a late writer. */
+  deleted?: true;
 }
 
 interface MemoryFile {
-  version: 1;
+  version: 2;
   projects: Record<string, ProjectMemory>;
+  deletedProjects?: Record<string, string>;
 }
 
 export interface MemoryStorePort {
@@ -145,7 +156,7 @@ function emptyProjectMemory(): ProjectMemory {
 }
 
 function emptyFile(): MemoryFile {
-  return { version: 1, projects: {} };
+  return { version: 2, projects: {} };
 }
 
 export class MemoryStore implements MemoryStorePort {
@@ -193,34 +204,57 @@ export class MemoryStore implements MemoryStorePort {
     let raw: string;
     try {
       raw = await readFile(this.filePath, 'utf8');
-    } catch {
-      // 文件不存在或不可读：以空记忆开始，首次写入时再创建。
-      this.data = emptyFile();
-      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        this.data = emptyFile();
+        return;
+      }
+      throw new StoreError('记忆文件无法读取。', { cause: error });
     }
     try {
-      const parsed = JSON.parse(raw) as Partial<MemoryFile>;
-      this.data = {
-        version: 1,
-        projects: parsed.projects ?? {},
-      };
-    } catch {
-      // 文件损坏时不让 Agent 崩溃：重置为空记忆（记忆是增强项，非关键数据）。
-      this.data = emptyFile();
+      const parsed = JSON.parse(raw) as Omit<MemoryFile, 'version'> & { version: number };
+      const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
+      if (!isRecord(parsed) || (parsed.version !== 1 && parsed.version !== 2) || !isRecord(parsed.projects) ||
+          (parsed.deletedProjects !== undefined && !isRecord(parsed.deletedProjects))) throw new Error('Unsupported memory file');
+      for (const [projectId, project] of Object.entries(parsed.projects)) {
+        if (!isRecord(project)) throw new Error('Invalid project memory');
+        for (const key of ['summaries', 'facts', 'criticalStates', 'rejectedChapterIds', 'learnings', 'workflow', 'foreshadows'] as const) {
+          if (project[key] !== undefined && !Array.isArray(project[key])) throw new Error('Invalid legacy memory collection');
+          if (project[key]?.length) project.legacyUntracked = true;
+        }
+        if (project.sourceMemory !== undefined) {
+          if (!isRecord(project.sourceMemory)) throw new Error('Invalid memory partitions');
+          for (const [mode, partition] of Object.entries(project.sourceMemory)) {
+            if (mode !== 'short_drama' && mode !== 'novel') throw new Error('Unsupported source memory mode');
+            validateSourceMemoryPartition(partition, projectId, mode);
+          }
+        }
+      }
+      for (const [projectId, at] of Object.entries(parsed.deletedProjects ?? {})) {
+        if (typeof at !== 'string' || !Number.isFinite(Date.parse(at)) || Object.hasOwn(parsed.projects, projectId)) throw new Error('Invalid project tombstone');
+      }
+      this.data = { ...parsed, version: 2 };
+    } catch (error) {
+      throw new StoreError('记忆文件损坏或版本不受支持，未重置现有数据。', { cause: error });
     }
   }
 
-  private async persist(): Promise<void> {
+  private async persist(candidate: MemoryFile): Promise<void> {
     if (!this.persistent) return;
     await mkdir(dirname(this.filePath), { recursive: true });
     const tempPath = `${this.filePath}.${randomUUID()}.tmp`;
-    await writeFile(tempPath, JSON.stringify(this.data, null, 2), 'utf8');
-    await rename(tempPath, this.filePath);
+    try {
+      await writeFile(tempPath, JSON.stringify(candidate, null, 2), 'utf8');
+      await rename(tempPath, this.filePath);
+    } finally {
+      await rm(tempPath, { force: true }).catch(() => undefined);
+    }
   }
 
   /** 读取某项目记忆的深拷贝（缺省返回空记忆，不写盘）。旧文件缺 foreshadows 时自动补空数组。 */
   read(projectId: string): ProjectMemory {
-    const mem = this.data.projects[projectId];
+    if (Object.hasOwn(this.data.deletedProjects ?? {}, projectId)) return { ...emptyProjectMemory(), deleted: true };
+    const mem = Object.hasOwn(this.data.projects, projectId) ? this.data.projects[projectId] : undefined;
     if (mem === undefined) return emptyProjectMemory();
     const copy = JSON.parse(JSON.stringify(mem)) as Partial<ProjectMemory>;
     return {
@@ -232,14 +266,20 @@ export class MemoryStore implements MemoryStorePort {
       workflow: Array.isArray(copy.workflow) ? copy.workflow : [],
       foreshadows: Array.isArray(copy.foreshadows) ? copy.foreshadows : [],
       updatedAt: typeof copy.updatedAt === 'string' ? copy.updatedAt : new Date().toISOString(),
+      ...(copy.sourceMemory ? { sourceMemory: copy.sourceMemory } : {}),
+      ...(copy.legacyUntracked ? { legacyUntracked: true as const } : {}),
     };
   }
 
   /** 覆盖写入某项目记忆并落盘（与其它写路径串行）。 */
   async write(projectId: string, memory: ProjectMemory): Promise<void> {
+    const frozen = structuredClone(memory);
     return this.enqueueWrite(async () => {
-      this.data.projects[projectId] = { ...memory, updatedAt: new Date().toISOString() };
-      await this.persist();
+      this.assertWritable(projectId);
+      const candidate = { ...this.data, projects: { ...this.data.projects,
+        [projectId]: { ...frozen, updatedAt: new Date().toISOString() } } };
+      await this.persist(candidate);
+      this.data = candidate;
     });
   }
 
@@ -252,11 +292,16 @@ export class MemoryStore implements MemoryStorePort {
     mutator: (memory: ProjectMemory) => ProjectMemory | void,
   ): Promise<ProjectMemory> {
     return this.enqueueWrite(async () => {
+      this.assertWritable(projectId);
       const memory = this.read(projectId);
+      const before = JSON.stringify(memory);
       const result = mutator(memory);
       const next = result === undefined ? memory : result;
-      this.data.projects[projectId] = { ...next, updatedAt: new Date().toISOString() };
-      await this.persist();
+      if (before === JSON.stringify(next)) return this.read(projectId);
+      const candidate = { ...this.data, projects: { ...this.data.projects,
+        [projectId]: { ...structuredClone(next), updatedAt: new Date().toISOString() } } };
+      await this.persist(candidate);
+      this.data = candidate;
       return this.read(projectId);
     });
   }
@@ -264,9 +309,16 @@ export class MemoryStore implements MemoryStorePort {
   /** 删除某项目的全部记忆（项目删除时调用；与其它写路径串行）。 */
   async clearProject(projectId: string): Promise<void> {
     return this.enqueueWrite(async () => {
-      if (this.data.projects[projectId] === undefined) return;
-      delete this.data.projects[projectId];
-      await this.persist();
+      if (Object.hasOwn(this.data.deletedProjects ?? {}, projectId)) return;
+      const candidate = { ...this.data, projects: { ...this.data.projects },
+        deletedProjects: { ...this.data.deletedProjects, [projectId]: new Date().toISOString() } };
+      delete candidate.projects[projectId];
+      await this.persist(candidate);
+      this.data = candidate;
     });
+  }
+
+  private assertWritable(projectId: string): void {
+    if (Object.hasOwn(this.data.deletedProjects ?? {}, projectId)) throw sourceMemoryConflict('SOURCE_MEMORY_DELETED');
   }
 }

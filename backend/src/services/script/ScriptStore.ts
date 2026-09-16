@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import type { FrozenMemoryProjection, MemorySyncClaim, MemorySyncIntent, MemorySyncTarget } from '../../types/SourceMemory.js';
 
 import type {
   ScriptCharacter,
@@ -61,6 +62,20 @@ export interface ScriptStore {
     expectedRevision?: number,
   ): Promise<ScriptReviewIssueCollection>;
   deleteProject(projectId: string): Promise<void>;
+  listMemorySyncTargets?(): Promise<MemorySyncTarget[]>;
+  getMemorySync?(projectId: string): Promise<MemorySyncIntent | undefined>;
+  claimMemorySync?(projectId: string, options: {
+    owner: string;
+    now: string;
+    leaseMs: number;
+    retryFailed?: boolean;
+  }): Promise<MemorySyncClaim | undefined>;
+  /** Only a local, idempotent projection write may run inside the project queue. */
+  applyMemorySync?(
+    projectId: string,
+    claim: MemorySyncClaim,
+    write: (projection: FrozenMemoryProjection) => Promise<void>,
+  ): Promise<MemorySyncIntent | undefined>;
 }
 
 function canonicalize(value: unknown): unknown {
