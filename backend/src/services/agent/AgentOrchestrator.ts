@@ -12,6 +12,7 @@ import type {
   AgentProgressEvent,
   AgentTask,
   ChatMessage,
+  Chapter,
   Id,
   LongNovelAutomationLevel,
   LongNovelModeConfig,
@@ -29,9 +30,15 @@ import type { ModelConfigService } from '../modelConfig/ModelConfigService.js';
 import type {
   CriticalStateIssue,
   CriticalStateUpdateInput,
-  MemoryService,
 } from '../memory/MemoryService.js';
-import { scaledMemoryOptions } from '../memory/MemoryService.js';
+import { MemoryService, scaledMemoryOptions } from '../memory/MemoryService.js';
+import { MemoryStore, type CriticalStateEntry, type CriticalStateKind } from '../memory/MemoryStore.js';
+import type { AcceptedMemoryEntry } from '../../types/SourceMemory.js';
+import { projectSourceMemory } from '../memory/sourceMemoryContract.js';
+import { novelMemoryBlocks } from '../chapter/NovelSourceMemory.js';
+import { emptyStoryControls } from '../story/StoryControls.js';
+import { composeStoryMemoryContext } from '../memory/StoryMemoryContext.js';
+import { buildStoryThreads } from '../memory/StoryThreads.js';
 import type { ReferenceAnalysisService } from '../reference/ReferenceAnalysisService.js';
 import { MaterialResearchService } from '../research/MaterialResearchService.js';
 import { stripReasoningArtifacts } from '../text/reasoningSanitizer.js';
@@ -516,7 +523,8 @@ export class AgentOrchestrator {
     emit(`首章正文已保存（约 ${draft.length} 字），正在反思记忆…`, 'chapter', 6, 7);
 
     emit('反思子 Agent 正在沉淀长期记忆…', 'reflect', 7, 7);
-    await this.reflectAndRemember(config, pid, chapter.id, chapterTitle, draft, signal);
+    const criticalIssues = await this.reflectAndRemember(config, pid, chapter.id, chapterTitle, draft, signal);
+    if (criticalIssues.length > 0) throw ServiceError.validation('本章存在关键状态冲突，正文保留为待接受草稿，请修订后重新审查。');
     steps.push('已反思首章并写入长期记忆（摘要 / 事实 / 风格 / 伏笔）。');
     emit('首章生成完成。', 'info', 7, 7);
 
@@ -618,7 +626,8 @@ export class AgentOrchestrator {
 
     if (mode === 'draft' && chapterId !== undefined) {
       signal.throwIfAborted();
-      await this.store.updateChapterContent(chapterId, output, polishBrief!.target.revision, { brief: polishBrief! });
+      if (this.store.acceptChapter) await this.store.acceptChapter({ chapterId, content: output, expectedRevision: polishBrief!.target.revision, contentHash: hashWriteBriefValue(output), guard: { brief: polishBrief!, signal } });
+      else await this.store.updateChapterContent(chapterId, output, polishBrief!.target.revision, { brief: polishBrief! });
       const chapter = await this.store.getChapter(chapterId);
       artifacts.push({ kind: 'chapter', id: chapterId, title: chapter?.title ?? '章节' });
       steps.push('已将润写结果写回当前章节。');
@@ -894,7 +903,7 @@ export class AgentOrchestrator {
       chars: chapter.content.length,
       excerpt: chapter.content.replace(/\s+/g, ' ').slice(0, 240),
     }));
-    const memoryContext = this.memory.buildContext(projectId, scaledMemoryOptions(chapters.length));
+    const memoryContext = await this.memoryForWriting(projectId, chapters.length + 1, scaledMemoryOptions(chapters.length));
     const snapshot = {
       project: project.name,
       counts: {
@@ -970,7 +979,8 @@ export class AgentOrchestrator {
     const baseRequirement =
       prompt.length > 0 ? prompt : '顺接上一章剧情，推进主线并留下章节钩子。';
     // 把长期记忆（前情 + 设定事实 + 风格）注入蓝图需求，保证跨章节连贯。
-    const memoryContext = this.memory.buildContext(projectId, scaledMemoryOptions(nextNum));
+    // The generated blueprint's frozen brief owns the shared memory section.
+    const memoryContext = this.store.acceptChapter ? '' : this.memory.buildContext(projectId, scaledMemoryOptions(nextNum));
     const transferPrompt = this.referenceService?.buildActiveTransferPrompt(projectId) ?? '';
     const extraBlocks = [
       memoryContext.length > 0 ? `=== 须严格遵循的故事记忆 ===\n${memoryContext}` : '',
@@ -1017,7 +1027,7 @@ export class AgentOrchestrator {
       current: 4,
       total: 4,
     });
-    await this.reflectAndRemember(
+    const criticalIssues = await this.reflectAndRemember(
       config,
       projectId,
       chapter.id,
@@ -1025,7 +1035,8 @@ export class AgentOrchestrator {
       saved?.content ?? '',
       signal,
     );
-    const openFs = this.memory.listOpenForeshadows(projectId).length;
+    if (criticalIssues.length > 0) throw ServiceError.validation('本章存在关键状态冲突，正文保留为待接受草稿，请修订后重新审查。');
+    const openFs = (await this.currentOpenForeshadows(projectId, (await this.store.listChapters(projectId)).length + 1)).length;
     steps.push(
       openFs > 0
         ? `已反思本章并更新长期记忆与伏笔台账（未回收 ${openFs} 条）。`
@@ -1329,7 +1340,7 @@ export class AgentOrchestrator {
         total: chapterCount,
       });
       const chapter = await this.getOrCreateLongNovelChapter(pid, title);
-      const reuseUninspectedDraft = this.shouldReuseUninspectedChapterDraft(
+      const reuseUninspectedDraft = await this.shouldReuseUninspectedChapterDraft(
         pid,
         chapter.id,
         chapter.content,
@@ -1730,7 +1741,7 @@ export class AgentOrchestrator {
       artifacts.push({ kind: 'chapter', id: chapter.id, title });
       lastChapterId = chapter.id;
 
-      const reuseUninspectedDraft = this.shouldReuseUninspectedChapterDraft(
+      const reuseUninspectedDraft = await this.shouldReuseUninspectedChapterDraft(
         pid,
         chapter.id,
         chapter.content,
@@ -1895,7 +1906,7 @@ export class AgentOrchestrator {
     let writeBrief = await captureNovelWriteBrief(this.store, chapterId, { requirement: seedPrompt, targetWords });
     pack = (await this.loadExistingPack(projectId, seedPrompt, [])) ?? pack;
     await assertNovelWriteBriefCurrent(this.store, writeBrief);
-    const memoryContext = await this.memoryForWriting(projectId, writeBrief.target.unitNumber, scaledMemoryOptions(chapterNumber));
+    const memoryContext = writeBrief.memoryContext ? '' : await this.memoryForWriting(projectId, writeBrief.target.unitNumber, scaledMemoryOptions(chapterNumber));
     const requirement = buildChapterBlueprintRequirement({
       chapterNumber,
       chapterTitle,
@@ -2040,7 +2051,7 @@ export class AgentOrchestrator {
     });
     const transferPrompt = this.referenceService?.buildActiveTransferPrompt(projectId) ?? '';
     const memoryBlock = [
-      memoryContext.length > 0 ? memoryContext : '',
+      !writeBrief.memoryContext && memoryContext.length > 0 ? memoryContext : '',
       transferPrompt.length > 0 ? transferPrompt : '',
     ]
       .filter(Boolean)
@@ -2058,7 +2069,7 @@ export class AgentOrchestrator {
           : progressRatio >= 0.75
             ? '这是后段章节：推进主线并开始自然回收高优先伏笔，章末仍可留轻钩子。'
             : '这是中段章节：顺接前情、推进主线、深化人物；可呼应旧伏笔并留下章末钩子。';
-    const openCount = await this.hasLaterStoryState(projectId, writeBrief.target.unitNumber) ? 0 : this.memory.listOpenForeshadows(projectId).length;
+    const openCount = (await this.currentOpenForeshadows(projectId, writeBrief.target.unitNumber)).length;
     const foreshadowHint =
       openCount > 0
         ? `当前未回收伏笔 ${openCount} 条，写作时须遵守记忆中的「伏笔台账」指引。`
@@ -2084,6 +2095,7 @@ export class AgentOrchestrator {
       '# 本章大纲锚点',
       chapterOutlineBlock,
       memoryBlock,
+      '# 写前任务书',
       renderWriteBrief(writeBrief),
     ].join('\n');
     return this.generateText(
@@ -2511,8 +2523,29 @@ export class AgentOrchestrator {
   }
 
   private async memoryForWriting(projectId: Id, chapterNumber: number, options?: Parameters<MemoryService['buildContext']>[1]): Promise<string> {
+    if (this.store.acceptChapter) {
+      const project = await this.store.getProject(projectId);
+      const projection = project?.memorySync?.projection;
+      const view = projection ? projectSourceMemory(projection, chapterNumber) : { mode: 'novel' as const, projectId, beforeUnit: chapterNumber,
+        projectionRevision: 0, origin: 'accepted_sources' as const, entries: [], unverifiedReferences: [] };
+      const chapter = (await this.store.listChapters(projectId))[chapterNumber - 1];
+      const blueprint = chapter ? await this.store.getChapterBlueprintByChapter(chapter.id) : undefined;
+      return composeStoryMemoryContext({ projection, view, controls: project?.storyControls ?? emptyStoryControls(),
+        query: [chapter?.title ?? '', blueprint?.main_goal ?? ''].join(' ').slice(0, 200) }).text;
+    }
     if (await this.hasLaterStoryState(projectId, chapterNumber)) return '';
     return this.memory.buildContext(projectId, options ?? scaledMemoryOptions(chapterNumber));
+  }
+
+  private async currentOpenForeshadows(projectId: Id, beforeUnit: number): Promise<Array<{ title: string; detail: string }>> {
+    if (!this.store.acceptChapter) return await this.hasLaterStoryState(projectId, beforeUnit) ? [] : this.memory.listOpenForeshadows(projectId);
+    const project = await this.store.getProject(projectId);
+    const projection = project?.memorySync?.projection;
+    const view = projection ? projectSourceMemory(projection, beforeUnit) : { entries: [] };
+    return buildStoryThreads(view, project?.storyControls ?? emptyStoryControls(), beforeUnit,
+      projection?.acceptances.map((input) => input.source) ?? [])
+      .filter((thread) => thread.status === 'planted' || thread.status === 'echoed')
+      .map((thread) => ({ title: thread.title, detail: thread.text }));
   }
 
   private async processChapterDraft(
@@ -2829,9 +2862,15 @@ export class AgentOrchestrator {
     }
     await this.assertCurrentCandidate(chapterId, finalContent, reviewBrief);
     if (!gates?.hardFail) {
+      try {
       await this.applyInspectorFindings(projectId, finalInspection);
       await this.memory.markChapterCommitted(projectId, chapterId);
       await this.syncForeshadowLedgerOutline(projectId);
+      } catch (error) {
+        // The accepted source and its outbox are already durable. Optional legacy
+        // mirrors cannot turn a successful acceptance into a failed generation.
+        if (!this.store.acceptChapter) throw error;
+      }
     } else {
       await this.memory.markChapterRejected(projectId, chapterId);
       await this.memory.recordWorkflow(projectId, {
@@ -2961,25 +3000,29 @@ export class AgentOrchestrator {
    * long run must not create a second "第 N 章" after a provider timeout: the
    * first chapter owns the scene drafts that make the run resumable.
    */
-  private longNovelChapterFlags(projectId: Id): (chapter: { id: string }) => {
+  private longNovelChapterFlags(projectId: Id): (chapter: { id: string; acceptance?: Chapter['acceptance'] }) => {
     rejected: boolean;
     hasSummary: boolean;
   } {
     return (chapter) => ({
-      rejected: this.memory.isChapterRejected(projectId, chapter.id),
-      hasSummary: this.memory.hasChapterSummary(projectId, chapter.id),
+      rejected: chapter.acceptance?.status === 'current' ? false : this.memory.isChapterRejected(projectId, chapter.id),
+      hasSummary: this.store.acceptChapter ? chapter.acceptance?.status === 'current' : this.memory.hasChapterSummary(projectId, chapter.id),
     });
   }
 
-  private shouldReuseUninspectedChapterDraft(
+  private async shouldReuseUninspectedChapterDraft(
     projectId: Id,
     chapterId: Id,
     content: string,
-  ): boolean {
+  ): Promise<boolean> {
+    if (this.store.acceptChapter) {
+      const chapter = await this.store.getChapter(chapterId);
+      if (!chapter?.generatedCandidate || chapter.generatedCandidate.candidateHash !== hashWriteBriefValue(content)) return false;
+    }
     return (
       content.trim().length > 0 &&
       !this.memory.isChapterRejected(projectId, chapterId) &&
-      !this.memory.hasChapterSummary(projectId, chapterId)
+      (Boolean(this.store.acceptChapter) || !this.memory.hasChapterSummary(projectId, chapterId))
     );
   }
 
@@ -2989,7 +3032,7 @@ export class AgentOrchestrator {
       if (chapter.title !== title) continue;
       if (this.memory.isChapterRejected(projectId, chapter.id)) return chapter;
       if (chapter.content.trim().length > 0) {
-        if (this.memory.hasChapterSummary(projectId, chapter.id)) continue;
+        if (this.store.acceptChapter ? chapter.acceptance?.status === 'current' : this.memory.hasChapterSummary(projectId, chapter.id)) continue;
         return chapter;
       }
       const [blueprint, drafts] = await Promise.all([
@@ -3046,15 +3089,17 @@ export class AgentOrchestrator {
     const chapters = await this.store.listChapters(projectId);
     const targetIndex = chapters.findIndex((chapter) => chapter.id === chapterId);
     const memoryOptions = scaledMemoryOptions(chapterNumber);
-    const injectedMemory = [await this.memoryForWriting(projectId, targetIndex + 1, memoryOptions), writeBrief ? renderWriteBrief(writeBrief) : ''].filter(Boolean).join('\n\n');
-    const samples = chapters.slice(0, Math.max(0, targetIndex)).filter(
-      (ch) =>
-        ch.id !== chapterId &&
-        !this.memory.isChapterRejected(projectId, ch.id) &&
-        ch.content.trim().length > 0,
-    );
+    const injectedMemory = [writeBrief?.memoryContext ? '' : await this.memoryForWriting(projectId, targetIndex + 1, memoryOptions), writeBrief ? renderWriteBrief(writeBrief) : ''].filter(Boolean).join('\n\n');
+    const projection = this.store.acceptChapter ? (await this.store.getProject(projectId))?.memorySync?.projection : undefined;
+    const samples = this.store.acceptChapter
+      ? (projection?.acceptances ?? []).filter((input) => input.source.unitNumber < targetIndex + 1)
+        .map((input) => ({ title: input.title, content: input.blocks.map((block) => block.text).join('') }))
+      : chapters.slice(0, Math.max(0, targetIndex)).filter(
+        (ch) => ch.id !== chapterId && !this.memory.isChapterRejected(projectId, ch.id) && ch.content.trim().length > 0,
+      );
     const early = samples.slice(0, 3);
     const recent = samples.slice(-3);
+    if (writeBrief) await assertNovelWriteBriefCurrent(this.store, writeBrief);
     return this.inspector.inspectChapter(
       config,
       {
@@ -3112,7 +3157,7 @@ export class AgentOrchestrator {
     pack = (await this.loadExistingPack(projectId, seedPrompt, [])) ?? pack;
     if (writeBrief) await assertNovelWriteBriefCurrent(this.store, writeBrief);
     const memoryContext = await this.memoryForWriting(projectId, writeBrief?.target.unitNumber ?? chapterNumber, scaledMemoryOptions(chapterNumber));
-    const memoryBlock = [memoryContext, writeBrief ? renderWriteBrief(writeBrief) : ''].filter(Boolean).join('\n\n');
+    const memoryBlock = [writeBrief?.memoryContext ? '' : memoryContext, writeBrief ? renderWriteBrief(writeBrief) : ''].filter(Boolean).join('\n\n');
     const rangeRequirement = wordRange
       ? `修订后的正文必须控制在 ${wordRange.minWords}-${wordRange.maxWords} 字；字数按去除空格和换行后的字符数计算，达到范围后立即收束，不得扩写超限。`
       : `修订后的正文保持约 ${targetWords} 字。`;
@@ -3152,7 +3197,8 @@ export class AgentOrchestrator {
   /**
    * 反思子 Agent（自我进化核心）：读章节正文，产出
    * { summary, facts[], stateUpdates[], learning, foreshadows[] } 并写入长期记忆。
-   * 模型未按 JSON 返回时降级：用正文截断作摘要，保证记忆始终被更新、流程不中断。
+   * 正式来源必须经过本轮有效提取与关键状态门；失败保留草稿供重试。
+   * 仅不支持原子接受的旧内存测试适配器保留原有摘要降级。
    */
   private async reflectAndRemember(
     config: ModelConfig,
@@ -3166,7 +3212,24 @@ export class AgentOrchestrator {
     const text = content.trim();
     if (text.length === 0) return [];
     const reflectionBrief = sourceBrief ?? await this.assertCurrentCandidate(chapterId, content);
-    if (await this.hasLaterStoryState(projectId, reflectionBrief.target.unitNumber)) return [];
+    if (!this.store.acceptChapter && await this.hasLaterStoryState(projectId, reflectionBrief.target.unitNumber)) return [];
+
+    // Evaluate the existing transition gate against past accepted facts. Legacy
+    // rolling state must not become a second source after manual source withdrawal.
+    let gateMemory = this.memory;
+    if (this.store.acceptChapter) {
+      const projection = (await this.store.getProject(projectId))?.memorySync?.projection;
+      const entries = projection ? projectSourceMemory(projection, reflectionBrief.target.unitNumber).entries : [];
+      const gateStore = MemoryStore.ephemeral();
+      const criticalKinds = new Set(['alive_status', 'mobility_status', 'location', 'physical_state', 'ability_state', 'critical_knowledge', 'key_item', 'relationship_stage']);
+      await gateStore.update(projectId, (memory) => {
+        memory.criticalStates = entries.filter((entry) => entry.kind === 'state' && criticalKinds.has((entry.key ?? '').split(':')[0]!))
+          .map((entry): CriticalStateEntry => ({ id: `${entry.source.acceptanceId}:${entry.id}`, kind: entry.key!.split(':')[0] as CriticalStateKind,
+            entity: entry.entity!, key: entry.key!.slice(entry.key!.indexOf(':') + 1), value: entry.value!,
+            evidence: entry.evidence.map((evidence) => evidence.quote).join('；'), chapterId: entry.source.resourceId, chapterTitle: '', updatedAt: new Date(0).toISOString() }));
+      });
+      gateMemory = new MemoryService(gateStore);
+    }
 
     const fallbackSummary = text.replace(/\s+/g, ' ').slice(0, 200);
     let summary = fallbackSummary;
@@ -3175,7 +3238,7 @@ export class AgentOrchestrator {
     let learning = '';
     let foreshadowOps: ParsedForeshadowOp[] = [];
 
-    const openLedger = this.memory.listOpenForeshadows(projectId);
+    const openLedger = await this.currentOpenForeshadows(projectId, reflectionBrief.target.unitNumber);
     const openLedgerHint =
       openLedger.length === 0
         ? '（当前无未回收伏笔）'
@@ -3184,7 +3247,7 @@ export class AgentOrchestrator {
             .map((f) => `- ${f.title}：${f.detail}`)
             .join('\n');
     const criticalStateHint =
-      this.memory.formatCriticalStateLedger(projectId) || '（当前无关键状态）';
+      gateMemory.formatCriticalStateLedger(projectId) || '（当前无关键状态）';
     const reflectionExcerpt =
       text.length <= 6000
         ? text
@@ -3223,12 +3286,17 @@ export class AgentOrchestrator {
         { jsonMode: true, disableThinking: true, maxTokens: 2048 },
       );
       const parsed = parseReflection(raw);
+      if (this.store.acceptChapter && !parsed.summary && parsed.facts.length === 0 && parsed.stateUpdates.length === 0 && !parsed.learning && parsed.foreshadows.length === 0) {
+        throw ServiceError.validation('反思输出未包含有效内容。');
+      }
       if (parsed.summary.length > 0) summary = parsed.summary;
       facts = parsed.facts;
       stateUpdates = parsed.stateUpdates;
       learning = parsed.learning;
       foreshadowOps = parsed.foreshadows;
-    } catch {
+    } catch (error) {
+      if (signal.aborted) throw error;
+      if (this.store.acceptChapter) throw ServiceError.validation('本章记忆提取未完成，正文保留为待接受草稿，请重新审查。');
       // 反思失败：保留 fallback 摘要，记忆仍前进，不中断主流程。
     }
 
@@ -3238,7 +3306,7 @@ export class AgentOrchestrator {
       content: text,
       summary,
       facts,
-      existingStates: this.memory.get(projectId).criticalStates,
+      existingStates: gateMemory.get(projectId).criticalStates,
     });
     const stateKey = (update: ParsedCriticalStateUpdate): string =>
       [update.kind, update.entity, update.key ?? 'current']
@@ -3251,7 +3319,7 @@ export class AgentOrchestrator {
 
     signal.throwIfAborted();
     await this.assertCurrentCandidate(chapterId, content, reflectionBrief);
-    const stateResult = await this.memory.applyCriticalStateUpdates(
+    const stateResult = await gateMemory.applyCriticalStateUpdates(
       projectId,
       stateUpdates.map((update): CriticalStateUpdateInput => ({
         ...update,
@@ -3264,6 +3332,30 @@ export class AgentOrchestrator {
     );
     if (stateResult.issues.length > 0) return stateResult.issues;
 
+    if (this.store.acceptChapter) {
+      const blocks = novelMemoryBlocks(content);
+      const entries: AcceptedMemoryEntry[] = [];
+      const add = (entry: Omit<AcceptedMemoryEntry, 'evidence'>, quote = entry.text): void => {
+        if (!entry.text.trim()) return;
+        const block = blocks.find((item) => quote.trim() && item.text.includes(quote));
+        const start = block?.text.indexOf(quote) ?? -1;
+        entries.push({ ...entry, evidence: block && start >= 0 ? [{ blockId: block.id, start, end: start + quote.length, quote }] : [] });
+      };
+      add({ id: 'summary', kind: 'summary', text: summary });
+      facts.forEach((fact, index) => add({ id: `fact:${index}`, kind: 'fact', text: fact.text }));
+      stateUpdates.forEach((update, index) => add({ id: `state:${index}`, kind: 'state', entity: update.entity,
+        key: `${update.kind}:${update.key ?? 'current'}`, value: update.value, action: 'set', text: `${update.entity}：${update.value}` }, update.evidence));
+      foreshadowOps.forEach((operation, index) => add({ id: `thread:${index}`, kind: 'thread', entity: operation.title || operation.detail,
+        key: 'thread', action: operation.action === 'resolve' ? 'close' : 'open', text: operation.detail || operation.title }));
+      if (learning) add({ id: 'learning', kind: 'learning', text: learning });
+      await this.store.acceptChapter({ chapterId, expectedRevision: reflectionBrief.target.revision, contentHash: hashWriteBriefValue(content),
+        guard: { brief: reflectionBrief, signal }, entries });
+    }
+
+    // Compatibility mirrors run only after the authoritative acceptance. Their
+    // availability never changes acceptance or the replayable frozen input.
+    try {
+    if (gateMemory !== this.memory) await this.memory.applyCriticalStateUpdates(projectId, stateUpdates.map((update) => ({ ...update, chapterId, chapterTitle })));
     await this.memory.appendChapterSummary(projectId, {
       chapterId,
       title: chapterTitle,
@@ -3301,11 +3393,14 @@ export class AgentOrchestrator {
       );
     }
     if (!sourceBrief) await this.syncForeshadowLedgerOutline(projectId);
+    } catch (error) { if (!this.store.acceptChapter) throw error; }
     return [];
   }
 
   /** 把伏笔台账同步到项目大纲资料，便于作者在 UI 侧边栏查看。 */
   private async syncForeshadowLedgerOutline(projectId: Id): Promise<void> {
+    // Copying legacy rolling memory into an outline would turn withdrawn facts into settings.
+    if (this.store.acceptChapter) return;
     const content = this.memory.formatForeshadowLedger(projectId);
     const title = '伏笔台账';
     try {
@@ -3439,7 +3534,7 @@ export class AgentOrchestrator {
     signal: AbortSignal,
   ): Promise<string> {
     const chapters = await this.store.listChapters(projectId);
-    const memoryContext = this.memory.buildContext(
+    const memoryContext = this.store.acceptChapter ? '' : this.memory.buildContext(
       projectId,
       scaledMemoryOptions(chapters.length + 1),
     );

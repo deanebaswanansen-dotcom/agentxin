@@ -3,6 +3,23 @@ import type { WriteBrief, WriteBriefSource } from '../types/WriteBrief.js';
 import { createWriteBrief, hashWriteBriefValue, writeBriefSourceKey } from '../services/writing/WriteBrief.js';
 import { ServiceError } from '../services/ServiceError.js';
 import type { DataStore } from './DataStore.js';
+import type { AcceptedMemoryEntry } from '../types/SourceMemory.js';
+import type { FrozenMemoryProjection } from '../types/SourceMemory.js';
+import { applyStoryControlsToBrief, emptyStoryControls } from '../services/story/StoryControls.js';
+import { projectSourceMemory } from '../services/memory/sourceMemoryContract.js';
+import { composeStoryMemoryContext } from '../services/memory/StoryMemoryContext.js';
+
+export interface NovelChapterAcceptanceInput {
+  chapterId: string;
+  expectedRevision: number;
+  /** Hash of the exact content being accepted (existing or supplied). */
+  contentHash: string;
+  /** Omit to accept an already saved manual/reviewed body without rewriting it. */
+  content?: string;
+  guard?: NovelWriteGuard;
+  /** Fresh extraction from this candidate only; never copied from global memory. */
+  entries?: AcceptedMemoryEntry[];
+}
 
 export interface NovelWriteGuard {
   brief: WriteBrief;
@@ -20,6 +37,7 @@ export interface NovelWriteSnapshot {
   outlines: Outline[];
   blueprint?: ChapterBlueprint;
   sceneDrafts: SceneDraft[];
+  memoryProjection?: FrozenMemoryProjection;
 }
 
 export function novelBlueprintContent(blueprint?: ChapterBlueprint): unknown {
@@ -28,7 +46,14 @@ export function novelBlueprintContent(blueprint?: ChapterBlueprint): unknown {
   return content;
 }
 
+/** Historical generated reports remain visible documents, never manuscript facts. */
+export function isUnverifiedSystemOutline(outline: Pick<Outline, 'title'>): boolean {
+  const title = outline.title.trim();
+  return title === '伏笔台账' || title === '诊断报告' || title === '主动审阅报告' || title === '润写建议' || title.startsWith('章节诊断：');
+}
+
 export function buildNovelWriteBrief(snapshot: NovelWriteSnapshot, options: { requirement?: string; targetWords?: number } = {}): WriteBrief {
+  snapshot = { ...snapshot, outlines: snapshot.outlines.filter((outline) => !isUnverifiedSystemOutline(outline)) };
   const { chapter, project, blueprint } = snapshot;
   options = { ...blueprint?.authorRequirements, ...options };
   if (!chapter || !project) throw ServiceError.notFound('写作目标章节或项目不存在。');
@@ -42,6 +67,7 @@ export function buildNovelWriteBrief(snapshot: NovelWriteSnapshot, options: { re
   };
   add('collection', 'project', '项目', { id: project.id, name: project.name, kind: project.kind });
   add('collection', 'chapters', '章节集合与顺序', ordered.map(({ id, title, position }) => ({ id, title, position })));
+  add('collection', 'preceding-manuscripts', '前文版本监测（未接受草稿不作为事实）', ordered.slice(0, index).map(({ id, revision, content }) => ({ id, revision: revision ?? 0, contentHash: hashWriteBriefValue(content) })));
   const groups = [
     ['character', snapshot.characters, '人物'],
     ['world', snapshot.worldSettings, '世界观'],
@@ -52,16 +78,23 @@ export function buildNovelWriteBrief(snapshot: NovelWriteSnapshot, options: { re
     add('collection', kind, `${label}资料集合`, sorted.map((entity) => entity.id));
     for (const entity of sorted) add(kind, entity.id, 'name' in entity ? entity.name : entity.title, entity, 'description' in entity ? entity.description : entity.content);
   }
-  for (const [precedingIndex, preceding] of ordered.slice(0, index).entries()) {
-    add('chapter', preceding.id, preceding.title, { id: preceding.id, title: preceding.title, content: preceding.content, position: preceding.position }, preceding.content.slice(-500));
-    sources[sources.length - 1]!.unitNumber = precedingIndex + 1;
-    sources[sources.length - 1]!.revision = preceding.revision ?? 0;
+  const projection = snapshot.memoryProjection ?? project.memorySync?.projection;
+  const past = projection?.acceptances.filter((input) => input.source.unitNumber < index + 1) ?? [];
+  add('collection', 'accepted-sources', '已接受正文来源集合', past.map((input) => input.source));
+  for (const input of past) {
+    add('chapter', input.source.resourceId, `已接受：${input.title}`, input, input.blocks.map((block) => block.text).join('').slice(-500));
+    sources[sources.length - 1]!.unitNumber = input.source.unitNumber;
+    sources[sources.length - 1]!.revision = input.source.revision;
   }
+  const view = projection ? projectSourceMemory(projection, index + 1) : { mode: 'novel' as const, projectId: project.id, beforeUnit: index + 1,
+    projectionRevision: 0, origin: 'accepted_sources' as const, entries: [], unverifiedReferences: [] };
+  const memoryContext = composeStoryMemoryContext({ view, projection, controls: project.storyControls ?? emptyStoryControls(),
+    query: [chapter.title, blueprint?.main_goal ?? ''].join(' ').slice(0, 200) });
   const blueprintKey = add('blueprint', chapter.id, '当前场景蓝图', novelBlueprintContent(blueprint));
   const requestKey = options.requirement ? add('request', 'requirement', '本次写作要求', options.requirement, options.requirement) : undefined;
   const wordKey = options.targetWords ? add('request', 'targetWords', '本次目标字数', options.targetWords) : undefined;
   const item = (text: string) => ({ text, sourceKeys: [blueprintKey] });
-  return createWriteBrief({
+  return createWriteBrief(applyStoryControlsToBrief({
     mode: 'novel', projectId: chapter.projectId,
     target: { id: chapter.id, title: chapter.title, revision: chapter.revision ?? 0, unitNumber: index + 1 },
     objective: [item(blueprint?.main_goal || `完成「${chapter.title}」正文。`)],
@@ -70,8 +103,8 @@ export function buildNovelWriteBrief(snapshot: NovelWriteSnapshot, options: { re
     authorConstraints: [
       ...(requestKey ? [{ text: options.requirement!, sourceKeys: [requestKey] }] : []),
       ...(wordKey ? [{ text: `目标约 ${options.targetWords} 字。`, sourceKeys: [wordKey] }] : []),
-    ], sources,
-  });
+    ], sources, memoryContext,
+  }, project.storyControls, { hashOnly: true }));
 }
 
 export async function captureNovelWriteSnapshot(store: DataStore, chapterId: string): Promise<NovelWriteSnapshot> {
@@ -82,7 +115,7 @@ export async function captureNovelWriteSnapshot(store: DataStore, chapterId: str
     store.listWorldSettings(chapter.projectId), store.listOutlines(chapter.projectId),
     store.getChapterBlueprintByChapter(chapterId), store.listSceneDrafts(chapterId),
   ]);
-  return { project, chapter, chapters, characters, worldSettings, outlines, blueprint, sceneDrafts };
+  return { project, chapter, chapters, characters, worldSettings, outlines, blueprint, sceneDrafts, memoryProjection: project?.memorySync?.projection };
 }
 
 export async function captureNovelWriteBrief(store: DataStore, chapterId: string, options: { requirement?: string; targetWords?: number } = {}): Promise<WriteBrief> {

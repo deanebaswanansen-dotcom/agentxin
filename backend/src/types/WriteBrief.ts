@@ -19,6 +19,23 @@ export interface WriteBriefItem {
   sourceKeys: string[];
 }
 
+/** Deterministic memory section; provider usage and retrieval timings are separate. */
+export interface WriteBriefMemoryContext {
+  text: string;
+  statistics: {
+    maxChars: number;
+    usedChars: number;
+    estimatedTokens: number;
+    requiredChars: number;
+    sourceChars: number;
+    authorChars: number;
+    threadChars: number;
+    retrievalChars: number;
+    omittedItems: number;
+    truncated: boolean;
+  };
+}
+
 export interface WriteBrief {
   schemaVersion: 1;
   mode: 'short_drama' | 'novel';
@@ -29,6 +46,7 @@ export interface WriteBrief {
   forbidden: WriteBriefItem[];
   authorConstraints: WriteBriefItem[];
   sources: WriteBriefSource[];
+  memoryContext?: WriteBriefMemoryContext;
   /** Source identity excluding the target body's own revision (checked by CAS). */
   sourceFingerprint: string;
   /** Full frozen brief, including its target revision and writing instructions. */

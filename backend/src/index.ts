@@ -53,6 +53,8 @@ import { MemoryStore } from './services/memory/MemoryStore.js';
 import { MemoryService } from './services/memory/MemoryService.js';
 import { MemorySyncRunner } from './services/memory/MemorySyncRunner.js';
 import { registerMemorySyncRoutes } from './routes/memorySyncRoutes.js';
+import { StoryMemoryService } from './services/memory/StoryMemoryService.js';
+import { registerStoryMemoryRoutes } from './routes/storyMemoryRoutes.js';
 import { ProjectService } from './services/project/ProjectService.js';
 import { ChapterService } from './services/chapter/ChapterService.js';
 import { SettingService } from './services/setting/SettingService.js';
@@ -200,17 +202,28 @@ export function buildServer(
     ? scriptCheckpointStore ?? new InMemoryScriptCheckpointStore()
     : undefined;
   let agentJobRunner: AgentJobRunner | undefined;
-  const memorySyncRunner = scriptStore?.listMemorySyncTargets && scriptStore.getMemorySync && scriptStore.claimMemorySync && scriptStore.applyMemorySync
-    ? new MemorySyncRunner(store, scriptStore, memory, {
+  const fixedMemoryClientId = store instanceof FileDataStore ? store.storageClientId
+    : scriptStore instanceof FileScriptStore ? scriptStore.storageClientId : undefined;
+  const memorySyncRunner = (store.getMemorySync && store.applyMemorySync) || (scriptStore?.getMemorySync && scriptStore.applyMemorySync)
+    ? new MemorySyncRunner(store, scriptStore ?? {}, memory, {
+        novelSource: store,
         // Only a concrete single-library store can override request scope.
         // The client-scoped proxy must continue using the validated HTTP client.
-        ...(scriptStore instanceof FileScriptStore ? { fixedClientId: scriptStore.storageClientId } : {}),
+        ...(fixedMemoryClientId !== undefined ? { fixedClientId: fixedMemoryClientId } : {}),
       })
     : undefined;
   if (memorySyncRunner) {
     app.addHook('onReady', () => memorySyncRunner.start());
     app.addHook('onClose', () => memorySyncRunner.close());
   }
+  const storyMemoryService = memorySyncRunner ? new StoryMemoryService(store, memorySyncRunner, store, scriptStore ?? {}, {
+    ...(fixedMemoryClientId !== undefined ? { fixedClientId: fixedMemoryClientId } : {}),
+    nextUnit: async (projectId, mode) => mode === 'novel' ? (await store.listChapters(projectId)).length + 1
+      : Math.max(0, ...(await scriptStore?.getProjectState(projectId))?.episodes.map((episode) => episode.episodeNumber) ?? []) + 1,
+    entityAliases: async (projectId, mode) => mode === 'novel'
+      ? Object.fromEntries((await store.listCharacters(projectId)).map((character) => [character.id, [character.name]]))
+      : Object.fromEntries(((await scriptStore?.getProjectState(projectId))?.characters ?? []).map((character) => [character.id, [character.name, ...character.aliases]])),
+  }) : undefined;
   const projectService = new ProjectService(store, {
     afterRemove: async (projectId) => {
       const clientId = getCurrentClientId();
@@ -321,6 +334,7 @@ export function buildServer(
   // Transport layer — register every route group against its service.
   registerProjectRoutes(app, projectService);
   if (memorySyncRunner) registerMemorySyncRoutes(app, memorySyncRunner);
+  if (storyMemoryService) registerStoryMemoryRoutes(app, storyMemoryService);
   if (scriptService) registerScriptRoutes(app, scriptService);
   if (scriptPlanTurnService) registerScriptPlanRoutes(app, scriptPlanTurnService, scriptConceptService);
   registerChapterRoutes(app, chapterService);

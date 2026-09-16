@@ -6,6 +6,17 @@ import type { WriteBriefView } from '../types/writeBrief.js';
 import { WritingBriefPanel } from './WritingBriefPanel.js';
 
 describe('WritingBriefPanel', () => {
+  it('shows the frozen memory section and distinguishes estimated tokens from provider usage', async () => {
+    const brief = makeWriteBrief({ memoryContext: { text: '承接钥匙仍在门外；作者要求简洁对白。', statistics: {
+      maxChars: 1000, usedChars: 22, estimatedTokens: 18, requiredChars: 8, sourceChars: 8, authorChars: 6,
+      threadChars: 0, retrievalChars: 0, omittedItems: 2, truncated: true,
+    } } });
+    render(<WritingBriefPanel targetKey="memory" load={vi.fn().mockResolvedValue({ status: 'current', origin: 'generation', brief })} />);
+    await screen.findByText('本次记忆段 · 22 / 1000 字符');
+    expect(screen.getByText('承接钥匙仍在门外；作者要求简洁对白。')).toBeInTheDocument();
+    expect(screen.getByText(/仅为本段预算估算，不是模型服务实际用量/)).toBeInTheDocument();
+    expect(screen.getByText('预算内省略 2 项参考内容。')).toBeInTheDocument();
+  });
   it('shows server provenance and generation status without exposing hashes', async () => {
     render(<WritingBriefPanel targetKey="ch-1" load={vi.fn().mockResolvedValue({ status: 'stale', origin: 'generation', brief: makeWriteBrief(), reason: '上一章已修改' })} />);
     expect(await screen.findByText('本次写前依据')).toBeInTheDocument();

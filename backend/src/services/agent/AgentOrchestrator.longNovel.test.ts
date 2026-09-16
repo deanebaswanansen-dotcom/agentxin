@@ -29,6 +29,8 @@ import type { DataStore } from '../../store/DataStore.js';
 import { FileDataStore } from '../../store/FileDataStore.js';
 import { MemoryService } from '../memory/MemoryService.js';
 import { MemoryStore } from '../memory/MemoryStore.js';
+import { projectSourceMemory } from '../memory/sourceMemoryContract.js';
+import { hashWriteBriefValue } from '../writing/WriteBrief.js';
 import { ModelConfigService } from '../modelConfig/ModelConfigService.js';
 import type { ChatMessage, ModelConfig, NovelStoryPlan } from '../../types/index.js';
 import type { StreamDelta } from '../../proxy/sseParser.js';
@@ -789,7 +791,7 @@ describe('normalizeFullNovelOptions', () => {
         return (async function* () {
           yield {
             kind: 'content' as const,
-            text: '林远推开门，雨砸在锈蚀的招牌上。他说：“跟我来。”众人却发现地图是假的，真正的危机才刚开始。'.repeat(10),
+            text: (reflections === 0 ? '众人确认师父已经死亡并安葬。' : '师父推门走进宴会厅。') + '林远推开门，雨砸在锈蚀的招牌上。他说：“跟我来。”众人却发现地图是假的，真正的危机才刚开始。'.repeat(10),
           };
         })();
       }
@@ -889,8 +891,8 @@ describe('normalizeFullNovelOptions', () => {
                 key: 'holder',
                 value: '顾棠',
                 evidence: reflections === 1
-                  ? '顾棠把横线纸折好放进衬衣口袋。'
-                  : '她将横线纸收进防水袋。',
+                  ? '顾棠从机柜底座深处取出一张横线纸，折好放进衬衣口袋。'
+                  : '顾棠在铁栅门后的砖缝中再次发现同一张横线纸，将它收进防水袋。',
               }],
               learning: '',
               foreshadows: [],
@@ -1313,7 +1315,7 @@ describe('normalizeFullNovelOptions', () => {
     expect(result.metrics?.completedChapters).toBe(1);
   });
 
-  it('plants foreshadows during reflection and injects open ledger into later chapters', async () => {
+  it('keeps reflection claims without body evidence as references without promoting a legacy ledger to settings', async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-foreshadow-'));
     const store = await FileDataStore.create(join(tempDir, 'store.json'));
     await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock-model' });
@@ -1341,9 +1343,12 @@ describe('normalizeFullNovelOptions', () => {
     const open = memory.listOpenForeshadows(result.projectId);
     expect(open.some((f) => f.title.includes('热数据坟场'))).toBe(true);
     const outlines = await store.listOutlines(result.projectId);
-    expect(outlines.some((o) => o.title === '伏笔台账')).toBe(true);
-    // 第 2 章写作时应回灌第 1 章埋下的伏笔
-    expect(proxy.chapterSystems[1]).toContain('伏笔台账');
+    expect(outlines.some((o) => o.title === '伏笔台账')).toBe(false);
+    const projection = (await store.getProject(result.projectId))!.memorySync!.projection;
+    const view = projectSourceMemory(projection, 2);
+    expect(view.entries.filter((entry) => entry.kind === 'thread')).toEqual([]);
+    expect(view.unverifiedReferences.some((entry) => entry.text.includes('热数据坟场'))).toBe(true);
+    expect(proxy.chapterSystems[1]).toContain('未核实，仅供核对');
     expect(proxy.chapterSystems[1]).toContain('热数据坟场');
   });
 
@@ -1356,6 +1361,8 @@ describe('normalizeFullNovelOptions', () => {
     for (const title of ['第1章', '第2章', '第5章']) {
       const chapter = await store.createChapter(project.id, title);
       await store.updateChapterContent(chapter.id, `${title}已完成正文。他说：“继续。”真正的危险才刚刚开始。`.repeat(8));
+      const saved = (await store.getChapter(chapter.id))!;
+      await store.acceptChapter({ chapterId: saved.id, expectedRevision: saved.revision!, contentHash: hashWriteBriefValue(saved.content) });
       await memory.appendChapterSummary(project.id, {
         chapterId: chapter.id,
         title,
@@ -1397,6 +1404,8 @@ describe('normalizeFullNovelOptions', () => {
     const project = await store.createProject('拦截续写', 'novel');
     const first = await store.createChapter(project.id, '第1章');
     await store.updateChapterContent(first.id, '第一章正文。他说：“跟我来。”真正的危险才刚刚开始。'.repeat(8));
+    const savedFirst = (await store.getChapter(first.id))!;
+    await store.acceptChapter({ chapterId: first.id, expectedRevision: savedFirst.revision!, contentHash: hashWriteBriefValue(savedFirst.content) });
     await memory.appendChapterSummary(project.id, {
       chapterId: first.id,
       title: '第1章',
@@ -1407,6 +1416,8 @@ describe('normalizeFullNovelOptions', () => {
     await memory.markChapterRejected(project.id, rejected.id);
     const third = await store.createChapter(project.id, '第3章');
     await store.updateChapterContent(third.id, '第三章正文。他说：“结束了。”真正的危险才刚刚开始。'.repeat(8));
+    const savedThird = (await store.getChapter(third.id))!;
+    await store.acceptChapter({ chapterId: third.id, expectedRevision: savedThird.revision!, contentHash: hashWriteBriefValue(savedThird.content) });
     await memory.appendChapterSummary(project.id, {
       chapterId: third.id,
       title: '第3章',
@@ -1438,6 +1449,34 @@ describe('normalizeFullNovelOptions', () => {
     expect(chapters[1]?.content).not.toContain('OLD REJECTED DRAFT');
     expect(chapters[1]?.content).toContain('洛言继续推进代码御剑主线');
     expect(memory.isChapterRejected(project.id, rejected.id)).toBe(false);
+  });
+
+  it.each(['long_novel', 'full_novel'] as const)('resumes the same saved candidate after a %s reflection failure without rewriting', async (task) => {
+    tempDir = await mkdtemp(join(tmpdir(), 'agent-reflection-resume-'));
+    const store = await FileDataStore.create(join(tempDir, 'store.json'));
+    await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock-model' });
+    const memory = new MemoryService(await MemoryStore.create(join(tempDir, 'memory.json')));
+    const proxy = new CaptureProxy();
+    const original = proxy.streamCompletion.bind(proxy);
+    let reflectionHealthy = false;
+    proxy.streamCompletion = (config, messages, signal, options) => {
+      if (!reflectionHealthy && messages[0]?.content.includes('反思子 Agent')) return (async function* () { yield { kind: 'content' as const, text: '{}' }; })();
+      return original(config, messages, signal, options);
+    };
+    const orchestrator = new AgentOrchestrator(store, new ModelConfigService(store), proxy, undefined as never, undefined as never, memory);
+    const options = { chapters: 1, totalChapters: 1, targetWords: 500, automationLevel: 'semi_auto' as const };
+    await expect(orchestrator.run({ task, mode: 'draft', prompt: '旧城悬疑长篇', options }, new AbortController().signal)).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    const project = (await store.listProjects())[0]!;
+    const draft = (await store.listChapters(project.id))[0]!;
+    expect(draft.content).not.toBe(''); expect(draft.acceptance).toBeUndefined();
+    expect(await store.getMemorySync(project.id)).toBeUndefined();
+    expect(proxy.chapterSystems).toHaveLength(1);
+    reflectionHealthy = true;
+    await orchestrator.run({ task, mode: 'draft', projectId: project.id, prompt: '旧城悬疑长篇', options }, new AbortController().signal);
+    const chapters = await store.listChapters(project.id);
+    expect(chapters).toHaveLength(1);
+    expect(chapters[0]).toMatchObject({ id: draft.id, content: draft.content, revision: draft.revision, acceptance: { status: 'current' } });
+    expect(proxy.chapterSystems).toHaveLength(1);
   });
 
   it('does not commit a chapter when inspector output is unusable, then re-inspects it', async () => {

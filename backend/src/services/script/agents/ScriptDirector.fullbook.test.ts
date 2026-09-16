@@ -316,9 +316,9 @@ describe('ScriptDirector offline ten-episode full-book diagnostic', () => {
     expect(episodeSixPrompt).toContain('第5集证据已登记');
     expect(episodeSixPrompt).toContain('第5集待解线索');
     expect(episodeSixPrompt).toContain('录音笔');
-    expect(episodeSixPrompt).toContain('causeEventIds');
-    expect(episodeSixPrompt).toContain('props');
-    expect(episodeSixPrompt).toContain('recentCommits');
+    expect(episodeSixPrompt).toContain('故事记忆与历史证据');
+    expect(episodeSixPrompt).toContain('未核实');
+    expect(episodeSixPrompt).not.toContain('recentCommits');
     const secondBatchOutlinePrompt = model.calls.find(
       (call) => call.node === 'episode_outline' && call.prompt.includes('需要集号：6、7、8、9、10'),
     )?.prompt;

@@ -17,6 +17,8 @@ export interface SourceMemoryServicePort {
 }
 
 export interface MemorySyncRunnerOptions {
+  /** Novel and screenplay intents live with their own atomic accepted documents. */
+  novelSource?: MemorySyncStorePort;
   /** Server-selected scope for a concrete single-library store; never inferred from an intent. */
   fixedClientId?: string;
   intervalMs?: number;
@@ -73,8 +75,13 @@ export class MemorySyncRunner {
     if (this.scanning) return this.scanning;
     const scan = (async () => {
       try {
-        const targets = await this.source.listMemorySyncTargets?.() ?? [];
-        for (const target of targets) {
+        const targets = new Map<string, MemorySyncTarget>();
+        for (const source of [this.source, this.options.novelSource]) {
+          try {
+            for (const target of await source?.listMemorySyncTargets?.() ?? []) targets.set(targetKey(target), target);
+          } catch { this.reportBackgroundError(); }
+        }
+        for (const target of targets.values()) {
           if (this.closed) break;
           if (target.clientId !== 'local' && !isValidClientId(target.clientId)) continue;
           try { await this.runTarget(target); }
@@ -87,9 +94,13 @@ export class MemorySyncRunner {
     return scan;
   }
 
-  private assertScope(intent: MemorySyncIntent, target: MemorySyncTarget): void {
+  private sourceFor(mode: SourceMemoryMode): MemorySyncStorePort | undefined {
+    return mode === 'short_drama' ? this.source : this.options.novelSource;
+  }
+
+  private assertScope(intent: MemorySyncIntent, target: MemorySyncTarget, mode: SourceMemoryMode): void {
     const projection = intent.projection;
-    if (projection.clientId !== target.clientId || projection.projectId !== target.projectId || projection.mode !== 'short_drama') {
+    if (projection.clientId !== target.clientId || projection.projectId !== target.projectId || projection.mode !== mode) {
       throw ServiceError.conflict('记忆同步来源与当前项目不匹配。');
     }
   }
@@ -102,12 +113,14 @@ export class MemorySyncRunner {
     if (existing) return existing;
     const execution = runWithStoredClientId(target.clientId, async () => {
       const project = await this.projects.getProject(target.projectId);
-      if (!project || project.kind !== 'short_drama' || this.blocked.has(key) || this.closed) return undefined;
-      const intent = await this.source.getMemorySync?.(target.projectId);
+      if (!project || this.blocked.has(key) || this.closed) return undefined;
+      const mode = project.kind === 'short_drama' ? 'short_drama' : 'novel';
+      const source = this.sourceFor(mode);
+      const intent = await source?.getMemorySync?.(target.projectId);
       if (!intent) return undefined;
-      this.assertScope(intent, target);
+      this.assertScope(intent, target, mode);
       if (this.blocked.has(key) || this.closed) return undefined;
-      const claim = await this.source.claimMemorySync?.(target.projectId, {
+      const claim = await source?.claimMemorySync?.(target.projectId, {
         owner: this.owner,
         now: (this.options.now?.() ?? new Date()).toISOString(),
         leaseMs: Math.max(1, this.options.leaseMs ?? 60_000),
@@ -115,11 +128,11 @@ export class MemorySyncRunner {
       });
       if (!claim) return undefined;
       if (claim.clientId !== target.clientId || claim.projectId !== target.projectId) throw ServiceError.conflict('记忆同步租约与当前项目不匹配。');
-      return this.source.applyMemorySync?.(target.projectId, claim, async (projection) => {
+      return source?.applyMemorySync?.(target.projectId, claim, async (projection) => {
         if (this.blocked.has(key)) throw ServiceError.conflict('项目正在删除，记忆同步已停止。');
         const currentProject = await this.projects.getProject(target.projectId);
-        if (!currentProject || currentProject.kind !== 'short_drama') throw ServiceError.notFound('记忆同步项目不存在。');
-        if (projection.clientId !== target.clientId || projection.projectId !== target.projectId || projection.mode !== 'short_drama' || projection.revision !== claim.revision || projection.idempotencyKey !== claim.idempotencyKey) {
+        if (!currentProject || (currentProject.kind === 'short_drama' ? 'short_drama' : 'novel') !== mode) throw ServiceError.notFound('记忆同步项目不存在。');
+        if (projection.clientId !== target.clientId || projection.projectId !== target.projectId || projection.mode !== mode || projection.revision !== claim.revision || projection.idempotencyKey !== claim.idempotencyKey) {
           throw ServiceError.conflict('记忆同步投影与租约不匹配。');
         }
         await this.memory.applySourceProjection(projection);
@@ -150,8 +163,8 @@ export class MemorySyncRunner {
     const project = await this.projects.getProject(projectId);
     if (!project) throw ServiceError.notFound('项目不存在。');
     const mode: SourceMemoryMode = project.kind === 'short_drama' ? 'short_drama' : 'novel';
-    const intent = mode === 'short_drama' ? await this.source.getMemorySync?.(projectId) : undefined;
-    if (intent) this.assertScope(intent, { clientId: getCurrentClientId(), projectId });
+    const intent = await this.sourceFor(mode)?.getMemorySync?.(projectId);
+    if (intent) this.assertScope(intent, { clientId: getCurrentClientId(), projectId }, mode);
     return { mode, intent };
   }
 
@@ -177,19 +190,25 @@ export class MemorySyncRunner {
   async retry(projectId: string): Promise<MemorySyncStatusView> {
     return this.inRequestScope(async () => {
       const { mode } = await this.readCurrent(projectId);
-      if (mode !== 'short_drama') throw ServiceError.validation('本阶段仅支持短剧来源记忆同步。');
+      if (!this.sourceFor(mode)?.applyMemorySync) throw ServiceError.validation('当前存储不支持接受来源记忆同步。');
       await this.runTarget({ clientId: getCurrentClientId(), projectId }, true);
       return this.getStatus(projectId);
     });
   }
 
   async query(projectId: string, beforeUnit: number): Promise<SourceMemoryQueryResult> {
+    const { projection: _projection, ...view } = await this.queryContext(projectId, beforeUnit);
+    return view;
+  }
+
+  /** Internal workbench/retrieval snapshot. Routes never expose every frozen body. */
+  async queryContext(projectId: string, beforeUnit: number): Promise<SourceMemoryQueryResult & { projection?: FrozenMemoryProjection }> {
     if (!Number.isSafeInteger(beforeUnit) || beforeUnit < 1) throw ServiceError.validation('beforeUnit必须是大于0的整数。');
     return this.inRequestScope(async () => {
       const { mode, intent } = await this.readCurrent(projectId);
       const memorySync = this.statusView(mode, intent);
       if (!intent) return { mode, projectId, beforeUnit, projectionRevision: 0, origin: 'accepted_sources', memorySync, entries: [], unverifiedReferences: [] };
-      return { ...this.memory.querySourceMemory(intent.projection, beforeUnit), memorySync };
+      return { ...this.memory.querySourceMemory(intent.projection, beforeUnit), memorySync, projection: intent.projection };
     });
   }
 }

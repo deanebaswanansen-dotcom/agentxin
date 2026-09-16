@@ -321,6 +321,8 @@ describe('ScriptDirectWriting', () => {
     const previousEpisodes = Array.from({ length: 59 }, (_, index) => ({
       ...episode,
       id: `episode-${index + 1}`,
+      status: 'completed',
+      openedThreads: [], closedThreads: [],
       episodeNumber: index + 1,
       title: `第${index + 1}集`,
       summary: `第${index + 1}集发生了不可重复的关键事件。`,

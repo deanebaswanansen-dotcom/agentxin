@@ -371,6 +371,7 @@ function renderActionText(text: string, characterNames: readonly string[]): Arra
 }
 
 export function ScriptEpisodeReader({
+  evidenceTarget,
   episodes,
   summaries,
   characters,
@@ -379,6 +380,7 @@ export function ScriptEpisodeReader({
   loading,
   onEditEpisode,
 }: {
+  evidenceTarget?: { episodeNumber: number; blockId: string; token: number };
   episodes: ScriptEpisode[];
   summaries: ScriptEpisodeSummary[];
   characters: ScriptCharacter[];
@@ -387,6 +389,12 @@ export function ScriptEpisodeReader({
   loading: boolean;
   onEditEpisode: (episodeNumber: number) => void;
 }): JSX.Element {
+  useEffect(() => {
+    if (!evidenceTarget) return;
+    const element = document.getElementById(`script-source-${evidenceTarget.episodeNumber}-${evidenceTarget.blockId}`);
+    element?.scrollIntoView?.({ block: 'center' });
+    element?.focus();
+  }, [evidenceTarget]);
   const charactersById = new Map(characters.map((character) => [character.id, character]));
   const characterNames = characters.map((character) => character.name);
   const introducedCharacterIds = new Set<string>();
@@ -414,19 +422,21 @@ export function ScriptEpisodeReader({
                 {names.length ? <p className="script-reader-characters"><strong>人物：</strong>{names.join(' ')}</p> : null}
                 <div className="script-reader-blocks">
                   {scene.blocks.map((block) => {
+                    const sourceProps = { id: `script-source-${episode.episodeNumber}-${block.id}`, tabIndex: -1,
+                      'data-memory-evidence': evidenceTarget?.episodeNumber === episode.episodeNumber && evidenceTarget.blockId === block.id ? 'current' : undefined };
                     if (block.type === 'caption') {
                       const caption = block.text
                         .replace(/^【|】$/g, '')
                         .replace(/^字幕\s*[：:]\s*/, '');
-                      return <p className="is-caption" key={block.id}>{/^(?:闪回|闪回结束|闪出)$/u.test(caption) ? `【${caption}】` : `【字幕：${caption}】`}</p>;
+                      return <p {...sourceProps} className="is-caption" key={block.id}>{/^(?:闪回|闪回结束|闪出)$/u.test(caption) ? `【${caption}】` : `【字幕：${caption}】`}</p>;
                     }
                     if (block.type === 'action') {
                       const action = block.text.replace(/^△/, '');
-                      return <p className="is-action" key={block.id}>△{renderActionText(action, characterNames)}</p>;
+                      return <p {...sourceProps} className="is-action" key={block.id}>△{renderActionText(action, characterNames)}</p>;
                     }
                     const mode = block.mode === 'os' || block.mode === 'vo' ? block.mode.toUpperCase() : '';
                     const delivery = block.delivery?.trim();
-                    return <p className="is-dialogue" key={block.id}><strong>{block.speaker}{mode || (delivery ? `（${delivery}）` : '')}：</strong>{block.text}</p>;
+                    return <p {...sourceProps} className="is-dialogue" key={block.id}><strong>{block.speaker}{mode || (delivery ? `（${delivery}）` : '')}：</strong>{block.text}</p>;
                   })}
                 </div>
               </section>

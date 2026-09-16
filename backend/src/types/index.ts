@@ -15,6 +15,8 @@
 
 // 唯一标识符统一使用 string（UUID v4）
 import type { WriteBrief } from './WriteBrief.js';
+import type { AcceptedMemoryInput, MemorySyncIntent } from './SourceMemory.js';
+import type { StoryControlCollection } from './StoryControl.js';
 export type Id = string;
 
 export type ProjectKind = 'novel' | 'short_drama';
@@ -25,6 +27,17 @@ export interface Project {
   kind: ProjectKind;
   createdAt: string; // ISO 8601
   updatedAt: string;
+  novelAcceptances?: NovelChapterAcceptance[];
+  memorySync?: MemorySyncIntent;
+  storyControls?: StoryControlCollection;
+}
+
+export interface NovelChapterAcceptance {
+  id: string;
+  status: 'current' | 'stale';
+  memoryInput: AcceptedMemoryInput;
+  /** Exact preceding manuscript versions reviewed at this acceptance. */
+  dependencies: Array<{ id: string; title: string; revision: number; contentHash: string; unitNumber: number }>;
 }
 
 export interface Chapter {
@@ -36,6 +49,7 @@ export interface Chapter {
   /** 正文乐观锁版本；旧数据缺失时按 0 处理。 */
   revision?: number;
   generatedCandidate?: { brief: WriteBrief; candidateHash: string; sceneDependencies?: Array<{ sceneId: string; contentHash: string }> };
+  acceptance?: { id: string; status: 'current' | 'stale'; revision: number; contentHash: string; acceptedAt: string; unitNumber: number };
 }
 
 export interface Character {

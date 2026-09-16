@@ -72,4 +72,20 @@ describe('shared write brief provenance', () => {
     small.sources[0]!.excerpt = '计划在第十章转交账本';
     expect(renderWriteBrief(createWriteBrief(small))).toContain('剧情安排（尚未发生的部分不是事实）');
   });
+
+  it('freezes and renders the whole budgeted memory section without the excerpt limit', () => {
+    const text = '完整的作者要求。'.repeat(100);
+    const memoryContext = { text, statistics: { maxChars: 16000, usedChars: text.length,
+      estimatedTokens: Math.ceil(text.length / 2), requiredChars: text.length, sourceChars: 0,
+      authorChars: text.length, threadChars: 0, retrievalChars: 0, omittedItems: 0, truncated: false } };
+    const brief = createWriteBrief({ ...input(), memoryContext });
+    expect(renderWriteBrief(brief)).toContain(text);
+    expect(createWriteBrief(brief)).toEqual(brief);
+    const changed = structuredClone(memoryContext);
+    changed.text = changed.text.replace('作者', '写作');
+    expect(createWriteBrief({ ...input(), memoryContext: changed }).fingerprint).not.toBe(brief.fingerprint);
+    memoryContext.text = '';
+    expect(brief.memoryContext?.text).toBe(text);
+    expect(() => createWriteBrief({ ...input(), memoryContext })).toThrow('预算');
+  });
 });

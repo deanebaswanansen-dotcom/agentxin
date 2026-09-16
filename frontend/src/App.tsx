@@ -17,6 +17,8 @@ import { ChatWorkspace, type PendingReferenceImport } from './components/ChatWor
 import { ChapterEditor, type ChapterEditorHandle } from './components/ChapterEditor.js';
 import { AdoptionPreviewDialog } from './components/AdoptionPreviewDialog.js';
 import { ChapterToolsDrawer } from './components/ChapterToolsDrawer.js';
+import { StoryMemoryDrawer } from './components/StoryMemoryDrawer.js';
+import { AcceptChapterSource } from './components/AcceptChapterSource.js';
 import { ProjectTree } from './components/ProjectTree.js';
 import { ErrorProvider, useErrorReporter } from './components/ErrorToast.js';
 import { Icon } from './components/Icon.js';
@@ -32,6 +34,7 @@ import { useWorkspaceSelection } from './hooks/useWorkspaceSelection.js';
 import { usePaneLayout } from './hooks/usePaneLayout.js';
 import { useNovelImportDrop } from './hooks/useNovelImportDrop.js';
 import applyAdoption from './lib/applyAdoption.js';
+import { locateNovelMemoryEvidence } from './lib/memoryEvidence.js';
 import type { AgentArtifact, Chapter, Id, ProjectKind } from './types/index.js';
 import type { WriteBrief } from './types/writeBrief.js';
 import type { WorkspaceTab } from './components/ProjectWorkspaceView.js';
@@ -45,7 +48,7 @@ const ResourceDrawer = lazy(() => import('./components/ResourceDrawer.js'));
 const ScriptWorkspace = lazy(() => import('./components/ScriptWorkspace.js'));
 const SettingsPanel = lazy(() => import('./components/SettingsPanel.js'));
 
-type DrawerKind = 'none' | 'chapterTools' | 'resource';
+type DrawerKind = 'none' | 'chapterTools' | 'resource' | 'memory';
 type AppMode = 'agent' | 'reader';
 type ThemeMode = 'tavern' | 'midnight' | 'paper';
 interface PendingAdoption {
@@ -177,6 +180,7 @@ function Workbench(): JSX.Element {
   const [selectionRequest, setSelectionRequest] = useState<EditorSelectionRequest | null>(null);
   const [pendingAdoption, setPendingAdoption] = useState<PendingAdoption | null>(null);
   const [adoptionSaving, setAdoptionSaving] = useState(false);
+  const [memoryRefresh, setMemoryRefresh] = useState(0);
   const adoptionEditorKey = JSON.stringify([selectedProjectId, selectedChapterId, editorContent, selection?.start, selection?.end]);
   const adoptionEditorRef = useRef({ key: adoptionEditorKey, version: 0, projectId: selectedProjectId, chapterId: selectedChapterId });
   if (adoptionEditorRef.current.key !== adoptionEditorKey) adoptionEditorRef.current = { key: adoptionEditorKey, version: adoptionEditorRef.current.version + 1, projectId: selectedProjectId, chapterId: selectedChapterId };
@@ -660,6 +664,7 @@ function Workbench(): JSX.Element {
                 >
                   资料
                 </button>
+                <button type="button" className="nwa-button nwa-button--ghost nwa-button--sm" disabled={selectedProjectId === null} onClick={() => setDrawer(drawer === 'memory' ? 'none' : 'memory')}>故事记忆</button>
                 <button
                   type="button"
                   className="nwa-button nwa-button--ghost nwa-button--sm"
@@ -838,6 +843,30 @@ function Workbench(): JSX.Element {
 
       {appMode === 'agent' && !isScriptProject ? (
         <>
+          {drawer === 'memory' && selectedProjectId ? <StoryMemoryDrawer
+            projectId={selectedProjectId} mode="novel"
+            refreshKey={`${projectListVersion}:${selectedChapter?.revision ?? ''}:${memoryRefresh}`}
+            bodyState={selectedChapter ? editorContent === selectedChapter.content ? 'saved' : 'unsaved' : 'none'}
+            onClose={handleCloseDrawer}
+            onControlsChanged={() => { setMemoryRefresh((value) => value + 1); bumpProjectList(); }}
+            onNavigate={async ({ source, evidence }) => {
+              const projectId = selectedProjectId;
+              const version = adoptionEditorRef.current.version;
+              try {
+                await flushEditor();
+                if (adoptionEditorRef.current.projectId !== projectId || adoptionEditorRef.current.version !== version) return;
+                const found = await loadChapter(projectId, source.resourceId);
+                if (!found || adoptionEditorRef.current.projectId !== projectId) return;
+                setDrawer('none');
+                if (evidence) {
+                  const range = locateNovelMemoryEvidence(found.content, evidence);
+                  if ((found.revision ?? 0) !== source.revision || !range) { reportError(new Error('来源正文已变化，请结合记忆面板中的冻结引文核对。')); return; }
+                  setSelectionRequest({ ...range, revision: Date.now() });
+                }
+              } catch { reportError(new Error('来源章节未能打开，请先保存当前修改后重试。')); }
+            }}
+          >{selectedChapter ? <AcceptChapterSource key={selectedChapter.id} chapter={selectedChapter} editorContent={editorContent} editorVersion={adoptionEditorRef.current.version}
+            beforePreview={flushEditor} onAccepted={(saved) => { handleSaved(saved.id, saved.content, saved.revision); setMemoryRefresh((value) => value + 1); }} /> : null}</StoryMemoryDrawer> : null}
           {/* —— 章节工具抽屉 —— */}
           <ChapterToolsDrawer
             chapter={drawer === 'chapterTools' ? selectedChapter : null}

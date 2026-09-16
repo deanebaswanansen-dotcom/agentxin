@@ -2224,6 +2224,14 @@ export class ScriptDirector {
       );
       if (alreadyCanonical) continue;
 
+      // A previously accepted source may have been explicitly withdrawn by an
+      // author correction or invalidated by a body edit. Repairing a later unit
+      // is not permission to accept that old body again. Only genuinely legacy
+      // episodes, which have never had a frozen acceptance, can be repaired here.
+      if (state.continuityCommits?.some((commit) =>
+        commit.episodeNumber === episodeNumber && commit.memoryInput,
+      )) return state;
+
       const charactersById = new Map(state.characters.map((item) => [item.id, item.name]));
       const registeredCharacterNames = new Set(charactersById.values());
       const outline = state.episodeOutlines.find((item) => item.episodeNumber === episodeNumber);
@@ -2600,6 +2608,10 @@ export class ScriptDirector {
       const batchCards = seriesOutline.episodeCards.filter(
         (card) => range.includes(card.episodeNumber),
       );
+      const batchMemoryCandidate = buildScriptWriteBrief(state, request.startEpisode, {
+        memoryQuery: batchCards.map((card) => `${card.title} ${card.mainEvent}`).join(' ').slice(0, 200),
+      })?.memoryContext;
+      const batchMemoryContext = batchMemoryCandidate?.text ? batchMemoryCandidate : undefined;
       const episodeOutlineUpstreamArtifactRefs = [buildScriptUpstreamArtifactRef(
         'episode_outline_range',
         request.startEpisode,
@@ -2607,6 +2619,7 @@ export class ScriptDirector {
           episodeNumbers: range,
           cards: batchCards,
           continuity: projectScriptContinuity(state, request.startEpisode),
+          ...(batchMemoryContext ? { memoryContext: batchMemoryContext } : {}),
         },
       )];
       const episodeOutlinePromptVersion = 'episode-outline-batch-v4';
@@ -2627,7 +2640,7 @@ export class ScriptDirector {
         scriptCreativeWritingInstruction(plan),
         `策划：${JSON.stringify(plan)}`,
         `分集卡：${JSON.stringify(batchCards)}`,
-        `当前连续性：${JSON.stringify({
+        batchMemoryContext ? `当前有来源的记忆与作者安排：${batchMemoryContext.text}` : `当前连续性：${JSON.stringify({
           aggregate: projectScriptContinuity(state, request.startEpisode),
           recentCommits: currentScriptContinuityCommits(state)
             .filter((commit) => commit.episodeNumber < request.startEpisode)
@@ -3566,7 +3579,7 @@ export class ScriptDirector {
           attempt > 1 ? '这是修订后复检。不得假设上一轮问题已解决，必须以当前正文重新判断。' : '',
           `策划：${JSON.stringify(plan)}`,
           `大纲：${JSON.stringify(outline)}`,
-          `连续性：${JSON.stringify({
+          writeBrief?.memoryContext ? '' : `连续性：${JSON.stringify({
             aggregate: projectScriptContinuity(reviewState, episodeNumber),
             recentCommits: currentScriptContinuityCommits(reviewState)
               .filter((commit) => commit.episodeNumber < episodeNumber)
@@ -5642,6 +5655,7 @@ export class ScriptDirector {
       ['格式规则', '结构化 JSON；1—5 场；每场含地点、时间、内外景、人物与 caption/action/dialogue 块。', 1_000],
     ] as const;
     return [writeBrief ? renderWriteBrief(writeBrief) : '', ...sections
+      .filter(([label]) => !writeBrief?.memoryContext || (label !== '上集承接' && label !== '伏笔与当前状态'))
       .map(([label, content, limit]) => `${label}：${content.slice(0, limit)}`)
     ].filter(Boolean).join('\n');
   }

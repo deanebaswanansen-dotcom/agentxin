@@ -326,10 +326,17 @@ describe('scriptRoutes', () => {
     const context = directWritingContext(state, state.plan!, {
       ...episodeOutlineInput(2), id: 'next-outline', projectId, revision: 1,
     });
-    expect(context.previousEpisode).toMatchObject({ summary: '', newFacts: [], openedThreads: [] });
-    expect(context.priorEpisodeHistory).toMatchObject({
-      allEpisodeSummaries: [{ episodeNumber: 1, summary: '', newFacts: [] }],
-    });
+    // The accepted brief is the sole history input; raw episode aggregates must
+    // not bypass the source revision or restore invalidated hidden metadata.
+    expect(context.historySource).toBe('accepted_writing_brief');
+    expect(context).not.toHaveProperty('previousEpisode');
+    expect(context).not.toHaveProperty('priorEpisodeHistory');
+    expect(context).not.toHaveProperty('continuity');
+    expect(context.writingBrief).toContain('完好的原始账本交给警方保管');
+    const accepted = state.memorySync!.projection.acceptances;
+    expect(accepted).toHaveLength(1);
+    expect(accepted[0]!.source.revision).toBe(saved.revision);
+    expect(accepted[0]!.blocks.some((block) => block.text.includes('完好的原始账本交给警方保管'))).toBe(true);
     expect(JSON.stringify(context)).not.toContain('销毁');
     expect(JSON.stringify(context)).toContain('完好的原始账本交给警方保管');
     expect(saved.status).toBe('completed');

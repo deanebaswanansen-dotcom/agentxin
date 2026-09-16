@@ -4,6 +4,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import fc from 'fast-check';
 import { App } from './App.js';
 import { makeWriteBrief } from './test/writeBriefFixture.js';
+import { makeStoryMemory, memorySource } from './test/storyMemoryFixture.js';
 
 function installWritingServer(accept?: (body: { content: string }) => Response | Promise<Response>) {
   let chapter = { id: 'ch-1', projectId: 'p-1', title: '测试第一章', content: '已有正文', revision: 3, position: 0 };
@@ -91,6 +92,60 @@ describe('App shell', () => {
     await screen.findByText('来源已过期');
     expect(screen.getByRole('textbox', { name: '章节正文' })).toHaveValue('已有正文');
     expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/content'))).toHaveLength(0);
+  });
+
+  it('flushes the manual editor before accepting its frozen saved source without an extra content write', async () => {
+    const baseFetch = installWritingServer();
+    const requests = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), 'http://localhost').pathname;
+      if (path.endsWith('/story-memory')) return Response.json(makeStoryMemory({ entries: [], unverifiedReferences: [], acceptedSources: [] }));
+      if (path.endsWith('/accept-source')) return Response.json(init?.method === 'POST'
+        ? { id: 'ch-1', projectId: 'p-1', title: '测试第一章', content: '我的手写正文', revision: 4, position: 0 }
+        : { chapterId: 'ch-1', title: '测试第一章', content: '我的手写正文', revision: 4, contentHash: 'frozen-manual-content' });
+      return baseFetch(input, init);
+    });
+    vi.stubGlobal('fetch', requests);
+    render(<App />);
+    fireEvent.click(await screen.findByTitle('小说测试项目'));
+    fireEvent.click(await screen.findByTitle('测试第一章'));
+    const editor = await screen.findByRole('textbox', { name: '章节正文' });
+    fireEvent.change(editor, { target: { value: '我的手写正文' } });
+    fireEvent.click(screen.getByRole('button', { name: '故事记忆' }));
+    fireEvent.click(screen.getByRole('button', { name: '查看并接受正文来源' }));
+    await screen.findByText('测试第一章 · 保存版本 4');
+    const paths = requests.mock.calls.map(([url]) => String(url));
+    expect(paths.findIndex((path) => path.endsWith('/content'))).toBeLessThan(paths.findIndex((path) => path.endsWith('/accept-source')));
+    fireEvent.click(screen.getByRole('checkbox'));
+    fireEvent.click(screen.getByRole('button', { name: '确认接受为来源' }));
+    await screen.findByText('所确认的已保存正文已接受为来源，记忆同步独立进行。');
+    const accepted = requests.mock.calls.find(([url, init]) => String(url).endsWith('/accept-source') && init?.method === 'POST')!;
+    expect(JSON.parse(accepted[1]!.body as string)).toEqual({ expectedRevision: 4, expectedContentHash: 'frozen-manual-content' });
+    expect(requests.mock.calls.filter(([url]) => String(url).endsWith('/content'))).toHaveLength(1);
+    expect(editor).toHaveValue('我的手写正文');
+  });
+
+  it('opens a source chapter and selects the matching frozen evidence', async () => {
+    const baseFetch = installWritingServer();
+    const source = { ...memorySource, revision: 3 };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes('/story-memory')) return Response.json(makeStoryMemory({
+        acceptedSources: [{ source, title: '测试第一章' }], unverifiedReferences: [],
+        entries: [{ ...makeStoryMemory().entries[0], text: '此前已经出现的段落', source, evidence: [{ blockId: 'body', start: 0, end: 4, quote: '已有正文' }] }],
+      }));
+      return baseFetch(input, init);
+    }));
+    render(<App />);
+    fireEvent.click(await screen.findByTitle('小说测试项目'));
+    fireEvent.click(await screen.findByTitle('测试第一章'));
+    await screen.findByRole('textbox', { name: '章节正文' });
+    fireEvent.click(screen.getByRole('button', { name: '故事记忆' }));
+    await screen.findByText('此前已经出现的段落');
+    const sourceSummary = screen.getAllByText('第 1 章 · 测试第一章 · 保存版本 3')[0];
+    fireEvent.click(sourceSummary);
+    fireEvent.click(screen.getByRole('button', { name: '定位正文证据' }));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '故事记忆' })).not.toBeInTheDocument());
+    const editor = screen.getByRole('textbox', { name: '章节正文' }) as HTMLTextAreaElement;
+    await waitFor(() => expect([editor.selectionStart, editor.selectionEnd]).toEqual([0, 4]));
   });
 
   it('does not overwrite an edit made while generated acceptance is in flight', async () => {

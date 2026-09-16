@@ -12,6 +12,9 @@ import { join, resolve } from 'node:path';
 import { getCurrentClientId, isValidClientId } from '../client/clientScope.js';
 import type { FrozenMemoryProjection, MemorySyncClaim, MemorySyncIntent, MemorySyncTarget } from '../../types/SourceMemory.js';
 import { validateFrozenMemoryProjection } from '../memory/sourceMemoryContract.js';
+import type { StoryControlCollection, StoryControlInput } from '../../types/StoryControl.js';
+import { assertStoryControls, deleteStoryControlRecord, emptyStoryControls, upsertStoryControlRecord } from '../story/StoryControls.js';
+import { ServiceError } from '../ServiceError.js';
 import { StoreError } from '../../store/StoreError.js';
 import type {
   ScriptCharacter,
@@ -179,6 +182,7 @@ function normalizeState(value: unknown, projectId: string): ScriptProjectState {
     episodes,
     continuityCommits,
     ...(input.memorySync ? { memorySync: clone(input.memorySync) } : {}),
+    ...(input.storyControls ? { storyControls: clone(input.storyControls) } : {}),
     continuity: {
       currentState: Array.isArray(continuity?.currentState)
         ? clone(continuity.currentState)
@@ -481,6 +485,7 @@ export class FileScriptStore implements ScriptStore {
   private readonly loaded = new Set<string>();
   private readonly states = new Map<string, ScriptProjectState | undefined>();
   private readonly mutationQueues = new Map<string, Promise<void>>();
+  private readonly deletedProjects = new Set<string>();
 
   private constructor(rootDirectory: string, private readonly clientId: string) {
     this.rootDirectory = resolve(rootDirectory);
@@ -508,6 +513,7 @@ export class FileScriptStore implements ScriptStore {
     try {
       const parsed = JSON.parse(await readFile(filePath, 'utf8')) as unknown;
       const state = normalizeState(parsed, projectId);
+      if (state.storyControls !== undefined) assertStoryControls(state.storyControls, { clientId: this.clientId, projectId, mode: 'short_drama' });
       if (state.memorySync) {
         validateFrozenMemoryProjection(state.memorySync.projection);
         if (state.memorySync.projection.clientId !== this.clientId ||
@@ -553,6 +559,7 @@ export class FileScriptStore implements ScriptStore {
     operation: (state: ScriptProjectState) => Promise<T> | T,
   ): Promise<T> {
     return this.inProjectQueue(projectId, async () => {
+      if (this.deletedProjects.has(projectId)) throw ServiceError.notFound('短剧项目已删除。');
       const current = (await this.load(projectId)) ?? emptyState(projectId);
       const working = clone(current);
       const value = await operation(working);
@@ -891,6 +898,7 @@ export class FileScriptStore implements ScriptStore {
       }
       this.states.set(projectId, undefined);
       this.loaded.add(projectId);
+      this.deletedProjects.add(projectId);
     };
     const queued = previous.then(run, run);
     this.mutationQueues.set(projectId, queued);
@@ -913,6 +921,45 @@ export class FileScriptStore implements ScriptStore {
       targets.push({ clientId: this.clientId, projectId });
     }
     return targets.sort((left, right) => left.projectId.localeCompare(right.projectId));
+  }
+
+  async getStoryControls(projectId: string): Promise<StoryControlCollection> {
+    const state = await this.getProjectState(projectId);
+    return clone(state?.storyControls ?? emptyStoryControls());
+  }
+
+  upsertStoryControl(projectId: string, input: StoryControlInput, expectedRevision: number): Promise<StoryControlCollection> {
+    return this.mutate(projectId, (state) => {
+      const changed = upsertStoryControlRecord(state.storyControls ?? emptyStoryControls(), input, expectedRevision, {
+        clientId: this.clientId, projectId, mode: 'short_drama',
+        activeAcceptances: currentScriptContinuityCommits(state).flatMap((commit) => commit.memoryInput ? [commit.memoryInput] : []),
+      });
+      state.storyControls = changed.collection;
+      if (changed.retractFromUnit !== undefined) {
+        const now = new Date().toISOString();
+        for (const commit of state.continuityCommits ?? []) {
+          if (commit.episodeNumber >= changed.retractFromUnit && commit.status === 'current') {
+            commit.status = 'stale';
+            commit.updatedAt = now;
+          }
+        }
+        for (const episode of state.episodes) {
+          if (episode.episodeNumber >= changed.retractFromUnit) {
+            episode.status = 'reviewing';
+            episode.revision += 1;
+            episode.updatedAt = now;
+          }
+        }
+      }
+      return changed.collection;
+    });
+  }
+
+  deleteStoryControl(projectId: string, id: string, expectedRevision: number): Promise<StoryControlCollection> {
+    return this.mutate(projectId, (state) => {
+      state.storyControls = deleteStoryControlRecord(state.storyControls ?? emptyStoryControls(), id, expectedRevision);
+      return state.storyControls;
+    });
   }
 
   async getMemorySync(projectId: string): Promise<MemorySyncIntent | undefined> {

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { FrozenMemoryProjection, MemorySyncClaim, MemorySyncIntent, MemorySyncTarget } from '../../types/SourceMemory.js';
+import type { StoryControlCollection, StoryControlInput } from '../../types/StoryControl.js';
 
 import type {
   ScriptCharacter,
@@ -62,6 +63,9 @@ export interface ScriptStore {
     expectedRevision?: number,
   ): Promise<ScriptReviewIssueCollection>;
   deleteProject(projectId: string): Promise<void>;
+  getStoryControls?(projectId: string): Promise<StoryControlCollection>;
+  upsertStoryControl?(projectId: string, input: StoryControlInput, expectedRevision: number): Promise<StoryControlCollection>;
+  deleteStoryControl?(projectId: string, id: string, expectedRevision: number): Promise<StoryControlCollection>;
   listMemorySyncTargets?(): Promise<MemorySyncTarget[]>;
   getMemorySync?(projectId: string): Promise<MemorySyncIntent | undefined>;
   claimMemorySync?(projectId: string, options: {

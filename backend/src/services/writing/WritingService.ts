@@ -20,7 +20,7 @@
 import type { ModelProxy } from '../../proxy/ModelProxy.js';
 import type { StreamDelta } from '../../proxy/sseParser.js';
 import type { DataStore } from '../../store/DataStore.js';
-import { assertNovelWriteBriefCurrent, captureNovelWriteBrief } from '../../store/NovelWriteGuard.js';
+import { assertNovelWriteBriefCurrent, captureNovelWriteBrief, isUnverifiedSystemOutline } from '../../store/NovelWriteGuard.js';
 import type { WriteBrief } from '../../types/WriteBrief.js';
 import type {
   Id,
@@ -180,8 +180,10 @@ export class WritingService {
         if (entity) {
           snippets.push({
             kind: 'outline',
-            title: entity.title,
-            body: entity.content,
+            title: isUnverifiedSystemOutline(entity) ? `${entity.title}（系统未核实参考）` : entity.title,
+            body: isUnverifiedSystemOutline(entity)
+              ? `作者显式选中的系统历史参考，未经正文来源核实，不代表已发生事实，不得覆盖当前已接受事实或作者裁决。\n\n${entity.content}`
+              : entity.content,
           });
         }
       }

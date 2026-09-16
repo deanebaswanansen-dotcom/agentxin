@@ -8,6 +8,7 @@ import type { ModelProxy } from '../proxy/ModelProxy.js';
 import type { StreamDelta } from '../proxy/sseParser.js';
 import { FileDataStore } from '../store/FileDataStore.js';
 import { FileScriptStore } from '../services/script/FileScriptStore.js';
+import { hashSourceMemoryBlocks, projectSourceMemory } from '../services/memory/sourceMemoryContract.js';
 import type { ChatMessage, ModelConfig } from '../types/index.js';
 import { parseAgentBody, parsePlanSummary } from './agentRoutes.js';
 
@@ -22,8 +23,11 @@ class FakeProxy implements ModelProxy {
   ): AsyncIterable<StreamDelta> {
     this.calls.push(messages);
     this.signalStates.push(signal.aborted);
+    const response = messages.some((message) => message.role === 'system' && message.content.includes('反思子 Agent'))
+      ? JSON.stringify({ summary: '自动控稿输出', facts: [], stateUpdates: [], learning: '', foreshadows: [] })
+      : '自动控稿输出';
     return (async function* () {
-      yield { kind: 'content' as const, text: '自动控稿输出' };
+      yield { kind: 'content' as const, text: response };
     })();
   }
 }
@@ -297,7 +301,7 @@ describe('agent routes', () => {
     await app.close();
   });
 
-  it('runs draft automation from one sentence and persists project artifacts', async () => {
+  it('persists an accepted draft from one sentence without promoting a legacy ledger to outlines', async () => {
     const store = await FileDataStore.create(join(dir, 'store.json'));
     const proxy = new FakeProxy();
     const app = buildServer(store, proxy);
@@ -317,11 +321,25 @@ describe('agent routes', () => {
     expect(await store.listWorldSettings(body.projectId)).toHaveLength(1);
     expect(await store.listCharacters(body.projectId)).toHaveLength(1);
     const outlines = await store.listOutlines(body.projectId);
-    expect(outlines).toHaveLength(2);
+    expect(outlines).toHaveLength(1);
     expect(outlines.some((outline) => outline.title.endsWith('：大纲'))).toBe(true);
-    expect(outlines.some((outline) => outline.title === '伏笔台账')).toBe(true);
+    expect(outlines.some((outline) => outline.title === '伏笔台账')).toBe(false);
     const chapter = await store.getChapter(body.chapterId);
     expect(chapter?.content).toBe('自动控稿输出');
+    expect(chapter?.acceptance).toMatchObject({ status: 'current', revision: chapter?.revision, unitNumber: 1 });
+    const intent = await store.getMemorySync(body.projectId);
+    expect(intent?.projection.acceptances).toHaveLength(1);
+    const accepted = intent!.projection.acceptances[0]!;
+    expect(accepted.source).toMatchObject({ clientId: 'local', projectId: body.projectId, mode: 'novel',
+      resourceId: body.chapterId, revision: chapter!.revision, acceptanceId: chapter!.acceptance!.id });
+    expect(accepted.blocks.map((block) => block.text).join('')).toBe(chapter!.content);
+    expect(accepted.source.contentHash).toBe(hashSourceMemoryBlocks(accepted.blocks));
+    // The next unit consumes the attributable accepted reflection, not a synthesized settings document.
+    const view = projectSourceMemory(intent!.projection, 2);
+    expect(view.entries).toContainEqual(expect.objectContaining({ kind: 'summary', text: '自动控稿输出',
+      status: 'active', evidenceStatus: 'matched', source: accepted.source }));
+    expect(view.entries.filter((entry) => entry.kind === 'thread')).toEqual([]);
+    expect(view.unverifiedReferences).toEqual([]);
     expect(proxy.calls.length).toBeGreaterThanOrEqual(2);
     expect(proxy.signalStates.every((aborted) => aborted === false)).toBe(true);
     expect(proxy.signalStates.length).toBeGreaterThanOrEqual(4);

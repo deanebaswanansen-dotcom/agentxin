@@ -60,6 +60,44 @@ function fixture() {
 afterEach(() => vi.useRealTimers());
 
 describe('MemorySyncRunner', () => {
+  it('routes novel recovery, query and retry to the novel store and keeps screenplay independent', async () => {
+    const f = fixture();
+    f.add(CLIENT_A, 'drama');
+    const novel = fixture();
+    const intent = novel.add(CLIENT_A, 'novel');
+    intent.projection = createFrozenMemoryProjection({ ...intent.projection, mode: 'novel' });
+    f.projects.set(key(CLIENT_A, 'novel'), 'novel');
+    const runner = f.runner({ novelSource: novel.source });
+    await runner.scan();
+    expect(f.appliedScopes).toEqual([CLIENT_A, CLIENT_A]);
+    expect(intent.status).toBe('succeeded');
+    expect(novel.source.claimMemorySync).toHaveBeenCalledWith('novel', expect.anything());
+    expect(f.source.claimMemorySync).not.toHaveBeenCalledWith('novel', expect.anything());
+    const view = await runWithStoredClientId(CLIENT_A, () => runner.query('novel', 2));
+    expect(view).toMatchObject({ mode: 'novel', memorySync: { status: 'succeeded' } });
+    expect(view).not.toHaveProperty('projection');
+    intent.status = 'failed';
+    expect(await runWithStoredClientId(CLIENT_A, () => runner.retry('novel'))).toMatchObject({ status: 'succeeded', attempts: 2 });
+    await expect(runWithStoredClientId(CLIENT_B, () => runner.query('novel', 2))).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  it('continues novel recovery when screenplay enumeration fails and honors the fixed local library', async () => {
+    const f = fixture(), novel = fixture();
+    const local = novel.add('local', 'novel');
+    local.projection = createFrozenMemoryProjection({ ...local.projection, mode: 'novel' });
+    f.projects.set(key('local', 'novel'), 'novel');
+    const foreign = novel.add(CLIENT_A, 'foreign');
+    foreign.projection = createFrozenMemoryProjection({ ...foreign.projection, mode: 'novel' });
+    f.projects.set(key(CLIENT_A, 'foreign'), 'novel');
+    vi.mocked(f.source.listMemorySyncTargets).mockRejectedValue(new Error('damaged screenplay library'));
+    const runner = f.runner({ novelSource: novel.source, fixedClientId: 'local' });
+    await runner.scan();
+    expect(local.status).toBe('succeeded');
+    expect(foreign.status).toBe('pending');
+    expect(await runWithStoredClientId(CLIENT_A, () => runner.query('novel', 2))).toMatchObject({ mode: 'novel' });
+    expect(f.appliedScopes).toEqual(['local']);
+  });
+
   it('recovers pending and abandoned work for all stored clients without a model context', async () => {
     const f = fixture();
     const pending = f.add(CLIENT_A, 'pending');

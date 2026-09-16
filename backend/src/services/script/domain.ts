@@ -1,6 +1,7 @@
 /** Canonical short-drama domain contract. Structured JSON is the source of truth. */
 import type { WriteBrief } from '../../types/WriteBrief.js';
 import type { AcceptedMemoryInput, MemorySyncIntent } from '../../types/SourceMemory.js';
+import type { StoryControlCollection } from '../../types/StoryControl.js';
 
 export type ScriptId = string;
 export type ScriptPlanStatus = 'draft' | 'approved' | 'locked';
@@ -420,6 +421,7 @@ export interface ScriptReviewIssueUpdateResult {
 export interface ScriptProjectState {
   schemaVersion: 1;
   projectId: ScriptId;
+  storyControls?: StoryControlCollection;
   plan?: ScriptPlan;
   characters: ScriptCharacter[];
   worldBible?: ScriptWorldBible;
