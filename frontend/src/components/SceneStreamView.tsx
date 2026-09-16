@@ -77,13 +77,21 @@ export function SceneStreamView({
   const [instruction, setInstruction] = useState('');
 
   const abortRef = useRef<AbortController | null>(null);
+  const targetKey = `${chapterId}:${sceneId}:${operation}`;
+  const targetRef = useRef(targetKey);
+  targetRef.current = targetKey;
 
   // 卸载时中止仍在进行的流，避免对已卸载组件 setState。
   useEffect(() => {
+    setLiveText('');
+    setFullText('');
+    setStreaming(false);
+    setDone(false);
     return () => {
       abortRef.current?.abort();
+      abortRef.current = null;
     };
-  }, []);
+  }, [targetKey]);
 
   const parsedAddWords = Number(addWordsInput);
   const addWordsValid =
@@ -115,12 +123,14 @@ export function SceneStreamView({
 
     const controller = new AbortController();
     abortRef.current = controller;
+    const isCurrent = () => targetRef.current === targetKey && abortRef.current === controller;
 
     // 用本地变量累积全部增量，确保中止时也能保留已生成内容。
     let accumulated = '';
     const options = {
       signal: controller.signal,
       onDelta: (delta: string) => {
+        if (!isCurrent() || controller.signal.aborted) return;
         accumulated += delta;
         setLiveText(accumulated);
       },
@@ -145,10 +155,12 @@ export function SceneStreamView({
       } else {
         full = await client.blueprint.writeScene(chapterId, sceneId, options);
       }
+      if (!isCurrent() || controller.signal.aborted) return;
       setFullText(full);
       setDone(true);
       onComplete?.(full);
     } catch (error) {
+      if (!isCurrent()) return;
       if (isAbort(error)) {
         // 用户中止：保留已生成的部分文本以供查看。
         if (accumulated.length > 0) {
@@ -159,9 +171,11 @@ export function SceneStreamView({
         onError?.(error);
       }
     } finally {
-      setLiveText('');
-      setStreaming(false);
-      abortRef.current = null;
+      if (isCurrent()) {
+        setLiveText('');
+        setStreaming(false);
+        abortRef.current = null;
+      }
     }
   }, [
     streaming,
@@ -175,6 +189,7 @@ export function SceneStreamView({
     sceneId,
     onComplete,
     onError,
+    targetKey,
   ]);
 
   const label = OPERATION_LABELS[operation];

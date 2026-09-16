@@ -22,12 +22,44 @@ import type { DataStore } from '../../store/DataStore.js';
 import { ChapterRevisionConflictError } from '../../store/ChapterRevisionConflictError.js';
 import type { Chapter, Id } from '../../types/index.js';
 import { ServiceError } from '../ServiceError.js';
+import type { WriteBrief, WriteBriefView } from '../../types/WriteBrief.js';
+import { captureNovelWriteSnapshot, buildNovelWriteBrief, assertNovelWriteGuard, rebaseNovelWriteBrief } from '../../store/NovelWriteGuard.js';
+import { createWriteBrief, hashWriteBriefValue } from '../writing/WriteBrief.js';
 
 export interface ChapterServiceOptions {
   afterRemove?: (chapter: Chapter) => Promise<void>;
 }
 
 export class ChapterService {
+  async getWriteBrief(id: Id): Promise<WriteBriefView> {
+    const snapshot = await captureNovelWriteSnapshot(this.store, id);
+    const candidate = snapshot.chapter?.generatedCandidate;
+    const brief = candidate?.brief ?? snapshot.blueprint?.writeBrief;
+    if (!brief) return { status: 'current', origin: 'preview', brief: buildNovelWriteBrief(snapshot) };
+    try {
+      if (candidate && (candidate.candidateHash !== hashWriteBriefValue(snapshot.chapter?.content) ||
+          snapshot.chapter?.revision !== brief.target.revision + 1)) throw ServiceError.conflict('生成后的正文已被更新。');
+      assertNovelWriteGuard(snapshot, { brief: candidate ? rebaseNovelWriteBrief(brief, brief.target.revision + 1) : brief, sceneDrafts: candidate?.sceneDependencies });
+      return { status: 'current', origin: candidate ? 'generation' : 'preview', brief, ...(candidate ? { candidateHash: candidate.candidateHash } : {}) };
+    } catch {
+      return { status: 'stale', origin: candidate ? 'generation' : 'preview', brief, reason: '正文或写作来源已更新，请重新生成。', ...(candidate ? { candidateHash: candidate.candidateHash } : {}) };
+    }
+  }
+
+  async acceptGeneratedContent(id: Id, content: string, rawBrief: unknown): Promise<Chapter> {
+    let brief: WriteBrief;
+    try {
+      if (!rawBrief || typeof rawBrief !== 'object') throw new Error('missing');
+      const supplied = rawBrief as WriteBrief;
+      const { schemaVersion: _version, fingerprint: _fingerprint, sourceFingerprint: _sources, ...input } = supplied;
+      brief = createWriteBrief(input);
+      if (supplied.schemaVersion !== 1 || supplied.fingerprint !== brief.fingerprint || supplied.sourceFingerprint !== brief.sourceFingerprint || brief.target.id !== id || brief.mode !== 'novel') throw new Error('invalid');
+    } catch {
+      throw ServiceError.validation('生成正文缺少有效写前任务书，请重新生成。');
+    }
+    if (!content.trim()) throw ServiceError.validation('生成正文不能为空。');
+    return this.store.updateChapterContent(id, content, brief.target.revision, { brief });
+  }
   /**
    * @param store 持久化抽象。通过依赖注入传入，使领域逻辑与具体存储实现解耦。
    */

@@ -1,3 +1,5 @@
+import { captureNovelWriteSnapshot, assertNovelBlueprintCurrent, buildNovelWriteBrief, sceneDraftDependency, type NovelWriteSnapshot } from '../../store/NovelWriteGuard.js';
+import { hashWriteBriefValue } from '../writing/WriteBrief.js';
 /**
  * WordCountChecker — 字数检查编排（design: "Services 领域层 > WordCountService（字数检查，无模型调用）"）。
  *
@@ -21,6 +23,13 @@ import { ServiceError } from '../ServiceError.js';
 import { buildWordCountReport } from './wordCount.js';
 
 export class WordCountChecker {
+  async getReport(chapterId: Id): Promise<WordCountReport> {
+    const report = await this.store.getWordCountReportByChapter(chapterId);
+    if (!report) throw ServiceError.notFound(`字数检查报告不存在：${chapterId}`);
+    const snapshot = await captureNovelWriteSnapshot(this.store, chapterId);
+    if (report.candidateHash !== wordCountCandidateHash(snapshot) || report.sourceFingerprint !== buildNovelWriteBrief(snapshot).sourceFingerprint) throw ServiceError.conflict('字数检查依据或正文已更新，请重新检查。');
+    return report;
+  }
   /**
    * @param store 持久化抽象，用于加载章节蓝图、场景正文并持久化字数检查报告。
    */
@@ -45,13 +54,16 @@ export class WordCountChecker {
    */
   async check(chapterId: Id): Promise<WordCountReport> {
     // 1) 加载章节蓝图（统计依据：场景列表与目标字数）；缺失 → NOT_FOUND。
-    const blueprint = await this.store.getChapterBlueprintByChapter(chapterId);
+    const snapshot = await captureNovelWriteSnapshot(this.store, chapterId);
+    assertNovelBlueprintCurrent(snapshot);
+    const brief = buildNovelWriteBrief(snapshot);
+    const blueprint = snapshot.blueprint;
     if (!blueprint) {
       throw ServiceError.notFound(`章节蓝图不存在：${chapterId}`);
     }
 
     // 2) 读取全部场景正文并构建 sceneId → content 映射。
-    const drafts = await this.store.listSceneDrafts(chapterId);
+    const drafts = snapshot.sceneDrafts;
     const draftsBySceneId = new Map<string, string>(
       drafts.map((draft) => [draft.sceneId, draft.content]),
     );
@@ -64,9 +76,15 @@ export class WordCountChecker {
       ...body,
       chapterId,
       generatedAt: new Date().toISOString(),
+      candidateHash: wordCountCandidateHash(snapshot),
+      sourceFingerprint: brief.sourceFingerprint,
     };
 
     // 5) upsert 持久化（需求 9.4）并返回。
-    return this.store.saveWordCountReport(report);
+    return this.store.saveWordCountReport(report, { brief, sceneDrafts: blueprint.scenes.map((scene) => sceneDraftDependency(scene.scene_id, snapshot.sceneDrafts.find((draft) => draft.sceneId === scene.scene_id))) });
   }
+}
+
+function wordCountCandidateHash(snapshot: NovelWriteSnapshot): string {
+  return hashWriteBriefValue(snapshot.blueprint?.scenes.map((scene) => [scene.scene_id, snapshot.sceneDrafts.find((draft) => draft.sceneId === scene.scene_id)?.content ?? null]));
 }

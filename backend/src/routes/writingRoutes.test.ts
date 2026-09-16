@@ -18,6 +18,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { ProxyError } from '../proxy/ProxyError.js';
 import type { StreamDelta } from '../proxy/sseParser.js';
 import { ServiceError } from '../services/ServiceError.js';
+import { createWriteBrief, hashWriteBriefValue } from '../services/writing/WriteBrief.js';
 import type { WritingService } from '../services/writing/WritingService.js';
 import type { WritingRequestBody } from '../types/index.js';
 import { registerWritingRoutes } from './writingRoutes.js';
@@ -111,6 +112,27 @@ describe('writingRoutes', () => {
     const apiError = JSON.parse(match![1]) as { error: { code: string; message: string } };
     expect(apiError.error.code).toBe('MODEL_NOT_CONFIGURED');
     expect(apiError.error.message).toBe('尚未配置模型。');
+    expect(res.body).not.toContain('event: done');
+  });
+
+  it('frames the frozen brief before正文 and ends a stale stream with conflict instead of done', async () => {
+    const brief = createWriteBrief({
+      mode: 'novel', projectId: 'p1', target: { id: 'c1', title: '第一章', unitNumber: 1, revision: 0 },
+      objective: [{ text: '守住城门', sourceKeys: ['outline:o1'] }], required: [], forbidden: [], authorConstraints: [],
+      sources: [{ key: 'outline:o1', kind: 'outline', id: 'o1', label: '第一卷', contentHash: hashWriteBriefValue('守住城门') }],
+    });
+    async function* staleStream(): AsyncIterable<StreamDelta> {
+      yield { kind: 'content', text: '候选正文' };
+      throw ServiceError.conflict('人物设定已更新');
+    }
+    await buildApp(mockWritingService(async () => Object.assign(staleStream(), { writeBrief: brief })));
+    const res = await app.inject({ method: 'POST', url: '/api/projects/p1/chapters/c1/write', payload: VALID_BODY });
+    const briefFrame = `event: write_brief\ndata: ${JSON.stringify(brief)}\n\n`;
+    expect(res.body).toContain(briefFrame);
+    expect(res.body.indexOf(briefFrame)).toBeLessThan(res.body.indexOf('event: delta'));
+    const deltas = [...res.body.matchAll(/event: delta\ndata: (.*)\n\n/g)].map((match) => JSON.parse(match[1]));
+    expect(deltas).toEqual(['候选正文']);
+    expect(JSON.parse(res.body.match(/event: error\ndata: (.*)\n\n/)![1])).toMatchObject({ error: { code: 'CONFLICT' } });
     expect(res.body).not.toContain('event: done');
   });
 

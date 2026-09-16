@@ -1,3 +1,5 @@
+import { buildNovelWriteBrief, captureNovelWriteSnapshot, assertNovelWriteBriefCurrent } from '../../store/NovelWriteGuard.js';
+import { renderWriteBrief } from '../writing/WriteBrief.js';
 /**
  * BlueprintService — 章节蓝图生成编排（design: "Services 领域层 > BlueprintService（生成 / 读取 / 替换蓝图）"）。
  *
@@ -28,7 +30,6 @@
  */
 import type { ModelProxy } from '../../proxy/ModelProxy.js';
 import type { StreamDelta } from '../../proxy/sseParser.js';
-import { pythonBridge } from '../../proxy/PythonBridge.js';
 import type { DataStore } from '../../store/DataStore.js';
 import type {
   BlueprintCore,
@@ -59,57 +60,6 @@ const MAX_REQUIREMENT_LENGTH = 5000;
 /** 是否为正整数（严格大于 0 且为整数；非有限值一律视为非法）。 */
 function isPositiveInteger(value: number): boolean {
   return Number.isInteger(value) && value > 0;
-}
-
-/**
- * Coerce Python/template `chapter_id` / `scene_id` numbers to strings so
- * {@link parseBlueprintFromText} can accept them. Other fields are left as-is;
- * invalid shapes still fail parse/validate and must not be saved.
- */
-function stringifyBlueprintIds(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(stringifyBlueprintIds);
-  }
-  if (value !== null && typeof value === 'object') {
-    const out: Record<string, unknown> = {};
-    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-      if (
-        (key === 'scene_id' || key === 'chapter_id') &&
-        (typeof nested === 'number' || typeof nested === 'bigint')
-      ) {
-        out[key] = String(nested);
-      } else {
-        out[key] = stringifyBlueprintIds(nested);
-      }
-    }
-    return out;
-  }
-  return value;
-}
-
-/**
- * Run the Node parse + structure-validate pipeline on a Python blueprint.
- * Returns `null` on `VALIDATION_ERROR` so the caller can fall through to Node
- * generation instead of persisting template / int-id objects.
- */
-function parseAndValidatePythonBlueprint(
-  raw: unknown,
-  chapterId: Id,
-  targetWords: number,
-): ChapterBlueprint | null {
-  try {
-    const core = normalizeBlueprintWordTargets(
-      parseBlueprintFromText(JSON.stringify(stringifyBlueprintIds(raw))),
-      targetWords,
-    );
-    validateBlueprint(core);
-    return { ...core, chapter_id: chapterId };
-  } catch (error) {
-    if (error instanceof ServiceError && error.code === 'VALIDATION_ERROR') {
-      return null;
-    }
-    throw error;
-  }
 }
 
 /**
@@ -201,35 +151,9 @@ export class BlueprintService {
     }
     const { projectId } = chapter;
 
-    // === Refactor: delegate core planning to Python LangGraph (thin proxy) ===
-    // Only when explicitly enabled (USE_PYTHON_CORE=1). Default legacy for test compat & envs without full Python agent.
-    // Explicit config already checked. Python bridge will fail fast on missing provider (no silent mock).
-    let bpFromPy: ChapterBlueprint | null = null;
-    if (process.env.USE_PYTHON_CORE === '1') {
-      const pyPrompt = `target ${body.targetWords} words. requirement: ${body.requirement}`;
-      try {
-        const py = await pythonBridge.call({
-          task: 'plan_blueprint',
-          prompt: pyPrompt,
-          chapterId,
-          // projectDir inferred by workspace + bridge
-        });
-        if (py.blueprint) {
-          bpFromPy = parseAndValidatePythonBlueprint(
-            py.blueprint,
-            chapterId,
-            body.targetWords,
-          );
-        }
-      } catch (e) {
-        // fallthrough to legacy Node path
-      }
-    }
-
-    if (bpFromPy) {
-      return this.store.saveChapterBlueprint(bpFromPy);
-    }
-
+    if (process.env.USE_PYTHON_CORE === '1') throw ServiceError.validation('Python 写作分支尚不支持来源版本校验，请关闭 USE_PYTHON_CORE 后重试。');
+    const snapshot = await captureNovelWriteSnapshot(this.store, chapterId);
+    const writeBrief = buildNovelWriteBrief(snapshot, body);
     // --- Legacy Node path (kept for tests / fallback) ---
     // 4) 读取项目大纲 / 人物 / 世界观作为生成上下文；缺某类则以空集合处理（需求 2.1）。
     const [outlines, characters, worldSettings] = await Promise.all([
@@ -261,6 +185,8 @@ export class BlueprintService {
 
     // 6) 经模型代理流式生成并聚合为完整文本（需求 2.2）。
     //    模型错误 / 超时由 ModelProxy 抛出 ProxyError，向上透传（需求 2.6）。
+    messages.push({ role: 'system', content: renderWriteBrief(writeBrief) });
+    await assertNovelWriteBriefCurrent(this.store, writeBrief);
     const fullText = await this.collectStream(
       this.modelProxy.streamCompletion(config, messages, signal, {
         jsonMode: true,
@@ -299,10 +225,12 @@ export class BlueprintService {
     }
 
     // 9) 绑定目标章节标识符，确保蓝图与目标章节一致。
-    const blueprint: ChapterBlueprint = { ...core, chapter_id: chapterId };
+    const blueprint: ChapterBlueprint = { ...core, chapter_id: chapterId, authorRequirements: { requirement: body.requirement, targetWords: body.targetWords } };
 
     // 10) 持久化（按章节替换既有，仅保留一份，需求 5.1 / 5.3），返回。
-    return this.store.saveChapterBlueprint(blueprint);
+    signal.throwIfAborted();
+    blueprint.writeBrief = buildNovelWriteBrief({ ...snapshot, blueprint }, body);
+    return this.store.saveChapterBlueprint(blueprint, { brief: writeBrief });
   }
 
   /**

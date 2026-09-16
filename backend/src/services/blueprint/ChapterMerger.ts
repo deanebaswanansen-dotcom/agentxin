@@ -1,3 +1,6 @@
+import type { WriteBrief } from '../../types/WriteBrief.js';
+import { captureNovelWriteSnapshot, buildNovelWriteBrief, assertNovelWriteGuard, sceneDraftDependency } from '../../store/NovelWriteGuard.js';
+import { assertCurrentBlueprint, assertReusableSceneDraft } from './SceneWriteGuard.js';
 /**
  * ChapterMerger — 章节正文合并编排（design.md「ChapterMerger（场景合并为章节正文）」）。
  *
@@ -15,7 +18,7 @@
  * - 不调用模型：合并全程在本地完成。
  */
 import type { DataStore } from '../../store/DataStore.js';
-import type { Id } from '../../types/index.js';
+import type { Id, Chapter } from '../../types/index.js';
 import { ServiceError } from '../ServiceError.js';
 import { stripReasoningArtifacts } from '../text/reasoningSanitizer.js';
 
@@ -46,15 +49,23 @@ export class ChapterMerger {
    * @throws {ServiceError} `NOT_FOUND`（章节蓝图不存在，需求 8.5）。
    * @throws {ServiceError} `VALIDATION_ERROR`（存在未写作场景，需求 8.4）。
    */
-  async merge(chapterId: Id): Promise<string> {
+  async merge(chapterId: Id, originalBrief?: WriteBrief): Promise<string> {
+    return (await this.mergeChapter(chapterId, originalBrief)).content;
+  }
+
+  async mergeChapter(chapterId: Id, originalBrief?: WriteBrief): Promise<Chapter> {
+    const snapshot = await captureNovelWriteSnapshot(this.store, chapterId);
+    assertCurrentBlueprint(snapshot);
+    const brief = originalBrief ?? buildNovelWriteBrief(snapshot);
+    assertNovelWriteGuard(snapshot, { brief });
     // 1) 加载章节蓝图（合并依据：声明的场景列表）；缺失 → NOT_FOUND（需求 8.5）。
-    const blueprint = await this.store.getChapterBlueprintByChapter(chapterId);
+    const blueprint = snapshot.blueprint;
     if (!blueprint) {
       throw ServiceError.notFound(`章节蓝图不存在：${chapterId}`);
     }
 
     // 2) 读取该章节全部已持久化的场景正文（需求 8.1）。
-    const drafts = await this.store.listSceneDrafts(chapterId);
+    const drafts = snapshot.sceneDrafts;
 
     // 判定口径：必须存在可见正文；空白或仅闭合思维痕迹的残留草稿仍视为未写作。
     // 不对已落盘草稿做「未闭合标签吃到 EOF」——那会把后续场景一并抹掉。
@@ -80,6 +91,7 @@ export class ChapterMerger {
         `存在未写作场景，无法合并：${missing.join('、')}`,
       );
     }
+    for (const draft of drafts) assertReusableSceneDraft(snapshot, draft);
 
     // 4) 按 blueprint.scenes 数组顺序拼接为整章正文（需求 8.2）。
     const merged = blueprint.scenes
@@ -88,7 +100,6 @@ export class ChapterMerger {
 
     // 5) 写入章节正文（需求 8.3）并返回合并结果。
     const cleanMerged = stripReasoningArtifacts(merged, { danglingToEof: false });
-    await this.store.updateChapterContent(chapterId, cleanMerged);
-    return cleanMerged;
+    return this.store.updateChapterContent(chapterId, cleanMerged, brief.target.revision, { brief, sceneDrafts: drafts.map((draft) => sceneDraftDependency(draft.sceneId, draft)) });
   }
 }

@@ -63,6 +63,8 @@ import { makeId } from './chat/types-shared.js';
 import { useAgentEngine } from './chat/useAgentEngine.js';
 import { useChatEngine } from './chat/useChatEngine.js';
 import './components.css';
+import type { WriteBrief } from '../types/writeBrief.js';
+import type { ChapterPreviewMessage } from './chat/types.js';
 
 const CHAT_ENV = (import.meta as unknown as { env?: { DEV?: boolean } }).env;
 const SHOW_MOCK_CONTROLS = CHAT_ENV?.DEV === true;
@@ -146,7 +148,8 @@ export interface ChatWorkspaceProps {
   /** 流式状态变化（供中央实时预览，与旧架构兼容）。 */
   onStreamingChange?: (state: { streaming: boolean; content: string; thinking: string }) => void;
   /** 写作模式生成文本被"采用"时触发（写回抽屉内的编辑器）。 */
-  onAdoptContent?: (content: string, targetChapterId?: Id) => void;
+  onAdoptContent?: (content: string, targetChapterId?: Id, writeBrief?: WriteBrief) => void;
+  beforeWriting?: () => Promise<void>;
   /** Agent 任务完成（刷新项目树/加载章节）。第二个参数是任务启动时的项目。 */
   onAgentCompleted?: (result: AgentRunResult, sourceProjectId?: Id | null) => void;
   /** 点击 artifact 跳转（切资源抽屉 tab / 加载章节）。 */
@@ -169,6 +172,7 @@ export function ChatWorkspace({
   onError,
   onStreamingChange,
   onAdoptContent,
+  beforeWriting,
   onAgentCompleted,
   onJumpToArtifact,
   onOpenChapter,
@@ -179,7 +183,12 @@ export function ChatWorkspace({
 
   // —— 采用回调：把章节预览的生成内容写回抽屉编辑器 ——
   const handleAdoptChapter = useCallback(
-    (_messageId: string, generated: string, previewChapterId?: string) => {
+    (_messageId: string, generated: string, previewChapterId?: string, writeBrief?: WriteBrief, context?: ChapterPreviewMessage['generationContext']) => {
+      if (context) {
+        const target = resolveAdoptionTarget(context.baseContent, context.selection);
+        onAdoptContent?.(applyAdoption(context.baseContent, generated, target), previewChapterId, writeBrief);
+        return;
+      }
       if (previewChapterId && previewChapterId !== (chapterId ?? '')) {
         onAdoptContent?.(generated, previewChapterId);
         return;
@@ -198,6 +207,7 @@ export function ChatWorkspace({
     onError,
     onStreamingChange,
     onAdoptChapter: handleAdoptChapter,
+    beforeWriting,
   });
 
   const agent = useAgentEngine({

@@ -60,6 +60,17 @@ function makeImmediateStreamFn() {
 }
 
 describe('SceneStreamView', () => {
+  it('ignores late deltas and completion after changing scene target', async () => {
+    const ctrl = makeDeferredWriteClient();
+    const onComplete = vi.fn();
+    const { rerender } = render(<SceneStreamView chapterId="ch-1" sceneId="s-1" operation="write" client={ctrl.client} onComplete={onComplete} />);
+    fireEvent.click(screen.getByRole('button', { name: '开始写作' }));
+    rerender(<SceneStreamView chapterId="ch-2" sceneId="s-1" operation="write" client={ctrl.client} onComplete={onComplete} />);
+    await act(async () => { ctrl.onDelta()?.('旧场景'); ctrl.resolve('旧场景'); });
+    expect(screen.queryByText('旧场景')).not.toBeInTheDocument();
+    expect(onComplete).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: '开始写作' })).toBeEnabled();
+  });
   it('appends streamed deltas as they arrive and shows the full text on completion (Requirement 14.3)', async () => {
     const ctrl = makeDeferredWriteClient();
     render(

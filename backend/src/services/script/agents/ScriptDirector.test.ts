@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -26,6 +26,8 @@ import {
   type ScriptStore,
 } from '../ScriptStore.js';
 import { computeScriptCheckpointInputFingerprint } from './ScriptCheckpoint.js';
+import { scriptWriteBriefView } from '../ScriptWriteBrief.js';
+import { renderWriteBrief } from '../../writing/WriteBrief.js';
 import {
   InMemoryScriptCheckpointStore,
   ScriptBatchPausedError,
@@ -464,6 +466,138 @@ function exactScriptText(seed: string, length: number, variant?: number): string
 }
 
 describe('ScriptDirector', () => {
+  it.each([
+    ['direct_text', false], ['structured_legacy', false],
+    ['direct_text', true], ['structured_legacy', true],
+  ] as const)('resumes %s with the frozen brief and regenerates after source change=%s', async (draftMode, changeSources) => {
+    const root = await mkdtemp(join(tmpdir(), 'script-brief-resume-'));
+    try {
+      const state = readySingleEpisodeState();
+      const store = await FileScriptStore.create(root);
+      await store.savePlan(state.plan!, 0);
+      await store.saveCharacters(state.projectId, state.characters, 0);
+      await store.saveWorldBible(state.worldBible!, 0);
+      await store.saveSeriesOutline(state.seriesOutline!, 0);
+      await store.saveEpisodeOutline(state.episodeOutlines[0]!, 0);
+      const checkpoints = new InMemoryScriptCheckpointStore();
+      let draftCalls = 0;
+      let reviewCalls = 0;
+      const director = new ScriptDirector({
+        store, checkpoints,
+        model: { complete: async (request) => {
+          expect(request.prompt).toContain('写前任务书');
+          if (request.node === 'draft') {
+            draftCalls += 1;
+            return draftMode === 'direct_text' ? directScriptText() : JSON.stringify({
+              episodeNumber: 1, title: '第一集', scenes: [{
+                ordinal: 1, location: '校报社', timeOfDay: 'day', interiorExterior: 'interior',
+                characterIds: ['lead'], blocks: balancedDraftBlocks(360),
+              }], summary: '', newFacts: [], openedThreads: [], closedThreads: [],
+            });
+          }
+          if (request.node !== 'review') throw new Error(`unexpected ${request.node}`);
+          if (++reviewCalls === 1) throw new DOMException('interrupted review', 'AbortError');
+          return draftMode === 'direct_text' ? directReviewJson()
+            : JSON.stringify({ issues: [], summary: '沈清取得采访证据。', newFacts: [], openedThreads: [], closedThreads: [], wardrobe: [] });
+        } },
+      });
+      const request = { task: 'script_episode_batch' as const, projectId: state.projectId, startEpisode: 1, episodeCount: 1, expectedPlanRevision: 1, draftMode };
+      await expect(director.run(request)).rejects.toMatchObject({ name: 'AbortError' });
+      const initialDraft = (await checkpoints.list(state.projectId, 'script_episode_batch:1:1'))
+        .find((item) => item.node === (draftMode === 'direct_text' ? 'direct_draft' : 'draft') && item.status === 'succeeded');
+      const initialBrief = (initialDraft?.artifact as { writeBrief?: { fingerprint: string } })?.writeBrief;
+      expect(initialBrief?.fingerprint).toMatch(/^[a-f0-9]{64}$/);
+      if (changeSources) {
+        const fresh = (await store.getProjectState(state.projectId))!;
+        await store.saveWorldBible({ ...fresh.worldBible!, rules: [...fresh.worldBible!.rules, '采访必须取得同意'] }, fresh.worldBible!.revision);
+      }
+      const fresh = (await store.getProjectState(state.projectId))!;
+      await director.run({ ...request, expectedPlanRevision: fresh.plan!.revision });
+      expect(draftCalls).toBe(changeSources ? 2 : 1);
+      const view = scriptWriteBriefView((await store.getProjectState(state.projectId))!, 1);
+      expect(view.status).toBe('current');
+      if (changeSources) expect(view.brief?.fingerprint).not.toBe(initialBrief?.fingerprint);
+      else expect(view.brief?.fingerprint).toBe(initialBrief?.fingerprint);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['direct_text', 'none'], ['structured_legacy', 'none'],
+    ['direct_text', 'character-added'], ['structured_legacy', 'character-added'],
+    ['direct_text', 'author-constraint'], ['structured_legacy', 'author-constraint'],
+  ] as const)('binds %s writing to real-store sources and rejects %s drift', async (draftMode, change) => {
+    const root = await mkdtemp(join(tmpdir(), 'script-brief-generation-'));
+    try {
+      const state = readySingleEpisodeState();
+      const store = await FileScriptStore.create(root);
+      await store.savePlan(state.plan!, 0);
+      await store.saveCharacters(state.projectId, state.characters, 0);
+      await store.saveWorldBible(state.worldBible!, 0);
+      await store.saveSeriesOutline(state.seriesOutline!, 0);
+      await store.saveEpisodeOutline(state.episodeOutlines[0]!, 0);
+      await store.saveEpisode({
+        ...reviewingEpisode(state, '未来正文'), id: 'future-episode', episodeNumber: 3,
+        status: 'completed', summary: '未来事实标记 FUTURE_SECRET', newFacts: ['FUTURE_SECRET'],
+      }, 0);
+      const checkpoints = new InMemoryScriptCheckpointStore();
+      const prompts: string[] = [];
+      let beforeCommit = '';
+      const director = new ScriptDirector({
+        store, checkpoints,
+        model: { complete: async (request) => {
+          prompts.push(request.prompt);
+          expect(request.prompt).toContain('写前任务书');
+          expect(request.prompt).not.toContain('FUTURE_SECRET');
+          if (request.node === 'draft') {
+            return draftMode === 'direct_text' ? directScriptText()
+              : JSON.stringify({
+                episodeNumber: 1, title: '第一集', scenes: [{
+                  ordinal: 1, location: '校报社', timeOfDay: 'day', interiorExterior: 'interior',
+                  characterIds: ['lead'], blocks: balancedDraftBlocks(360),
+                }], summary: '', newFacts: [], openedThreads: [], closedThreads: [],
+              });
+          }
+          if (request.node !== 'review') throw new Error(`unexpected ${request.node}`);
+          const fresh = (await store.getProjectState(state.projectId))!;
+          if (change === 'character-added') {
+            await store.saveCharacters(state.projectId, [...fresh.characters, {
+              ...fresh.characters[0]!, id: 'new-witness', name: '新证人',
+            }], Math.max(...fresh.characters.map((item) => item.revision)));
+          } else if (change === 'author-constraint') {
+            await store.savePlan({ ...fresh.plan!, coreRequirements: '作者新增：保留采访段落' }, fresh.plan!.revision);
+          }
+          beforeCommit = await readFile(join(root, 'project-1.json'), 'utf8');
+          return draftMode === 'direct_text' ? directReviewJson()
+            : JSON.stringify({ issues: [], summary: '沈清取得采访证据。', newFacts: [], openedThreads: [], closedThreads: [], wardrobe: [] });
+        } },
+      });
+      const operation = director.run({
+        task: 'script_episode_batch', projectId: state.projectId, startEpisode: 1, episodeCount: 1,
+        expectedPlanRevision: 1, draftMode,
+      });
+      if (change !== 'none') {
+        await expect(operation).rejects.toBeInstanceOf(ScriptConflictError);
+        expect(await readFile(join(root, 'project-1.json'), 'utf8')).toBe(beforeCommit);
+        expect((await store.getProjectState(state.projectId))?.episodes.some((item) => item.episodeNumber === 1)).toBe(false);
+      } else {
+        await expect(operation).resolves.toMatchObject({ kind: 'episode_batch' });
+        const savedState = (await store.getProjectState(state.projectId))!;
+        const view = scriptWriteBriefView(savedState, 1);
+        expect(view).toMatchObject({ status: 'current', origin: 'generation' });
+        expect(view.brief?.target.id).toBe(savedState.episodes.find((item) => item.episodeNumber === 1)?.id);
+        const rendered = renderWriteBrief(view.brief!);
+        expect(prompts.every((prompt) => prompt.includes(rendered) || prompt.includes(JSON.stringify(rendered).slice(1, -1)))).toBe(true);
+        const completed = (await checkpoints.list(state.projectId, 'script_episode_batch:1:1')).find((item) => item.node === 'completed');
+        expect(completed?.artifact).toMatchObject({ writeBrief: view.brief });
+      }
+      expect(prompts).toHaveLength(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('summarizes only blocking issues and puts revision rejection first', () => {
     const ordinaryBlocking = {
       code: 'TOO_SHORT', severity: 'hard' as const, source: 'deterministic' as const,
@@ -1815,7 +1949,7 @@ describe('ScriptDirector', () => {
     }
   });
 
-  it('stales an episode-draft-v3 checkpoint after the dialogue-safe v12 prompt upgrade', async () => {
+  it('stales an episode-draft-v3 checkpoint after the writing-brief v13 prompt upgrade', async () => {
     const state = readySingleEpisodeState();
     let draftCalls = 0;
     const store = new MemoryScriptStore(state);
@@ -1909,7 +2043,7 @@ describe('ScriptDirector', () => {
         artifactRevision: 0, promptVersion: 'episode-draft-v3', status: 'stale',
       }),
       expect.objectContaining({
-        artifactRevision: 1, promptVersion: 'episode-draft-v12', status: 'succeeded',
+        artifactRevision: 1, promptVersion: 'episode-draft-v13', status: 'succeeded',
       }),
     ]));
   });
@@ -2168,7 +2302,7 @@ describe('ScriptDirector', () => {
       expect.objectContaining({
         artifactRevision: 1,
         status: 'succeeded',
-        promptVersion: 'episode-draft-v12',
+        promptVersion: 'episode-draft-v13',
       }),
     ]));
   });

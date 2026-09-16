@@ -37,6 +37,7 @@ import {
   type ScriptPrimaryStage,
 } from './script/ScriptProductViews.js';
 import './script-workspace.css';
+import { WritingBriefPanel } from './WritingBriefPanel.js';
 
 type ScriptStage = ScriptPrimaryStage;
 type ScriptExportRange = { startEpisode: number; episodeCount: number };
@@ -1098,6 +1099,9 @@ function jobBatchStart(job: ScriptAgentJobSnapshot): number | undefined {
 }
 
 function EpisodeBatchPanel({
+  projectId,
+  client,
+  locallyChanged,
   data,
   busy,
   batchStart,
@@ -1118,6 +1122,9 @@ function EpisodeBatchPanel({
   onReviewStatus,
   onExport,
 }: {
+  projectId: Id;
+  client: Pick<ApiClient, 'script'>;
+  locallyChanged: boolean;
   data: ScriptWorkspaceData;
   busy: boolean;
   batchStart: number;
@@ -1143,6 +1150,8 @@ function EpisodeBatchPanel({
   onExport: (format: 'txt' | 'md' | 'docx' | 'fountain', range?: ScriptExportRange) => void;
 }): JSX.Element {
   const [exportScope, setExportScope] = useState<'all' | 'batch'>('all');
+  const briefEpisodeNumber = episode?.episodeNumber ?? batchStart;
+  const loadWriteBrief = useCallback((signal: AbortSignal) => client.script.episodes.writeBrief(projectId, briefEpisodeNumber, signal), [client, projectId, briefEpisodeNumber]);
   const [contentMode, setContentMode] = useState<'read' | 'edit'>('read');
   const [fullscreen, setFullscreen] = useState(false);
   const [rewriteTarget, setRewriteTarget] = useState<number>();
@@ -1288,6 +1297,7 @@ function EpisodeBatchPanel({
         ) : <div className="script-proofread-empty">当前批次暂无校稿问题。建议在正文修改后重新运行单集校稿。</div>}
       </section>
       {episodeLoading ? <div className="script-loading script-loading--compact" role="status">正在加载单集正文…</div> : null}
+      <WritingBriefPanel targetKey={`${projectId}:${briefEpisodeNumber}`} refreshKey={`${episode?.revision ?? 0}:${data.plan.revision}:${data.outline?.revision ?? 0}:${data.world?.revision ?? 0}:${data.characters.map((item) => `${item.id}:${item.revision}`).join(',')}`} load={typeof client.script.episodes.writeBrief === 'function' ? loadWriteBrief : undefined} locallyChanged={locallyChanged} />
       {contentMode === 'read' ? <ScriptEpisodeReader episodes={batchEpisodes} summaries={data.episodes} characters={data.characters} batchStart={fixedBatchStart} batchEnd={batchEnd} loading={batchLoading} onEditEpisode={(episodeNumber) => { setContentMode('edit'); onOpenEpisode(episodeNumber); }} /> : null}
       {contentMode === 'edit' && !episode ? <div className="script-editor-empty"><strong>请选择要编辑的单集</strong><span>从上方分集进度中打开一集，或切回“成品阅读”连续查看本批正文。</span></div> : null}
       {contentMode === 'edit' && episode ? (
@@ -3024,7 +3034,7 @@ export function ScriptWorkspace({
         {data && stage === 'plan' ? <PlanEditor value={data.plan} busy={busy} conceptBusy={conceptBusy} conceptPrompt={conceptPrompt} concepts={concepts} questions={planQuestions} answers={planAnswers} onChange={(plan) => { markResourceDirty('plan'); setData((current) => current ? { ...current, plan } : current); }} onConceptPromptChange={changeConceptPrompt} onGenerateConcepts={() => void generateConcepts()} onAdoptConcept={adoptConcept} onSave={() => void savePlan()} onAgentPlan={() => void startPlanInterview()} onAutoComplete={() => void autoCompletePlan()} onAnswer={(field, value) => setPlanAnswers((current) => ({ ...current, [field]: { field, value } }))} onDelegate={(field) => setPlanAnswers((current) => ({ ...current, [field]: { field, delegate: true } }))} onSubmitAnswers={() => void submitPlanAnswers()} onApprove={() => void approvePlan()} /> : null}
         {data && stage === 'outline' ? <OutlineEditor value={data.outline ?? emptyOutline(projectId)} busy={busy} onChange={(outline) => { markResourceDirty('outline'); setData((current) => current ? { ...current, outline } : current); }} onSave={() => void saveOutline()} onGenerate={(regenerate) => void (regenerate ? startMaterialJob('script_series_outline', ['plan', 'outline'], true) : startOutlineCompletion())} /> : null}
         {data && stage === 'characters' ? <CharacterEditor projectId={projectId} value={data.characters} busy={busy} onChange={(characters) => { markResourceDirty('characters'); setData((current) => current ? { ...current, characters } : current); }} onSave={() => void saveCharacters()} onGenerate={(regenerate) => void startMaterialJob('script_bible', ['plan', 'outline', 'characters', 'world'], regenerate)} /> : null}
-        {data && stage === 'episodes' ? <EpisodeBatchPanel data={data} busy={busy} batchStart={selectedBatchStart} batchEpisodes={batchEpisodes} batchLoading={batchLoading} episode={selectedEpisode} episodeLoading={episodeLoading} onStart={(start, count, regenerate) => void startEpisodeBatch(start, count, regenerate)} onResume={(jobId) => void resumeJob(jobId)} onCancel={(jobId) => void cancelJob(jobId)} onTrash={(jobId) => void trashJob(jobId)} onOpenEpisode={(episodeNumber) => void openEpisode(episodeNumber)} onRegenerateEpisode={(episodeNumber, instruction, rewriteMode) => startEpisodeBatch(episodeNumber, 1, true, instruction, rewriteMode)} onEpisodeChange={editSelectedEpisode} onSaveEpisode={() => void saveEpisode()} onReviewEpisode={(episodeNumber) => void reviewEpisode(episodeNumber)} onReviewBatch={(episodeNumbers) => void reviewCurrentBatch(episodeNumbers)} onReviewStatus={(issueId, status) => void updateReviewStatus(issueId, status)} onExport={(format, range) => void exportScript(format, range)} /> : null}
+        {data && stage === 'episodes' ? <EpisodeBatchPanel projectId={projectId} client={client} locallyChanged={selectedEpisodeDirty.current || Object.values(dirtyResources.current).some(Boolean)} data={data} busy={busy} batchStart={selectedBatchStart} batchEpisodes={batchEpisodes} batchLoading={batchLoading} episode={selectedEpisode} episodeLoading={episodeLoading} onStart={(start, count, regenerate) => void startEpisodeBatch(start, count, regenerate)} onResume={(jobId) => void resumeJob(jobId)} onCancel={(jobId) => void cancelJob(jobId)} onTrash={(jobId) => void trashJob(jobId)} onOpenEpisode={(episodeNumber) => void openEpisode(episodeNumber)} onRegenerateEpisode={(episodeNumber, instruction, rewriteMode) => startEpisodeBatch(episodeNumber, 1, true, instruction, rewriteMode)} onEpisodeChange={editSelectedEpisode} onSaveEpisode={() => void saveEpisode()} onReviewEpisode={(episodeNumber) => void reviewEpisode(episodeNumber)} onReviewBatch={(episodeNumbers) => void reviewCurrentBatch(episodeNumbers)} onReviewStatus={(issueId, status) => void updateReviewStatus(issueId, status)} onExport={(format, range) => void exportScript(format, range)} /> : null}
         {data && stage === 'world' ? <WorldEditor value={data.world ?? emptyWorld(projectId)} busy={busy} onChange={(world) => { markResourceDirty('world'); setData((current) => current ? { ...current, world } : current); }} onSave={() => void saveWorld()} onGenerate={(regenerate) => void startMaterialJob('script_bible', ['plan', 'outline', 'characters', 'world'], regenerate)} /> : null}
       </main>
     </div>

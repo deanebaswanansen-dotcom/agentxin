@@ -22,6 +22,8 @@ import {
   computeScriptEpisodeCandidateHash,
   computeScriptInputFingerprint,
 } from './ScriptStore.js';
+import { buildScriptAtomicCommitInput } from './ScriptContinuityCommit.js';
+import { buildScriptWriteBrief, scriptWriteBriefRef, scriptWriteBriefView } from './ScriptWriteBrief.js';
 
 function plan(projectId = 'project-1'): ScriptPlan {
   return {
@@ -199,6 +201,22 @@ function commitInput(
   };
 }
 
+async function generatedInput(store: FileScriptStore): Promise<ScriptCommitEpisodeWithContinuityInput> {
+  await store.savePlan(plan(), 0);
+  await registerCharacters(store);
+  await store.saveSeriesOutline({
+    projectId: 'project-1', synopsis: '家庭争执', openingState: '初入老宅', midpointTurn: '发现秘密',
+    climax: '揭开真相', endingState: '和解', mainArc: [], subplotArcs: [], revision: 0,
+    episodeCards: [{ episodeNumber: 1, title: '初入老宅', logline: '沈清进入老宅。', mainEvent: '沈清观察旧规。', endingHook: '绝食另有隐情' }],
+  }, 0);
+  const state = (await store.getProjectState('project-1'))!;
+  const writeBrief = buildScriptWriteBrief(state, 1)!;
+  return buildScriptAtomicCommitInput(state, episode(), continuity(), {
+    promptVersion: 'short-drama-direct-writing-v2', modelConfigFingerprint: 'model-v1',
+    writeBrief, upstreamArtifactRefs: [scriptWriteBriefRef(writeBrief)],
+  });
+}
+
 describe('FileScriptStore', () => {
   let root: string;
 
@@ -208,6 +226,81 @@ describe('FileScriptStore', () => {
 
   afterEach(async () => {
     await rm(root, { recursive: true, force: true });
+  });
+
+  it.each(['character-added', 'character-removed', 'author-constraint', 'world-added'] as const)(
+    'rejects a generated brief after %s changes inside the actual store mutation', async (change) => {
+      const store = await FileScriptStore.create(root);
+      const input = await generatedInput(store);
+      const state = (await store.getProjectState('project-1'))!;
+      if (change === 'character-added') {
+        await store.saveCharacters('project-1', [...state.characters, character({ id: 'new-character', name: '新人物' })], 1);
+      } else if (change === 'character-removed') {
+        await store.saveCharacters('project-1', [], 1);
+      } else if (change === 'author-constraint') {
+        await store.savePlan({ ...state.plan!, coreRequirements: '作者新要求：不能伤害家人' }, state.plan!.revision);
+      } else {
+        await store.saveWorldBible({
+          projectId: 'project-1', era: '当代', primaryLocations: ['老宅'], worldState: '家庭聚会',
+          rules: ['不得出现魔法'], transport: [], communication: [], organizations: [], recurringProps: [],
+          forbiddenAnachronisms: [], revision: 0, updatedAt: state.updatedAt,
+        }, 0);
+      }
+      const before = await readFile(join(root, 'project-1.json'), 'utf8');
+      await expect(store.commitEpisodeWithContinuity(input)).rejects.toBeInstanceOf(ScriptConflictError);
+      expect(await readFile(join(root, 'project-1.json'), 'utf8')).toBe(before);
+      expect((await store.getProjectState('project-1'))?.episodes).toEqual([]);
+      expect((await store.getProjectState('project-1'))?.continuityCommits).toEqual([]);
+    },
+  );
+
+  it.each(['missing', 'different-id', 'different-unit', 'corrupted-brief', 'unbound-ref'] as const)(
+    'rejects a %s task brief without saving either the episode or continuity', async (change) => {
+      const store = await FileScriptStore.create(root);
+      const input = await generatedInput(store);
+      if (change === 'missing') delete input.writeBrief;
+      else if (change === 'different-id') input.writeBrief!.target.id = 'another-episode';
+      else if (change === 'different-unit') input.writeBrief!.target.unitNumber = 2;
+      else if (change === 'corrupted-brief') input.writeBrief!.authorConstraints[0]!.text = '伪造要求';
+      else input.upstreamArtifactRefs = [];
+      input.inputFingerprint = computeScriptInputFingerprint(input);
+      const before = await readFile(join(root, 'project-1.json'), 'utf8');
+      await expect(store.commitEpisodeWithContinuity(input)).rejects.toBeInstanceOf(ScriptConflictError);
+      expect(await readFile(join(root, 'project-1.json'), 'utf8')).toBe(before);
+    },
+  );
+
+  it('detects additions to a formerly empty cast even though no old character revision exists', async () => {
+    const store = await FileScriptStore.create(root);
+    await generatedInput(store);
+    await store.saveCharacters('project-1', [], 1);
+    const state = (await store.getProjectState('project-1'))!;
+    const writeBrief = buildScriptWriteBrief(state, 1)!;
+    const candidate = episode();
+    candidate.scenes[0]!.characterIds = [];
+    const input = buildScriptAtomicCommitInput(state, candidate, continuity({ characterUpdates: [] }), {
+      promptVersion: 'short-drama-direct-writing-v2', modelConfigFingerprint: 'model-v1',
+      writeBrief, upstreamArtifactRefs: [scriptWriteBriefRef(writeBrief)],
+    });
+    expect(input.inputRevisionRefs.some((ref) => ref.resource === 'characters')).toBe(false);
+    await store.saveCharacters('project-1', [character()], 0);
+    const before = await readFile(join(root, 'project-1.json'), 'utf8');
+    await expect(store.commitEpisodeWithContinuity(input)).rejects.toThrow('来源或作者约束已变化');
+    expect(await readFile(join(root, 'project-1.json'), 'utf8')).toBe(before);
+  });
+
+  it('persists the real brief across restart and marks it stale after a manual edit without requiring a new brief', async () => {
+    let store = await FileScriptStore.create(root);
+    const input = await generatedInput(store);
+    const accepted = await store.commitEpisodeWithContinuity(input);
+    store = await FileScriptStore.create(root);
+    let state = (await store.getProjectState('project-1'))!;
+    expect(scriptWriteBriefView(state, 1)).toMatchObject({ status: 'current', origin: 'generation', brief: input.writeBrief });
+    await store.saveEpisode({ ...accepted.episode, title: '作者手改标题', writeBrief: undefined, writeBriefCandidateHash: undefined }, accepted.episode.revision);
+    state = (await store.getProjectState('project-1'))!;
+    expect(scriptWriteBriefView(state, 1)).toMatchObject({ status: 'stale', origin: 'generation', brief: input.writeBrief });
+    state.episodes[0]!.writeBrief!.fingerprint = 'a'.repeat(64);
+    expect(scriptWriteBriefView(state, 1).status).toBe('stale');
   });
 
   it('atomically persists a project and restores it after restart', async () => {

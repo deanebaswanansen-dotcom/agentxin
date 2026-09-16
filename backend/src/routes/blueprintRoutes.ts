@@ -1,3 +1,4 @@
+import type { NovelWriteGuard } from '../store/NovelWriteGuard.js';
 /**
  * Fastify 路由模块：章节蓝图与分场景写作（design.md「HTTP API（REST + SSE）」，
  * 任务 11.1 / 11.2 / 11.3）。
@@ -211,8 +212,8 @@ async function assertChapterBelongsToProject(
  */
 async function runSceneStream(
   reply: import('fastify').FastifyReply,
-  start: (signal: AbortSignal) => Promise<{ stream: AsyncIterable<StreamDelta> }>,
-  finalize: (content: string) => Promise<void>,
+  start: (signal: AbortSignal) => Promise<{ stream: AsyncIterable<StreamDelta>; guard: NovelWriteGuard }>,
+  finalize: (content: string, guard: NovelWriteGuard) => Promise<void>,
 ): Promise<void> {
   // 提交事件流响应：接管套接字并写出 SSE 响应头。
   reply.hijack();
@@ -237,7 +238,8 @@ async function runSceneStream(
   raw.on('close', onClose);
 
   try {
-    const { stream } = await start(controller.signal);
+    const { stream, guard } = await start(controller.signal);
+    raw.write(sseFrame('write_brief', JSON.stringify(guard.brief)));
     const filter = new ReasoningArtifactFilter();
 
     // 累加完整正文并逐段转发增量（需求 6.4 等）。
@@ -265,7 +267,7 @@ async function runSceneStream(
       if (fullText.trim().length === 0) {
         throw ServiceError.validation('场景正文为空，未写入草稿。');
       }
-      await finalize(fullText);
+      await finalize(fullText, guard);
     }
 
     // 正常完成哨兵（前端据此 resolve）。
@@ -379,8 +381,8 @@ export function registerBlueprintRoutes(
     '/api/chapters/:chapterId/merge',
     async (request, reply) => {
       try {
-        const content = await chapterMerger.merge(request.params.chapterId);
-        return reply.code(200).send({ content });
+        const chapter = await chapterMerger.mergeChapter(request.params.chapterId);
+        return reply.code(200).send({ content: chapter.content, chapter });
       } catch (error) {
         const { status, body } = toErrorResponse(error);
         return reply.code(status).send(body);
@@ -408,9 +410,7 @@ export function registerBlueprintRoutes(
     '/api/chapters/:chapterId/word-count-report',
     async (request, reply) => {
       try {
-        const report = await store.getWordCountReportByChapter(
-          request.params.chapterId,
-        );
+        const report = await wordCountChecker.getReport(request.params.chapterId);
         if (!report) {
           throw ServiceError.notFound(
             `字数检查报告不存在：${request.params.chapterId}`,
@@ -464,7 +464,7 @@ export function registerBlueprintRoutes(
       await runSceneStream(
         reply,
         (signal) => sceneWriter.streamScene(chapterId, sceneId, signal),
-        (content) => sceneWriter.finalizeDraft(chapterId, sceneId, content),
+        (content, guard) => sceneWriter.finalizeDraft(chapterId, sceneId, content, guard),
       );
     },
   );
@@ -483,7 +483,7 @@ export function registerBlueprintRoutes(
             parseExpandBody(request.body),
             signal,
           ),
-        (content) => sceneExpander.finalizeDraft(chapterId, sceneId, content),
+        (content, guard) => sceneExpander.finalizeDraft(chapterId, sceneId, content, guard),
       );
     },
   );
@@ -502,7 +502,7 @@ export function registerBlueprintRoutes(
             parseRewriteBody(request.body),
             signal,
           ),
-        (content) => sceneRewriter.finalizeDraft(chapterId, sceneId, content),
+        (content, guard) => sceneRewriter.finalizeDraft(chapterId, sceneId, content, guard),
       );
     },
   );

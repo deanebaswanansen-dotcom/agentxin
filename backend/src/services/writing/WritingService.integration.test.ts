@@ -48,6 +48,7 @@ import type {
 } from '../../types/index.js';
 import { ModelConfigService } from '../modelConfig/ModelConfigService.js';
 import { WritingService } from './WritingService.js';
+import { renderWriteBrief } from './WriteBrief.js';
 
 /** A valid model config whose API key is a unique, easy-to-detect canary. */
 const VALID_CONFIG: ModelConfig = {
@@ -327,4 +328,54 @@ describe('WritingService integration — provider error (Req 5.5)', () => {
       (e: unknown) => isProxyError(e) && e.status === 502,
     );
   });
+});
+
+describe('WritingService integration — frozen writing sources', () => {
+  it('passes the exact streamed brief to the model and never includes future chapter facts', async () => {
+    const seeded = await seed();
+    const future = await seeded.store.createChapter(seeded.projectId, '未来章节');
+    await seeded.store.updateChapterContent(future.id, '未来秘密：城主已经死亡。');
+    const { proxy, calls } = makeRecordingProxy(['候选正文']);
+    const service = new WritingService(seeded.store, seeded.modelConfigService, proxy);
+    const stream = await service.streamWriting(seeded.projectId, seeded.chapterId,
+      { operation: 'continue', instruction: '保持角色克制。' }, new AbortController().signal);
+
+    expect(stream.writeBrief).toBeDefined();
+    expect(stream.writeBrief!.authorConstraints).toEqual(expect.arrayContaining([
+      expect.objectContaining({ text: '保持角色克制。' }),
+    ]));
+    expect(stream.writeBrief!.sources.some((source) => source.kind === 'chapter' && source.id === future.id)).toBe(false);
+    const prompt = calls[0].messages.map((message) => message.content).join('\n');
+    expect(prompt).toContain(renderWriteBrief(stream.writeBrief!));
+    expect(prompt).not.toContain('未来秘密');
+    expect(JSON.stringify(stream.writeBrief)).not.toContain(VALID_CONFIG.apiKey);
+    await expect(collect(stream)).resolves.toEqual(['候选正文']);
+  });
+
+  it.each(['character edit', 'character addition', 'target edit', 'previous chapter edit'])(
+    'rejects a late candidate after %s, preserving persisted changes', async (change) => {
+      const seeded = await seed();
+      const target = await seeded.store.createChapter(seeded.projectId, '第二章');
+      await seeded.store.updateChapterContent(target.id, '第二章原文');
+      const proxy: ModelProxy = {
+        streamCompletion() {
+          return (async function* () {
+            yield { kind: 'content' as const, text: '迟到候选' };
+            if (change === 'character edit') await seeded.store.updateCharacter(seeded.characterId, { description: '作者新设定' });
+            if (change === 'character addition') await seeded.store.createCharacter(seeded.projectId, '新人物', '新约束');
+            if (change === 'target edit') await seeded.store.updateChapterContent(target.id, '作者手改正文');
+            if (change === 'previous chapter edit') await seeded.store.updateChapterContent(seeded.chapterId, '前章作者新正文');
+          })();
+        },
+      };
+      const service = new WritingService(seeded.store, seeded.modelConfigService, proxy);
+      const stream = await service.streamWriting(seeded.projectId, target.id,
+        { operation: 'continue', instruction: '继续' }, new AbortController().signal);
+
+      await expect(collect(stream)).rejects.toMatchObject({ code: 'CONFLICT' });
+      const reopened = await FileDataStore.create(file);
+      expect((await reopened.getChapter(target.id))!.content).toBe(change === 'target edit' ? '作者手改正文' : '第二章原文');
+      expect((await reopened.getChapter(target.id))!.generatedCandidate).toBeUndefined();
+    },
+  );
 });

@@ -144,6 +144,7 @@ export function registerWritingRoutes(
           controller.signal,
         );
         const filter = new ReasoningArtifactFilter();
+        if (stream.writeBrief) raw.write(sseFrame('write_brief', JSON.stringify(stream.writeBrief)));
 
         // Forward each provider increment immediately as it arrives (5.3).
         for await (const delta of stream) {

@@ -35,6 +35,7 @@ import {
   type ScriptStore,
 } from './ScriptStore.js';
 import { currentScriptContinuityCommits } from './ScriptContinuityCommit.js';
+import { assertScriptWriteBriefCurrent, scriptWriteBriefRef } from './ScriptWriteBrief.js';
 import {
   allowsTemporaryDialogueSpeakers,
   isBlockingScriptReviewIssue,
@@ -670,6 +671,14 @@ export class FileScriptStore implements ScriptStore {
         createdAt: current?.createdAt ?? value.createdAt,
         updatedAt,
       };
+      // HTTP/manual inputs cannot attach generation provenance. Preserve the
+      // last actual brief as history so an edit is displayed as stale.
+      delete saved.writeBrief;
+      delete saved.writeBriefCandidateHash;
+      if (current?.writeBrief) {
+        saved.writeBrief = clone(current.writeBrief);
+        saved.writeBriefCandidateHash = current.writeBriefCandidateHash;
+      }
       if (editedCompletedEpisode) {
         staleCurrentContinuityCommit(state, value.episodeNumber, updatedAt);
       }
@@ -705,6 +714,24 @@ export class FileScriptStore implements ScriptStore {
           reference.revision,
           resourceRevision(state, reference.resource, reference.id),
         );
+      }
+
+      const briefRefs = input.upstreamArtifactRefs.filter((reference) => reference.node === 'write_brief');
+      const requiresBrief = briefRefs.length > 0 ||
+        input.promptVersion === 'short-drama-director-v3' || input.promptVersion === 'short-drama-direct-writing-v2';
+      if (requiresBrief && !input.writeBrief) {
+        throw new ScriptCommitConflictError('生成正文缺少写作任务书，拒绝提交未绑定来源的候选。');
+      }
+      if (input.writeBrief) {
+        if (input.writeBrief.target.unitNumber !== input.episode.episodeNumber || input.writeBrief.target.id !== input.episode.id) {
+          throw new ScriptCommitConflictError('写作任务书集号与候选正文不一致。');
+        }
+        assertScriptWriteBriefCurrent(state, input.writeBrief, input.expectedEpisodeRevision);
+        const expectedRef = scriptWriteBriefRef(input.writeBrief);
+        if (briefRefs.length !== 1 || briefRefs[0]?.artifactHash !== expectedRef.artifactHash ||
+            briefRefs[0]?.artifactRevision !== expectedRef.artifactRevision) {
+          throw new ScriptCommitConflictError('写作任务书未绑定到候选来源，拒绝提交。');
+        }
       }
 
       const candidateHash = computeScriptEpisodeCandidateHash(input.episode);
@@ -743,6 +770,15 @@ export class FileScriptStore implements ScriptStore {
         createdAt: currentEpisode?.createdAt ?? input.episode.createdAt,
         updatedAt,
       };
+      delete episode.writeBrief;
+      delete episode.writeBriefCandidateHash;
+      if (input.writeBrief) {
+        episode.writeBrief = clone(input.writeBrief);
+        episode.writeBriefCandidateHash = computeScriptEpisodeCandidateHash(episode);
+      } else if (currentEpisode?.writeBrief) {
+        episode.writeBrief = clone(currentEpisode.writeBrief);
+        episode.writeBriefCandidateHash = currentEpisode.writeBriefCandidateHash;
+      }
 
       staleCurrentContinuityCommit(state, episode.episodeNumber, updatedAt);
       const continuityCommits = state.continuityCommits ??= [];

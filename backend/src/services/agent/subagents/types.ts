@@ -14,6 +14,8 @@ export interface InspectorCharacterStatus {
 }
 
 export interface InspectorReport {
+  candidateHash?: string;
+  sourceFingerprint?: string;
   score0to100: number;
   verdict: string;
   plotCoherence: string;

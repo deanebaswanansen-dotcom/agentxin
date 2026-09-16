@@ -1,3 +1,5 @@
+import { captureNovelWriteSnapshot, buildNovelWriteBrief, assertNovelWriteGuard } from '../../store/NovelWriteGuard.js';
+import { assertCurrentBlueprint, assertReusableSceneDraft } from './SceneWriteGuard.js';
 /**
  * ChapterWriter — 整章生成编排（design.md「ChapterAssemblyService（整章生成编排 + 合并）」，需求 7）。
  *
@@ -99,7 +101,10 @@ export class ChapterWriter {
     }
 
     // 2) 读取章节蓝图（场景列表与顺序依据）；缺失 → NOT_FOUND。
-    const blueprint = await this.store.getChapterBlueprintByChapter(chapterId);
+    const snapshot = await captureNovelWriteSnapshot(this.store, chapterId);
+    assertCurrentBlueprint(snapshot);
+    const brief = buildNovelWriteBrief(snapshot);
+    const blueprint = snapshot.blueprint;
     if (!blueprint) {
       throw ServiceError.notFound(`章节蓝图不存在：${chapterId}`);
     }
@@ -108,12 +113,16 @@ export class ChapterWriter {
     //    已有非空草稿则跳过（崩溃续写）；替换蓝图会清掉该章草稿，故跳过不会沿用旧蓝图正文。
     for (const scene of blueprint.scenes) {
       const sceneId = scene.scene_id;
+      signal.throwIfAborted();
+      const currentSnapshot = await captureNovelWriteSnapshot(this.store, chapterId);
+      assertNovelWriteGuard(currentSnapshot, { brief });
 
       // A chapter is a resumable unit.  A previous successful scene draft is
       // already a durable checkpoint, so do not spend another model call or
       // overwrite it when a later scene is retried.
       const existingDraft = await this.store.getSceneDraft(chapterId, sceneId);
-      if (stripReasoningArtifacts(existingDraft?.content ?? '').trim().length > 0) {
+      if (existingDraft && stripReasoningArtifacts(existingDraft.content).trim().length > 0) {
+        assertReusableSceneDraft(currentSnapshot, existingDraft);
         yield { type: 'scene', sceneId };
         continue;
       }
@@ -124,7 +133,7 @@ export class ChapterWriter {
       let saved = false;
       for (let attempt = 1; attempt <= MAX_EMPTY_SCENE_ATTEMPTS; attempt += 1) {
         // 取得该场景增量流；streamScene 内部亦会做配置 / 蓝图 / 场景校验。
-        const { stream } = await this.sceneWriter.streamScene(
+        const { stream, guard } = await this.sceneWriter.streamScene(
           chapterId,
           sceneId,
           signal,
@@ -152,7 +161,8 @@ export class ChapterWriter {
         const cleanText = stripReasoningArtifacts(fullText).trim();
         if (cleanText.length > 0) {
           // 该场景流正常结束后持久化整段正文，再进入下一个场景（需求 7.2）。
-          await this.sceneWriter.finalizeDraft(chapterId, sceneId, cleanText);
+          signal.throwIfAborted();
+          await this.sceneWriter.finalizeDraft(chapterId, sceneId, cleanText, guard);
           saved = true;
           break;
         }
@@ -167,6 +177,7 @@ export class ChapterWriter {
     }
 
     // 4) 全部场景完成后合并为整章正文并写入章节 content（需求 7.3）。
-    await this.chapterMerger.merge(chapterId);
+    signal.throwIfAborted();
+    await this.chapterMerger.merge(chapterId, brief);
   }
 }

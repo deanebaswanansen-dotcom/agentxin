@@ -13,14 +13,20 @@ export type ChapterToolsTab = 'blueprint' | 'report';
 
 export interface ChapterToolsDrawerProps {
   chapter: Chapter | null;
+  locallyChanged?: boolean;
+  editorVersion?: number;
+  editorContent?: string;
   initialTab?: ChapterToolsTab;
-  onAdoptChapterContent?: (content: string) => void;
+  onAdoptChapterContent?: (content: string, savedChapter?: Chapter, expectedContent?: string) => boolean | Promise<boolean>;
   onClose: () => void;
   onError?: (error: unknown) => void;
 }
 
 export function ChapterToolsDrawer({
   chapter,
+  locallyChanged,
+  editorVersion,
+  editorContent,
   initialTab = 'blueprint',
   onAdoptChapterContent,
   onClose,
@@ -85,6 +91,10 @@ export function ChapterToolsDrawer({
             <ChapterBlueprintPanel
               key={chapter.id}
               chapterId={chapter.id}
+              chapterRevision={chapter.revision}
+              locallyChanged={locallyChanged}
+              editorVersion={editorVersion}
+              editorContent={editorContent}
               onAdoptChapterContent={onAdoptChapterContent}
               onError={onError}
             />

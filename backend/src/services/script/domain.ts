@@ -1,4 +1,5 @@
 /** Canonical short-drama domain contract. Structured JSON is the source of truth. */
+import type { WriteBrief } from '../../types/WriteBrief.js';
 
 export type ScriptId = string;
 export type ScriptPlanStatus = 'draft' | 'approved' | 'locked';
@@ -227,11 +228,14 @@ export interface ScriptEpisode {
   revision: number;
   createdAt: string;
   updatedAt: string;
+  /** Actual generation input; preserved as history when an author edits later. */
+  writeBrief?: WriteBrief;
+  writeBriefCandidateHash?: string;
 }
 
 export type ScriptEpisodeInput = Omit<
   ScriptEpisode,
-  'id' | 'projectId' | 'revision' | 'createdAt' | 'updatedAt'
+  'id' | 'projectId' | 'revision' | 'createdAt' | 'updatedAt' | 'writeBrief' | 'writeBriefCandidateHash'
 > & { id?: ScriptId };
 
 export interface ScriptContinuityState {
@@ -354,6 +358,8 @@ export interface ScriptCommitEpisodeWithContinuityInput {
   modelConfigFingerprint: string;
   inputFingerprint: string;
   candidateHash: string;
+  /** Only generated commits carry a task brief; manual acceptance remains separate. */
+  writeBrief?: WriteBrief;
 }
 
 export interface ScriptCommitEpisodeWithContinuityResult {

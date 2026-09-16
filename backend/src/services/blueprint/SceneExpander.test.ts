@@ -1,3 +1,4 @@
+import { saveCurrentSceneDraft } from './sceneTestFixtures.js';
 /**
  * Example/edge-case unit tests for {@link SceneExpander} (task 9.5).
  *
@@ -124,7 +125,7 @@ describe('SceneExpander.streamExpand', () => {
     'throws VALIDATION_ERROR for out-of-range addWords %p before any provider call (Req 11.2)',
     async (addWords) => {
       await store.saveModelConfig(VALID_CONFIG);
-      await store.saveSceneDraft({
+      await saveCurrentSceneDraft(store, {
         chapterId,
         sceneId: 'scene-0',
         content: '原始正文',
@@ -147,7 +148,7 @@ describe('SceneExpander.streamExpand', () => {
   );
 
   it('throws MODEL_NOT_CONFIGURED before any provider call when no config is saved (Req 11.8)', async () => {
-    await store.saveSceneDraft({
+    await saveCurrentSceneDraft(store, {
       chapterId,
       sceneId: 'scene-0',
       content: '原始正文',
@@ -208,13 +209,13 @@ describe('SceneExpander.streamExpand', () => {
   it('streams deltas and finalizeDraft updates ONLY the target scene (Req 11.5)', async () => {
     await store.saveModelConfig(VALID_CONFIG);
     // Two scenes already written.
-    await store.saveSceneDraft({
+    await saveCurrentSceneDraft(store, {
       chapterId,
       sceneId: 'scene-0',
       content: '场景0原始正文',
       updatedAt: new Date().toISOString(),
     });
-    await store.saveSceneDraft({
+    await saveCurrentSceneDraft(store, {
       chapterId,
       sceneId: 'scene-1',
       content: '场景1原始正文',
@@ -228,7 +229,7 @@ describe('SceneExpander.streamExpand', () => {
       proxy,
     );
 
-    const { scene, stream } = await expander.streamExpand(
+    const { scene, stream, guard } = await expander.streamExpand(
       chapterId,
       'scene-0',
       { addWords: 500 },
@@ -243,7 +244,7 @@ describe('SceneExpander.streamExpand', () => {
     expect(fullText).toBe(DELTAS.join(''));
 
     // Persist only after the stream completes (Req 11.5).
-    await expander.finalizeDraft(chapterId, 'scene-0', fullText);
+    await expander.finalizeDraft(chapterId, 'scene-0', fullText, guard);
 
     const updated = await store.getSceneDraft(chapterId, 'scene-0');
     expect(updated?.content).toBe(fullText);

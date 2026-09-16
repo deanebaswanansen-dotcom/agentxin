@@ -20,6 +20,8 @@
 import type { ModelProxy } from '../../proxy/ModelProxy.js';
 import type { StreamDelta } from '../../proxy/sseParser.js';
 import type { DataStore } from '../../store/DataStore.js';
+import { assertNovelWriteBriefCurrent, captureNovelWriteBrief } from '../../store/NovelWriteGuard.js';
+import type { WriteBrief } from '../../types/WriteBrief.js';
 import type {
   Id,
   SettingSnippet,
@@ -29,6 +31,9 @@ import type {
 import { ServiceError } from '../ServiceError.js';
 import type { ModelConfigService } from '../modelConfig/ModelConfigService.js';
 import { buildPromptMessages } from './buildPromptMessages.js';
+import { renderWriteBrief } from './WriteBrief.js';
+
+export type WritingStream = AsyncIterable<StreamDelta> & { writeBrief?: WriteBrief };
 
 export class WritingService {
   /**
@@ -63,7 +68,7 @@ export class WritingService {
     chapterId: Id,
     body: WritingRequestBody,
     signal: AbortSignal,
-  ): Promise<AsyncIterable<StreamDelta>> {
+  ): Promise<WritingStream> {
     // 1) 模型配置存在性检查 —— 必须先于任何提供商调用（Requirement 5.4）。
     const config = await this.modelConfigService.getInternalConfig();
     if (config === undefined) {
@@ -76,6 +81,10 @@ export class WritingService {
     const chapter = await this.store.getChapter(chapterId);
     if (!chapter || chapter.projectId !== projectId) {
       throw ServiceError.notFound(`章节不存在：${chapterId}`);
+    }
+    const writeBrief = await captureNovelWriteBrief(this.store, chapterId, { requirement: body.instruction });
+    if ((chapter.revision ?? 0) !== writeBrief.target.revision) {
+      throw ServiceError.conflict('正文已更新，请基于当前正文重新生成。');
     }
 
     // 3) 解析附加设定为上下文片段（Requirement 6.5）。
@@ -94,9 +103,22 @@ export class WritingService {
       sessionHistory: body.sessionHistory ?? [],
     };
     const messages = buildPromptMessages(context);
+    const system = messages.find((message) => message.role === 'system');
+    if (system) system.content += `\n\n${renderWriteBrief(writeBrief)}`;
+    await assertNovelWriteBriefCurrent(this.store, writeBrief);
+    signal.throwIfAborted();
 
     // 5) 发起流式补全并透传增量（Requirements 5.1, 5.3）。
-    return this.modelProxy.streamCompletion(config, messages, signal);
+    const store = this.store;
+    const providerStream = this.modelProxy.streamCompletion(config, messages, signal);
+    const stream = (async function* (): AsyncGenerator<StreamDelta> {
+      yield* providerStream;
+      signal.throwIfAborted();
+      // Do not emit the success sentinel for a result whose dependencies changed
+      // during generation. The final adoption also checks inside the store write.
+      await assertNovelWriteBriefCurrent(store, writeBrief);
+    })();
+    return Object.assign(stream, { writeBrief });
   }
 
   /**

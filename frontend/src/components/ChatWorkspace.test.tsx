@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../api/apiClient.js', () => ({
@@ -32,12 +32,88 @@ import {
   formatPlanQuestionsForHistory,
 } from '../lib/planHistory.js';
 import { ChatWorkspace } from './ChatWorkspace.js';
+import { makeWriteBrief } from '../test/writeBriefFixture.js';
+import type { WriteOptions } from '../api/apiClient.js';
 
 function mockWriteResponse(content: string): void {
-  vi.mocked(apiClient.write).mockResolvedValue(content);
+  vi.mocked(apiClient.write).mockImplementation(async (_projectId, _chapterId, _body, options) => { options?.onWriteBrief?.(makeWriteBrief()); return content; });
 }
 
 describe('ChatWorkspace', () => {
+  it('flushes the editor before generating and refuses a candidate after the selection changes', async () => {
+    let releaseSave!: () => void;
+    const beforeWriting = vi.fn(() => new Promise<void>((resolve) => { releaseSave = resolve; }));
+    mockWriteResponse('新片段');
+    const onAdoptContent = vi.fn();
+    const onError = vi.fn();
+    const props = { projectId: 'p-1', chapterId: 'ch-1', editorContent: '已有正文', beforeWriting, onAdoptContent, onError };
+    const { rerender } = render(<ChatWorkspace {...props} selection={{ start: 4, end: 4 }} />);
+    fireEvent.change(screen.getByLabelText('对话输入'), { target: { value: '继续写' } });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    expect(beforeWriting).toHaveBeenCalledOnce();
+    expect(apiClient.write).not.toHaveBeenCalled();
+    await act(async () => releaseSave());
+    await screen.findByText('新片段');
+    rerender(<ChatWorkspace {...props} selection={{ start: 0, end: 2 }} />);
+    fireEvent.click(screen.getByRole('button', { name: '采用到正文' }));
+    expect(onAdoptContent).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('选区已改变') }));
+  });
+
+  it('rejects an old candidate after editing and reverting the same text', async () => {
+    mockWriteResponse('新片段');
+    const onAdoptContent = vi.fn();
+    const props = { projectId: 'p-1', chapterId: 'ch-1', onAdoptContent };
+    const { rerender } = render(<ChatWorkspace {...props} editorContent="初稿" />);
+    fireEvent.change(screen.getByLabelText('对话输入'), { target: { value: '继续写' } });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await screen.findByText('新片段');
+    rerender(<ChatWorkspace {...props} editorContent="修改" />);
+    rerender(<ChatWorkspace {...props} editorContent="初稿" />);
+    fireEvent.click(screen.getByRole('button', { name: '采用到正文' }));
+    expect(onAdoptContent).not.toHaveBeenCalled();
+  });
+
+  it('does not leak late writing callbacks into a different chapter', async () => {
+    let resolveWrite!: (content: string) => void;
+    let streamOptions: WriteOptions | undefined;
+    vi.mocked(apiClient.write).mockImplementation((_projectId, _chapterId, _body, options) => {
+      streamOptions = options;
+      return new Promise((resolve) => { resolveWrite = resolve; });
+    });
+    const { rerender } = render(<ChatWorkspace projectId="p-1" chapterId="ch-1" />);
+    fireEvent.change(screen.getByLabelText('对话输入'), { target: { value: '继续写' } });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(apiClient.write).toHaveBeenCalled());
+    rerender(<ChatWorkspace projectId="p-1" chapterId="ch-2" />);
+    await act(async () => { streamOptions?.onDelta?.('迟到正文'); resolveWrite('迟到正文'); });
+    expect(streamOptions?.signal?.aborted).toBe(true);
+    expect(screen.queryByText('迟到正文')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '采用到正文' })).not.toBeInTheDocument();
+  });
+
+  it('preserves a preview but refuses unprovenanced output from an older server', async () => {
+    vi.mocked(apiClient.write).mockResolvedValue('旧服务结果');
+    const onAdoptContent = vi.fn();
+    const onError = vi.fn();
+    render(<ChatWorkspace projectId="p-1" chapterId="ch-1" onAdoptContent={onAdoptContent} onError={onError} />);
+    fireEvent.change(screen.getByLabelText('对话输入'), { target: { value: '继续写' } });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    await screen.findByText('旧服务结果');
+    fireEvent.click(screen.getByRole('button', { name: '采用到正文' }));
+    expect(onAdoptContent).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('缺少写前依据') }));
+  });
+
+  it('does not adopt a persisted historical preview without its original brief', async () => {
+    window.localStorage.setItem('nwa.chatSessions.v1', JSON.stringify({ 'p-1': [{ id: 'old', role: 'assistant', kind: 'chapter-preview', chapterId: 'ch-1', title: '历史结果', content: '历史正文' }] }));
+    const onAdoptContent = vi.fn();
+    const onError = vi.fn();
+    render(<ChatWorkspace projectId="p-1" chapterId="ch-1" onAdoptContent={onAdoptContent} onError={onError} />);
+    fireEvent.click(await screen.findByRole('button', { name: '采用到正文' }));
+    expect(onAdoptContent).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('缺少写前依据') }));
+  });
   beforeEach(() => {
     vi.clearAllMocks();
     window.localStorage.clear();
@@ -100,7 +176,7 @@ describe('ChatWorkspace', () => {
     await screen.findByText('续写段落');
     fireEvent.click(screen.getByRole('button', { name: '采用到正文' }));
 
-    expect(onAdoptContent).toHaveBeenCalledWith('已有正文续写段落');
+    expect(onAdoptContent).toHaveBeenCalledWith('已有正文续写段落', 'ch-1', makeWriteBrief());
   });
 
   it('adopts generated writing text by replacing the selected range', async () => {
@@ -127,7 +203,7 @@ describe('ChatWorkspace', () => {
     await screen.findByText('替换段落');
     fireEvent.click(screen.getByRole('button', { name: '采用到正文' }));
 
-    expect(onAdoptContent).toHaveBeenCalledWith('已有替换段落');
+    expect(onAdoptContent).toHaveBeenCalledWith('已有替换段落', 'ch-1', makeWriteBrief());
   });
 
   it('lists plan mode slash command', async () => {

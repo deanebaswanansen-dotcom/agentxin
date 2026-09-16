@@ -170,7 +170,7 @@ describe('SceneWriter / ChapterWriter integration', () => {
       proxy,
     );
 
-    const { scene, stream } = await sceneWriter.streamScene(
+    const { scene, stream, guard } = await sceneWriter.streamScene(
       chapterId,
       'scene-1',
       signal(),
@@ -187,7 +187,7 @@ describe('SceneWriter / ChapterWriter integration', () => {
     expect(calls[0].options).toEqual({ disableThinking: true, maxTokens: 424 });
 
     // The caller persists only after the stream completes normally (Req 6.5).
-    await sceneWriter.finalizeDraft(chapterId, 'scene-1', fullText);
+    await sceneWriter.finalizeDraft(chapterId, 'scene-1', fullText, guard);
 
     const draft = await store.getSceneDraft(chapterId, 'scene-1');
     expect(draft?.content).toBe(fullText);
@@ -205,7 +205,7 @@ describe('SceneWriter / ChapterWriter integration', () => {
       proxy,
     );
 
-    const { stream } = await sceneWriter.streamScene(
+    const { stream, guard } = await sceneWriter.streamScene(
       chapterId,
       'scene-1',
       signal(),
@@ -219,7 +219,7 @@ describe('SceneWriter / ChapterWriter integration', () => {
         if (delta.kind === 'content') fullText += delta.text;
       }
       // Only reached on a normal end — NOT the case here.
-      await sceneWriter.finalizeDraft(chapterId, 'scene-1', fullText);
+      await sceneWriter.finalizeDraft(chapterId, 'scene-1', fullText, guard);
     } catch (error) {
       caught = error;
     }

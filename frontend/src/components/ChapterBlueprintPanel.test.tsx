@@ -14,9 +14,10 @@
  * the panel consumes; each method is a `vi.fn()` so no real network happens.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { ApiClientError } from '../api/apiClient.js';
 import type { ChapterBlueprint } from '../types/index.js';
+import { makeWriteBrief } from '../test/writeBriefFixture.js';
 import {
   ChapterBlueprintPanel,
   type BlueprintPanelClient,
@@ -89,6 +90,22 @@ function notFoundError(): ApiClientError {
 }
 
 describe('ChapterBlueprintPanel', () => {
+  it('loads the chapter provenance and drops late generation after switching chapters', async () => {
+    let resolve!: (value: ChapterBlueprint) => void;
+    const generate = vi.fn(() => new Promise<ChapterBlueprint>((done) => { resolve = done; }));
+    const writeBrief = vi.fn().mockResolvedValue({ status: 'current', origin: 'preview', brief: makeWriteBrief() });
+    const client = makeClient({ get: vi.fn().mockRejectedValue(notFoundError()), generate, writeBrief });
+    const { rerender } = render(<ChapterBlueprintPanel chapterId="ch-1" client={client} />);
+    await screen.findByText('该章节尚无蓝图，请先生成章节蓝图。');
+    expect(writeBrief).toHaveBeenCalledWith('ch-1', expect.any(AbortSignal));
+    fireEvent.change(screen.getByLabelText('章节需求'), { target: { value: '进入古城' } });
+    fireEvent.click(screen.getByRole('button', { name: '生成蓝图' }));
+    await waitFor(() => expect(generate).toHaveBeenCalled());
+    rerender(<ChapterBlueprintPanel chapterId="ch-2" client={client} />);
+    await act(async () => resolve(makeBlueprint({ title: '迟到蓝图' })));
+    expect(screen.queryByText('迟到蓝图')).not.toBeInTheDocument();
+    expect(writeBrief).toHaveBeenLastCalledWith('ch-2', expect.any(AbortSignal));
+  });
   it('renders the empty state + BlueprintForm after automatic NOT_FOUND load (Requirement 14.7)', async () => {
     const client = makeClient({ get: vi.fn().mockRejectedValue(notFoundError()) });
     const onError = vi.fn();

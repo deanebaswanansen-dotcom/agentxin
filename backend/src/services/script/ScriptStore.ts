@@ -89,6 +89,8 @@ export function computeScriptEpisodeCandidateHash(
   delete candidate.revision;
   delete candidate.createdAt;
   delete candidate.updatedAt;
+  delete candidate.writeBrief;
+  delete candidate.writeBriefCandidateHash;
   return canonicalHash(candidate);
 }
 

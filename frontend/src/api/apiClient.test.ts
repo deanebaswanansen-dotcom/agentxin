@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import fc from 'fast-check';
+import { makeWriteBrief } from '../test/writeBriefFixture.js';
 import {
   ApiClientError,
   createApiClient,
@@ -85,6 +86,36 @@ const client = () => createApiClient('/api');
 // ---------------------------------------------------------------------------
 
 describe('apiClient request building', () => {
+  it('uses brief GET routes and keeps generated acceptance separate from manual save', async () => {
+    const brief = makeWriteBrief();
+    const fetchMock = installFetch(() => jsonResponse({ id: 'ch-1', content: '整章', revision: 4 }));
+    await client().script.episodes.writeBrief('p/1', 2);
+    await client().blueprint.writeBrief('ch/1');
+    await client().chapters.acceptGeneratedContent('ch/1', { content: '整章', writeBrief: brief });
+    await client().chapters.updateContent('ch/1', '手工', 4);
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(['/api/script/projects/p%2F1/episodes/2/write-brief', '/api/chapters/ch%2F1/write-brief', '/api/chapters/ch%2F1/generated-content', '/api/chapters/ch%2F1/content']);
+    expect(fetchMock.mock.calls[2][1]?.method).toBe('POST');
+    expect(JSON.parse(fetchMock.mock.calls[2][1]!.body as string)).toEqual({ content: '整章', writeBrief: brief });
+    expect(JSON.parse(fetchMock.mock.calls[3][1]!.body as string)).toEqual({ content: '手工', expectedRevision: 4 });
+  });
+
+  it('consumes write_brief metadata before text without mixing it into streamed content', async () => {
+    const brief = makeWriteBrief();
+    installFetch(() => sseResponse([`event: write_brief\ndata: ${JSON.stringify(brief)}\n\nevent: delta\ndata: "正文"\n\nevent: done\ndata: \n\n`]));
+    const onWriteBrief = vi.fn();
+    const onDelta = vi.fn();
+    expect(await client().write('p-1', 'ch-1', { operation: 'continue', instruction: '继续' }, { onWriteBrief, onDelta })).toBe('正文');
+    expect(onWriteBrief).toHaveBeenCalledWith(brief);
+    expect(onDelta).toHaveBeenCalledExactlyOnceWith('正文');
+    expect(onWriteBrief.mock.invocationCallOrder[0]).toBeLessThan(onDelta.mock.invocationCallOrder[0]);
+  });
+
+  it('rejects malformed writing provenance instead of converting it into prose', async () => {
+    installFetch(() => sseResponse(['event: write_brief\ndata: {"schemaVersion":1}\n\nevent: delta\ndata: "正文"\n\n']));
+    const onDelta = vi.fn();
+    await expect(client().write('p-1', 'ch-1', { operation: 'continue', instruction: '继续' }, { onDelta })).rejects.toThrow('写前依据无效');
+    expect(onDelta).not.toHaveBeenCalled();
+  });
   it('loads the aggregate short-drama state in one request', async () => {
     const state = {
       schemaVersion: 1 as const,

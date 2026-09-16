@@ -48,6 +48,8 @@ import { serializeScriptMarkdown } from './serializers/markdown.js';
 import { serializeFountain } from './serializers/fountain.js';
 import { ScriptConflictError, type ScriptStore } from './ScriptStore.js';
 import { ScriptServiceError } from './ScriptServiceError.js';
+import type { WriteBriefView } from '../../types/WriteBrief.js';
+import { scriptWriteBriefView } from './ScriptWriteBrief.js';
 import {
   collectTemporaryDialogueSpeakers,
   createScriptReviewIssues,
@@ -603,6 +605,11 @@ export class ScriptService {
       items: saved.items.filter((item) => item.episodeNumber === episodeNumber),
       report,
     };
+  }
+
+  async getWriteBrief(projectId: string, episodeNumber: number): Promise<WriteBriefView> {
+    await this.assertProject(projectId);
+    return scriptWriteBriefView(await this.store.getProjectState(projectId), episodeNumber);
   }
 
   /**

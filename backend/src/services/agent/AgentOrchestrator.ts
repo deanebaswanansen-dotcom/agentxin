@@ -1,3 +1,6 @@
+import { captureNovelWriteBrief, captureNovelWriteSnapshot, assertNovelWriteBriefCurrent, assertNovelWriteGuard, isNovelWriteConflict, rebaseNovelWriteBrief } from '../../store/NovelWriteGuard.js';
+import type { WriteBrief } from '../../types/WriteBrief.js';
+import { hashWriteBriefValue, renderWriteBrief } from '../writing/WriteBrief.js';
 import type { ModelProxy } from '../../proxy/ModelProxy.js';
 import type { DataStore } from '../../store/DataStore.js';
 import type {
@@ -17,7 +20,6 @@ import type {
   NovelPlanSummary,
 } from '../../types/index.js';
 import { getCacheStatsSummary, type CacheStatsSummary } from '../../proxy/cacheStats.js';
-import { pythonBridge, type PythonBridgeResult } from '../../proxy/PythonBridge.js';
 import type { BlueprintService } from '../blueprint/BlueprintService.js';
 import type { ChapterWriter } from '../blueprint/ChapterWriter.js';
 import { countActualWords, tokenBudgetForCharacterTarget } from '../blueprint/wordCount.js';
@@ -412,8 +414,7 @@ export class AgentOrchestrator {
       case 'plan_blueprint':
       case 'write_scene':
       case 'write_chapter_from_blueprint':
-        result = await this.runPythonDelegated(task, prompt, request.projectId, request.chapterId, request.options, signal, onProgress);
-        break;
+        throw ServiceError.validation('Python 写作分支尚不支持来源版本校验，请使用章节蓝图写作。');
       default:
         throw ServiceError.validation(`未知 Agent 任务：${task as string}`);
     }
@@ -507,8 +508,10 @@ export class AgentOrchestrator {
     steps.push('已创建首章。');
 
     emit(`正在写「${chapterTitle}」正文（这一步较久）…`, 'chapter', 6, 7);
-    const draft = await this.generateDraft(config, prompt, pack, pid, signal);
-    await this.store.updateChapterContent(chapter.id, draft);
+    const draftBrief = await captureNovelWriteBrief(this.store, chapter.id, { requirement: prompt });
+    const draft = await this.generateDraft(config, `${prompt}\n\n${renderWriteBrief(draftBrief)}`, pack, pid, signal);
+    signal.throwIfAborted();
+    await this.store.updateChapterContent(chapter.id, draft, draftBrief.target.revision, { brief: draftBrief });
     steps.push('已生成并保存首章正文。');
     emit(`首章正文已保存（约 ${draft.length} 字），正在反思记忆…`, 'chapter', 6, 7);
 
@@ -583,6 +586,7 @@ export class AgentOrchestrator {
       if (!existing) throw ServiceError.notFound(`项目不存在：${pid}`);
     }
 
+    const polishBrief = chapterId ? await captureNovelWriteBrief(this.store, chapterId, { requirement: prompt }) : undefined;
     let sourceText = prompt;
     if (chapterId !== undefined) {
       const chapter = await this.store.getChapter(chapterId);
@@ -597,6 +601,10 @@ export class AgentOrchestrator {
         ? '你是润写 Agent。根据用户要求直接输出润写后的正文，不要解释流程。'
         : '你是润写顾问 Agent。输出分条润写建议（场景、对白、节奏），不要直接替写整章。';
 
+    if (polishBrief) {
+      await assertNovelWriteBriefCurrent(this.store, polishBrief);
+      sourceText += `\n\n${renderWriteBrief(polishBrief)}`;
+    }
     const output = await this.generateText(
       config,
       [
@@ -609,7 +617,8 @@ export class AgentOrchestrator {
     const artifacts: AgentArtifact[] = [{ kind: 'project', id: pid, title: (await this.store.getProject(pid))!.name }];
 
     if (mode === 'draft' && chapterId !== undefined) {
-      await this.store.updateChapterContent(chapterId, output);
+      signal.throwIfAborted();
+      await this.store.updateChapterContent(chapterId, output, polishBrief!.target.revision, { brief: polishBrief! });
       const chapter = await this.store.getChapter(chapterId);
       artifacts.push({ kind: 'chapter', id: chapterId, title: chapter?.title ?? '章节' });
       steps.push('已将润写结果写回当前章节。');
@@ -1275,7 +1284,7 @@ export class AgentOrchestrator {
         `- 本批：${chapterCount} 章`,
         `- 自动修订：${modeConfig.autoRevisionEnabled ? '开' : '关'}`,
         `- 硬冲突暂停：${modeConfig.stopOnCanonConflict ? '开' : '关'}`,
-        `- 子代理：${[...new Set(subAgents)].join(' → ')} → ChapterAgent → ContinuityAgent → MemoryAgent`,
+        '- 工作流程：策划 → 章节写作 → 连贯性审查 → 记忆',
       ].join('\n'),
     );
     artifacts.push({ kind: 'outline', id: cfgDoc.id, title: cfgDoc.title });
@@ -1348,7 +1357,7 @@ export class AgentOrchestrator {
             steps,
           );
         } catch (error) {
-          if (signal.aborted) throw error;
+          if (signal.aborted || isNovelWriteConflict(error)) throw error;
           await this.discardEmptyChapterUnlessCheckpoint(chapter.id);
           const detail = error instanceof Error ? error.message.slice(0, 120) : '未知模型错误';
           stoppedReason = `第${num}章生成失败，检查点已保留，可从本章继续（${detail}）`;
@@ -1401,6 +1410,7 @@ export class AgentOrchestrator {
           current: i + 1,
           total: chapterCount,
         });
+        const rewriteBrief = await captureNovelWriteBrief(this.store, chapter.id);
         const rewrittenContent = await this.generateChapterWithMemory(
           config,
           pid,
@@ -1410,8 +1420,11 @@ export class AgentOrchestrator {
           `${directorBrief}\n\n# 修订要求\n上一稿格式不合格：${gates.findings.map((f) => f.message).join('；')}`,
           perChapter,
           signal,
+          rewriteBrief,
         );
         if (rewrittenContent.trim().length > 0) {
+          signal.throwIfAborted();
+          await this.store.updateChapterContent(chapter.id, rewrittenContent, rewriteBrief.target.revision, { brief: rewriteBrief });
           content = rewrittenContent;
         } else {
           emit({
@@ -1423,7 +1436,7 @@ export class AgentOrchestrator {
         }
       }
 
-      await this.store.updateChapterContent(chapter.id, content);
+      await this.assertCurrentCandidate(chapter.id, content);
 
       // 审校 → 可选修订 → 再检 → 仅对终稿应用结论与反思
       const processed = await this.processChapterDraft(
@@ -1879,7 +1892,10 @@ export class AgentOrchestrator {
     progress: { current: number; total: number },
     steps: string[],
   ): Promise<string> {
-    const memoryContext = this.memory.buildContext(projectId, scaledMemoryOptions(chapterNumber));
+    let writeBrief = await captureNovelWriteBrief(this.store, chapterId, { requirement: seedPrompt, targetWords });
+    pack = (await this.loadExistingPack(projectId, seedPrompt, [])) ?? pack;
+    await assertNovelWriteBriefCurrent(this.store, writeBrief);
+    const memoryContext = await this.memoryForWriting(projectId, writeBrief.target.unitNumber, scaledMemoryOptions(chapterNumber));
     const requirement = buildChapterBlueprintRequirement({
       chapterNumber,
       chapterTitle,
@@ -1909,11 +1925,12 @@ export class AgentOrchestrator {
           total: progress.total,
         });
       } else {
-        await this.blueprintService.generate(
+        const generatedBlueprint = await this.blueprintService.generate(
           chapterId,
           { targetWords, requirement },
           signal,
         );
+        writeBrief = generatedBlueprint.writeBrief ?? await captureNovelWriteBrief(this.store, chapterId);
         steps.push(`【ChapterPlanner】已保存「${chapterTitle}」场景蓝图。`);
       }
 
@@ -1937,7 +1954,8 @@ export class AgentOrchestrator {
       }
       throw ServiceError.validation(`「${chapterTitle}」场景已结束但合并正文为空。`);
     } catch (error) {
-      if (signal.aborted) throw error;
+      if (signal.aborted || isNovelWriteConflict(error)) throw error;
+      await assertNovelWriteBriefCurrent(this.store, writeBrief);
       const detail = error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160);
       steps.push(`【ChapterPlanner】「${chapterTitle}」蓝图链路未完成，已降级为正文续写（${detail}）。`);
       emit({
@@ -1963,6 +1981,7 @@ export class AgentOrchestrator {
             : `${seedPrompt}\n\n# 重试要求\n上一次模型返回了空正文或临时网关失败。本次必须直接输出完整章节正文，不得只输出思考、解释或空白。`,
           targetWords,
           signal,
+          writeBrief,
         );
         lastProviderError = undefined;
       } catch (error) {
@@ -1993,7 +2012,8 @@ export class AgentOrchestrator {
       throw lastProviderError;
     }
     if (content.trim().length > 0) {
-      await this.store.updateChapterContent(chapterId, content);
+      signal.throwIfAborted();
+      await this.store.updateChapterContent(chapterId, content, writeBrief.target.revision, { brief: writeBrief });
     }
     return content;
   }
@@ -2008,9 +2028,13 @@ export class AgentOrchestrator {
     seedPrompt: string,
     targetWords: number,
     signal: AbortSignal,
+    writeBrief: WriteBrief,
   ): Promise<string> {
+    await assertNovelWriteBriefCurrent(this.store, writeBrief);
+    pack = (await this.loadExistingPack(projectId, seedPrompt, [])) ?? pack;
+    await assertNovelWriteBriefCurrent(this.store, writeBrief);
     const progressRatio = totalChapters > 0 ? chapterNumber / totalChapters : 0;
-    const memoryContext = this.memory.buildContext(projectId, {
+    const memoryContext = await this.memoryForWriting(projectId, writeBrief.target.unitNumber, {
       ...scaledMemoryOptions(chapterNumber),
       progressRatio,
     });
@@ -2034,7 +2058,7 @@ export class AgentOrchestrator {
           : progressRatio >= 0.75
             ? '这是后段章节：推进主线并开始自然回收高优先伏笔，章末仍可留轻钩子。'
             : '这是中段章节：顺接前情、推进主线、深化人物；可呼应旧伏笔并留下章末钩子。';
-    const openCount = this.memory.listOpenForeshadows(projectId).length;
+    const openCount = await this.hasLaterStoryState(projectId, writeBrief.target.unitNumber) ? 0 : this.memory.listOpenForeshadows(projectId).length;
     const foreshadowHint =
       openCount > 0
         ? `当前未回收伏笔 ${openCount} 条，写作时须遵守记忆中的「伏笔台账」指引。`
@@ -2060,6 +2084,7 @@ export class AgentOrchestrator {
       '# 本章大纲锚点',
       chapterOutlineBlock,
       memoryBlock,
+      renderWriteBrief(writeBrief),
     ].join('\n');
     return this.generateText(
       config,
@@ -2461,6 +2486,35 @@ export class AgentOrchestrator {
    * 章节草稿后的共享后处理：审校 →（可选）修订 → 再检 → 应用结论 → 反思一次。
    * 不在修订前 reflect，避免草稿污染记忆；质量 Gate 仅在 qualityGates 提供时启用。
    */
+  private async assertCurrentCandidate(chapterId: Id, content: string, originalBrief?: WriteBrief): Promise<WriteBrief> {
+    const snapshot = await captureNovelWriteSnapshot(this.store, chapterId);
+    const chapter = snapshot.chapter;
+    if (hashWriteBriefValue(chapter?.content) !== hashWriteBriefValue(content)) throw ServiceError.conflict('章节正文已更新，旧候选审查不能用于当前正文。');
+    let brief = originalBrief;
+    if (!brief) {
+      const candidate = chapter?.generatedCandidate;
+      if (!candidate || candidate.candidateHash !== hashWriteBriefValue(content) || (chapter?.revision ?? 0) !== candidate.brief.target.revision + 1) {
+        throw ServiceError.conflict('现有正文缺少有效生成来源，不能自动续用旧审查。');
+      }
+      brief = rebaseNovelWriteBrief(candidate.brief, chapter!.revision ?? 0);
+    }
+    assertNovelWriteGuard(snapshot, { brief, sceneDrafts: chapter?.generatedCandidate?.sceneDependencies });
+    return brief;
+  }
+
+  private async hasLaterStoryState(projectId: Id, chapterNumber: number): Promise<boolean> {
+    const chapters = await this.store.listChapters(projectId);
+    return chapters.length > chapterNumber || this.memory.get(projectId).summaries.some((summary) => {
+      const index = chapters.findIndex((chapter) => chapter.id === summary.chapterId);
+      return index >= 0 ? index >= chapterNumber : (parseLongNovelChapterNumber(summary.title) ?? 0) > chapterNumber;
+    });
+  }
+
+  private async memoryForWriting(projectId: Id, chapterNumber: number, options?: Parameters<MemoryService['buildContext']>[1]): Promise<string> {
+    if (await this.hasLaterStoryState(projectId, chapterNumber)) return '';
+    return this.memory.buildContext(projectId, options ?? scaledMemoryOptions(chapterNumber));
+  }
+
   private async processChapterDraft(
     config: ModelConfig,
     projectId: Id,
@@ -2493,6 +2547,7 @@ export class AgentOrchestrator {
     gates?: GateResult;
     revised: boolean;
   }> {
+    let reviewBrief = await this.assertCurrentCandidate(chapterId, content);
     const progress = options.progress;
     const labels = options.labels;
 
@@ -2527,9 +2582,10 @@ export class AgentOrchestrator {
           chapterTitle,
           content,
           signal,
+          reviewBrief,
         );
       } catch (error) {
-        if (signal.aborted) throw error;
+        if (signal.aborted || isNovelWriteConflict(error)) throw error;
         emit({
           phase: 'info',
           message: `【ContinuityAgent】审校请求失败，已保留「${chapterTitle}」正文，本章未提交，待重新审查。`,
@@ -2551,6 +2607,8 @@ export class AgentOrchestrator {
       }
     }
 
+    await this.assertCurrentCandidate(chapterId, content, reviewBrief);
+    inspection = { ...inspection, candidateHash: hashWriteBriefValue(content), sourceFingerprint: reviewBrief.sourceFingerprint };
     if (inspection.verdict === 'inspection_unavailable') {
       return {
         finalContent: content,
@@ -2639,9 +2697,10 @@ export class AgentOrchestrator {
           hints,
           signal,
           options.qualityGates ?? undefined,
+          reviewBrief,
         );
       } catch (error) {
-        if (signal.aborted) throw error;
+        if (signal.aborted || isNovelWriteConflict(error)) throw error;
         emit({
           phase: 'info',
           message: `【ReviewAgent】修订请求失败，已保留「${chapterTitle}」原稿并继续。`,
@@ -2656,9 +2715,11 @@ export class AgentOrchestrator {
           revisionDoesNotWorsenWordRange(finalContent, revisedContent, options.qualityGates))
       ) {
         finalContent = revisedContent;
-        await this.store.updateChapterContent(chapterId, finalContent);
+        signal.throwIfAborted();
+        await this.store.updateChapterContent(chapterId, finalContent, reviewBrief.target.revision, { brief: reviewBrief });
+        reviewBrief = rebaseNovelWriteBrief(reviewBrief, reviewBrief.target.revision + 1);
         revised = true;
-        // 修订后重检失败不撤销已保存的修订稿，继续使用首次审校结论。
+        // A review of the original body cannot approve a changed candidate.
         try {
           finalInspection = await this.inspectChapterDraft(
             config,
@@ -2668,15 +2729,12 @@ export class AgentOrchestrator {
             chapterTitle,
             finalContent,
             signal,
+            reviewBrief,
           );
         } catch (error) {
-          if (signal.aborted) throw error;
-          emit({
-            phase: 'info',
-            message: `【ContinuityAgent】复检请求失败，已保留「${chapterTitle}」修订稿并继续。`,
-            current: progress?.current,
-            total: progress?.total,
-          });
+          if (signal.aborted || isNovelWriteConflict(error)) throw error;
+          await this.assertCurrentCandidate(chapterId, finalContent, reviewBrief);
+          return { finalContent, finalInspection: { ...finalInspection, verdict: 'inspection_unavailable', score0to100: 0, recommendRevision: true, candidateHash: hashWriteBriefValue(finalContent), sourceFingerprint: reviewBrief.sourceFingerprint }, revised: true };
         }
         if (options.qualityGates) {
           gates = runChapterQualityGates({
@@ -2721,6 +2779,8 @@ export class AgentOrchestrator {
       }
     }
 
+    await this.assertCurrentCandidate(chapterId, finalContent, reviewBrief);
+    finalInspection = { ...finalInspection, candidateHash: hashWriteBriefValue(finalContent), sourceFingerprint: reviewBrief.sourceFingerprint };
     // 只让通过现有硬门的终稿进入状态提取，避免已知坏稿污染后续记忆。
     let criticalStateIssues: CriticalStateIssue[] = [];
     if (!gates?.hardFail) {
@@ -2739,6 +2799,7 @@ export class AgentOrchestrator {
         chapterTitle,
         finalContent,
         signal,
+        reviewBrief,
       );
     }
     if (criticalStateIssues.length > 0) {
@@ -2766,9 +2827,11 @@ export class AgentOrchestrator {
         ].slice(0, 8),
       };
     }
+    await this.assertCurrentCandidate(chapterId, finalContent, reviewBrief);
     if (!gates?.hardFail) {
       await this.applyInspectorFindings(projectId, finalInspection);
       await this.memory.markChapterCommitted(projectId, chapterId);
+      await this.syncForeshadowLedgerOutline(projectId);
     } else {
       await this.memory.markChapterRejected(projectId, chapterId);
       await this.memory.recordWorkflow(projectId, {
@@ -2977,11 +3040,14 @@ export class AgentOrchestrator {
     chapterTitle: string,
     content: string,
     signal: AbortSignal,
+    writeBrief?: WriteBrief,
   ): Promise<InspectorReport> {
+    if (writeBrief) await assertNovelWriteBriefCurrent(this.store, writeBrief);
     const chapters = await this.store.listChapters(projectId);
+    const targetIndex = chapters.findIndex((chapter) => chapter.id === chapterId);
     const memoryOptions = scaledMemoryOptions(chapterNumber);
-    const injectedMemory = this.memory.buildContext(projectId, memoryOptions);
-    const samples = chapters.filter(
+    const injectedMemory = [await this.memoryForWriting(projectId, targetIndex + 1, memoryOptions), writeBrief ? renderWriteBrief(writeBrief) : ''].filter(Boolean).join('\n\n');
+    const samples = chapters.slice(0, Math.max(0, targetIndex)).filter(
       (ch) =>
         ch.id !== chapterId &&
         !this.memory.isChapterRejected(projectId, ch.id) &&
@@ -3040,9 +3106,13 @@ export class AgentOrchestrator {
     hints: string[],
     signal: AbortSignal,
     wordRange?: { minWords: number; maxWords: number },
+    writeBrief?: WriteBrief,
   ): Promise<string> {
-    const memoryContext = this.memory.buildContext(projectId, scaledMemoryOptions(chapterNumber));
-    const memoryBlock = memoryContext.length > 0 ? `\n\n${memoryContext}` : '';
+    if (writeBrief) await assertNovelWriteBriefCurrent(this.store, writeBrief);
+    pack = (await this.loadExistingPack(projectId, seedPrompt, [])) ?? pack;
+    if (writeBrief) await assertNovelWriteBriefCurrent(this.store, writeBrief);
+    const memoryContext = await this.memoryForWriting(projectId, writeBrief?.target.unitNumber ?? chapterNumber, scaledMemoryOptions(chapterNumber));
+    const memoryBlock = [memoryContext, writeBrief ? renderWriteBrief(writeBrief) : ''].filter(Boolean).join('\n\n');
     const rangeRequirement = wordRange
       ? `修订后的正文必须控制在 ${wordRange.minWords}-${wordRange.maxWords} 字；字数按去除空格和换行后的字符数计算，达到范围后立即收束，不得扩写超限。`
       : `修订后的正文保持约 ${targetWords} 字。`;
@@ -3091,9 +3161,12 @@ export class AgentOrchestrator {
     chapterTitle: string,
     content: string,
     signal: AbortSignal,
+    sourceBrief?: WriteBrief,
   ): Promise<CriticalStateIssue[]> {
     const text = content.trim();
     if (text.length === 0) return [];
+    const reflectionBrief = sourceBrief ?? await this.assertCurrentCandidate(chapterId, content);
+    if (await this.hasLaterStoryState(projectId, reflectionBrief.target.unitNumber)) return [];
 
     const fallbackSummary = text.replace(/\s+/g, ' ').slice(0, 200);
     let summary = fallbackSummary;
@@ -3176,6 +3249,8 @@ export class AgentOrchestrator {
       if (!modelStateKeys.has(stateKey(update))) stateUpdates.push(update);
     }
 
+    signal.throwIfAborted();
+    await this.assertCurrentCandidate(chapterId, content, reflectionBrief);
     const stateResult = await this.memory.applyCriticalStateUpdates(
       projectId,
       stateUpdates.map((update): CriticalStateUpdateInput => ({
@@ -3225,7 +3300,7 @@ export class AgentOrchestrator {
         })),
       );
     }
-    await this.syncForeshadowLedgerOutline(projectId);
+    if (!sourceBrief) await this.syncForeshadowLedgerOutline(projectId);
     return [];
   }
 
@@ -3411,83 +3486,7 @@ export class AgentOrchestrator {
     return stripReasoningArtifacts(chunks.join(''));
   }
 
-  /**
-   * Delegate long-running / blueprint tasks to Python LangGraph (single truth engine).
-   * Emits progress events for UX (real steps from result or synthetic).
-   * Uses workspace inference for projectDir.
-   */
-  private async runPythonDelegated(
-    task: AgentTask,
-    prompt: string,
-    projectId: Id | undefined,
-    chapterId: Id | undefined,
-    _options: { targetWords?: number; chapters?: number } | undefined,
-    _signal: AbortSignal,
-    onProgress?: (event: AgentProgressEvent) => void,
-  ): Promise<AgentRunResult> {
-    const emit = (phase: AgentProgressEvent['phase'], message: string, current?: number): void => {
-      if (onProgress) {
-        try { onProgress({ phase, message, current }); } catch { /* ignore */ }
-      }
-    };
 
-    emit('setup', '正在调用 Python LangGraph Agent...');
-
-    const effectiveChapter = chapterId || 'ch001';
-    // Map to python task name
-    const pyTask = task === 'plan_blueprint' ? 'plan_blueprint' : task === 'write_scene' ? 'write_scene' : 'write_chapter_from_blueprint';
-
-    const bridgePayload = {
-      task: pyTask,
-      prompt,
-      chapterId: effectiveChapter,
-      // projectDir inferred inside bridge via workspace
-    };
-
-    emit('setup', `执行任务 ${pyTask} (章节 ${effectiveChapter})`);
-
-    let pyRes: PythonBridgeResult;
-    try {
-      pyRes = await pythonBridge.call(bridgePayload);
-    } catch (e: any) {
-      throw ServiceError.validation(`Python agent 调用失败: ${e?.message || e}`);
-    }
-
-    if (!pyRes.ok) {
-      throw ServiceError.validation('Python agent 返回失败');
-    }
-
-    // Map Python result to AgentRunResult (sync UI state later)
-    const steps: string[] = [
-      `已通过 Python LangGraph 执行 ${pyTask}`,
-      pyRes.summary || '完成',
-    ];
-    if (pyRes.blueprint) {
-      steps.push(`生成蓝图：${pyRes.blueprint.title}，共 ${pyRes.blueprint.scenes?.length || 0} 场景`);
-    }
-    if (pyRes.reports?.word_count) steps.push('已生成字数报告');
-    if (pyRes.reports?.pacing) steps.push('已生成节奏报告');
-
-    emit('reflect', 'Python 结果已返回，写入记忆与 UI 状态');
-
-    const artifacts: AgentArtifact[] = projectId ? [{ kind: 'project', id: projectId, title: 'project' }] : [];
-    if (chapterId) artifacts.push({ kind: 'chapter', id: chapterId, title: `ch ${chapterId}` });
-
-    // If projectId missing, we still return; caller/UI handles.
-    const pid = projectId || 'unknown';
-
-    // Non-destructive note: Python currently writes to project files; Node may layer draft in future.
-    return {
-      task,
-      mode: 'draft',
-      projectId: pid,
-      chapterId: chapterId || pyRes.chapterId,
-      summary: pyRes.summary || `Python ${pyTask} 完成`,
-      steps,
-      artifacts,
-      // include extra for clients aware of blueprint (not in strict type, but runtime ok)
-    } as AgentRunResult;
-  }
 }
 
 function emptyMetrics(plannedWords: number, completedChapters: number): AgentRunMetrics {

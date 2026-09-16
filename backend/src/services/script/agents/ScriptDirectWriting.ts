@@ -1,4 +1,7 @@
 import { createHash } from 'node:crypto';
+import type { WriteBrief } from '../../../types/WriteBrief.js';
+import { renderWriteBrief } from '../../writing/WriteBrief.js';
+import { buildScriptWriteBrief } from '../ScriptWriteBrief.js';
 
 import type {
   ScriptCharacter,
@@ -69,6 +72,7 @@ export interface ScriptDirectDraftArtifact {
   candidateHash: string;
   parseWarnings: ScriptTextParseWarning[];
   createdAt: string;
+  writeBrief?: WriteBrief;
 }
 
 export interface ScriptDirectReviewArtifact {
@@ -358,6 +362,7 @@ export function directWritingContext(
   state: ScriptProjectState,
   plan: ScriptPlan,
   outline: ScriptEpisodeOutline,
+  writeBrief = buildScriptWriteBrief(state, outline.episodeNumber, { outline }),
 ): Record<string, unknown> {
   const involvedIds = new Set(outline.characterIds);
   const involvedCharacters = state.characters.filter((character) => involvedIds.has(character.id));
@@ -365,6 +370,7 @@ export function directWritingContext(
     (card) => card.episodeNumber === outline.episodeNumber + 1,
   );
   return {
+    ...(writeBrief ? { writingBrief: renderWriteBrief(writeBrief) } : {}),
     project: {
       title: plan.title,
       theme: plan.theme,

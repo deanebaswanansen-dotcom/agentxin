@@ -1,3 +1,5 @@
+import { captureNovelWriteSnapshot, assertNovelBlueprintCurrent, buildNovelWriteBrief, sceneDraftDependency } from '../../store/NovelWriteGuard.js';
+import { hashWriteBriefValue } from '../writing/WriteBrief.js';
 /**
  * PacingChecker — 节奏检查编排（design.md「Services 领域层 > PacingService（节奏检查，经模型）」）。
  *
@@ -412,13 +414,16 @@ export class PacingChecker {
     }
 
     // 2) 读取章节蓝图（节奏检查依据）；缺失 → NOT_FOUND。
-    const blueprint = await this.store.getChapterBlueprintByChapter(chapterId);
+    const snapshot = await captureNovelWriteSnapshot(this.store, chapterId);
+    assertNovelBlueprintCurrent(snapshot);
+    const brief = buildNovelWriteBrief(snapshot);
+    const blueprint = snapshot.blueprint;
     if (!blueprint) {
       throw ServiceError.notFound(`章节蓝图不存在：${chapterId}`);
     }
 
     // 3) 读取整章正文（合并后写入章节 content）；为空也继续（需求 10.1）。
-    const chapter = await this.store.getChapter(chapterId);
+    const chapter = snapshot.chapter;
     const chapterContent = chapter?.content ?? '';
 
     // 4) 组装消息 → 聚合流式输出 → 解析为报告主体。
@@ -437,9 +442,11 @@ export class PacingChecker {
       ...body,
       chapterId,
       generatedAt: new Date().toISOString(),
+      candidateHash: hashWriteBriefValue(snapshot.chapter?.content ?? ""),
+      sourceFingerprint: brief.sourceFingerprint,
     };
 
-    return this.store.savePacingReport(report);
+    return this.store.savePacingReport(report, { brief, sceneDrafts: snapshot.sceneDrafts.map((draft) => sceneDraftDependency(draft.sceneId, draft)) });
   }
 
   /**
@@ -455,6 +462,10 @@ export class PacingChecker {
     const report = await this.store.getPacingReportByChapter(chapterId);
     if (!report) {
       throw ServiceError.notFound(`节奏检查报告不存在：${chapterId}`);
+    }
+    const snapshot = await captureNovelWriteSnapshot(this.store, chapterId);
+    if (report.candidateHash !== hashWriteBriefValue(snapshot.chapter?.content ?? '') || report.sourceFingerprint !== buildNovelWriteBrief(snapshot).sourceFingerprint) {
+      throw ServiceError.conflict('节奏检查依据或正文已更新，请重新检查。');
     }
     return report;
   }
