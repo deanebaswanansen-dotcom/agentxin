@@ -777,7 +777,7 @@ describe('normalizeFullNovelOptions', () => {
     expect(revisions).toBe(0);
   });
 
-  it('pauses on a P0 critical-state regression without committing the bad chapter to memory', async () => {
+  it.each(['long_novel', 'full_novel'] as const)('pauses %s on a P0 critical-state regression without committing the bad chapter to memory', async (task) => {
     tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-critical-state-'));
     const store = await FileDataStore.create(join(tempDir, 'store.json'));
     await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock-model' });
@@ -831,7 +831,7 @@ describe('normalizeFullNovelOptions', () => {
 
     const result = await orchestrator.run(
       {
-        task: 'long_novel',
+        task,
         mode: 'draft',
         prompt: '旧城悬疑长篇',
         options: { chapters: 2, totalChapters: 2, targetWords: 500, automationLevel: 'semi_auto' },
@@ -841,6 +841,8 @@ describe('normalizeFullNovelOptions', () => {
 
     expect(reflections).toBe(2);
     expect(result.summary).toContain('已暂停');
+    expect(result.outcome).toMatchObject({ status: 'paused', code: 'NOVEL_QUALITY_NEEDS_REVIEW' });
+    expect(result.metrics?.completedChapters).toBe(1);
     expect(result.steps.join('\n')).toContain('DEAD_CHARACTER_REAPPEARS');
     expect(memory.get(result.projectId).criticalStates).toEqual([
       expect.objectContaining({ entity: '师父', value: 'dead', chapterTitle: '第1章' }),
@@ -1033,6 +1035,7 @@ describe('normalizeFullNovelOptions', () => {
       new AbortController().signal,
     );
     expect(first.summary).toContain('已暂停');
+    expect(first.outcome).toMatchObject({ status: 'paused', code: 'NOVEL_GENERATION_FAILED' });
     expect(first.metrics?.completedChapters).toBe(1);
 
     failSecondChapter = false;
@@ -1048,6 +1051,7 @@ describe('normalizeFullNovelOptions', () => {
     );
     const chapters = await store.listChapters(first.projectId);
     expect(resumed.summary).toContain('完成 2/2 章');
+    expect(resumed.outcome).toEqual({ status: 'completed' });
     expect(chapters.map((chapter) => chapter.title)).toEqual(['第1章', '第2章', '第3章']);
     expect(chapters.every((chapter) => chapter.content.trim().length > 0)).toBe(true);
   });
@@ -1119,6 +1123,40 @@ describe('normalizeFullNovelOptions', () => {
     expect(chapters[0]?.content).toContain('誓言还没有结束');
     expect(result.metrics?.completedChapters).toBe(1);
     expect(result.summary).not.toContain('已暂停');
+  });
+
+  it.each(['long_novel', 'full_novel'] as const)('pauses %s after bounded empty-body retries without reporting completion', async (task) => {
+    tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-empty-pause-'));
+    const store = await FileDataStore.create(join(tempDir, 'store.json'));
+    await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock-model' });
+    const memory = new MemoryService(await MemoryStore.create(join(tempDir, 'memory.json')));
+    const proxy = new CaptureProxy();
+    const original = proxy.streamCompletion.bind(proxy);
+    let writerCalls = 0;
+    let inspectionCalls = 0;
+    proxy.streamCompletion = (config, messages, signal, options) => {
+      const system = messages[0]?.content ?? '';
+      if (system.includes('正文写作子 Agent')) {
+        writerCalls += 1;
+        return (async function* () { yield { kind: 'content' as const, text: '' }; })();
+      }
+      if (system.includes('检测子 Agent')) inspectionCalls += 1;
+      return original(config, messages, signal, options);
+    };
+    const orchestrator = new AgentOrchestrator(
+      store, new ModelConfigService(store), proxy, undefined as never, undefined as never, memory,
+    );
+    const result = await orchestrator.run({
+      task, mode: 'draft', prompt: '旧城悬疑长篇',
+      options: { chapters: 1, totalChapters: 1, targetWords: 500, automationLevel: 'semi_auto' },
+    }, new AbortController().signal);
+    expect(result.outcome).toMatchObject({ status: 'paused', code: 'NOVEL_EMPTY_CHAPTER' });
+    expect(result.metrics?.completedChapters).toBe(0);
+    expect(result.summary).toContain('已暂停');
+    expect(writerCalls).toBe(3);
+    expect(inspectionCalls).toBe(0);
+    expect(await store.listChapters(result.projectId)).toEqual([]);
+    expect(memory.get(result.projectId).summaries).toEqual([]);
   });
 
   it('retries transient provider errors in the direct long-chapter fallback', async () => {
@@ -1479,7 +1517,7 @@ describe('normalizeFullNovelOptions', () => {
     expect(proxy.chapterSystems).toHaveLength(1);
   });
 
-  it('does not commit a chapter when inspector output is unusable, then re-inspects it', async () => {
+  it.each(['long_novel', 'full_novel'] as const)('does not commit a %s chapter when inspector output is unusable, then re-inspects it', async (task) => {
     tempDir = await mkdtemp(join(tmpdir(), 'agent-orchestrator-inspect-unavailable-'));
     const store = await FileDataStore.create(join(tempDir, 'store.json'));
     await store.saveModelConfig({ baseUrl: 'mock', apiKey: 'mock', modelName: 'mock-model' });
@@ -1513,7 +1551,7 @@ describe('normalizeFullNovelOptions', () => {
 
     const first = await orchestrator.run(
       {
-        task: 'long_novel',
+        task,
         mode: 'draft',
         prompt: '旧城悬疑长篇',
         options: { chapters: 2, totalChapters: 2, targetWords: 500, automationLevel: 'semi_auto' },
@@ -1522,6 +1560,8 @@ describe('normalizeFullNovelOptions', () => {
     );
     const afterFirst = await store.listChapters(first.projectId);
     expect(first.summary).toContain('审校暂不可用');
+    expect(first.outcome).toMatchObject({ status: 'paused', code: 'NOVEL_INSPECTION_UNAVAILABLE' });
+    expect(first.metrics?.completedChapters).toBe(0);
     expect(afterFirst).toHaveLength(1);
     expect(afterFirst[0]?.content.trim().length).toBeGreaterThan(0);
     expect(memory.get(first.projectId).summaries).toEqual([]);
@@ -1532,7 +1572,7 @@ describe('normalizeFullNovelOptions', () => {
     inspectWithJson = true;
     const resumed = await orchestrator.run(
       {
-        task: 'long_novel',
+        task,
         mode: 'draft',
         prompt: '旧城悬疑长篇',
         projectId: first.projectId,
@@ -1546,6 +1586,7 @@ describe('normalizeFullNovelOptions', () => {
     expect(memory.get(first.projectId).summaries.map((item) => item.title)).toContain('第1章');
     expect(afterResume.map((chapter) => chapter.title)).toEqual(['第1章', '第2章']);
     expect(resumed.summary).not.toContain('审校暂不可用');
+    expect(resumed.outcome).toEqual({ status: 'completed' });
   });
 });
 

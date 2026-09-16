@@ -261,10 +261,12 @@ export class AgentRunStore {
     });
   }
 
-  async markWaiting(id: string, error: AgentRunError): Promise<StoredAgentRun> {
+  async markWaiting(id: string, error: AgentRunError, result?: AgentRunResult): Promise<StoredAgentRun> {
     return this.update(id, (run) => {
+      if (run.status === 'cancelled') return;
       run.status = 'waiting_user';
       run.error = clone(error);
+      if (result !== undefined) run.result = clone(result);
     });
   }
 

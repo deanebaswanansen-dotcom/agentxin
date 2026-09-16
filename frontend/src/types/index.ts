@@ -302,6 +302,8 @@ export interface AgentRunResult {
   steps: string[];
   artifacts: AgentArtifact[];
   metrics?: AgentRunMetrics;
+  /** Omitted by older executors; a paused run retains its partial result for resume. */
+  outcome?: { status: 'completed' } | { status: 'paused'; code: string; message: string };
 }
 
 /** Agent 执行过程中的实时进度事件（SSE 流式推送）。 */

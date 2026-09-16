@@ -1041,14 +1041,16 @@ export function ChatMessageView({
     return (
       <div className="nwa-chat__msg nwa-chat__msg--assistant nwa-chat__msg--result">
         <span className="nwa-chat__role">
-          <LottieMotion
-            animationData={taskCompleteAnimation}
-            label="任务完成动画"
-            loop={false}
-            fallbackIcon="check"
-            className="nwa-lottie--inline"
-          />
-          任务完成
+          {message.outcome?.status === 'paused' ? <Icon name="fileText" /> : (
+            <LottieMotion
+              animationData={taskCompleteAnimation}
+              label="任务完成动画"
+              loop={false}
+              fallbackIcon="check"
+              className="nwa-lottie--inline"
+            />
+          )}
+          {message.outcome?.status === 'paused' ? '任务已暂停' : '任务完成'}
         </span>
         <div className="nwa-chat__content">
           <strong>{message.summary}</strong>

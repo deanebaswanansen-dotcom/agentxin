@@ -12,6 +12,7 @@
 import type {
   AgentArtifact,
   AgentRunMetrics,
+  AgentRunResult,
   AgentProgressEvent,
   Chapter,
   NovelPlanChecklist,
@@ -48,6 +49,7 @@ export interface AgentResultMessage {
   steps: string[];
   artifacts: AgentArtifact[];
   metrics?: AgentRunMetrics;
+  outcome?: AgentRunResult['outcome'];
   /** 若任务生成了章节，附带章节预览。 */
   chapterPreview?: Pick<Chapter, 'id' | 'title' | 'content'> | null;
 }

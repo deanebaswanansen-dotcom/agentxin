@@ -223,14 +223,15 @@ export class AgentJobRunner {
     if (!run) return undefined;
     const pending = this.resuming.get(id);
     if (pending) return pending.promise;
-    const resumableScriptFailure =
-      run.request.task.startsWith('script_') &&
+    const resumableFailure =
+      (run.request.task.startsWith('script_') ||
+        run.request.task === 'full_novel' || run.request.task === 'long_novel') &&
       (run.status === 'failed' || run.status === 'cancelled');
     if (
       run.status === 'waiting_user' ||
       run.status === 'queued' ||
       run.status === 'retrying' ||
-      resumableScriptFailure
+      resumableFailure
     ) {
       if (!this.active.has(id)) {
         const context = shouldResumeRejectedCandidates(run)
@@ -415,7 +416,11 @@ export class AgentJobRunner {
               if (!canWriteAttempt()) return result;
               if (result.projectId) await this.store.bindRequestProjectId(id, result.projectId);
               if (!canWriteAttempt()) return result;
-              await this.store.complete(id, result);
+              if (result.outcome?.status === 'paused') {
+                await this.store.markWaiting(id, safeError(result.outcome), result);
+              } else {
+                await this.store.complete(id, result);
+              }
               return result;
             });
             await Promise.race([execution, watchdog]);

@@ -1245,7 +1245,9 @@ function mergeBackgroundResults(results: AgentRunResult[]): AgentRunResult {
   }
   return {
     ...last,
-    summary: `长篇任务已分批完成 ${results.length}/${results.length} 章。${last.summary}`,
+    summary: last.outcome?.status === 'paused'
+      ? last.summary
+      : `长篇任务已分批完成 ${results.length}/${results.length} 章。${last.summary}`,
     steps: results.flatMap((result) => result.steps).slice(-100),
     artifacts,
     metrics,
@@ -1286,6 +1288,7 @@ export async function runAgentBackgroundJob(
     );
     results.push(result);
     projectId = result.projectId;
+    if (result.outcome?.status === 'paused') break;
   }
   return mergeBackgroundResults(results);
 }
@@ -1365,6 +1368,7 @@ export async function watchPersistentAgentJob(
         });
         continue;
       }
+      if (snapshot.result?.outcome?.status === 'paused') return snapshot.result;
       const waitingMessage = snapshot.error?.message ?? '任务等待确认后才能继续。';
       const waitingKey = `${snapshot.error?.code ?? ''}:${waitingMessage}`;
       if (lastWaitingKey !== waitingKey) {
@@ -1537,6 +1541,7 @@ export interface ApiClient {
     clearPlanSession(projectId: Id, signal?: AbortSignal): Promise<void>;
     listJobs(projectId: Id, signal?: AbortSignal): Promise<PersistentAgentJobSnapshot[]>;
     watchJob(jobId: string, options?: AgentRunStreamOptions): Promise<AgentRunResult>;
+    resumeJob(jobId: string, signal?: AbortSignal): Promise<PersistentAgentJobSnapshot>;
     cancelJob(jobId: string, signal?: AbortSignal): Promise<PersistentAgentJobSnapshot>;
   };
   projects: {
@@ -1799,6 +1804,8 @@ export function createApiClient(baseUrl: string = DEFAULT_BASE_URL): ApiClient {
         request(b, 'GET', `/projects/${seg(projectId)}/agent-jobs`, undefined, { signal }),
       watchJob: (jobId, options) =>
         watchPersistentAgentJob(b, jobId, options, options?.deliveredEvents ?? 0),
+      resumeJob: (jobId, signal) =>
+        request(b, 'POST', `/agent/jobs/${seg(jobId)}/resume`, {}, { signal, includeModelConfig: true }),
       cancelJob: (jobId, signal) =>
         request(b, 'POST', `/agent/jobs/${seg(jobId)}/cancel`, {}, { signal }),
     },

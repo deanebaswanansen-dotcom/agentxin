@@ -49,6 +49,7 @@ export interface AgentEngineState {
   running: boolean;
   /** 当前正在运行的任务 key（用于 UI 提示）。 */
   runningTask: AgentTask | null;
+  pausedJob: { id: string; task: AgentTask; message: string; sourceProjectId: Id | null } | null;
 }
 
 export interface AgentRunParams {
@@ -80,6 +81,7 @@ function isAbort(error: unknown): boolean {
 
 export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState & {
   run: (params: AgentRunParams) => Promise<void>;
+  resume: () => Promise<void>;
   stop: () => void;
 } {
   const {
@@ -95,13 +97,26 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
 
   const [running, setRunning] = useState(false);
   const [runningTask, setRunningTask] = useState<AgentTask | null>(null);
+  const [pausedJob, setPausedJob] = useState<AgentEngineState['pausedJob']>(null);
   const abortRef = useRef<AbortController | null>(null);
   const activeJobIdRef = useRef<string | null>(null);
   const projectRef = useRef(projectId);
   const onCompletedRef = useRef(onCompleted);
   const onErrorRef = useRef(onError);
+  const onStreamingChangeRef = useRef(onStreamingChange);
   onCompletedRef.current = onCompleted;
   onErrorRef.current = onError;
+  onStreamingChangeRef.current = onStreamingChange;
+
+  const retainPausedJob = useCallback((jobId: string, task: AgentTask, result: AgentRunResult, sourceProjectId: Id | null, progressMessageId: string) => {
+    if (result.outcome?.status === 'paused') {
+      setPausedJob({ id: jobId, task, message: result.outcome.message, sourceProjectId });
+      rememberActiveAgentJob({ id: jobId, task, sourceProjectId: result.projectId, progressMessageId });
+    } else {
+      setPausedJob(null);
+      forgetActiveAgentJob(jobId);
+    }
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -114,7 +129,10 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
     if (jobId && typeof apiClient.agent.cancelJob === 'function') {
       void apiClient.agent.cancelJob(jobId).catch(() => undefined);
     }
-    if (jobId) forgetActiveAgentJob(jobId);
+    if (jobId) {
+      forgetActiveAgentJob(jobId);
+      setPausedJob(null);
+    }
     abortRef.current?.abort();
   }, []);
 
@@ -125,6 +143,7 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
       activeJobIdRef.current = null;
       setRunning(false);
       setRunningTask(null);
+      setPausedJob(null);
       projectRef.current = projectId;
     }
     const rememberedJob = loadActiveAgentJob();
@@ -149,7 +168,7 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
         appendMessage({
           id: `agent-job:${completed.id}:result`, role: 'assistant', kind: 'agent-result',
           task: completedTask, summary: completed.result.summary, steps: completed.result.steps,
-          artifacts: completed.result.artifacts, metrics: completed.result.metrics, chapterPreview: null,
+          artifacts: completed.result.artifacts, metrics: completed.result.metrics, outcome: completed.result.outcome, chapterPreview: null,
         });
       }
       const job = jobs.find((candidate) =>
@@ -181,11 +200,12 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
         });
         if (disposed) return;
         removeMessage(progressId);
-        forgetActiveAgentJob(jobId);
+        retainPausedJob(jobId, task, result, recoverRememberedJob?.sourceProjectId ?? projectId ?? null, progressId);
+        onStreamingChangeRef.current?.({ streaming: false, content: '', thinking: '' });
         appendMessage({
           id: `agent-job:${jobId}:result`, role: 'assistant', kind: 'agent-result', task,
           summary: result.summary, steps: result.steps, artifacts: result.artifacts,
-          metrics: result.metrics, chapterPreview: null,
+          metrics: result.metrics, outcome: result.outcome, chapterPreview: null,
         });
         onCompletedRef.current?.(
           result,
@@ -213,12 +233,66 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
       disposed = true;
       controller.abort();
     };
-  }, [projectId, appendMessage, updateMessage, removeMessage]);
+  }, [projectId, appendMessage, updateMessage, removeMessage, retainPausedJob]);
+
+  const resume = useCallback(async () => {
+    if (!pausedJob || running || abortRef.current) return;
+    const job = pausedJob;
+    const controller = new AbortController();
+    const progressId = `agent-job:${job.id}:progress`;
+    const taskTitle = AGENT_TASKS.find((item) => item.key === job.task)?.title ?? job.task;
+    abortRef.current = controller;
+    activeJobIdRef.current = job.id;
+    setRunning(true);
+    setRunningTask(job.task);
+    appendMessage({ id: progressId, role: 'assistant', kind: 'agent-progress', task: job.task, taskTitle, events: [] });
+    onStreamingChangeRef.current?.({ streaming: true, content: '正在继续任务…', thinking: '' });
+    try {
+      const snapshot = await apiClient.agent.resumeJob(job.id, controller.signal);
+      const result = await apiClient.agent.watchJob(job.id, {
+        signal: controller.signal,
+        deliveredEvents: snapshot.events.length,
+        onProgress: (event) => {
+          updateMessage(progressId, (previous) => previous.kind === 'agent-progress'
+            ? { ...previous, events: [...previous.events, event] }
+            : previous);
+          onStreamingChangeRef.current?.({ streaming: true, content: event.message, thinking: '' });
+        },
+      });
+      if (controller.signal.aborted) return;
+      removeMessage(progressId);
+      retainPausedJob(job.id, job.task, result, job.sourceProjectId, progressId);
+      onStreamingChangeRef.current?.({ streaming: false, content: '', thinking: '' });
+      appendMessage({
+        id: `agent-job:${job.id}:result`, role: 'assistant', kind: 'agent-result', task: job.task,
+        summary: result.summary, steps: result.steps, artifacts: result.artifacts,
+        metrics: result.metrics, outcome: result.outcome, chapterPreview: null,
+      });
+      onCompletedRef.current?.(result, job.sourceProjectId);
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        removeMessage(progressId);
+        onErrorRef.current?.(error);
+      }
+    } finally {
+      if (abortRef.current === controller) {
+        setRunning(false);
+        setRunningTask(null);
+        abortRef.current = null;
+        activeJobIdRef.current = null;
+        onStreamingChangeRef.current?.({ streaming: false, content: '', thinking: '' });
+      }
+    }
+  }, [pausedJob, running, appendMessage, updateMessage, removeMessage, retainPausedJob]);
 
   const run = useCallback(
     async (params: AgentRunParams) => {
       const { task, prompt } = params;
       if (running) return;
+      if (pausedJob && (task === 'full_novel' || task === 'long_novel')) {
+        onErrorRef.current?.(new Error('已有暂停的写作任务，请点击“继续任务”。'));
+        return;
+      }
       if (!isRunnableAgentTask(task)) {
         onErrorRef.current?.(new Error('计划模式请使用对话区的选项提交，不要直接当 Agent 任务执行。'));
         return;
@@ -323,7 +397,7 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
             : await apiClient.agent.run(body, controller.signal);
 
         // 结果一到就立刻关掉中央「生成中」遮罩——后续拉预览/切换项目不应再挡住编辑器。
-        progressLines.push('任务完成，正在整理结果…');
+        progressLines.push(next.outcome?.status === 'paused' ? '任务已暂停，正在整理已保存结果…' : '任务完成，正在整理结果…');
         onStreamingChange?.({
           streaming: false,
           content: '',
@@ -349,9 +423,10 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
 
         // 移除进度占位，替换为结果消息
         removeMessage(progressMsgId);
-        if (activeJobIdRef.current) forgetActiveAgentJob(activeJobIdRef.current);
+        const jobId = activeJobIdRef.current;
+        if (jobId) retainPausedJob(jobId, task, next, projectId ?? null, progressMsgId);
         appendMessage({
-          id: makeId(),
+          id: jobId ? `agent-job:${jobId}:result` : makeId(),
           role: 'assistant',
           kind: 'agent-result',
           task,
@@ -359,6 +434,7 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
           steps: next.steps,
           artifacts: next.artifacts,
           metrics: next.metrics,
+          outcome: next.outcome,
           chapterPreview,
         });
 
@@ -415,16 +491,18 @@ export function useAgentEngine(options: UseAgentEngineOptions): AgentEngineState
     },
     [
       running,
+      pausedJob,
       projectId,
       chapterId,
       appendMessage,
       updateMessage,
       removeMessage,
       onStreamingChange,
+      retainPausedJob,
     ],
   );
 
-  return { running, runningTask, run, stop };
+  return { running, runningTask, pausedJob, run, resume, stop };
 }
 
 export { AGENT_TASKS, TASK_PLANS };

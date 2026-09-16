@@ -1319,11 +1319,11 @@ export class AgentOrchestrator {
     let lastChapterId: Id | undefined;
     let completedChapters = 0;
     let consecutiveFailures = 0;
-    let stoppedReason: string | undefined;
+    let pause: Extract<AgentRunResult['outcome'], { status: 'paused' }> | undefined;
 
     for (let i = 0; i < chapterCount; i += 1) {
       if (signal.aborted) {
-        stoppedReason = '用户中止';
+        pause = { status: 'paused', code: 'RUN_ABORTED', message: '用户中止' };
         break;
       }
       const currentChapters = await this.store.listChapters(pid);
@@ -1371,11 +1371,14 @@ export class AgentOrchestrator {
           if (signal.aborted || isNovelWriteConflict(error)) throw error;
           await this.discardEmptyChapterUnlessCheckpoint(chapter.id);
           const detail = error instanceof Error ? error.message.slice(0, 120) : '未知模型错误';
-          stoppedReason = `第${num}章生成失败，检查点已保留，可从本章继续（${detail}）`;
+          pause = {
+            status: 'paused', code: 'NOVEL_GENERATION_FAILED',
+            message: `第${num}章生成失败，检查点已保留，可从本章继续（${detail}）`,
+          };
           steps.push(`【ChapterAgent】「${title}」生成失败；前序章节与当前场景检查点均已保留。`);
           emit({
             phase: 'info',
-            message: `【主 Agent】${stoppedReason}`,
+            message: `【主 Agent】${pause.message}`,
             current: i + 1,
             total: chapterCount,
           });
@@ -1388,11 +1391,14 @@ export class AgentOrchestrator {
       // a later resume can generate the same chapter number cleanly.
       if (content.trim().length === 0) {
         await this.discardEmptyChapterUnlessCheckpoint(chapter.id);
-        stoppedReason = `ChapterAgent 连续 ${MAX_EMPTY_CHAPTER_ATTEMPTS} 次返回空正文，已暂停（${title}）`;
+        pause = {
+          status: 'paused', code: 'NOVEL_EMPTY_CHAPTER',
+          message: `ChapterAgent 连续 ${MAX_EMPTY_CHAPTER_ATTEMPTS} 次返回空正文，已暂停（${title}）`,
+        };
         steps.push(`【ChapterAgent】「${title}」连续 ${MAX_EMPTY_CHAPTER_ATTEMPTS} 次未返回正文，未进入审校。`);
         emit({
           phase: 'info',
-          message: `【主 Agent】${stoppedReason}`,
+          message: `【主 Agent】${pause.message}`,
           current: i + 1,
           total: chapterCount,
         });
@@ -1491,11 +1497,14 @@ export class AgentOrchestrator {
         steps.push(`【ReviewAgent】已修订「${title}」。`);
       }
       if (finalInspection.verdict === 'inspection_unavailable') {
-        stoppedReason = `审校暂不可用，已保留「${title}」正文待重新审查`;
+        pause = {
+          status: 'paused', code: 'NOVEL_INSPECTION_UNAVAILABLE',
+          message: `审校暂不可用，已保留「${title}」正文待重新审查`,
+        };
         steps.push(`【ContinuityAgent】「${title}」审校失败，未提交记忆，下一批将重新审查。`);
         emit({
           phase: 'info',
-          message: `【主 Agent】${stoppedReason}`,
+          message: `【主 Agent】${pause.message}`,
           current: i + 1,
           total: chapterCount,
         });
@@ -1540,10 +1549,13 @@ export class AgentOrchestrator {
           automationLevel === 'semi_auto' ||
           automationLevel === 'assistant'
         ) {
-          stoppedReason = `一致性/格式硬冲突，已暂停（${title}）`;
+          pause = {
+            status: 'paused', code: 'NOVEL_QUALITY_NEEDS_REVIEW',
+            message: `一致性/格式硬冲突，已暂停（${title}）`,
+          };
           emit({
             phase: 'info',
-            message: `【主 Agent】${stoppedReason}`,
+            message: `【主 Agent】${pause.message}`,
             current: i + 1,
             total: chapterCount,
           });
@@ -1566,8 +1578,8 @@ export class AgentOrchestrator {
     }
 
     const plannedWords = plannedTotalChapters * perChapter;
-    const summary = stoppedReason
-      ? `长篇小说模式已暂停：完成 ${completedChapters}/${chapterCount} 章。原因：${stoppedReason}`
+    const summary = pause
+      ? `长篇小说模式已暂停：完成 ${completedChapters}/${chapterCount} 章。原因：${pause.message}`
       : `长篇小说模式本批完成 ${completedChapters}/${chapterCount} 章（自动化=${automationLevel}；多子代理：规划→写作→审校→记忆）。`;
 
     emit({ phase: 'info', message: summary });
@@ -1583,6 +1595,7 @@ export class AgentOrchestrator {
       ],
       artifacts,
       metrics: emptyMetrics(plannedWords, completedChapters),
+      outcome: pause ?? { status: 'completed' },
     };
   }
 
@@ -1726,10 +1739,12 @@ export class AgentOrchestrator {
     const outlineByNumber = indexPlanChapterOutlines(planSummary?.chapterOutlines);
     let lastChapterId: Id | undefined;
     let completedChapters = 0;
-    let stoppedOnP0Title: string | undefined;
-    let inspectionUnavailableTitle: string | undefined;
+    let pause: Extract<AgentRunResult['outcome'], { status: 'paused' }> | undefined;
     for (let i = 0; i < chapterCount; i += 1) {
-      if (signal.aborted) break;
+      if (signal.aborted) {
+        pause = { status: 'paused', code: 'RUN_ABORTED', message: '用户中止' };
+        break;
+      }
       const currentChapters = await this.store.listChapters(pid);
       const num = nextLongNovelChapterNumber(currentChapters, this.longNovelChapterFlags(pid));
       const planChapter = outlineByNumber.get(num);
@@ -1770,6 +1785,10 @@ export class AgentOrchestrator {
       if (content.trim().length === 0) {
         await this.discardEmptyChapterUnlessCheckpoint(chapter.id);
         steps.push(`【ChapterAgent】「${title}」未生成正文，已保留项目状态供重试。`);
+        pause = {
+          status: 'paused', code: 'NOVEL_EMPTY_CHAPTER',
+          message: `「${title}」未生成正文，已保留项目状态供重试。`,
+        };
         break;
       }
       // 审校 → 可选修订 → 再检 → 仅对终稿应用结论与反思
@@ -1809,7 +1828,10 @@ export class AgentOrchestrator {
           current: i + 1,
           total: chapterCount,
         });
-        inspectionUnavailableTitle = title;
+        pause = {
+          status: 'paused', code: 'NOVEL_INSPECTION_UNAVAILABLE',
+          message: `审校暂不可用；「${title}」正文已保留，未提交记忆。`,
+        };
         break;
       }
       if (processed.gates?.hardFail) {
@@ -1825,7 +1847,10 @@ export class AgentOrchestrator {
           current: i + 1,
           total: chapterCount,
         });
-        stoppedOnP0Title = title;
+        pause = {
+          status: 'paused', code: 'NOVEL_QUALITY_NEEDS_REVIEW',
+          message: `P0 大 Bug 已拦截；「${title}」保留为待确认稿，未提交记忆。`,
+        };
         break;
       }
       completedChapters += 1;
@@ -1842,26 +1867,21 @@ export class AgentOrchestrator {
 
     emit({
       phase: 'info',
-      message: inspectionUnavailableTitle
-        ? `整本草稿已暂停：请重新审查「${inspectionUnavailableTitle}」。`
-        : stoppedOnP0Title
-          ? `整本草稿已暂停：请先确认并修复「${stoppedOnP0Title}」。`
-          : '整本草稿生成完成。',
+      message: pause ? `整本草稿已暂停：${pause.message}` : '整本草稿生成完成。',
     });
     return {
       task: 'full_novel',
       mode: 'draft',
       projectId: pid,
       chapterId: lastChapterId,
-      summary: inspectionUnavailableTitle
-        ? `整本草稿因审校暂不可用暂停：完成 ${completedChapters}/${chapterCount} 章；「${inspectionUnavailableTitle}」正文已保留，未提交记忆。`
-        : stoppedOnP0Title
-        ? `整本草稿因 P0 大 Bug 暂停：完成 ${completedChapters}/${chapterCount} 章；「${stoppedOnP0Title}」保留为待确认稿，未提交记忆。`
+      summary: pause
+        ? `整本草稿已暂停：完成 ${completedChapters}/${chapterCount} 章。原因：${pause.message}`
         : planSummary
           ? `已按计划生成整本草稿：完成 ${completedChapters}/${chapterCount} 章（分章大纲与创作规则已采纳），全程带长期记忆与逐章反思。`
           : `已一键生成整本草稿：完成 ${completedChapters}/${chapterCount} 章，全程带长期记忆与逐章反思自我进化。`,
       steps,
       artifacts,
+      outcome: pause ?? { status: 'completed' },
       metrics: {
         modelCalls: 0,
         promptTokens: 0,
